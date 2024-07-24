@@ -1,10 +1,4 @@
-필요한 컬럼을 추가하는 SQL ALTER TABLE 쿼리를 제공합니다:
-
-sql
-코드 복사
-ALTER TABLE USER_INFO_Trans
-ADD USER_CARD_ID VARCHAR(50);
-이제, 수정된 클래스와 WPF 코드를 제공합니다. 아래 코드는 데이터를 5분에 한 번씩 동기화하고, 매칭되지 않은 데이터는 빨간색으로 표시하며, 10분에 한 번씩 사용자 변경 작업을 체크합니다.
+는 요구사항에 맞게 수정된 WPF 애플리케이션의 코드입니다. Oracle에서 데이터를 가져오는 쿼리를 수정하고, USER_CARD_ID를 채우는 작업을 포함했으며, 5분 주기로 데이터 동기화 및 10분 주기로 사용자 변경 작업을 체크하여 ListBox에 로그를 추가하도록 구현했습니다. UI는 좌우로 쪼개어 왼쪽에는 ListBox, 오른쪽에는 DataGrid를 배치했습니다.
 
 데이터 동기화 클래스 (수정된 버전):
 csharp
@@ -21,9 +15,38 @@ public class DataSync
     private string targetConnectionString = "Data Source=TargetServer;Initial Catalog=TargetDB;User ID=YourUsername;Password=YourPassword";
     private string oracleConnectionString = "Data Source=OracleServer;User ID=YourUsername;Password=YourPassword";
 
-    public async Task StartDataSyncAsync()
+    public async Task StartDataSyncAsync(Action<string> logAction)
     {
-        await Task.WhenAll(SyncDataAsync(), CheckUserChangesAsync());
+        await Task.WhenAll(InitialUserCardIDUpdateAsync(), SyncDataAsync(), CheckUserChangesAsync(logAction));
+    }
+
+    private async Task InitialUserCardIDUpdateAsync()
+    {
+        DataTable targetData = await GetTargetDataAsync();
+        DataTable oracleData = await GetOracleUserDataAsync();
+
+        using (SqlConnection conn = new SqlConnection(targetConnectionString))
+        {
+            await conn.OpenAsync();
+
+            foreach (DataRow targetRow in targetData.Rows)
+            {
+                if (string.IsNullOrEmpty(targetRow["USER_CARD_ID"].ToString()))
+                {
+                    DataRow[] matchedRows = oracleData.Select($"USER_NAME = '{targetRow["USER_NAME"]}'");
+
+                    if (matchedRows.Length == 1)
+                    {
+                        string userCardId = matchedRows[0]["USER_CARD_ID"].ToString();
+                        string query = "UPDATE USER_INFO_Trans SET USER_CARD_ID = @USER_CARD_ID WHERE E_NUM = @E_NUM";
+                        SqlCommand cmd = new SqlCommand(query, conn);
+                        cmd.Parameters.AddWithValue("@USER_CARD_ID", userCardId);
+                        cmd.Parameters.AddWithValue("@E_NUM", targetRow["E_NUM"]);
+                        await cmd.ExecuteNonQueryAsync();
+                    }
+                }
+            }
+        }
     }
 
     private async Task SyncDataAsync()
@@ -47,7 +70,6 @@ public class DataSync
                 }
             }
 
-            // Delay for a certain interval before next sync
             await Task.Delay(TimeSpan.FromMinutes(5));
         }
     }
@@ -65,7 +87,7 @@ public class DataSync
         }
     }
 
-    private async Task<DataTable> GetTargetDataAsync()
+    public async Task<DataTable> GetTargetDataAsync()
     {
         using (SqlConnection conn = new SqlConnection(targetConnectionString))
         {
@@ -120,7 +142,7 @@ public class DataSync
         using (OracleConnection conn = new OracleConnection(oracleConnectionString))
         {
             await conn.OpenAsync();
-            string query = "SELECT USER_NAME, USER_CARD_ID FROM OracleUserTable";
+            string query = "SELECT USER_NAME, USER_CARD_ID FROM ut_esc_user WHERE station = 'SMD' AND work_group = 'REPAIR'";
             OracleDataAdapter adapter = new OracleDataAdapter(query, conn);
             DataTable dataTable = new DataTable();
             adapter.Fill(dataTable);
@@ -128,7 +150,7 @@ public class DataSync
         }
     }
 
-    private async Task CheckUserChangesAsync()
+    private async Task CheckUserChangesAsync(Action<string> logAction)
     {
         while (true)
         {
@@ -139,23 +161,21 @@ public class DataSync
                                 join oracle in oracleData.AsEnumerable()
                                 on target.Field<string>("USER_NAME") equals oracle.Field<string>("USER_NAME") into tempJoin
                                 from subOracle in tempJoin.DefaultIfEmpty()
-                                where target.Field<string>("USER_CARD_ID") == "Not Matched" || subOracle == null
+                                where string.IsNullOrEmpty(target.Field<string>("USER_CARD_ID")) && subOracle != null
                                 select new
                                 {
                                     USER_NAME = target.Field<string>("USER_NAME"),
-                                    USER_CARD_ID = target.Field<string>("USER_CARD_ID"),
+                                    USER_CARD_ID = subOracle.Field<string>("USER_CARD_ID"),
                                     E_NUM = target.Field<string>("E_NUM"),
                                     PROCESS = target.Field<string>("PROCESS"),
                                     GROUP_NAME = target.Field<string>("GROUP_NAME")
                                 };
 
-            // Log unmatched user changes
             foreach (var row in unmatchedRows)
             {
-                Console.WriteLine($"Unmatched User: {row.USER_NAME}, E_NUM: {row.E_NUM}");
+                logAction($"Unmatched User: {row.USER_NAME}, E_NUM: {row.E_NUM}");
             }
 
-            // Delay for a certain interval before next check
             await Task.Delay(TimeSpan.FromMinutes(10));
         }
     }
@@ -168,7 +188,14 @@ xaml
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Data Sync Application" Height="450" Width="800">
     <Grid>
-        <DataGrid x:Name="dataGrid" AutoGenerateColumns="False" Margin="10" CellEditEnding="DataGrid_CellEditEnding">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="2*" />
+        </Grid.ColumnDefinitions>
+        
+        <ListBox x:Name="logListBox" Grid.Column="0" Margin="10" />
+        
+        <DataGrid x:Name="dataGrid" AutoGenerateColumns="False" Grid.Column="1" Margin="10" CellEditEnding="DataGrid_CellEditEnding">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="USER_NAME" Binding="{Binding USER_NAME}" IsReadOnly="True"/>
                 <DataGridTextColumn Header="USER_CARD_ID" Binding="{Binding USER_CARD_ID}"/>
@@ -177,7 +204,9 @@ xaml
                 <DataGridTextColumn Header="GROUP_NAME" Binding="{Binding GROUP_NAME}" IsReadOnly="True"/>
             </DataGrid.Columns>
         </DataGrid>
+        
         <Button Content="Load Data" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="10" Click="LoadDataButton_Click"/>
+        <Button Content="Log Details" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="100,0,0,10" Click="LogDetailsButton_Click"/>
     </Grid>
 </Window>
 MainWindow.xaml.cs (수정된 버전):
@@ -201,7 +230,7 @@ namespace DataSyncApp
         {
             InitializeComponent();
             dataSync = new DataSync();
-            Task.Run(() => dataSync.StartDataSyncAsync());
+            Task.Run(() => dataSync.StartDataSyncAsync(LogAction));
         }
 
         private async void LoadDataButton_Click(object sender, RoutedEventArgs e)
@@ -250,6 +279,19 @@ namespace DataSyncApp
                 // For example, you might update a local list or another table in the database.
             }
         }
+
+        private void LogAction(string message)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                logListBox.Items.Add(message);
+            });
+        }
+
+        private void LogDetailsButton_Click(object sender, RoutedEventArgs e)
+        {
+            MessageBox.Show("Please manually review the log for unmatched users.");
+        }
     }
 }
-이 코드는 MSSQL의 USER_INFO_Trans 테이블에 USER_CARD_ID 컬럼을 추가하고, 데이터를 동기화하며, 매칭되지 않은 사용자 정보를 빨간색으로 표시하고, 10분에 한 번씩 사용자 변경 작업을 체크하여 콘솔에 로그를 남깁니다. UI는 사용자가 수동으로 USER_CA
+이 코드는 Oracle에서 데이터를 가져오는 쿼리를 수정하고, USER_CARD_ID를 채우는 작업을 초기화한 후 5분 주기로 데이터 동기화 및 10분 주기로 사용자 변경 작업을 체크하여 ListBox에 로그를 추가합니다. UI는 좌우로 쪼개어 왼쪽에는 ListBox, 오른쪽에는 DataGrid를 배치하여 사용자에게 상황을 알려줍
