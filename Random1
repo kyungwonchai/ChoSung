@@ -1,127 +1,183 @@
+겠습니다. while (true) 루프를 제거하고, 미전송된 데이터를 1분마다 전송하는 로직을 추가하여 EsdCheckMiddleSync 클래스를 수정하겠습니다.
+
+수정된 EsdCheckMiddleSync 클래스 전체 코드는 다음과 같습니다:
+
+csharp
+코드 복사
 using System;
+using System.Data;
 using System.Data.SqlClient;
-using System.Windows;
-using System.IO;
+using System.Threading.Tasks;
+using Oracle.ManagedDataAccess.Client;
 
-namespace AutoMemo
+public class EsdCheckMiddleSync
 {
-    public partial class MainWindow : Window
+    private string sourceConnectionString = "Data Source=SourceServer;Initial Catalog=SourceDB;User ID=YourUsername;Password=YourPassword";
+    private string middleConnectionString = "Data Source=MiddleServer;Initial Catalog=MiddleDB;User ID=YourUsername;Password=YourPassword";
+    private string oracleConnectionString = "Data Source=OracleServer;User ID=YourUsername;Password=YourPassword";
+
+    // 데이터 동기화를 시작하고 로그 액션을 인수로 받음
+    public async Task StartDataSyncAsync(Action<string> logAction)
     {
-        private string connectionString = "Server=your_server;Database=AutoMemoDB;User Id=your_username;Password=your_password;";
-        private string settingsFilePath = "settings.txt";
+        // 오라클 데이터 동기화
+        logAction("Starting Initial Oracle Data Sync...");
+        await SyncOracleDataToMiddleAsync(logAction);
+        logAction("Initial Oracle Data Sync Completed.");
 
-        public MainWindow()
-        {
-            InitializeComponent();
-            ProcessClipboardContent();
-            SetWindowTitle();
-        }
+        // 중간 데이터에서 소스 데이터베이스로 동기화
+        _ = SyncDataFromMiddleToSourceAsync(logAction);
+    }
 
-        private void ProcessClipboardContent()
+    // Oracle 데이터를 중간 데이터베이스로 동기화하는 함수
+    private async Task SyncOracleDataToMiddleAsync(Action<string> logAction)
+    {
+        logAction("Starting Oracle Data Sync to Middle...");
+
+        DataTable oracleData = await GetOracleDataAsync(); // 오라클 데이터 가져오기
+        DataTable middleData = await GetMiddleDataAsync(); // 중간 데이터 가져오기
+
+        foreach (DataRow oracleRow in oracleData.Rows)
         {
-            if (Clipboard.ContainsText())
+            DataRow[] middleRows = middleData.Select($"USER_CARD_ID = '{oracleRow["USER_CARD_ID"]}'");
+
+            // 중간 테이블에 데이터가 없는 경우에만 삽입
+            if (middleRows.Length == 0)
             {
-                string clipboardText = Clipboard.GetText();
-                clipboardTextBox.Text = clipboardText;
-                SaveMemoToDatabase(clipboardText);
+                await InsertMiddleRowAsync(oracleRow); // 중간 테이블에 새로운 행 삽입
+                logAction($"Inserted new row in middle for USER_CARD_ID: {oracleRow["USER_CARD_ID"]}");
             }
         }
+    }
 
-        private void SaveMemoToDatabase(string memoText)
+    // 오라클 데이터 가져오는 함수
+    private async Task<DataTable> GetOracleDataAsync()
+    {
+        using (OracleConnection conn = new OracleConnection(oracleConnectionString))
         {
-            using (SqlConnection conn = new SqlConnection(connectionString))
+            await conn.OpenAsync();
+            string query = @"SELECT u.USER_CARD_ID, u.USER_NAME, u.work_group, e.USER_CARD_ID, e.esd_check_tf, e.update_time 
+                             FROM ut_esc_user u 
+                             JOIN ut_esd_check_status_list e ON u.user_card_id = e.user_card_id 
+                             WHERE u.work_group = 'REPAIR' AND e.update_TIME >= SYSDATE - INTERVAL '1000' HOUR";
+            OracleDataAdapter adapter = new OracleDataAdapter(query, conn);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 중간 데이터 가져오는 함수
+    private async Task<DataTable> GetMiddleDataAsync()
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT USER_CARD_ID, INSERTED_TO_SOURCE FROM ESD_CHECK_MIDDLE";
+            SqlDataAdapter adapter = new SqlDataAdapter(query, conn);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 중간 테이블에 새로운 행 삽입하는 함수
+    private async Task InsertMiddleRowAsync(DataRow oracleRow)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"INSERT INTO ESD_CHECK_MIDDLE (USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME) 
+                             VALUES (@USER_CARD_ID, @USER_NAME, @WORK_GROUP, @ESD_CHECK_TF, @UPDATE_TIME)";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@WORK_GROUP", oracleRow["work_group"]);
+            cmd.Parameters.AddWithValue("@ESD_CHECK_TF", oracleRow["esd_check_tf"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    // 중간 데이터에서 소스 데이터베이스로 동기화하는 함수
+    private async Task SyncDataFromMiddleToSourceAsync(Action<string> logAction)
+    {
+        while (true)
+        {
+            logAction("Starting Data Sync from Middle to Source...");
+
+            DataTable middleData = await GetMiddleDataAsync(); // 중간 데이터 가져오기
+
+            foreach (DataRow middleRow in middleData.Rows)
             {
-                string query = "INSERT INTO T_AutoMemo (MemoText, RecordTime) VALUES (@MemoText, @RecordTime)";
-                SqlCommand cmd = new SqlCommand(query, conn);
-                cmd.Parameters.AddWithValue("@MemoText", memoText);
-                cmd.Parameters.AddWithValue("@RecordTime", DateTime.Now);
-
-                conn.Open();
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        private void btnLast5Days_Click(object sender, RoutedEventArgs e)
-        {
-            LoadMemos(DateTime.Now.AddDays(-5));
-        }
-
-        private void btnAll_Click(object sender, RoutedEventArgs e)
-        {
-            LoadMemos(null);
-        }
-
-        private void LoadMemos(DateTime? fromDate)
-        {
-            memoDataGrid.Items.Clear();
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                string query = "SELECT Id, MemoText, RecordTime FROM T_AutoMemo";
-                if (fromDate.HasValue)
+                // 중간 테이블에서 아직 소스로 전송되지 않은 항목만 처리
+                if (!(bool)middleRow["INSERTED_TO_SOURCE"])
                 {
-                    query += " WHERE RecordTime >= @FromDate";
-                }
+                    string userCardId = middleRow["USER_CARD_ID"].ToString();
+                    DataTable sourceData = await GetSourceDataAsync(userCardId);
 
-                SqlCommand cmd = new SqlCommand(query, conn);
-                if (fromDate.HasValue)
-                {
-                    cmd.Parameters.AddWithValue("@FromDate", fromDate.Value);
-                }
-
-                conn.Open();
-                SqlDataReader reader = cmd.ExecuteReader();
-                while (reader.Read())
-                {
-                    memoDataGrid.Items.Add(new MemoItem
+                    if (sourceData.Rows.Count > 0)
                     {
-                        Id = reader.GetInt32(0),
-                        MemoText = reader.GetString(1),
-                        RecordTime = reader.GetDateTime(2)
-                    });
-                }
-            }
-        }
+                        await InsertSourceDataAsync(sourceData.Rows[0]); // 소스 테이블에 새로운 행 삽입
+                        logAction($"Inserted new row for USER_CARD_ID: {userCardId} in ESC_CHECK_HISTORY");
 
-        private void memoDataGrid_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-        {
-            if (memoDataGrid.SelectedItem != null)
-            {
-                MemoItem selectedMemo = memoDataGrid.SelectedItem as MemoItem;
-                memoDetailsTextBox.Text = selectedMemo.MemoText;
-            }
-        }
-
-        public class MemoItem
-        {
-            public int Id { get; set; }
-            public string MemoText { get; set; }
-            public DateTime RecordTime { get; set; }
-
-            public override string ToString()
-            {
-                return $"{RecordTime}: {MemoText}";
-            }
-        }
-
-        private void SetWindowTitle()
-        {
-            int nextNumber = 1;
-
-            // 파일에서 마지막 번호를 읽어옴
-            if (File.Exists(settingsFilePath))
-            {
-                string lastNumberStr = File.ReadAllText(settingsFilePath);
-                if (int.TryParse(lastNumberStr, out int lastNumber))
-                {
-                    nextNumber = lastNumber + 1;
+                        // 중간 테이블 업데이트
+                        await UpdateMiddleTableAsync(userCardId);
+                    }
                 }
             }
 
-            // 새 번호를 제목에 설정
-            this.Title = $"M{nextNumber}";
+            await Task.Delay(TimeSpan.FromMinutes(1)); // 1분 대기
+        }
+    }
 
-            // 새 번호를 파일에 기록
-            File.WriteAllText(settingsFilePath, nextNumber.ToString());
+    // 소스 데이터 가져오는 함수
+    private async Task<DataTable> GetSourceDataAsync(string userCardId)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"SELECT USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME 
+                             FROM ESD_CHECK_MIDDLE 
+                             WHERE USER_CARD_ID = @USER_CARD_ID"; // 중간 테이블 이름으로 변경
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", userCardId);
+            SqlDataAdapter adapter = new SqlDataAdapter(cmd);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 소스 테이블에 새로운 행 삽입하는 함수
+    private async Task InsertSourceDataAsync(DataRow sourceRow)
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"INSERT INTO ESC_CHECK_HISTORY (USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME) 
+                             VALUES (@USER_CARD_ID, @USER_NAME, @WORK_GROUP, @ESD_CHECK_TF, @UPDATE_TIME)";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", sourceRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", sourceRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@WORK_GROUP", sourceRow["WORK_GROUP"]);
+            cmd.Parameters.AddWithValue("@ESD_CHECK_TF", sourceRow["ESD_CHECK_TF"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", sourceRow["UPDATE_TIME"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    // 중간 테이블을 업데이트하는 함수
+    private async Task UpdateMiddleTableAsync(string userCardId)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "UPDATE ESD_CHECK_MIDDLE SET INSERTED_TO_SOURCE = 1, INSERTED_TIME = @INSERTED_TIME WHERE USER_CARD_ID = @USER_CARD_ID";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@INSERTED_TIME", DateTime.Now);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", userCardId);
+            await cmd.ExecuteNonQueryAsync();
         }
     }
 }
+이제 SyncOracleDataToMiddleAsync는 한 번만 실행되고, 중간 테이블의 데이터를 1분마다 소스 데이터베이스로 전송하는 SyncDataFromMiddleToSourceAsync 함수가 실행됩니다. 이 수정된 코드는 오라클 데이터가 중간 테이블에 적절히 저장되고, 중간 테이블의 데이터가 소스 데이터베이스
