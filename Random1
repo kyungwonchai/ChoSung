@@ -1,7 +1,5 @@
-겠습니다. 두 가지 문제를 해결하기 위해 수정된 코드를 제공하겠습니다:
+정해야 합니다. 디렉터리를 검색할 때 UnauthorizedAccessException을 처리하여 프로그램이 계속 작동하도록 만들어야 합니다.
 
-Schema mismatch 오류 해결: ML.NET에서 Vector<float> 형식으로 변환해야 하는데, 현재 Vector<long> 형식으로 되어 있어 변환 오류가 발생합니다. 이를 해결하기 위해 데이터를 float 형식으로 변환하도록 수정합니다.
-시스템 볼륨 폴더 에러 없이 모든 하위 폴더 처리: 시스템 볼륨 폴더를 제외하고 모든 하위 폴더를 처리하도록 수정합니다.
 수정된 MainWindow.xaml.cs
 csharp
 코드 복사
@@ -141,14 +139,11 @@ namespace SMDFileCleaner
 
         private List<FileRecord> CollectInitialFileData(string folderPath, string fileExtension)
         {
+            var fileDataList = new List<FileRecord>();
             try
             {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories)
-                                      .Where(f => !IsSystemVolumeInformation(f) && f.Length > 1 * 1024 * 1024) // 1MB 이상의 파일
-                                      .ToList();
-
-                var fileDataList = files.Select(f => new FileRecord
+                var files = GetFiles(folderPath, fileExtension);
+                fileDataList = files.Select(f => new FileRecord
                 {
                     FilePath = f.FullName,
                     Extension = f.Extension,
@@ -160,19 +155,41 @@ namespace SMDFileCleaner
                 {
                     txtCurrentPatterns.Text = $"Training on {files.Count} files";
                 });
-
-                return fileDataList;
             }
             catch (Exception ex)
             {
                 LogError("Failed to collect initial file data: " + ex.Message);
-                return new List<FileRecord>();
             }
+            return fileDataList;
         }
 
-        private bool IsSystemVolumeInformation(FileInfo fileInfo)
+        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
         {
-            return fileInfo.DirectoryName.Contains("System Volume Information");
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
         }
 
         private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
@@ -312,6 +329,7 @@ namespace SMDFileCleaner
                 var data = _mlContext.Data.LoadFromEnumerable(fileData);
 
                 var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
                     .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
 
                 _model = pipeline.Fit(data);
@@ -420,12 +438,7 @@ namespace SMDFileCleaner
         {
             try
             {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories)
-                                      .Where(f => !IsSystemVolumeInformation(f) && f.Length > 1 * 1024 * 1024) // 1MB 이상의 파일
-                                      .OrderBy(f => f.CreationTime)
-                                      .ToList();
-
+                var files = GetFiles(folderPath, fileExtension);
                 var filesToDelete = files.Where(file => mlModelBuilder.Predict(file)).ToList();
 
                 dispatcher.Invoke(() =>
@@ -442,9 +455,33 @@ namespace SMDFileCleaner
             }
         }
 
-        private bool IsSystemVolumeInformation(FileInfo fileInfo)
+        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
         {
-            return fileInfo.DirectoryName.Contains("System Volume Information");
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
         }
 
         public async Task DeleteFilesAsync(List<FileInfo> files)
@@ -469,10 +506,7 @@ namespace SMDFileCleaner
         {
             try
             {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories)
-                                      .Where(f => !IsSystemVolumeInformation(f) && f.Length > 1 * 1024 * 1024) // 1MB 이상의 파일
-                                      .ToList();
+                var files = GetFiles(folderPath, fileExtension);
                 long totalSize = files.Sum(f => f.Length);
 
                 dispatcher.Invoke(() =>
@@ -520,6 +554,10 @@ namespace SMDFileCleaner
                 dispatcher.Invoke(() =>
                 {
                     logRecentActivity(logMessage);
+                    if (lstRecentLogs.Items.Count > 200)
+                    {
+                        lstRecentLogs.Items.RemoveAt(0);
+                    }
                 });
             }
             catch (Exception ex)
@@ -539,8 +577,4 @@ public class FileRecord
     public float Size { get; set; } // float 형식으로 변경
     public string FolderPath { get; set; }
 }
-이제 다음과 같은 사항이 해결되었습니다:
-
-Schema mismatch 오류 해결: FileRecord 클래스의 Size 속성을 float 형식으로 변경했습니다.
-시스템 볼륨 폴더를 제외하고 모든 하위 폴더 처리: IsSystemVolumeInformation 메서드를 사용하여 시스템 볼륨 폴더를 제외하도록 처리했습니다.
-이제 이 코드를 사용하면 모델이 파일 확장자, 폴더 경로 및 파일 크기를 학습하고, 학습된 데이터를 기반으로 파일을 삭제할 수 있습니다. 설정은 C:\Agent\SMDClean 폴더에 저장되며, 프로그램을 다시 실행할 때 이 설정을 불러옵니다.
+이제 다음과 
