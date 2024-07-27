@@ -1,48 +1,292 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Formatters.Binary;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
 
 namespace SMDFileCleaner
 {
-    [Serializable]
-    public class Settings
+    public partial class MainWindow : Window
     {
-        public string FolderPath { get; set; }
-        public string FileExtension { get; set; }
-        public string DriveName { get; set; }
-    }
+        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
+        private const int MinimumSampleSize = 10; // 최소 샘플 수
+        private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
+        private string logDirectory = @"C:\Agent\SMDClean\Logs";
+        private string settingsDirectory = @"C:\Agent\SMDClean";
+        private MLModelBuilder _mlModelBuilder;
+        private SettingsManager _settingsManager;
+        private FileCleaner _fileCleaner;
+        private Logger _logger;
+        private List<FileRecord> _trainingData;
 
-    public class SettingsManager
-    {
-        private readonly string settingsFilePath;
-
-        public SettingsManager(string settingsDirectory)
+        public MainWindow()
         {
-            settingsFilePath = Path.Combine(settingsDirectory, "settings.bin");
+            InitializeComponent();
+            _mlModelBuilder = new MLModelBuilder();
+            _settingsManager = new SettingsManager(settingsDirectory);
+            _logger = new Logger(logDirectory, Dispatcher, LogRecentActivity, LogDeletionActivity);
+            _fileCleaner = new FileCleaner(logDirectory, _mlModelBuilder, Dispatcher, _logger, UpdateFolderStatistics);
+            LoadSettings();
         }
 
-        public void SaveSettings(Settings settings)
+        private void btnSaveSettings_Click(object sender, RoutedEventArgs e)
         {
-            IFormatter formatter = new BinaryFormatter();
-            using (Stream stream = new FileStream(settingsFilePath, FileMode.Create, FileAccess.Write))
+            try
             {
-                formatter.Serialize(stream, settings);
+                SaveSettings();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
             }
         }
 
-        public Settings LoadSettings()
+        private void btnLoadSettings_Click(object sender, RoutedEventArgs e)
         {
-            if (!File.Exists(settingsFilePath))
+            try
             {
-                return null;
+                LoadSettings();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+        }
+
+        private void btnSelectFolder_Click(object sender, RoutedEventArgs e)
+        {
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
+            {
+                dialog.SelectedPath = txtFolderPath.Text;
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                {
+                    txtFolderPath.Text = dialog.SelectedPath;
+                    SaveSettings(); // 폴더 선택 시 설정 저장
+                }
+            }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                _settingsManager.SaveSettings(new Settings
+                {
+                    FolderPath = txtFolderPath.Text,
+                    FileExtension = cmbFileExtension.Text,
+                    DriveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\"
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+        }
+
+        private void LoadSettings()
+        {
+            try
+            {
+                var settings = _settingsManager.LoadSettings();
+                if (settings != null)
+                {
+                    txtFolderPath.Text = settings.FolderPath ?? "D:\\";
+                    cmbFileExtension.Text = settings.FileExtension ?? ".jpg";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+        }
+
+        private async void btnStart_Click(object sender, RoutedEventArgs e)
+        {
+            string folderPath = txtFolderPath.Text;
+            string fileExtension = cmbFileExtension.Text;
+            string driveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\";
+
+            if (string.IsNullOrEmpty(folderPath) || folderPath == "폴더 경로 입력" ||
+                string.IsNullOrEmpty(fileExtension))
+            {
+                System.Windows.Forms.MessageBox.Show("모든 입력값을 제공해주세요.");
+                return;
             }
 
-            IFormatter formatter = new BinaryFormatter();
-            using (Stream stream = new FileStream(settingsFilePath, FileMode.Open, FileAccess.Read))
+            try
             {
-                return (Settings)formatter.Deserialize(stream);
+                Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 중..."; });
+
+                _trainingData = await Task.Run(() => CollectInitialFileData(folderPath, fileExtension));
+                if (_trainingData.Count < MinimumSampleSize)
+                {
+                    System.Windows.Forms.MessageBox.Show($"학습 모델을 훈련시키기에 샘플이 충분하지 않습니다. 최소 샘플 수: {MinimumSampleSize}");
+                    Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: 샘플 부족"; });
+                    return;
+                }
+
+                _mlModelBuilder.TrainModel(_trainingData);
+
+                Dispatcher.Invoke(() =>
+                {
+                    dataGridTrainingData.ItemsSource = _trainingData;
+                    txtTrainingStatus.Text = "학습 완료";
+                    txtCurrentPatterns.Text = string.Join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString()));
+                });
+
+                await Task.Run(() => MonitorAndDisplayFilesToDelete(folderPath, fileExtension, driveName));
             }
+            catch (Exception ex)
+            {
+                _logger.LogError("모델 훈련 실패: " + ex.Message);
+                Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: " + ex.Message); });
+            }
+        }
+
+        private List<FileRecord> CollectInitialFileData(string folderPath, string fileExtension)
+        {
+            var fileDataList = new List<FileRecord>();
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                if (files != null && files.Count > 0)
+                {
+                    fileDataList = files.Select(f => new FileRecord
+                    {
+                        FilePath = f.FullName,
+                        Extension = f.Extension,
+                        Size = (float)f.Length, // float 형식으로 변환
+                        FolderPath = f.DirectoryName
+                    }).ToList();
+
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtCurrentPatterns.Text = $"학습 중인 파일 수: {files.Count}개";
+                    });
+                }
+                else
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        txtCurrentPatterns.Text = "학습할 파일이 없습니다.";
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("파일 데이터 수집 실패: " + ex.Message);
+                Dispatcher.Invoke(() =>
+                {
+                    txtCurrentPatterns.Text = "파일 데이터 수집 오류.";
+                });
+            }
+            return fileDataList;
+        }
+
+        private List<FileInfo> GetFiles(string folderPath, string fileExtension)
+        {
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogError("폴더 접근 거부됨: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
+        }
+
+        private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
+        {
+            while (true)
+            {
+                try
+                {
+                    long freeSpace = await Task.Run(() => _fileCleaner.GetDriveFreeSpace(driveName));
+                    List<FileInfo> filesToDelete = await Task.Run(() => _fileCleaner.GetFilesToDelete(folderPath, fileExtension));
+
+                    Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
+
+                    await _fileCleaner.DeleteFilesAsync(filesToDelete, folderPath);
+
+                    await Task.Run(() => _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension));
+                    await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError("모니터링 중 오류 발생: " + ex.Message);
+                }
+            }
+        }
+
+        private void DisplayFilesToDelete(List<FileInfo> filesToDelete)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                lstPriorityFiles.Items.Clear();
+                foreach (var file in filesToDelete)
+                {
+                    lstPriorityFiles.Items.Add($"{file.FullName} (생성 시간: {file.CreationTime})");
+                }
+                dataGridTrainingResults.ItemsSource = filesToDelete.Select(f => new { f.Name, f.CreationTime });
+            });
+        }
+
+        private void LogRecentActivity(string message)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                string logMessage = $"{DateTime.Now}: {message}";
+                lstRecentLogs.Items.Add(logMessage);
+                if (lstRecentLogs.Items.Count > 200)
+                {
+                    lstRecentLogs.Items.RemoveAt(0);
+                }
+            });
+        }
+
+        private void LogDeletionActivity(string message)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                string logMessage = $"{DateTime.Now}: {message}";
+                lstDeletionLogs.Items.Add(logMessage);
+                if (lstDeletionLogs.Items.Count > 200)
+                {
+                    lstDeletionLogs.Items.RemoveAt(0);
+                }
+            });
+        }
+
+        private void UpdateFolderStatistics(long totalSize, string folderPath)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                string logMessage = $"{DateTime.Now}: 폴더: {folderPath}, 총 크기: {totalSize / (1024 * 1024)} MB";
+                lstRecentLogs.Items.Add(logMessage);
+                if (lstRecentLogs.Items.Count > 200)
+                {
+                    lstRecentLogs.Items.RemoveAt(0);
+                }
+            });
         }
     }
 }
