@@ -1,406 +1,80 @@
-겠습니다. dispatcher.Invoke 안의 주석 부분에 실제 코드를 추가하여 폴더 통계를 UI에 업데이트하고, 삭제 로그를 UI에 표시하도록 하겠습니다.
-
-수정된 FileCleaner.cs
-csharp
-코드 복사
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
-using System.Windows.Threading;
+using Microsoft.ML;
+using Microsoft.ML.Data;
 
 namespace SMDFileCleaner
 {
-    public class FileCleaner
+    public class MLModelBuilder
     {
-        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
-        private readonly string logDirectory;
-        private readonly MLModelBuilder mlModelBuilder;
-        private readonly Dispatcher dispatcher;
-        private readonly Action<string> logRecentActivity;
-        private readonly Action<string> logDeletionActivity;
-        private readonly Action<long, string> updateFolderStatistics;
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
+        private List<FileRecord> _fileDataList;
 
-        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Action<string> logRecentActivity, Action<string> logDeletionActivity, Action<long, string> updateFolderStatistics)
+        public MLModelBuilder()
         {
-            this.logDirectory = logDirectory;
-            this.mlModelBuilder = mlModelBuilder;
-            this.dispatcher = dispatcher;
-            this.logRecentActivity = logRecentActivity;
-            this.logDeletionActivity = logDeletionActivity;
-            this.updateFolderStatistics = updateFolderStatistics;
+            _mlContext = new MLContext();
+            _fileDataList = new List<FileRecord>();
         }
 
-        public long GetDriveFreeSpace(string driveName)
+        public void TrainModel(List<FileRecord> fileData)
         {
             try
             {
-                DriveInfo drive = new DriveInfo(driveName);
-                return drive.AvailableFreeSpace;
+                _fileDataList = fileData;
+                var data = _mlContext.Data.LoadFromEnumerable(fileData);
+                var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Hour), nameof(FileRecord.DayOfWeek))
+                    .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
+
+                _model = pipeline.Fit(data);
             }
             catch (Exception ex)
             {
-                LogError(ex.Message);
-                return 0;
+                throw new ApplicationException("Failed to train model.", ex);
             }
         }
 
-        public List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension)
+        public bool Predict(FileInfo fileInfo)
         {
             try
             {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories)
-                                      .OrderBy(f => f.CreationTime)
-                                      .ToList();
-
-                var filesToDelete = files.Where(file => mlModelBuilder.Predict(file)).ToList();
-
-                dispatcher.Invoke(() =>
+                if (_model == null)
                 {
-                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
-                });
+                    throw new InvalidOperationException("Model is not trained.");
+                }
 
-                return filesToDelete;
+                var fileData = new FileRecord
+                {
+                    Hour = fileInfo.CreationTime.Hour,
+                    DayOfWeek = (int)fileInfo.CreationTime.DayOfWeek
+                };
+
+                var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
+                var prediction = predictionEngine.Predict(fileData);
+
+                return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
             }
             catch (Exception ex)
             {
-                LogError(ex.Message);
-                return new List<FileInfo>();
+                throw new ApplicationException("Failed to predict file classification.", ex);
             }
         }
 
-        public async Task DeleteFilesAsync(List<FileInfo> files)
-        {
-            foreach (var file in files)
-            {
-                try
-                {
-                    // 실제 파일 삭제
-                    // file.Delete();
-                    LogDeletion(file.FullName);
-                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
-                }
-                catch (Exception ex)
-                {
-                    LogError(ex.Message);
-                }
-            }
-        }
-
-        public void UpdateFolderStatistics(string folderPath, string fileExtension)
+        public string GetCurrentPatterns()
         {
             try
             {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories);
-                long totalSize = files.Sum(f => f.Length);
+                var patternGroups = _fileDataList.GroupBy(f => new { f.Hour, f.DayOfWeek })
+                    .Select(g => new { g.Key.Hour, g.Key.DayOfWeek, Count = g.Count() })
+                    .OrderByDescending(g => g.Count);
 
-                dispatcher.Invoke(() =>
-                {
-                    updateFolderStatistics(totalSize, folderPath);
-                });
+                return string.Join(", ", patternGroups.Select(g => $"Hour: {g.Hour}, Day: {g.DayOfWeek}, Count: {g.Count}"));
             }
             catch (Exception ex)
             {
-                LogError(ex.Message);
-            }
-        }
-
-        private void LogDeletion(string filePath)
-        {
-            try
-            {
-                string logPath = Path.Combine(logDirectory, DateTime.Now.ToString("yyyyMMdd"), "yyyyMMddlog.txt");
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
-                string logMessage = $"{DateTime.Now}: Deleted {filePath}";
-
-                File.AppendAllText(logPath, logMessage + Environment.NewLine);
-
-                dispatcher.Invoke(() =>
-                {
-                    logDeletionActivity(logMessage);
-                });
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private void LogError(string message)
-        {
-            try
-            {
-                string logPath = Path.Combine(logDirectory, DateTime.Now.ToString("yyyyMMdd"), "errorlog.txt");
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
-                string logMessage = $"{DateTime.Now}: {message}";
-
-                File.AppendAllText(logPath, logMessage + Environment.NewLine);
-
-                dispatcher.Invoke(() =>
-                {
-                    logRecentActivity(logMessage);
-                });
-            }
-            catch (Exception)
-            {
-                // 에러 로깅에 실패한 경우 추가 조치 없음
-            }
-        }
-    }
-}
-수정된 MainWindow.xaml.cs
-csharp
-코드 복사
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Forms;
-using System.Windows.Threading;
-
-namespace SMDFileCleaner
-{
-    public partial class MainWindow : Window
-    {
-        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
-        private string logDirectory = @"C:\agent\SMDFIleClean";
-        private MLModelBuilder _mlModelBuilder;
-        private SettingsManager _settingsManager;
-        private FileCleaner _fileCleaner;
-
-        public MainWindow()
-        {
-            InitializeComponent();
-            _mlModelBuilder = new MLModelBuilder();
-            _settingsManager = new SettingsManager();
-            _fileCleaner = new FileCleaner(logDirectory, _mlModelBuilder, Dispatcher, LogRecentActivity, LogDeletionActivity, UpdateFolderStatistics);
-            LoadSettings();
-        }
-
-        private void btnSaveSettings_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                SaveSettings();
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private void btnLoadSettings_Click(object sender, RoutedEventArgs e)
-        {
-            try
-            {
-                LoadSettings();
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private void btnSelectFolder_Click(object sender, RoutedEventArgs e)
-        {
-            using (var dialog = new FolderBrowserDialog())
-            {
-                dialog.SelectedPath = txtFolderPath.Text;
-                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
-                {
-                    txtFolderPath.Text = dialog.SelectedPath;
-                }
-            }
-        }
-
-        private void SaveSettings()
-        {
-            try
-            {
-                _settingsManager.SaveSettings(new Settings
-                {
-                    FolderPath = txtFolderPath.Text,
-                    FileExtension = txtFileExtension.Text,
-                    DriveName = txtDriveName.Text
-                });
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private void LoadSettings()
-        {
-            try
-            {
-                var settings = _settingsManager.LoadSettings();
-                if (settings != null)
-                {
-                    txtFolderPath.Text = settings.FolderPath ?? "D:\\";
-                    txtFileExtension.Text = settings.FileExtension ?? "Enter file extension (e.g., .jpg)";
-                    txtDriveName.Text = settings.DriveName ?? "D:\\";
-                }
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private async void btnStart_Click(object sender, RoutedEventArgs e)
-        {
-            string folderPath = txtFolderPath.Text;
-            string fileExtension = txtFileExtension.Text;
-            string driveName = txtDriveName.Text;
-
-            if (string.IsNullOrEmpty(folderPath) || folderPath == "Enter folder path" ||
-                string.IsNullOrEmpty(fileExtension) || fileExtension == "Enter file extension (e.g., .jpg)" ||
-                string.IsNullOrEmpty(driveName) || driveName == "Enter drive name (e.g., D:\\)")
-            {
-                MessageBox.Show("Please provide all inputs.");
-                return;
-            }
-
-            try
-            {
-                var initialFiles = CollectInitialFileData(folderPath, fileExtension);
-                _mlModelBuilder.TrainModel(initialFiles);
-
-                await MonitorAndDisplayFilesToDelete(folderPath, fileExtension, driveName);
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-            }
-        }
-
-        private List<FileRecord> CollectInitialFileData(string folderPath, string fileExtension)
-        {
-            try
-            {
-                DirectoryInfo directory = new DirectoryInfo(folderPath);
-                var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories);
-
-                var fileDataList = files.Select(f => new FileRecord
-                {
-                    Hour = f.CreationTime.Hour,
-                    DayOfWeek = (int)f.CreationTime.DayOfWeek
-                }).ToList();
-
-                Dispatcher.Invoke(() =>
-                {
-                    txtCurrentPatterns.Text = $"Training on {files.Length} files";
-                });
-
-                return fileDataList;
-            }
-            catch (Exception ex)
-            {
-                LogError(ex.Message);
-                return new List<FileRecord>();
-            }
-        }
-
-        private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
-        {
-            while (true)
-            {
-                try
-                {
-                    long freeSpace = _fileCleaner.GetDriveFreeSpace(driveName);
-                    if (freeSpace < MinimumFreeSpace)
-                    {
-                        List<FileInfo> filesToDelete = _fileCleaner.GetFilesToDelete(folderPath, fileExtension);
-                        DisplayFilesToDelete(filesToDelete);
-                        //await _fileCleaner.DeleteFilesAsync(filesToDelete); // 실제 삭제 코드 (주석 처리)
-                    }
-
-                    _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension);
-                    await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
-                }
-                catch (Exception ex)
-                {
-                    LogError(ex.Message);
-                }
-            }
-        }
-
-        private void DisplayFilesToDelete(List<FileInfo> filesToDelete)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                lstPriorityFiles.Items.Clear();
-                foreach (var file in filesToDelete)
-                {
-                    lstPriorityFiles.Items.Add(file.FullName);
-                }
-            });
-        }
-
-        private void LogRecentActivity(string message)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                lstRecentLogs.Items.Add(message);
-                if (lstRecentLogs.Items.Count > 200)
-                {
-                    lstRecentLogs.Items.RemoveAt(0);
-                }
-            });
-        }
-
-        private void LogDeletionActivity(string message)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                lstDeletionLogs.Items.Add(message);
-                if (lstDeletionLogs.Items.Count > 200)
-                {
-                    lstDeletionLogs.Items.RemoveAt(0);
-                }
-            });
-        }
-
-        private void UpdateFolderStatistics(long totalSize, string folderPath)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                lstRecentLogs.Items.Add($"Folder: {folderPath}, Total Size: {totalSize / (1024 * 1024)} MB");
-                if (lstRecentLogs.Items.Count > 200)
-                {
-                    lstRecentLogs.Items.RemoveAt(0);
-                }
-            });
-        }
-
-        private void LogError(string message)
-        {
-            try
-            {
-                string logPath = Path.Combine(logDirectory, DateTime.Now.ToString("yyyyMMdd"), "errorlog.txt");
-                Directory.CreateDirectory(Path.GetDirectoryName(logPath));
-                string logMessage = $"{DateTime.Now}: {message}";
-
-                File.AppendAllText(logPath, logMessage + Environment.NewLine);
-
-                Dispatcher.Invoke(() =>
-                {
-                    lstRecentLogs.Items.Add(logMessage);
-                    if (lstRecentLogs.Items.Count > 200)
-                    {
-                        lstRecentLogs.Items.RemoveAt(0);
-                    }
-                });
-            }
-            catch (Exception)
-            {
-                // 에러 로깅에 실패한 경우 추가 조치 없음
+                throw new ApplicationException("Failed to get current patterns.", ex);
             }
         }
     }
@@ -410,14 +84,10 @@ namespace SMDFileCleaner
         public float Hour { get; set; }
         public float DayOfWeek { get; set; }
     }
+
+    public class FilePrediction
+    {
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
+    }
 }
-설명
-MainWindow.xaml.cs 수정:
-
-FileCleaner 클래스에 필요한 델리게이트를 전달하여 UI를 업데이트하는 코드를 추가했습니다.
-LogRecentActivity, LogDeletionActivity, UpdateFolderStatistics 메서드를 추가하여 UI 업데이트를 처리합니다.
-FileCleaner.cs 수정:
-
-dispatcher.Invoke 블록 안에 실제 코드를 추가하여 폴더 통계와 삭제 로그를 UI에 업데이트합니다.
-필요한 델리게이트를 사용하여 UI 업데이트를 수행합니다.
-이제 이 코드를 사용하면 설정이 자동으로 저장되고 불러와지며, 머신러닝 모델을 통해 파일 생성 패턴을 분석하고, 주기적으로 파일을 모
