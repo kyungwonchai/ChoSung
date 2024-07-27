@@ -1,10 +1,157 @@
+FileCleaner.cs 수정
+폴더의 총 크기를 확인하고, 8GB를 넘으면 오래된 파일부터 삭제하도록 수정합니다.
+
+csharp
+코드 복사
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Threading;
+
+namespace SMDFileCleaner
+{
+    public class FileCleaner
+    {
+        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
+        private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
+        private readonly string logDirectory;
+        private readonly MLModelBuilder mlModelBuilder;
+        private readonly Dispatcher dispatcher;
+        private readonly Logger logger;
+        private readonly Action<long, string> updateFolderStatistics;
+
+        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Logger logger, Action<long, string> updateFolderStatistics)
+        {
+            this.logDirectory = logDirectory;
+            this.mlModelBuilder = mlModelBuilder;
+            this.dispatcher = dispatcher;
+            this.logger = logger;
+            this.updateFolderStatistics = updateFolderStatistics;
+        }
+
+        public long GetDriveFreeSpace(string driveName)
+        {
+            try
+            {
+                DriveInfo drive = new DriveInfo(driveName);
+                return drive.AvailableFreeSpace;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get drive free space: " + ex.Message);
+                return 0;
+            }
+        }
+
+        public List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                var filesToDelete = files.Where(file => mlModelBuilder.Predict(file)).OrderBy(file => file.CreationTime).ToList();
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
+                });
+
+                return filesToDelete;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get files to delete: " + ex.Message);
+                return new List<FileInfo>();
+            }
+        }
+
+        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
+        {
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logger.LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
+        }
+
+        public async Task DeleteFilesAsync(List<FileInfo> files, string folderPath)
+        {
+            long currentFolderSize = files.Sum(f => f.Length);
+
+            foreach (var file in files)
+            {
+                if (currentFolderSize <= MaxFolderSize)
+                {
+                    break;
+                }
+
+                try
+                {
+                    file.Delete();
+                    currentFolderSize -= file.Length;
+                    logger.LogDeletionActivity(file.FullName);
+                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError("Failed to delete file: " + ex.Message);
+                }
+            }
+
+            updateFolderStatistics(currentFolderSize, folderPath);
+        }
+
+        public void UpdateFolderStatistics(string folderPath, string fileExtension)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                long totalSize = files.Sum(f => f.Length);
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(totalSize, folderPath);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to update folder statistics: " + ex.Message);
+            }
+        }
+    }
+}
+MainWindow.xaml.cs 수정
+폴더의 총 크기가 8GB를 넘으면 파일을 삭제하는 로직을 추가합니다.
+
+csharp
+코드 복사
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Forms;
 using System.Windows.Threading;
 
 namespace SMDFileCleaner
@@ -57,10 +204,10 @@ namespace SMDFileCleaner
 
         private void btnSelectFolder_Click(object sender, RoutedEventArgs e)
         {
-            using (var dialog = new FolderBrowserDialog())
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
             {
                 dialog.SelectedPath = txtFolderPath.Text;
-                if (dialog.ShowDialog() == DialogResult.OK)
+                if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
                 {
                     txtFolderPath.Text = dialog.SelectedPath;
                 }
@@ -224,7 +371,7 @@ namespace SMDFileCleaner
 
                     Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
 
-                    //await _fileCleaner.DeleteFilesAsync(filesToDelete); // 실제 삭제 코드 (주석 처리)
+                    await _fileCleaner.DeleteFilesAsync(filesToDelete, folderPath);
 
                     await Task.Run(() => _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension));
                     await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
@@ -289,3 +436,4 @@ namespace SMDFileCleaner
         }
     }
 }
+이제 파일이 실제로 삭제되며, 삭제 로그가 기록되고 폴더의 총 크기가 8GB를 넘지 않도록 오래된 파일부터 삭제하도록 구현
