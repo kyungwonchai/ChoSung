@@ -1,78 +1,128 @@
-private async void btnStart_Click(object sender, RoutedEventArgs e)
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Threading;
+
+namespace SMDFileCleaner
 {
-    string folderPath = txtFolderPath.Text;
-    string fileExtension = cmbFileExtension.Text;
-    string driveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\";
-
-    if (string.IsNullOrEmpty(folderPath) || folderPath == "폴더 경로 입력" ||
-        string.IsNullOrEmpty(fileExtension))
+    public class FileCleaner
     {
-        System.Windows.Forms.MessageBox.Show("모든 입력값을 제공해주세요.");
-        return;
-    }
+        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
+        private readonly string logDirectory;
+        private readonly MLModelBuilder mlModelBuilder;
+        private readonly Dispatcher dispatcher;
+        private readonly Logger logger;
+        private readonly Action<long, string> updateFolderStatistics;
 
-    try
-    {
-        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 중..."; });
-
-        _trainingData = await Task.Run(() => CollectInitialFileData(folderPath, fileExtension));
-        if (_trainingData.Count < MinimumSampleSize)
+        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Logger logger, Action<long, string> updateFolderStatistics)
         {
-            System.Windows.Forms.MessageBox.Show($"학습 모델을 훈련시키기에 샘플이 충분하지 않습니다. 최소 샘플 수: {MinimumSampleSize}");
-            Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: 샘플 부족"; });
-            return;
+            this.logDirectory = logDirectory;
+            this.mlModelBuilder = mlModelBuilder;
+            this.dispatcher = dispatcher;
+            this.logger = logger;
+            this.updateFolderStatistics = updateFolderStatistics;
         }
 
-        _mlModelBuilder.TrainModel(_trainingData);
-
-        Dispatcher.Invoke(() =>
+        public long GetDriveFreeSpace(string driveName)
         {
-            dataGridTrainingData.ItemsSource = _trainingData;
-            txtTrainingStatus.Text = "학습 완료";
-            txtCurrentPatterns.Text = string.Join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString()));
-        });
-
-        await Task.Run(() => MonitorAndDisplayFilesToDelete(folderPath, fileExtension, driveName));
-    }
-    catch (Exception ex)
-    {
-        _logger.LogError("모델 훈련 실패: " + ex.Message);
-        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: " + ex.Message); });
-    }
-}
-
-private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
-{
-    while (true)
-    {
-        try
-        {
-            long freeSpace = await Task.Run(() => _fileCleaner.GetDriveFreeSpace(driveName));
-            List<FileInfo> filesToDelete = await Task.Run(() => _fileCleaner.GetFilesToDelete(folderPath, fileExtension));
-
-            Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
-
-            //await _fileCleaner.DeleteFilesAsync(filesToDelete); // 실제 삭제 코드 (주석 처리)
-
-            await Task.Run(() => _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension));
-            await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
+            try
+            {
+                DriveInfo drive = new DriveInfo(driveName);
+                return drive.AvailableFreeSpace;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get drive free space: " + ex.Message);
+                return 0;
+            }
         }
-        catch (Exception ex)
+
+        public List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension)
         {
-            _logger.LogError("모니터링 중 오류 발생: " + ex.Message);
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                var filesToDelete = files.Where(file => mlModelBuilder.Predict(file)).OrderBy(file => file.CreationTime).ToList();
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
+                });
+
+                return filesToDelete;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get files to delete: " + ex.Message);
+                return new List<FileInfo>();
+            }
+        }
+
+        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
+        {
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logger.LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
+        }
+
+        public async Task DeleteFilesAsync(List<FileInfo> files)
+        {
+            foreach (var file in files)
+            {
+                try
+                {
+                    // 실제 파일 삭제
+                    // file.Delete();
+                    logger.LogDeletionActivity(file.FullName);
+                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError("Failed to delete file: " + ex.Message);
+                }
+            }
+        }
+
+        public void UpdateFolderStatistics(string folderPath, string fileExtension)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                long totalSize = files.Sum(f => f.Length);
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(totalSize, folderPath);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to update folder statistics: " + ex.Message);
+            }
         }
     }
-}
-
-private void DisplayFilesToDelete(List<FileInfo> filesToDelete)
-{
-    Dispatcher.Invoke(() =>
-    {
-        lstPriorityFiles.Items.Clear();
-        foreach (var file in filesToDelete)
-        {
-            lstPriorityFiles.Items.Add($"{file.FullName} (생성 시간: {file.CreationTime})");
-        }
-        dataGridTrainingResults.ItemsSource = filesToDelete.Select(f => new { f.Name, f.CreationTime });
-    });
 }
