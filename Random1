@@ -1,48 +1,267 @@
-트를 여는 명령어는 다음과 같습니다.
+습니다. 머신러닝을 사용하여 주기적으로 생성되는 파일을 파악하고, 그 파일들을 삭제 대상으로 삼는 프로그램을 구현하겠습니다. WPF와 C#을 사용하여 프로그램을 구성하고, ML.NET을 사용하여 머신러닝 모델을 구축해보겠습니다. ML.NET은 Microsoft에서 제공하는 머신러닝 라이브러리로, .NET 애플리케이션에서 쉽게 머신러닝 기능을 사용할 수 있습니다.
 
-1. 방화벽 상태 확인
-먼저 방화벽 상태를 확인하려면 ufw 명령어를 사용합니다.
+1. 프로젝트 설정 및 기본 UI 구성
+기본 UI를 구성합니다. MainWindow.xaml 파일에서 UI를 정의합니다.
 
-bash
+xml
 코드 복사
-sudo ufw status
-2. 특정 포트 열기
-특정 포트를 열려면 다음 명령어를 사용합니다. 예를 들어, 포트 5000을 열려면:
+<Window x:Class="FileCleaner.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="File Cleaner" Height="450" Width="800">
+    <Grid>
+        <StackPanel>
+            <TextBox Name="txtFolderPath" Width="400" Margin="10" PlaceholderText="Enter folder path"/>
+            <TextBox Name="txtFileExtension" Width="400" Margin="10" PlaceholderText="Enter file extension (e.g., .jpg)"/>
+            <TextBox Name="txtDriveName" Width="400" Margin="10" PlaceholderText="Enter drive name (e.g., C:)"/>
+            <Button Name="btnStart" Content="Start Cleaning" Width="200" Margin="10" Click="btnStart_Click"/>
+            <ListBox Name="lstRecentLogs" Width="750" Height="150" Margin="10"/>
+            <ListBox Name="lstDeletionLogs" Width="750" Height="150" Margin="10"/>
+        </StackPanel>
+    </Grid>
+</Window>
+2. 머신러닝 모델 구축
+ML.NET을 사용하여 주기적으로 생성되는 파일을 파악하는 모델을 구축합니다. 이 모델은 파일의 생성 시간 등을 기반으로 주기성을 파악합니다. MLModelBuilder.cs 파일을 생성하여 머신러닝 모델을 정의합니다.
 
-bash
+csharp
 코드 복사
-sudo ufw allow 5000/tcp
-3. 방화벽 규칙 확인
-방화벽 규칙이 제대로 적용되었는지 확인하려면 다시 상태를 확인합니다.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Microsoft.ML;
+using Microsoft.ML.Data;
 
-bash
-코드 복사
-sudo ufw status
-전체 과정 요약
-방화벽 상태 확인:
+namespace FileCleaner
+{
+    public class MLModelBuilder
+    {
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
 
-bash
-코드 복사
-sudo ufw status
-특정 포트 열기 (예: 5000번 포트):
+        public MLModelBuilder()
+        {
+            _mlContext = new MLContext();
+        }
 
-bash
-코드 복사
-sudo ufw allow 5000/tcp
-방화벽 상태 확인 (규칙 적용 확인):
+        public void TrainModel(List<FileData> fileData)
+        {
+            var data = _mlContext.Data.LoadFromEnumerable(fileData);
+            var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileData.Hour), nameof(FileData.DayOfWeek))
+                .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
 
-bash
-코드 복사
-sudo ufw status
-방화벽 활성화 및 비활성화
-만약 방화벽이 활성화되지 않은 경우, 방화벽을 활성화하려면 다음 명령어를 사용합니다.
+            _model = pipeline.Fit(data);
+        }
 
-bash
-코드 복사
-sudo ufw enable
-방화벽을 비활성화하려면 다음 명령어를 사용합니다.
+        public bool Predict(FileInfo fileInfo)
+        {
+            if (_model == null)
+            {
+                throw new InvalidOperationException("Model is not trained.");
+            }
 
-bash
+            var fileData = new FileData
+            {
+                Hour = fileInfo.CreationTime.Hour,
+                DayOfWeek = (int)fileInfo.CreationTime.DayOfWeek
+            };
+
+            var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileData, FilePrediction>(_model);
+            var prediction = predictionEngine.Predict(fileData);
+
+            return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
+        }
+    }
+
+    public class FileData
+    {
+        public float Hour { get; set; }
+        public float DayOfWeek { get; set; }
+    }
+
+    public class FilePrediction
+    {
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
+    }
+}
+3. 파일 검색 및 삭제 로직 구현
+MainWindow.xaml.cs 파일에서 비동기 파일 검색 및 삭제 로직을 구현합니다.
+
+csharp
 코드 복사
-sudo ufw disable
-위의 명령어들을 사용하여 우분투 방화벽 상태를 확인하고, 특정 포트를 열 수 있
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
+using Microsoft.ML;
+
+namespace FileCleaner
+{
+    public partial class MainWindow : Window
+    {
+        private const long MinimumFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB
+        private string logDirectory = @"C:\agent\SMDFIleClean";
+        private MLModelBuilder _mlModelBuilder;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            _mlModelBuilder = new MLModelBuilder();
+        }
+
+        private async void btnStart_Click(object sender, RoutedEventArgs e)
+        {
+            string folderPath = txtFolderPath.Text;
+            string fileExtension = txtFileExtension.Text;
+            string driveName = txtDriveName.Text;
+
+            if (string.IsNullOrEmpty(folderPath) || string.IsNullOrEmpty(fileExtension) || string.IsNullOrEmpty(driveName))
+            {
+                MessageBox.Show("Please provide all inputs.");
+                return;
+            }
+
+            // 초기 파일 데이터 수집 및 모델 학습
+            var initialFiles = CollectInitialFileData(folderPath, fileExtension);
+            _mlModelBuilder.TrainModel(initialFiles);
+
+            await MonitorAndCleanFiles(folderPath, fileExtension, driveName);
+        }
+
+        private List<FileData> CollectInitialFileData(string folderPath, string fileExtension)
+        {
+            DirectoryInfo directory = new DirectoryInfo(folderPath);
+            var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories);
+
+            var fileDataList = files.Select(f => new FileData
+            {
+                Hour = f.CreationTime.Hour,
+                DayOfWeek = (int)f.CreationTime.DayOfWeek
+            }).ToList();
+
+            return fileDataList;
+        }
+
+        private async Task MonitorAndCleanFiles(string folderPath, string fileExtension, string driveName)
+        {
+            while (true)
+            {
+                try
+                {
+                    long freeSpace = GetDriveFreeSpace(driveName);
+                    if (freeSpace < MinimumFreeSpace)
+                    {
+                        List<FileInfo> filesToDelete = GetFilesToDelete(folderPath, fileExtension);
+                        await DeleteFilesAsync(filesToDelete);
+                    }
+
+                    UpdateFolderStatistics(folderPath, fileExtension);
+                    await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex.Message);
+                }
+            }
+        }
+
+        private long GetDriveFreeSpace(string driveName)
+        {
+            DriveInfo drive = new DriveInfo(driveName);
+            return drive.AvailableFreeSpace;
+        }
+
+        private List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension)
+        {
+            DirectoryInfo directory = new DirectoryInfo(folderPath);
+            var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories)
+                                  .OrderBy(f => f.CreationTime)
+                                  .ToList();
+
+            // 머신러닝 모델을 사용하여 주기적으로 생성되는 파일을 필터링
+            var filesToDelete = files.Where(file => _mlModelBuilder.Predict(file)).ToList();
+            return filesToDelete;
+        }
+
+        private async Task DeleteFilesAsync(List<FileInfo> files)
+        {
+            foreach (var file in files)
+            {
+                try
+                {
+                    file.Delete();
+                    LogDeletion(file.FullName);
+                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
+                }
+                catch (Exception ex)
+                {
+                    LogError(ex.Message);
+                }
+            }
+        }
+
+        private void UpdateFolderStatistics(string folderPath, string fileExtension)
+        {
+            DirectoryInfo directory = new DirectoryInfo(folderPath);
+            var files = directory.GetFiles($"*{fileExtension}", SearchOption.AllDirectories);
+            long totalSize = files.Sum(f => f.Length);
+
+            Dispatcher.Invoke(() =>
+            {
+                lstRecentLogs.Items.Add($"Folder: {folderPath}, Total Size: {totalSize / (1024 * 1024)} MB");
+                if (lstRecentLogs.Items.Count > 200)
+                {
+                    lstRecentLogs.Items.RemoveAt(0);
+                }
+            });
+        }
+
+        private void LogDeletion(string filePath)
+        {
+            string logPath = Path.Combine(logDirectory, DateTime.Now.ToString("yyyyMMdd"), "yyyyMMddlog.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            string logMessage = $"{DateTime.Now}: Deleted {filePath}";
+
+            File.AppendAllText(logPath, logMessage + Environment.NewLine);
+
+            Dispatcher.Invoke(() =>
+            {
+                lstDeletionLogs.Items.Add(logMessage);
+                if (lstDeletionLogs.Items.Count > 200)
+                {
+                    lstDeletionLogs.Items.RemoveAt(0);
+                }
+            });
+        }
+
+        private void LogError(string message)
+        {
+            string logPath = Path.Combine(logDirectory, DateTime.Now.ToString("yyyyMMdd"), "errorlog.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            string logMessage = $"{DateTime.Now}: {message}";
+
+            File.AppendAllText(logPath, logMessage + Environment.NewLine);
+
+            Dispatcher.Invoke(() =>
+            {
+                lstRecentLogs.Items.Add(logMessage);
+                if (lstRecentLogs.Items.Count > 200)
+                {
+                    lstRecentLogs.Items.RemoveAt(0);
+                }
+            });
+        }
+    }
+}
+설명
+UI 구성: MainWindow.xaml에서 사용자 입력을 받을 텍스트박스와 버튼, 그리고 로그를 표시할 리스트박스를 구성합니다.
+머신러닝 모델 구축: MLModelBuilder 클래스에서 ML.NET을 사용하여 파일 생성 시간 데이터를 학습합니다.
+비동기 파일 검색 및 삭제: MainWindow.xaml.cs 파일에서 폴더를 모니터링하고, 머신러닝 모델을 사용하여 주기적으로 생성된 파일을 식별하고 삭제합니다.
+로그 기록 및 UI 업데이트: 파일 삭제 로그와 오류 로그를 기록하고, UI에 표시합니다.
+이 프로그램은 주기적으로 폴더를 모니터링하며, 머신러닝을 사용하여 주기적으로 생성되는 파일을 식별하고 삭제합니다. 파일 삭제 로그는 지정된 디렉토리에 기록되며, UI 상에서도 최근 로그와 삭제 로그를 확인할 수 있습니다.
+
+프로그램을 실행하면, 사용자가 지정한 경로와 파일 확장자에 따라 주기적으로 파일을 삭제하고, 삭제 로그와 최근 동작 로그를 UI 상에 표시할 수 있습니다. 각 작업은 비동기로 처리되어 CPU
