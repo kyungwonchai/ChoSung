@@ -1,48 +1,267 @@
+패턴 규칙을 한글로 설명하는 기능을 추가합니다.
+
+csharp
+코드 복사
 using System;
+using System.Collections.Generic;
 using System.IO;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Formatters.Binary;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Microsoft.ML;
+using Microsoft.ML.Data;
 
 namespace SMDFileCleaner
 {
-    [Serializable]
-    public class Settings
+    public class MLModelBuilder
     {
-        public string FolderPath { get; set; }
-        public string FileExtension { get; set; }
-        public string DriveName { get; set; }
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
+        private List<FileRecord> _fileDataList;
+
+        public MLModelBuilder()
+        {
+            _mlContext = new MLContext();
+            _fileDataList = new List<FileRecord>();
+        }
+
+        public void TrainModel(List<FileRecord> fileData)
+        {
+            try
+            {
+                if (fileData == null || fileData.Count < 10) // 최소 샘플 수 확인
+                {
+                    throw new InvalidOperationException("Not enough samples to train the model. Minimum required samples: 10");
+                }
+
+                _fileDataList = fileData;
+                var data = _mlContext.Data.LoadFromEnumerable(fileData);
+
+                var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FolderPathFeaturized", nameof(FileRecord.FolderPath)))
+                    .Append(_mlContext.Transforms.Concatenate("Features", "Features", "FolderPathFeaturized"))
+                    .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
+                    .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
+
+                _model = pipeline.Fit(data);
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to train model: " + ex.Message, ex);
+            }
+        }
+
+        public bool Predict(FileInfo fileInfo)
+        {
+            try
+            {
+                if (_model == null)
+                {
+                    throw new InvalidOperationException("Model is not trained.");
+                }
+
+                var fileData = new FileRecord
+                {
+                    Size = (float)fileInfo.Length, // float 형식으로 변환
+                    FolderPath = fileInfo.DirectoryName
+                };
+
+                var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
+                var prediction = predictionEngine.Predict(fileData);
+
+                return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to predict file classification: " + ex.Message, ex);
+            }
+        }
+
+        public string GetCurrentPatterns()
+        {
+            try
+            {
+                var regexPatterns = GetRegexPatterns();
+                if (regexPatterns.Count == 0)
+                {
+                    return "No patterns found.";
+                }
+
+                return string.Join(", ", regexPatterns.Select(p => p.ToString()));
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to get current patterns: " + ex.Message, ex);
+            }
+        }
+
+        public string GetCurrentPatternsInKorean()
+        {
+            try
+            {
+                var regexPatterns = GetRegexPatterns();
+                if (regexPatterns.Count == 0)
+                {
+                    return "발견된 패턴이 없습니다.";
+                }
+
+                var patternDescriptions = regexPatterns.Select(p => TranslatePatternToKorean(p)).ToList();
+                return string.Join("\n", patternDescriptions);
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("패턴 설명을 가져오지 못했습니다: " + ex.Message, ex);
+            }
+        }
+
+        private string TranslatePatternToKorean(Regex pattern)
+        {
+            if (pattern.ToString().Contains(@"\d{4}-\d{2}-\d{2}"))
+            {
+                return "이 패턴은 날짜 형식을 포함합니다 (예: 2022-01-01).";
+            }
+            if (pattern.ToString().Contains(@"IMG_\d{8}"))
+            {
+                return "이 패턴은 이미지 파일 형식을 포함합니다 (예: IMG_20220101).";
+            }
+            if (pattern.ToString().Contains(@"\d+"))
+            {
+                return "이 패턴은 숫자를 포함합니다.";
+            }
+            if (pattern.ToString().Contains(@"[A-Za-z]+"))
+            {
+                return "이 패턴은 영문자를 포함합니다.";
+            }
+            // 추가적인 패턴 설명이 필요하면 여기에 추가
+            return "알 수 없는 패턴: " + pattern.ToString();
+        }
+
+        public List<Regex> GetRegexPatterns()
+        {
+            var patterns = new List<Regex>();
+
+            // 모든 폴더 경로에서 공통된 부분을 찾아서 정규식 패턴으로 변환
+            var folderPaths = _fileDataList.Select(f => f.FolderPath).Distinct().ToList();
+            if (folderPaths.Count > 1)
+            {
+                var commonPattern = FindCommonPattern(folderPaths);
+                if (!string.IsNullOrEmpty(commonPattern))
+                {
+                    patterns.Add(new Regex(commonPattern));
+                }
+            }
+
+            return patterns;
+        }
+
+        private string FindCommonPattern(List<string> paths)
+        {
+            // 모든 경로에서 공통된 부분을 찾기 위해 LCS(Longest Common Subsequence) 알고리즘 사용
+            var lcs = FindLCS(paths);
+            if (string.IsNullOrEmpty(lcs))
+            {
+                return string.Empty;
+            }
+
+            // 공통된 부분을 정규식 패턴으로 변환
+            var regexPattern = Regex.Escape(lcs).Replace("\\*", ".*").Replace("\\?", ".");
+            return regexPattern;
+        }
+
+        private string FindLCS(List<string> strs)
+        {
+            if (strs == null || strs.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var lcs = strs[0];
+            foreach (var str in strs)
+            {
+                lcs = FindLCS(lcs, str);
+            }
+
+            return lcs;
+        }
+
+        private string FindLCS(string str1, string str2)
+        {
+            var lengths = new int[str1.Length, str2.Length];
+            var greatestLength = 0;
+            var output = string.Empty;
+
+            for (int i = 0; i < str1.Length; i++)
+            {
+                for (int j = 0; j < str2.Length; j++)
+                {
+                    if (str1[i] == str2[j])
+                    {
+                        lengths[i, j] = (i == 0 || j == 0) ? 1 : lengths[i - 1, j - 1] + 1;
+                        if (lengths[i, j] > greatestLength)
+                        {
+                            greatestLength = lengths[i, j];
+                            output = str1.Substring(i - greatestLength + 1, greatestLength);
+                        }
+                    }
+                }
+            }
+
+            return output;
+        }
     }
 
-    public class SettingsManager
+    public class FilePrediction
     {
-        private readonly string settingsFilePath;
-
-        public SettingsManager(string settingsDirectory)
-        {
-            settingsFilePath = Path.Combine(settingsDirectory, "settings.bin");
-        }
-
-        public void SaveSettings(Settings settings)
-        {
-            IFormatter formatter = new BinaryFormatter();
-            using (Stream stream = new FileStream(settingsFilePath, FileMode.Create, FileAccess.Write))
-            {
-                formatter.Serialize(stream, settings);
-            }
-        }
-
-        public Settings LoadSettings()
-        {
-            if (!File.Exists(settingsFilePath))
-            {
-                return null;
-            }
-
-            IFormatter formatter = new BinaryFormatter();
-            using (Stream stream = new FileStream(settingsFilePath, FileMode.Open, FileAccess.Read))
-            {
-                return (Settings)formatter.Deserialize(stream);
-            }
-        }
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
     }
 }
+수정된 MainWindow.xaml.cs
+패턴 규칙을 한글로 상세히 설명하는 기능을 추가합니다.
+
+csharp
+코드 복사
+private async void btnStart_Click(object sender, RoutedEventArgs e)
+{
+    string folderPath = txtFolderPath.Text;
+    string fileExtension = cmbFileExtension.Text;
+    string driveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\";
+
+    if (string.IsNullOrEmpty(folderPath) || folderPath == "폴더 경로 입력" ||
+        string.IsNullOrEmpty(fileExtension))
+    {
+        System.Windows.Forms.MessageBox.Show("모든 입력값을 제공해주세요.");
+        return;
+    }
+
+    try
+    {
+        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 중..."; });
+
+        _trainingData = await Task.Run(() => CollectInitialFileData(folderPath, fileExtension));
+        if (_trainingData.Count < MinimumSampleSize)
+        {
+            System.Windows.Forms.MessageBox.Show($"학습 모델을 훈련시키기에 샘플이 충분하지 않습니다. 최소 샘플 수: {MinimumSampleSize}");
+            Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: 샘플 부족"; });
+            return;
+        }
+
+        _mlModelBuilder.TrainModel(_trainingData);
+
+        Dispatcher.Invoke(() =>
+        {
+            dataGridTrainingData.ItemsSource = _trainingData;
+            txtTrainingStatus.Text = "학습 완료";
+            txtCurrentPatterns.Text = string.Join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString()));
+            txtCurrentPatternsKorean.Text = _mlModelBuilder.GetCurrentPatternsInKorean();
+        });
+
+        await Task.Run(() => MonitorAndDisplayFilesToDelete(folderPath, fileExtension, driveName));
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError("모델 훈련 실패: " + ex.Message);
+        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: " + ex.Message); });
+    }
+}
+수정된 MainWindow.xaml
+한글로 된 패턴 설명을 
