@@ -1,7 +1,3 @@
- 통해 삭제할 파일의 패턴을 찾아내도록 수정합니다.
-
-csharp
-코드 복사
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -37,6 +33,8 @@ namespace SMDFileCleaner
                 var data = _mlContext.Data.LoadFromEnumerable(fileData);
 
                 var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FolderPathFeaturized", nameof(FileRecord.FolderPath)))
+                    .Append(_mlContext.Transforms.Concatenate("Features", "Features", "FolderPathFeaturized"))
                     .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
                     .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
 
@@ -59,7 +57,8 @@ namespace SMDFileCleaner
 
                 var fileData = new FileRecord
                 {
-                    Size = (float)fileInfo.Length // float 형식으로 변환
+                    Size = (float)fileInfo.Length, // float 형식으로 변환
+                    FolderPath = fileInfo.DirectoryName
                 };
 
                 var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
@@ -94,23 +93,74 @@ namespace SMDFileCleaner
         public List<Regex> GetRegexPatterns()
         {
             var patterns = new List<Regex>();
-            var regexes = new List<Regex>
-            {
-                new Regex(@"(\d{4})-(\d{2})-(\d{2})"), // 날짜 패턴 (예: 2022-01-01)
-                new Regex(@"IMG_(\d{8})"), // 이미지 파일 패턴 (예: IMG_20220101)
-                // 필요한 다른 정규식 패턴 추가
-            };
 
-            foreach (var regex in regexes)
+            // 모든 폴더 경로에서 공통된 부분을 찾아서 정규식 패턴으로 변환
+            var folderPaths = _fileDataList.Select(f => f.FolderPath).Distinct().ToList();
+            if (folderPaths.Count > 1)
             {
-                var matches = _fileDataList.Where(f => regex.IsMatch(f.FilePath)).ToList();
-                if (matches.Count > 0)
+                var commonPattern = FindCommonPattern(folderPaths);
+                if (!string.IsNullOrEmpty(commonPattern))
                 {
-                    patterns.Add(regex);
+                    patterns.Add(new Regex(commonPattern));
                 }
             }
 
             return patterns;
+        }
+
+        private string FindCommonPattern(List<string> paths)
+        {
+            // 모든 경로에서 공통된 부분을 찾기 위해 LCS(Longest Common Subsequence) 알고리즘 사용
+            var lcs = FindLCS(paths);
+            if (string.IsNullOrEmpty(lcs))
+            {
+                return string.Empty;
+            }
+
+            // 공통된 부분을 정규식 패턴으로 변환
+            var regexPattern = Regex.Escape(lcs).Replace("\\*", ".*").Replace("\\?", ".");
+            return regexPattern;
+        }
+
+        private string FindLCS(List<string> strs)
+        {
+            if (strs == null || strs.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var lcs = strs[0];
+            foreach (var str in strs)
+            {
+                lcs = FindLCS(lcs, str);
+            }
+
+            return lcs;
+        }
+
+        private string FindLCS(string str1, string str2)
+        {
+            var lengths = new int[str1.Length, str2.Length];
+            var greatestLength = 0;
+            var output = string.Empty;
+
+            for (int i = 0; i < str1.Length; i++)
+            {
+                for (int j = 0; j < str2.Length; j++)
+                {
+                    if (str1[i] == str2[j])
+                    {
+                        lengths[i, j] = (i == 0 || j == 0) ? 1 : lengths[i - 1, j - 1] + 1;
+                        if (lengths[i, j] > greatestLength)
+                        {
+                            greatestLength = lengths[i, j];
+                            output = str1.Substring(i - greatestLength + 1, greatestLength);
+                        }
+                    }
+                }
+            }
+
+            return output;
         }
     }
 
@@ -120,112 +170,3 @@ namespace SMDFileCleaner
         public uint PredictedClusterId { get; set; }
     }
 }
-MainWindow.xaml.cs 수정
-학습한 패턴을 UI에 표시하고, 로그에 시간 및 상세 설명을 추가합니다.
-
-csharp
-코드 복사
-private async void btnStart_Click(object sender, RoutedEventArgs e)
-{
-    string folderPath = txtFolderPath.Text;
-    string fileExtension = cmbFileExtension.Text;
-    string driveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\";
-
-    if (string.IsNullOrEmpty(folderPath) || folderPath == "폴더 경로 입력" ||
-        string.IsNullOrEmpty(fileExtension))
-    {
-        System.Windows.Forms.MessageBox.Show("모든 입력값을 제공해주세요.");
-        return;
-    }
-
-    try
-    {
-        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 중..."; });
-
-        _trainingData = await Task.Run(() => CollectInitialFileData(folderPath, fileExtension));
-        if (_trainingData.Count < MinimumSampleSize)
-        {
-            System.Windows.Forms.MessageBox.Show($"학습 모델을 훈련시키기에 샘플이 충분하지 않습니다. 최소 샘플 수: {MinimumSampleSize}");
-            Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: 샘플 부족"; });
-            return;
-        }
-
-        Dispatcher.Invoke(() =>
-        {
-            dataGridTrainingData.ItemsSource = _trainingData;
-            _mlModelBuilder.TrainModel(_trainingData);
-            txtTrainingStatus.Text = "학습 완료";
-            txtCurrentPatterns.Text = _mlModelBuilder.GetCurrentPatterns();
-        });
-
-        await Task.Run(() => MonitorAndDisplayFilesToDelete(folderPath, fileExtension, driveName));
-    }
-    catch (Exception ex)
-    {
-        LogError("모델 훈련 실패: " + ex.Message);
-        Dispatcher.Invoke(() => { txtTrainingStatus.Text = "학습 실패: " + ex.Message; });
-    }
-}
-
-private void LogRecentActivity(string message)
-{
-    Dispatcher.Invoke(() =>
-    {
-        string logMessage = $"{DateTime.Now}: {message}";
-        lstRecentLogs.Items.Add(logMessage);
-        if (lstRecentLogs.Items.Count > 200)
-        {
-            lstRecentLogs.Items.RemoveAt(0);
-        }
-    });
-}
-
-private void LogDeletionActivity(string message)
-{
-    Dispatcher.Invoke(() =>
-    {
-        string logMessage = $"{DateTime.Now}: {message}";
-        lstDeletionLogs.Items.Add(logMessage);
-        if (lstDeletionLogs.Items.Count > 200)
-        {
-            lstDeletionLogs.Items.RemoveAt(0);
-        }
-    });
-}
-
-private void UpdateFolderStatistics(long totalSize, string folderPath)
-{
-    Dispatcher.Invoke(() =>
-    {
-        string logMessage = $"{DateTime.Now}: 폴더: {folderPath}, 총 크기: {totalSize / (1024 * 1024)} MB";
-        lstRecentLogs.Items.Add(logMessage);
-        if (lstRecentLogs.Items.Count > 200)
-        {
-            lstRecentLogs.Items.RemoveAt(0);
-        }
-    });
-}
-
-private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
-{
-    while (true)
-    {
-        try
-        {
-            long freeSpace = await Task.Run(() => _fileCleaner.GetDriveFreeSpace(driveName));
-            List<FileInfo> filesToDelete = await Task.Run(() => _fileCleaner.GetFilesToDelete(folderPath, fileExtension));
-
-            Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
-
-            //await _fileCleaner.DeleteFilesAsync(filesToDelete); // 실제 삭제 코드 (주석 처리)
-
-            await Task.Run(() => _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension));
-            await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
-        }
-        catch (Exception ex)
-        {
-            LogError("모니터링 중 오류 발생: " + ex.Message);
-        }
-    }
-}
-이제 학습한 패턴을 정규식으로 UI에 표시하고, 로그에 시간과 상세 설명을 추가합니다. LogRecentActivity, LogDeletionA
