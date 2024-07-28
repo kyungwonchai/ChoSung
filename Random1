@@ -1,3 +1,186 @@
+ 위해 MLModelBuilder 클래스에서 학습된 패턴을 반환하고, MainWindow.xaml.cs에서 이를 UI에 표시하는 코드를 추가하겠습니다.
+
+MLModelBuilder.cs
+csharp
+코드 복사
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Microsoft.ML;
+using Microsoft.ML.Data;
+
+namespace SMDFileCleaner
+{
+    public class MLModelBuilder
+    {
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
+        private List<FileRecord> _fileDataList;
+        private List<Regex> _patterns;
+
+        public MLModelBuilder()
+        {
+            _mlContext = new MLContext();
+            _fileDataList = new List<FileRecord>();
+            _patterns = new List<Regex>();
+        }
+
+        public void TrainModel(List<FileRecord> fileData)
+        {
+            try
+            {
+                if (fileData == null || fileData.Count < 10) // 최소 샘플 수 확인
+                {
+                    throw new InvalidOperationException("Not enough samples to train the model. Minimum required samples: 10");
+                }
+
+                _fileDataList = fileData;
+                var data = _mlContext.Data.LoadFromEnumerable(fileData);
+
+                var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FolderPathFeaturized", nameof(FileRecord.FolderPath)))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FilePathFeaturized", nameof(FileRecord.FilePath)))
+                    .Append(_mlContext.Transforms.Concatenate("Features", "Features", "FolderPathFeaturized", "FilePathFeaturized"))
+                    .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
+                    .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
+
+                _model = pipeline.Fit(data);
+
+                // 학습된 패턴 생성
+                _patterns = ExtractPatterns(_fileDataList);
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to train model: " + ex.Message, ex);
+            }
+        }
+
+        public bool Predict(FileInfo fileInfo)
+        {
+            try
+            {
+                if (_model == null)
+                {
+                    throw new InvalidOperationException("Model is not trained.");
+                }
+
+                var fileData = new FileRecord
+                {
+                    Size = (float)fileInfo.Length, // float 형식으로 변환
+                    FolderPath = fileInfo.DirectoryName,
+                    FilePath = fileInfo.FullName
+                };
+
+                var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
+                var prediction = predictionEngine.Predict(fileData);
+
+                return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to predict file classification: " + ex.Message, ex);
+            }
+        }
+
+        public List<Regex> GetRegexPatterns()
+        {
+            return _patterns;
+        }
+
+        private List<Regex> ExtractPatterns(List<FileRecord> trainingData)
+        {
+            var patterns = new List<Regex>();
+
+            // 모든 폴더 경로에서 공통된 부분을 찾아서 정규식 패턴으로 변환
+            var folderPaths = trainingData.Select(f => f.FolderPath).Distinct().ToList();
+            if (folderPaths.Count > 1)
+            {
+                var commonPattern = FindCommonPattern(folderPaths);
+                if (!string.IsNullOrEmpty(commonPattern))
+                {
+                    patterns.Add(new Regex(commonPattern));
+                }
+            }
+
+            // 파일 경로 길이에 대한 패턴 추가
+            var filePathLengths = trainingData.Select(f => f.FilePath.Length).ToList();
+            var minFilePathLength = filePathLengths.Min();
+            var maxFilePathLength = filePathLengths.Max();
+
+            patterns.Add(new Regex(@".{" + minFilePathLength + "," + maxFilePathLength + "}"));
+
+            return patterns;
+        }
+
+        private string FindCommonPattern(List<string> paths)
+        {
+            // 모든 경로에서 공통된 부분을 찾기 위해 LCS(Longest Common Subsequence) 알고리즘 사용
+            var lcs = FindLCS(paths);
+            if (string.IsNullOrEmpty(lcs))
+            {
+                return string.Empty;
+            }
+
+            // 공통된 부분을 정규식 패턴으로 변환
+            var regexPattern = Regex.Escape(lcs).Replace("\\*", ".*").Replace("\\?", ".");
+            return regexPattern;
+        }
+
+        private string FindLCS(List<string> strs)
+        {
+            if (strs == null || strs.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var lcs = strs[0];
+            foreach (var str in strs)
+            {
+                lcs = FindLCS(lcs, str);
+            }
+
+            return lcs;
+        }
+
+        private string FindLCS(string str1, string str2)
+        {
+            var lengths = new int[str1.Length, str2.Length];
+            var greatestLength = 0;
+            var output = string.Empty;
+
+            for (int i = 0; i < str1.Length; i++)
+            {
+                for (int j = 0; j < str2.Length; j++)
+                {
+                    if (str1[i] == str2[j])
+                    {
+                        lengths[i, j] = (i == 0 || j == 0) ? 1 : lengths[i - 1, j - 1] + 1;
+                        if (lengths[i, j] > greatestLength)
+                        {
+                            greatestLength = lengths[i, j];
+                            output = str1.Substring(i - greatestLength + 1, greatestLength);
+                        }
+                    }
+                }
+            }
+
+            return output;
+        }
+    }
+
+    public class FilePrediction
+    {
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
+    }
+}
+MainWindow.xaml.cs
+이제 MainWindow.xaml.cs에서 학습된 패턴을 UI에 표시하도록 수정하겠습니다.
+
+csharp
+코드 복사
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -150,6 +333,10 @@ namespace SMDFileCleaner
 
                 LogRecentActivity("학습 완료");
                 LogRecentActivity(string.Join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString())));
+
+                // 학습된 패턴을 UI에 표시
+                var patterns = _mlModelBuilder.GetRegexPatterns();
+                txtTrainingStatus.Text = "학습된 패턴:\n" + string.Join("\n", patterns.Select(p => p.ToString()));
 
                 Dispatcher.Invoke(() =>
                 {
@@ -348,3 +535,4 @@ namespace SMDFileCleaner
         }
     }
 }
+이제 MLModelBuilder에서 학습된 정규식 패턴을 MainWindow.xaml.cs에서 UI에 표시하도록 하였습니다. 학습된 패턴을 txtTrainingStatus 텍스트 박스에 표시하여
