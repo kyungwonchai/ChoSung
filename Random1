@@ -1,152 +1,35 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using System.Windows.Threading;
-
-namespace SMDFileCleaner
+private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
 {
-    public class FileCleaner
+    while (true)
     {
-        private const long MinimumFreeSpace = 25L * 1024 * 1024 * 1024; // 25 GB
-        private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
-        private readonly string logDirectory;
-        private readonly MLModelBuilder mlModelBuilder;
-        private readonly Dispatcher dispatcher;
-        private readonly Logger logger;
-        private readonly Action<long, string> updateFolderStatistics;
-        private long lastLoggedSize = -1; // 마지막으로 기록된 폴더 크기 저장
-
-        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Logger logger, Action<long, string> updateFolderStatistics)
+        try
         {
-            this.logDirectory = logDirectory;
-            this.mlModelBuilder = mlModelBuilder;
-            this.dispatcher = dispatcher;
-            this.logger = logger;
-            this.updateFolderStatistics = updateFolderStatistics;
-        }
+            long freeSpace = await Task.Run(() => _fileCleaner.GetDriveFreeSpace(driveName));
+            List<FileInfo> filesToDelete;
 
-        public long GetDriveFreeSpace(string driveName)
-        {
-            try
+            if (freeSpace <= MinimumFreeSpace)
             {
-                DriveInfo drive = new DriveInfo(driveName);
-                return drive.AvailableFreeSpace;
+                filesToDelete = await Task.Run(() => _fileCleaner.GetFilesToDelete(folderPath, fileExtension, forceDelete: true));
+                _logger.LogRecentActivity($"용량이 {freeSpace / (1024 * 1024 * 1024)} GB 남아서 강제 삭제를 진행합니다.");
             }
-            catch (Exception ex)
+            else
             {
-                logger.LogError("Failed to get drive free space: " + ex.Message);
-                return 0;
-            }
-        }
-
-        public List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension, bool forceDelete = false)
-        {
-            try
-            {
-                var files = GetFiles(folderPath, fileExtension);
-                var filesToDelete = files.Where(file => forceDelete || file.CreationTime < DateTime.Now.AddDays(-35)).OrderBy(file => file.CreationTime).ToList();
-
-                dispatcher.Invoke(() =>
+                filesToDelete = await Task.Run(() => _fileCleaner.GetFilesToDelete(folderPath, fileExtension));
+                if (filesToDelete.Count > 0)
                 {
-                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
-                });
-
-                return filesToDelete;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError("Failed to get files to delete: " + ex.Message);
-                return new List<FileInfo>();
-            }
-        }
-
-        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
-        {
-            var files = new List<FileInfo>();
-            try
-            {
-                var directory = new DirectoryInfo(folderPath);
-                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
-                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
-
-                foreach (var subDir in directory.GetDirectories())
-                {
-                    if (!IsSystemVolumeInformation(subDir))
-                    {
-                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
-                    }
-                }
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                logger.LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
-            }
-            return files;
-        }
-
-        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
-        {
-            return dirInfo.FullName.Contains("System Volume Information");
-        }
-
-        public async Task DeleteFilesAsync(List<FileInfo> files, string folderPath, bool forceDelete = false)
-        {
-            long currentFolderSize = files.Sum(f => f.Length);
-            long freeSpace = GetDriveFreeSpace(folderPath.Split('\\')[0] + "\\");
-
-            foreach (var file in files)
-            {
-                if (currentFolderSize <= MaxFolderSize && !forceDelete)
-                {
-                    logger.LogRecentActivity("현재 폴더 크기가 8GB 이하입니다.");
-                    break;
-                }
-
-                if (freeSpace > MinimumFreeSpace && !forceDelete)
-                {
-                    logger.LogRecentActivity($"용량이 {freeSpace / (1024 * 1024 * 1024)} GB 남아서 삭제를 하지 않습니다.");
-                    break;
-                }
-
-                try
-                {
-                    file.Delete();
-                    currentFolderSize -= file.Length;
-                    logger.LogDeletionActivity($"파일 삭제됨: {file.FullName}");
-                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError("Failed to delete file: " + ex.Message);
+                    _logger.LogRecentActivity("삭제를 진행합니다.");
                 }
             }
 
-            updateFolderStatistics(currentFolderSize, folderPath);
+            Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
+            await _fileCleaner.DeleteFilesAsync(filesToDelete, folderPath, forceDelete: freeSpace <= MinimumFreeSpace);
+
+            await Task.Run(() => _fileCleaner.UpdateFolderStatistics(folderPath, fileExtension));
+            await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
         }
-
-        public async Task UpdateFolderStatistics(string folderPath, string fileExtension)
+        catch (Exception ex)
         {
-            try
-            {
-                var files = GetFiles(folderPath, fileExtension);
-                long totalSize = files.Sum(f => f.Length);
-
-                if (totalSize > 0 && totalSize != lastLoggedSize) // 총 크기가 0인 경우와 중복 크기 로그 생성을 피함
-                {
-                    lastLoggedSize = totalSize;
-                    dispatcher.Invoke(() =>
-                    {
-                        updateFolderStatistics(totalSize, folderPath);
-                        logger.LogRecentActivity($"폴더: {folderPath}, 총 크기: {totalSize / (1024 * 1024)} MB");
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogError("Failed to update folder statistics: " + ex.Message);
-            }
+            _logger.LogError("모니터링 중 오류 발생: " + ex.Message);
         }
     }
 }
