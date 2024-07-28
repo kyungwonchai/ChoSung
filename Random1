@@ -1,5 +1,172 @@
-도록 수정하겠습니다.
+일 삭제 작업을 취소할 수 있도록 하겠습니다.
 
+수정된 FileCleaner.cs
+csharp
+코드 복사
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Threading;
+
+namespace SMDFileCleaner
+{
+    public class FileCleaner
+    {
+        private const long MinimumFreeSpace = 25L * 1024 * 1024 * 1024; // 25 GB
+        private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
+        private readonly string logDirectory;
+        private readonly MLModelBuilder mlModelBuilder;
+        private readonly Dispatcher dispatcher;
+        private readonly Logger logger;
+        private readonly Action<long, string> updateFolderStatistics;
+
+        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Logger logger, Action<long, string> updateFolderStatistics)
+        {
+            this.logDirectory = logDirectory;
+            this.mlModelBuilder = mlModelBuilder;
+            this.dispatcher = dispatcher;
+            this.logger = logger;
+            this.updateFolderStatistics = updateFolderStatistics;
+        }
+
+        public long GetDriveFreeSpace(string driveName)
+        {
+            try
+            {
+                DriveInfo drive = new DriveInfo(driveName);
+                return drive.AvailableFreeSpace;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get drive free space: " + ex.Message);
+                return 0;
+            }
+        }
+
+        public List<FileInfo> GetFilesToDelete(string folderPath, string fileExtension, bool forceDelete = false)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                var filesToDelete = files.Where(file => forceDelete || file.CreationTime < DateTime.Now.AddDays(-35)).OrderBy(file => file.CreationTime).ToList();
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
+                });
+
+                return filesToDelete;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get files to delete: " + ex.Message);
+                return new List<FileInfo>();
+            }
+        }
+
+        private IEnumerable<FileInfo> GetFiles(string folderPath, string fileExtension)
+        {
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles($"*{fileExtension}", SearchOption.TopDirectoryOnly)
+                    .Where(f => f.Length > 1 * 1024 * 1024)); // 1MB 이상의 파일
+
+                foreach (var subDir in directory.GetDirectories())
+                {
+                    if (!IsSystemVolumeInformation(subDir))
+                    {
+                        files.AddRange(GetFiles(subDir.FullName, fileExtension));
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logger.LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        private bool IsSystemVolumeInformation(DirectoryInfo dirInfo)
+        {
+            return dirInfo.FullName.Contains("System Volume Information");
+        }
+
+        public async Task DeleteFilesAsync(List<FileInfo> files, string folderPath, bool forceDelete = false, CancellationToken cancellationToken = default)
+        {
+            long currentFolderSize = files.Sum(f => f.Length);
+            long freeSpace = GetDriveFreeSpace(folderPath.Split('\\')[0] + "\\");
+
+            var startTime = DateTime.Now;
+
+            foreach (var file in files)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    logger.LogRecentActivity("파일 삭제 중지됨.");
+                    break;
+                }
+
+                if (currentFolderSize <= MaxFolderSize && !forceDelete)
+                {
+                    logger.LogRecentActivity("현재 폴더 크기가 8GB 이하입니다.");
+                    break;
+                }
+
+                if (freeSpace > MinimumFreeSpace && !forceDelete)
+                {
+                    logger.LogRecentActivity($"용량이 {freeSpace / (1024 * 1024 * 1024)} GB 남아서 삭제를 하지 않습니다.");
+                    break;
+                }
+
+                try
+                {
+                    file.Delete();
+                    currentFolderSize -= file.Length;
+                    logger.LogDeletionActivity($"파일 삭제됨: {file.FullName}");
+                    
+                    var elapsed = DateTime.Now - startTime;
+                    if (elapsed.TotalMinutes < 3)
+                    {
+                        await Task.Delay(5000, cancellationToken); // 처음 3분 동안 5초 간격으로 파일 삭제
+                    }
+                    else
+                    {
+                        await Task.Delay(100, cancellationToken); // 3분 이후에는 100ms 간격으로 파일 삭제
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError("Failed to delete file: " + ex.Message);
+                }
+            }
+
+            updateFolderStatistics(currentFolderSize, folderPath);
+        }
+
+        public void UpdateFolderStatistics(string folderPath, string fileExtension)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, fileExtension);
+                long totalSize = files.Sum(f => f.Length);
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(totalSize, folderPath);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to update folder statistics: " + ex.Message);
+            }
+        }
+    }
+}
 수정된 MainWindow.xaml.cs
 csharp
 코드 복사
@@ -7,6 +174,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -27,6 +195,7 @@ namespace SMDFileCleaner
         private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
         private List<FileRecord> _trainingData;
         private bool isCleaning;
+        private CancellationTokenSource cancellationTokenSource;
 
         public MainWindow()
         {
@@ -192,7 +361,7 @@ namespace SMDFileCleaner
                 _mlModelBuilder.TrainModel(_trainingData);
 
                 LogRecentActivity("학습 완료");
-                LogRecentActivity(string.join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString())));
+                LogRecentActivity(string.Join(", ", _mlModelBuilder.GetRegexPatterns().Select(p => p.ToString())));
 
                 // 학습된 패턴 설명을 UI에 표시
                 var patternDescription = _mlModelBuilder.GetPatternDescription();
@@ -212,7 +381,8 @@ namespace SMDFileCleaner
                     HighlightTrainingData();
                 });
 
-                await MonitorAndDisplayFilesToDelete(folderPath, fileExtension, txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\");
+                cancellationTokenSource = new CancellationTokenSource();
+                await MonitorAndDisplayFilesToDelete(folderPath, fileExtension, txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\", cancellationTokenSource.Token);
             }
             catch (Exception ex)
             {
@@ -281,7 +451,7 @@ namespace SMDFileCleaner
             return dirInfo.FullName.Contains("System Volume Information");
         }
 
-        private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName)
+        private async Task MonitorAndDisplayFilesToDelete(string folderPath, string fileExtension, string driveName, CancellationToken cancellationToken)
         {
             while (isCleaning)
             {
@@ -305,14 +475,21 @@ namespace SMDFileCleaner
                     }
 
                     Dispatcher.Invoke(() => DisplayFilesToDelete(filesToDelete));
-                    await _fileCleaner.DeleteFilesAsync(filesToDelete, folderPath, forceDelete: freeSpace <= MinimumFreeSpace);
+                    await _fileCleaner.DeleteFilesAsync(filesToDelete, folderPath, forceDelete: freeSpace <= MinimumFreeSpace, cancellationToken);
 
                     await UpdateFolderStatistics(folderPath, fileExtension);
-                    await Task.Delay(TimeSpan.FromMinutes(10)); // 10분마다 체크
+                    await Task.Delay(TimeSpan.FromMinutes(10), cancellationToken); // 10분마다 체크
                 }
                 catch (Exception ex)
                 {
-                    LogError("모니터링 중 오류 발생: " + ex.Message);
+                    if (ex is TaskCanceledException)
+                    {
+                        LogRecentActivity("파일 삭제 작업이 취소되었습니다.");
+                    }
+                    else
+                    {
+                        LogError("모니터링 중 오류 발생: " + ex.Message);
+                    }
                 }
             }
         }
@@ -431,6 +608,7 @@ namespace SMDFileCleaner
             if (isCleaning)
             {
                 isCleaning = false;
+                cancellationTokenSource?.Cancel();
                 btnStart.Content = "시작";
                 LogRecentActivity("파일 삭제 중지됨.");
             }
@@ -439,10 +617,12 @@ namespace SMDFileCleaner
                 isCleaning = true;
                 btnStart.Content = "중지";
                 LogRecentActivity("파일 삭제 시작됨.");
-                MonitorAndDisplayFilesToDelete(txtFolderPath.Text, GetFileExtension(cmbFileExtension.SelectedItem?.ToString()), txtFolderPath.Text.Split('\\')[0] + "\\");
+                cancellationTokenSource = new CancellationTokenSource();
+                MonitorAndDisplayFilesToDelete(txtFolderPath.Text, GetFileExtension(cmbFileExtension.SelectedItem?.ToString()), txtFolderPath.Text.Split('\\')[0] + "\\", cancellationTokenSource.Token);
             }
         }
     }
 }
 수정된 기능 설명
-btnStart_Click: 시
+cancellationTokenSource를 사용하여 파일 삭제 작업을 취소할 수 있도록 수정했습니다.
+DeleteFilesAsync 메서드에 CancellationToken을 추가하여 
