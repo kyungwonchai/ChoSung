@@ -1,33 +1,134 @@
-private void cmbFileExtension_SelectionChanged(object sender, SelectionChangedEventArgs e)
-{
-    SaveSettings();
-    ResetAndRetrain();
-}
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Microsoft.ML;
+using Microsoft.ML.Data;
 
-private void SaveSettings()
+namespace SMDFileCleaner
 {
-    try
+    public class MLModelBuilder
     {
-        string fileExtension = GetFileExtension(cmbFileExtension.SelectedItem?.ToString());
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
+        private List<FileRecord> _fileDataList;
 
-        _settingsManager.SaveSettings(new Settings
+        public MLModelBuilder()
         {
-            FolderPath = txtFolderPath.Text,
-            FileExtension = fileExtension,
-            DriveName = txtFolderPath.Text.Split('\\').FirstOrDefault() + "\\"
-        });
-    }
-    catch (Exception ex)
-    {
-        _logger.LogError("SaveSettings", ex.Message);
-    }
-}
+            _mlContext = new MLContext();
+            _fileDataList = new List<FileRecord>();
+        }
 
-private string GetFileExtension(string selectedItem)
-{
-    if (string.IsNullOrEmpty(selectedItem) || selectedItem.Length < 4)
-    {
-        return ".jpg"; // 기본값으로 설정
+        public void TrainModel(List<FileRecord> fileData)
+        {
+            try
+            {
+                if (fileData == null || fileData.Count < 10) // 최소 샘플 수 확인
+                {
+                    throw new InvalidOperationException("Not enough samples to train the model. Minimum required samples: 10");
+                }
+
+                _fileDataList = fileData;
+                var data = _mlContext.Data.LoadFromEnumerable(fileData);
+
+                var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FolderPathFeaturized", nameof(FileRecord.FolderPath)))
+                    .Append(_mlContext.Transforms.Concatenate("Features", "Features", "FolderPathFeaturized"))
+                    .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
+                    .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
+
+                _model = pipeline.Fit(data);
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to train model: " + ex.Message, ex);
+            }
+        }
+
+        public bool Predict(FileInfo fileInfo)
+        {
+            try
+            {
+                if (_model == null)
+                {
+                    throw new InvalidOperationException("Model is not trained.");
+                }
+
+                var fileData = new FileRecord
+                {
+                    Size = (float)fileInfo.Length, // float 형식으로 변환
+                    FolderPath = fileInfo.DirectoryName
+                };
+
+                var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
+                var prediction = predictionEngine.Predict(fileData);
+
+                return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to predict file classification: " + ex.Message, ex);
+            }
+        }
+
+        public string GetCurrentPatterns()
+        {
+            try
+            {
+                var regexPatterns = GetRegexPatterns();
+                if (regexPatterns.Count == 0)
+                {
+                    return "No patterns found.";
+                }
+
+                return string.Join(", ", regexPatterns.Select(p => p.ToString()));
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to get current patterns: " + ex.Message, ex);
+            }
+        }
+
+        public List<Regex> GetRegexPatterns()
+        {
+            var patterns = new List<Regex>();
+
+            // 모든 폴더 경로에서 공통된 부분을 찾아서 정규식 패턴으로 변환
+            var folderPaths = _fileDataList.Select(f => f.FolderPath).Distinct().ToList();
+            if (folderPaths.Count > 1)
+            {
+                var commonPatterns = FindCommonPatterns(folderPaths);
+                foreach (var pattern in commonPatterns)
+                {
+                    patterns.Add(new Regex(pattern));
+                }
+            }
+
+            return patterns;
+        }
+
+        private List<string> FindCommonPatterns(List<string> paths)
+        {
+            var commonPatterns = new List<string>();
+            var segments = paths.Select(path => path.Split(Path.DirectorySeparatorChar)).ToList();
+
+            for (int i = 0; i < segments[0].Length; i++)
+            {
+                var segment = segments[0][i];
+                if (segments.All(seg => seg.Length > i && seg[i] == segment))
+                {
+                    commonPatterns.Add(segment);
+                }
+            }
+
+            return commonPatterns.Select(pattern => Regex.Escape(pattern)).ToList();
+        }
     }
-    return selectedItem.Substring(selectedItem.Length - 4);
+
+    public class FilePrediction
+    {
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
+    }
 }
