@@ -1,24 +1,300 @@
- 뷰어(Event Viewer)를 사용하여 마지막 재부팅 시간을 확인할 수 있습니다. 이벤트 뷰어에서 시스템 로그를 확인하면 컴퓨터가 마지막으로 재부팅된 시간을 알 수 있습니다. 다음은 이벤트 뷰어에서 이를 확인하는 방법입니다.
+존 DB의 오라클 사용자가 USER_ID를 변경했을 때, 중계 테이블에 이름이 하나만 존재하는 경우 USER_ID를 새로운 값으로 업데이트하려면 중계 테이블의 동기화 로직에서 이를 처리해야 합니다. 이 로직을 SyncOracleDataToMiddleAsync 함수에 추가하면 됩니다.
 
-이벤트 뷰어에서 마지막 재부팅 시간 확인 방법
-이벤트 뷰어 열기
+아래는 이를 반영하여 수정된 EsdCheckMiddleSync 클래스입니다:
 
-Windows + R을 눌러 실행 창을 엽니다.
-eventvwr을 입력하고 엔터 키를 누릅니다.
-Windows 로그 확인
+EsdCheckMiddleSync.cs
+csharp
+코드 복사
+using System;
+using System.Data;
+using System.Data.SqlClient;
+using System.Threading.Tasks;
+using Oracle.ManagedDataAccess.Client;
 
-왼쪽 패널에서 **"Windows 로그"**를 확장합니다.
-**"시스템"**을 클릭합니다.
-필터 적용
+public class EsdCheckMiddleSync
+{
+    private string sourceConnectionString = "Data Source=SourceServer;Initial Catalog=SourceDB;User ID=YourUsername;Password=YourPassword";
+    private string middleConnectionString = "Data Source=MiddleServer;Initial Catalog=MiddleDB;User ID=YourUsername;Password=YourPassword";
+    private string oracleConnectionString = "Data Source=OracleServer;User ID=YourUsername;Password=YourPassword";
 
-오른쪽 패널에서 **"현재 로그 필터링"**을 클릭합니다.
-이벤트 소스에서 **"Kernel-General"**을 선택합니다.
-이벤트 ID로 **"12"**와 "13", "6006", "6008" 등을 입력합니다.
-**"12"**와 **"13"**은 시스템 부팅 이벤트를 나타냅니다.
-**"6006"**과 **"6008"**은 시스템 종료 이벤트를 나타냅니다.
-확인을 클릭합니다.
-재부팅 시간 확인
+    // 데이터 동기화를 시작하고 로그 액션을 인수로 받음
+    public async Task StartDataSyncAsync(Action<string> logAction)
+    {
+        while (true)
+        {
+            try
+            {
+                // 오라클 데이터 동기화
+                logAction("Starting Oracle Data Sync to Middle...");
+                await SyncOracleDataToMiddleAsync(logAction);
+                logAction("Oracle Data Sync to Middle Completed.");
 
-필터가 적용된 이벤트 로그에서 최근의 "Kernel-General" 이벤트를 찾아 클릭합니다.
-이벤트 세부 정보에서 시스템이 마지막으로 부팅된 시간을 확인할 수 있습니다.
-이 방법을 통해 이벤트 뷰어에서 마지막 재부팅 시간을 정확하게 확인할 수 있습
+                // 중간 데이터에서 소스 데이터베이스로 동기화
+                logAction("Starting Data Sync from Middle to Source...");
+                await SyncDataFromMiddleToSourceAsync(logAction);
+                logAction("Data Sync from Middle to Source Completed.");
+
+                // 1분 대기
+                await Task.Delay(TimeSpan.FromMinutes(1));
+            }
+            catch (Exception ex)
+            {
+                ErrorHandler.HandleException(ex);
+            }
+        }
+    }
+
+    // Oracle 데이터를 중간 데이터베이스로 동기화하는 함수
+    private async Task SyncOracleDataToMiddleAsync(Action<string> logAction)
+    {
+        DataTable oracleData = await GetOracleDataAsync(); // 오라클 데이터 가져오기
+        DataTable middleData = await GetMiddleDataAsync(); // 중간 데이터 가져오기
+
+        foreach (DataRow oracleRow in oracleData.Rows)
+        {
+            DataRow[] middleRows = middleData.Select($"USER_NAME = '{oracleRow["USER_NAME"]}'");
+
+            // 중간 테이블에 데이터가 없는 경우 삽입
+            if (middleRows.Length == 0)
+            {
+                await InsertMiddleRowAsync(oracleRow);
+                logAction($"Inserted new row in middle for USER_CARD_ID: {oracleRow["USER_CARD_ID"]}");
+            }
+            // 중간 테이블에 이름이 하나만 존재하는 경우 USER_ID를 업데이트
+            else if (middleRows.Length == 1)
+            {
+                DataRow middleRow = middleRows[0];
+                if (middleRow["USER_CARD_ID"].ToString() != oracleRow["USER_CARD_ID"].ToString())
+                {
+                    await UpdateMiddleRowAsync(oracleRow);
+                    logAction($"Updated USER_CARD_ID for USER_NAME: {oracleRow["USER_NAME"]}");
+                }
+            }
+        }
+    }
+
+    // 오라클 데이터 가져오는 함수
+    private async Task<DataTable> GetOracleDataAsync()
+    {
+        using (OracleConnection conn = new OracleConnection(oracleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"SELECT u.USER_CARD_ID, u.USER_NAME, u.work_group, e.USER_CARD_ID, e.esd_check_tf, e.update_time 
+                             FROM ut_esc_user u 
+                             JOIN ut_esd_check_status_list e ON u.user_card_id = e.user_card_id 
+                             WHERE u.work_group = 'REPAIR' AND e.update_TIME >= SYSDATE - INTERVAL '1000' HOUR";
+            OracleDataAdapter adapter = new OracleDataAdapter(query, conn);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 중간 데이터 가져오는 함수
+    private async Task<DataTable> GetMiddleDataAsync()
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT USER_CARD_ID, USER_NAME, ESD_CHECK_TF, UPDATE_TIME, INSERTED_TO_SOURCE FROM ESD_CHECK_MIDDLE";
+            SqlDataAdapter adapter = new SqlDataAdapter(query, conn);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 중간 테이블에 새로운 행 삽입하는 함수
+    private async Task InsertMiddleRowAsync(DataRow oracleRow)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"INSERT INTO ESD_CHECK_MIDDLE (USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME) 
+                             VALUES (@USER_CARD_ID, @USER_NAME, @WORK_GROUP, @ESD_CHECK_TF, @UPDATE_TIME)";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@WORK_GROUP", oracleRow["work_group"]);
+            cmd.Parameters.AddWithValue("@ESD_CHECK_TF", oracleRow["esd_check_tf"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    // 중간 테이블의 USER_CARD_ID를 업데이트하는 함수
+    private async Task UpdateMiddleRowAsync(DataRow oracleRow)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"UPDATE ESD_CHECK_MIDDLE 
+                             SET USER_CARD_ID = @USER_CARD_ID, UPDATE_TIME = @UPDATE_TIME
+                             WHERE USER_NAME = @USER_NAME";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    // 중간 데이터에서 소스 데이터베이스로 동기화하는 함수
+    private async Task SyncDataFromMiddleToSourceAsync(Action<string> logAction)
+    {
+        DataTable middleData = await GetMiddleDataAsync(); // 중간 데이터 가져오기
+
+        foreach (DataRow middleRow in middleData.Rows)
+        {
+            // 중간 테이블에서 아직 소스로 전송되지 않은 항목만 처리
+            if (!(bool)middleRow["INSERTED_TO_SOURCE"])
+            {
+                string userCardId = middleRow["USER_CARD_ID"].ToString();
+                string esdCheckTf = middleRow["ESD_CHECK_TF"].ToString();
+                DateTime updateTime = (DateTime)middleRow["UPDATE_TIME"];
+
+                // E_NUM 얻기
+                string eNum = await GetENumFromUserCardIdAsync(userCardId);
+
+                // ESD_CHECK_TF가 'T'일 때 소스DB로 데이터 전송
+                if (esdCheckTf == "T")
+                {
+                    // 소스DB에 같은 E_NUM에 대해 RESULT가 'OK'인 최신 행이 있는지 확인
+                    DataRow latestRow = await GetLatestRowFromHistoryAsync(eNum);
+
+                    if (latestRow != null)
+                    {
+                        // 최신 행이 있는 경우
+                        await InsertSourceDataAsync(latestRow, eNum, updateTime, logAction);
+                    }
+                    else
+                    {
+                        // 최신 행이 없는 경우 임의의 값을 인서트
+                        await InsertDefaultSourceDataAsync(eNum, updateTime, logAction);
+                    }
+
+                    // 중간 테이블 업데이트
+                    await UpdateMiddleTableAsync(userCardId);
+                }
+            }
+        }
+    }
+
+    // E_NUM을 얻는 함수
+    private async Task<string> GetENumFromUserCardIdAsync(string userCardId)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT E_NUM FROM ESD_USER_INFO_Trans WHERE USER_CARD_ID = @USER_CARD_ID";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", userCardId);
+            return (string)await cmd.ExecuteScalarAsync();
+        }
+    }
+
+    // 소스 DB에서 최신 행을 얻는 함수
+    private async Task<DataRow> GetLatestRowFromHistoryAsync(string eNum)
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"SELECT TOP 1 * FROM ESD_CHECK_HISTORY 
+                             WHERE DESCRIPTION = @E_NUM AND RESULT = 'OK' 
+                             ORDER BY UPDATE_TIME DESC";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@E_NUM", eNum);
+            SqlDataAdapter adapter = new SqlDataAdapter(cmd);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable.Rows.Count > 0 ? dataTable.Rows[0] : null;
+        }
+    }
+
+    // 소스 테이블에 데이터를 삽입하는 함수 (기존 행 복사)
+    private async Task InsertSourceDataAsync(DataRow latestRow, string eNum, DateTime updateTime, Action<string> logAction)
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"INSERT INTO ESD_CHECK_HISTORY (USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME, DESCRIPTION, RESULT, STRAP, GRAMENT, SHOES_R, SHOES_L, NFC_ID) 
+                             VALUES (@USER_CARD_ID, @USER_NAME, @WORK_GROUP, @ESD_CHECK_TF, @UPDATE_TIME, @DESCRIPTION, @RESULT, @STRAP, @GRAMENT, @SHOES_R, @SHOES_L, @NFC_ID)";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", latestRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", latestRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@WORK_GROUP", latestRow["WORK_GROUP"]);
+            cmd.Parameters.AddWithValue("@ESD_CHECK_TF", latestRow["ESD_CHECK_TF"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", updateTime);
+            cmd.Parameters.AddWithValue("@DESCRIPTION", eNum);
+            cmd.Parameters.AddWithValue("@RESULT", latestRow["RESULT"]);
+            cmd.Parameters.AddWithValue("@STRAP", latestRow["STRAP"]);
+            cmd.Parameters.AddWithValue("@GRAMENT", latestRow["GRAMENT"]);
+            cmd.Parameters.AddWithValue("@SHOES_R", latestRow["SHOES_R"]);
+            cmd.Parameters.AddWithValue("@SHOES_L", latestRow["SHOES_L"]);
+            cmd.Parameters.AddWithValue("@NFC_ID", latestRow["NFC_ID"]);
+            await cmd.ExecuteNonQueryAsync();
+            logAction($"Inserted copied row for E_NUM: {eNum} with updated UPDATE_TIME.");
+        }
+    }
+
+    // 소스 테이블에 임의의 기본값을 삽입하는 함수
+    private async Task InsertDefaultSourceDataAsync(string eNum, DateTime updateTime, Action<string> logAction)
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"INSERT INTO ESD_CHECK_HISTORY (USER_CARD_ID, USER_NAME, WORK_GROUP, ESD_CHECK_TF, UPDATE_TIME, DESCRIPTION, RESULT, STRAP, GRAMENT, SHOES_R, SHOES_L, NFC_ID) 
+                             VALUES (@USER_CARD_ID, @USER_NAME, @WORK_GROUP, @ESD_CHECK_TF, @UPDATE_TIME, @DESCRIPTION, @RESULT, @STRAP, @GRAMENT, @SHOES_R, @SHOES_L, @NFC_ID)";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", DBNull.Value);
+            cmd.Parameters.AddWithValue("@USER_NAME", DBNull.Value);
+            cmd.Parameters.AddWithValue("@WORK_GROUP", DBNull.Value);
+            cmd.Parameters.AddWithValue("@ESD_CHECK_TF", "T");
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", updateTime);
+            cmd.Parameters.AddWithValue("@DESCRIPTION", eNum);
+            cmd.Parameters.AddWithValue("@RESULT", "OK");
+            cmd.Parameters.AddWithValue("@STRAP", "11.1");
+            cmd.Parameters.AddWithValue("@GRAMENT", "-");
+            cmd.Parameters.AddWithValue("@SHOES_R", "11.1");
+            cmd.Parameters.AddWithValue("@SHOES_L", "11.1");
+
+            // NFC_ID는 ESD_USER_INFO 테이블에서 E_NUM을 통해 가져오기
+            string nfcId = await GetNfcIdFromENumAsync(eNum);
+            cmd.Parameters.AddWithValue("@NFC_ID", nfcId);
+
+            await cmd.ExecuteNonQueryAsync();
+            logAction($"Inserted default row for E_NUM: {eNum} with UPDATE_TIME: {updateTime}.");
+        }
+    }
+
+    // E_NUM을 통해 NFC_ID를 얻는 함수
+    private async Task<string> GetNfcIdFromENumAsync(string eNum)
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT NFC_ID FROM ESD_USER_INFO WHERE E_NUM = @E_NUM";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@E_NUM", eNum);
+            return (string)await cmd.ExecuteScalarAsync();
+        }
+    }
+
+    // 중간 테이블을 업데이트하는 함수
+    private async Task UpdateMiddleTableAsync(string userCardId)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "UPDATE ESD_CHECK_MIDDLE SET INSERTED_TO_SOURCE = 1, INSERTED_TIME = @INSERTED_TIME WHERE USER_CARD_ID = @USER_CARD_ID";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@INSERTED_TIME", DateTime.Now);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", userCardId);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+}
+위 코드에서는 다음과 같은 변경 사항이 적용되었습니다:
+
+SyncOracleDataToMiddleAsync 함수에서 오라클 데이터와 중계 데이터베이스의 사용자 이름을 비교하여, 중계 데이터베이스에 이름이 하나만 존재하는 경우 USER_ID를 업데이트하도록 로직이 추가되었습니다.
+UpdateMiddleRowAsync 함수가 추가되어, 사용자 이름에 해당하는 중계 데이터베이스의 USER_ID를 새로운 값
