@@ -1,6 +1,6 @@
-기존 DB의 오라클 사용자가 USER_ID를 변경했을 때, 중계 테이블에 이름이 하나만 존재하는 경우 USER_ID를 새로운 값으로 업데이트하려면 중계 테이블의 동기화 로직에서 이를 처리해야 합니다. 이 로직을 SyncOracleDataToMiddleAsync 함수에 추가하면 됩니다.
+알겠습니다. 오라클과 소스 DB에서 이름이 하나만 존재할 때 USER_CARD_ID를 갱신하는 로직을 추가하도록 하겠습니다.
 
-아래는 이를 반영하여 수정된 EsdCheckMiddleSync 클래스입니다:
+아래는 수정된 EsdCheckMiddleSync 클래스의 전체 코드입니다. 이제 SyncOracleDataToMiddleAsync 함수에서 오라클 데이터와 소스 DB의 데이터를 비교하여 이름이 하나만 존재하는 경우 USER_CARD_ID를 갱신합니다.
 
 EsdCheckMiddleSync.cs
 csharp
@@ -49,10 +49,12 @@ public class EsdCheckMiddleSync
     {
         DataTable oracleData = await GetOracleDataAsync(); // 오라클 데이터 가져오기
         DataTable middleData = await GetMiddleDataAsync(); // 중간 데이터 가져오기
+        DataTable sourceData = await GetSourceDataAsync(); // 소스 데이터 가져오기
 
         foreach (DataRow oracleRow in oracleData.Rows)
         {
             DataRow[] middleRows = middleData.Select($"USER_NAME = '{oracleRow["USER_NAME"]}'");
+            DataRow[] sourceRows = sourceData.Select($"USER_NAME = '{oracleRow["USER_NAME"]}'");
 
             // 중간 테이블에 데이터가 없는 경우 삽입
             if (middleRows.Length == 0)
@@ -60,13 +62,16 @@ public class EsdCheckMiddleSync
                 await InsertMiddleRowAsync(oracleRow);
                 logAction($"Inserted new row in middle for USER_CARD_ID: {oracleRow["USER_CARD_ID"]}");
             }
-            // 중간 테이블에 이름이 하나만 존재하는 경우 USER_ID를 업데이트
-            else if (middleRows.Length == 1)
+            // 중간 테이블과 소스 DB에 이름이 하나만 존재하는 경우 USER_ID를 업데이트
+            else if (middleRows.Length == 1 && sourceRows.Length == 1)
             {
                 DataRow middleRow = middleRows[0];
-                if (middleRow["USER_CARD_ID"].ToString() != oracleRow["USER_CARD_ID"].ToString())
+                DataRow sourceRow = sourceRows[0];
+
+                if (middleRow["USER_CARD_ID"].ToString() != oracleRow["USER_CARD_ID"].ToString() ||
+                    sourceRow["USER_CARD_ID"].ToString() != oracleRow["USER_CARD_ID"].ToString())
                 {
-                    await UpdateMiddleRowAsync(oracleRow);
+                    await UpdateMiddleAndSourceRowAsync(oracleRow);
                     logAction($"Updated USER_CARD_ID for USER_NAME: {oracleRow["USER_NAME"]}");
                 }
             }
@@ -104,6 +109,49 @@ public class EsdCheckMiddleSync
         }
     }
 
+    // 소스 데이터 가져오는 함수
+    private async Task<DataTable> GetSourceDataAsync()
+    {
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = "SELECT USER_CARD_ID, USER_NAME FROM ESD_USER_INFO_Trans";
+            SqlDataAdapter adapter = new SqlDataAdapter(query, conn);
+            DataTable dataTable = new DataTable();
+            adapter.Fill(dataTable);
+            return dataTable;
+        }
+    }
+
+    // 중간 테이블과 소스 테이블의 USER_CARD_ID를 업데이트하는 함수
+    private async Task UpdateMiddleAndSourceRowAsync(DataRow oracleRow)
+    {
+        using (SqlConnection conn = new SqlConnection(middleConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"UPDATE ESD_CHECK_MIDDLE 
+                             SET USER_CARD_ID = @USER_CARD_ID, UPDATE_TIME = @UPDATE_TIME
+                             WHERE USER_NAME = @USER_NAME";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
+            cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (SqlConnection conn = new SqlConnection(sourceConnectionString))
+        {
+            await conn.OpenAsync();
+            string query = @"UPDATE ESD_USER_INFO_Trans 
+                             SET USER_CARD_ID = @USER_CARD_ID
+                             WHERE USER_NAME = @USER_NAME";
+            SqlCommand cmd = new SqlCommand(query, conn);
+            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
+            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
     // 중간 테이블에 새로운 행 삽입하는 함수
     private async Task InsertMiddleRowAsync(DataRow oracleRow)
     {
@@ -117,23 +165,6 @@ public class EsdCheckMiddleSync
             cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
             cmd.Parameters.AddWithValue("@WORK_GROUP", oracleRow["work_group"]);
             cmd.Parameters.AddWithValue("@ESD_CHECK_TF", oracleRow["esd_check_tf"]);
-            cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
-
-    // 중간 테이블의 USER_CARD_ID를 업데이트하는 함수
-    private async Task UpdateMiddleRowAsync(DataRow oracleRow)
-    {
-        using (SqlConnection conn = new SqlConnection(middleConnectionString))
-        {
-            await conn.OpenAsync();
-            string query = @"UPDATE ESD_CHECK_MIDDLE 
-                             SET USER_CARD_ID = @USER_CARD_ID, UPDATE_TIME = @UPDATE_TIME
-                             WHERE USER_NAME = @USER_NAME";
-            SqlCommand cmd = new SqlCommand(query, conn);
-            cmd.Parameters.AddWithValue("@USER_CARD_ID", oracleRow["USER_CARD_ID"]);
-            cmd.Parameters.AddWithValue("@USER_NAME", oracleRow["USER_NAME"]);
             cmd.Parameters.AddWithValue("@UPDATE_TIME", oracleRow["update_time"]);
             await cmd.ExecuteNonQueryAsync();
         }
@@ -296,5 +327,5 @@ public class EsdCheckMiddleSync
 }
 위 코드에서는 다음과 같은 변경 사항이 적용되었습니다:
 
-SyncOracleDataToMiddleAsync 함수에서 오라클 데이터와 중계 데이터베이스의 사용자 이름을 비교하여, 중계 데이터베이스에 이름이 하나만 존재하는 경우 USER_ID를 업데이트하도록 로직이 추가되었습니다.
-UpdateMiddleRowAsync 함수가 추가되어, 사용자 이름에 해당하는 중계 데이터베이스의 USER_ID를 새로운 값으로 업데이트합니다.
+SyncOracleDataToMiddleAsync 함수에서 오라클 데이터와 중계 데이터베이스 및 소스 DB의 사용자 이름을 비교하여, 이름이 하나만 존재하는 경우 USER_CARD_ID를 업데이트하도록 로직이 추가되었습니다.
+UpdateMiddleAndSourceRowAsync 함수가 추가되어, 사용자 이름에 해당하는 중계 데이터베이스와 소스 데이터베이스의 USER_CARD_ID를 새로운 값으로 업데이트합니다.
