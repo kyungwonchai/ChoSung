@@ -1,77 +1,109 @@
+삭제 시 하드 디스크 용량이 부족한 경우, 보관 기간이 남아 있는 파일 중에서 오래된 파일을 먼저 삭제하는 로직으로 수정하겠습니다. 파일을 순차적으로 확인하며 용량을 확보할 때까지 파일을 삭제하도록 변경하겠습니다.
+
+FileManager.cs
+csharp
+코드 복사
 using System;
 using System.IO;
 using System.Linq;
-using System.Threading;
-using System.Windows;
-using System.Windows.Threading;
+using System.Threading.Tasks;
 
-namespace FileCopyApp
+namespace FileCleanupApp
 {
-    public partial class MainWindow : Window
+    public class FileManager
     {
-        private Timer _timer;
-        private string _sourceDirectoryPath = @"C:\Agent\pics";
-        private string _destinationFolderPath = @"F:\ABCD\";
-        private Random _random = new Random();
+        private string targetFolder;
+        private int retentionDays;
+        private long maxDiskUsage;
+        private string logFolder = @"C:\agent\smdfilecleaner\log";
 
-        public MainWindow()
+        public FileManager(string targetFolder, int retentionDays, long maxDiskUsage)
         {
-            InitializeComponent();
+            this.targetFolder = targetFolder;
+            this.retentionDays = retentionDays;
+            this.maxDiskUsage = maxDiskUsage;
+
+            // 로그 폴더가 없으면 생성
+            if (!Directory.Exists(logFolder))
+            {
+                Directory.CreateDirectory(logFolder);
+            }
         }
 
-        private void StartButton_Click(object sender, RoutedEventArgs e)
+        public async Task CleanUpAsync()
         {
-            // 타이머 초기화
-            _timer = new Timer(CopyFile, null, 0, 5000);
+            DateTime serverTime = await TimeSyncManager.GetServerTimeAsync();
+            var files = new DirectoryInfo(targetFolder).GetFiles().OrderBy(f => f.CreationTime).ToList();
+            long currentUsage = files.Sum(f => f.Length);
+            string logFilePath = Path.Combine(logFolder, serverTime.ToString("yyyyMMdd") + ".txt");
+
+            using (StreamWriter logWriter = new StreamWriter(logFilePath, true))
+            {
+                // 보관 기간이 지난 파일 삭제
+                foreach (var file in files.Where(f => serverTime - f.CreationTime > TimeSpan.FromDays(retentionDays)))
+                {
+                    if (!IsFileLocked(file))
+                    {
+                        logWriter.WriteLine($"{serverTime}: Deleted {file.FullName} due to retention policy");
+                        file.Delete();
+                        currentUsage -= file.Length;
+                    }
+                }
+
+                // 하드 디스크 용량 확보를 위해 오래된 파일 삭제
+                foreach (var file in files.Where(f => serverTime - f.CreationTime <= TimeSpan.FromDays(retentionDays)))
+                {
+                    if (currentUsage <= maxDiskUsage)
+                    {
+                        break;
+                    }
+
+                    if (!IsFileLocked(file))
+                    {
+                        logWriter.WriteLine($"{serverTime}: Deleted {file.FullName} due to disk space limit");
+                        file.Delete();
+                        currentUsage -= file.Length;
+                    }
+                }
+            }
+
+            CleanUpLogs(serverTime);
         }
 
-        private void CopyFile(object state)
+        private void CleanUpLogs(DateTime serverTime)
         {
-            // sourceDirectoryPath 내 모든 파일 목록 가져오기
-            var files = Directory.GetFiles(_sourceDirectoryPath);
+            var logFiles = new DirectoryInfo(logFolder).GetFiles("*.txt").OrderBy(f => f.CreationTime).ToList();
 
-            // 파일이 없으면 로그 메시지 추가 후 리턴
-            if (files.Length == 0)
+            foreach (var logFile in logFiles)
             {
-                LogMessage("No files found in the source directory.");
-                return;
+                if (serverTime - logFile.CreationTime > TimeSpan.FromDays(60))
+                {
+                    logFile.Delete();
+                }
             }
+        }
 
-            // 랜덤으로 파일 하나 선택
-            string randomFile = files[_random.Next(files.Length)];
-
-            // 날짜 형식을 기반으로 폴더 및 파일 이름 생성
-            string timestampFolder = DateTime.Now.ToString("yyyyMMddHH");
-            string timestampFile = DateTime.Now.ToString("yyyyMMddHHmmss");
-            string destinationPath = Path.Combine(_destinationFolderPath, timestampFolder);
-
-            // 폴더가 없으면 생성
-            if (!Directory.Exists(destinationPath))
-            {
-                Directory.CreateDirectory(destinationPath);
-                LogMessage($"Directory created: {destinationPath}");
-            }
-
-            // 파일 복사
-            string destinationFilePath = Path.Combine(destinationPath, $"{timestampFile}{Path.GetExtension(randomFile)}");
+        private bool IsFileLocked(FileInfo file)
+        {
             try
             {
-                File.Copy(randomFile, destinationFilePath, true);
-                LogMessage($"File copied to: {destinationFilePath}");
+                using (FileStream stream = file.Open(FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    stream.Close();
+                }
             }
-            catch (Exception ex)
+            catch (IOException)
             {
-                LogMessage($"Error: {ex.Message}");
+                return true;
             }
-        }
 
-        private void LogMessage(string message)
-        {
-            // UI 스레드에서 리스트박스에 메시지 추가
-            Dispatcher.Invoke(() => {
-                LogListBox.Items.Add($"{DateTime.Now}: {message}");
-                LogListBox.ScrollIntoView(LogListBox.Items[LogListBox.Items.Count - 1]);
-            });
+            return false;
         }
     }
 }
+이제 파일이 삭제되는 로직은 다음과 같이 작동합니다:
+
+보관 기간이 지난 파일을 먼저 삭제합니다.
+하드 디스크 용량이 부족한 경우, 보관 기간이 남아 있는 파일 중에서 오래된 파일을 순차적으로 삭제합니다.
+파일 삭제는 잠금 상태가 아닌 파일만 처리합니다.
+이 변경사항을 통해 파일을 더 효율적으로 삭제하고 하드 디스크 용량을 확보할 
