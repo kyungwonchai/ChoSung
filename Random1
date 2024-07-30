@@ -1,73 +1,227 @@
-설정된 용량만큼 확보되면 삭제를 중지하도록 DeleteFilesAsync 함수를 수정하겠습니다. 필요한 코드만 수정해서 제공하겠습니다.
+겠습니다. 학습 시 같은 패턴의 파일이 20개 이상일 때만 패턴으로 인정하도록 수정하겠습니다.
 
-FileCleaner.cs 내의 특정 함수 코드
-DeleteFilesAsync 함수 수정
+MLModelBuilder.cs 수정
 csharp
 코드 복사
-public async Task DeleteFilesAsync(List<FileInfo> files, string folderPath, bool forceDelete = false, CancellationToken cancellationToken = default)
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Microsoft.ML;
+using Microsoft.ML.Data;
+
+namespace SMDFileCleaner
 {
-    long currentFolderSize = files.Sum(f => f.Length);
-    long freeSpace = GetDriveFreeSpace(folderPath.Split('\\')[0] + "\\");
-    long targetFreeSpace = 20L * 1024 * 1024 * 1024; // 20 GB 확보 목표
-
-    var startTime = DateTime.Now;
-    var allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".png", ".bmp" };
-    var minimumCreationTime = DateTime.Now.AddDays(-3); // 3일 이전 파일만 삭제
-
-    foreach (var file in files)
+    public class MLModelBuilder
     {
-        if (cancellationToken.IsCancellationRequested)
+        private readonly MLContext _mlContext;
+        private ITransformer _model;
+        private List<FileRecord> _fileDataList;
+
+        public MLModelBuilder()
         {
-            logger.LogRecentActivity("파일 삭제 중지됨.");
-            break;
+            _mlContext = new MLContext();
+            _fileDataList = new List<FileRecord>();
         }
 
-        if (!allowedExtensions.Contains(file.Extension))
+        public void TrainModel(List<FileRecord> fileData)
         {
-            logger.LogRecentActivity($"허용되지 않은 확장자: {file.Extension}. 파일 삭제 안 함: {file.FullName}");
-            continue;
-        }
-
-        if (file.CreationTime > minimumCreationTime)
-        {
-            logger.LogRecentActivity($"파일 생성 시간이 3일 이내입니다. 파일 삭제 안 함: {file.FullName}");
-            continue;
-        }
-
-        if (freeSpace >= targetFreeSpace && !forceDelete)
-        {
-            logger.LogRecentActivity($"목표 용량 {targetFreeSpace / (1024 * 1024 * 1024)} GB에 도달하여 삭제를 중지합니다.");
-            break;
-        }
-
-        try
-        {
-            file.Delete();
-            currentFolderSize -= file.Length;
-            freeSpace += file.Length; // 파일을 삭제할 때마다 여유 공간을 업데이트
-            logger.LogDeletionActivity($"파일 삭제됨: {file.FullName}");
-
-            var elapsed = DateTime.Now - startTime;
-            if (elapsed.TotalMinutes < 3)
+            try
             {
-                await Task.Delay(5000, cancellationToken); // 처음 3분 동안 5초 간격으로 파일 삭제
+                if (fileData == null || fileData.Count < 20) // 최소 샘플 수 확인
+                {
+                    throw new InvalidOperationException("Not enough samples to train the model. Minimum required samples: 20");
+                }
+
+                _fileDataList = fileData;
+                var data = _mlContext.Data.LoadFromEnumerable(fileData);
+
+                var pipeline = _mlContext.Transforms.Concatenate("Features", nameof(FileRecord.Size))
+                    .Append(_mlContext.Transforms.Text.FeaturizeText("FolderPathFeaturized", nameof(FileRecord.FolderPath)))
+                    .Append(_mlContext.Transforms.Concatenate("Features", "Features", "FolderPathFeaturized"))
+                    .Append(_mlContext.Transforms.Conversion.ConvertType("Features", outputKind: DataKind.Single))
+                    .Append(_mlContext.Clustering.Trainers.KMeans("Features", numberOfClusters: 2));
+
+                _model = pipeline.Fit(data);
             }
-            else
+            catch (Exception ex)
             {
-                await Task.Delay(100, cancellationToken); // 3분 이후에는 100ms 간격으로 파일 삭제
+                throw new ApplicationException("Failed to train model: " + ex.Message, ex);
             }
         }
-        catch (OperationCanceledException)
+
+        public bool Predict(FileInfo fileInfo)
         {
-            logger.LogRecentActivity("파일 삭제 작업이 취소되었습니다.");
-            break;
+            try
+            {
+                if (_model == null)
+                {
+                    throw new InvalidOperationException("Model is not trained.");
+                }
+
+                var fileData = new FileRecord
+                {
+                    Size = (float)fileInfo.Length, // float 형식으로 변환
+                    FolderPath = fileInfo.DirectoryName
+                };
+
+                var predictionEngine = _mlContext.Model.CreatePredictionEngine<FileRecord, FilePrediction>(_model);
+                var prediction = predictionEngine.Predict(fileData);
+
+                return prediction.PredictedClusterId == 1; // Cluster 1 is considered as regularly generated files
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to predict file classification: " + ex.Message, ex);
+            }
         }
-        catch (Exception ex)
+
+        public string GetCurrentPatterns()
         {
-            logger.LogError("Failed to delete file: " + ex.Message);
+            try
+            {
+                var regexPatterns = GetRegexPatterns();
+                if (regexPatterns.Count == 0)
+                {
+                    return "No patterns found.";
+                }
+
+                return string.Join(", ", regexPatterns.Select(p => p.ToString()));
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("Failed to get current patterns: " + ex.Message, ex);
+            }
+        }
+
+        public string GetCurrentPatternsInKorean()
+        {
+            try
+            {
+                var regexPatterns = GetRegexPatterns();
+                if (regexPatterns.Count == 0)
+                {
+                    return "발견된 패턴이 없습니다.";
+                }
+
+                var patternDescriptions = regexPatterns.Select(p => TranslatePatternToKorean(p)).ToList();
+                return string.Join("\n", patternDescriptions);
+            }
+            catch (Exception ex)
+            {
+                throw new ApplicationException("패턴 설명을 가져오지 못했습니다: " + ex.Message, ex);
+            }
+        }
+
+        private string TranslatePatternToKorean(Regex pattern)
+        {
+            if (pattern.ToString().Contains(@"\d{4}-\d{2}-\d{2}"))
+            {
+                return "이 패턴은 날짜 형식을 포함합니다 (예: 2022-01-01).";
+            }
+            if (pattern.ToString().Contains(@"IMG_\d{8}"))
+            {
+                return "이 패턴은 이미지 파일 형식을 포함합니다 (예: IMG_20220101).";
+            }
+            if (pattern.ToString().Contains(@"\d+"))
+            {
+                return "이 패턴은 숫자를 포함합니다.";
+            }
+            if (pattern.ToString().Contains(@"[A-Za-z]+"))
+            {
+                return "이 패턴은 영문자를 포함합니다.";
+            }
+            // 추가적인 패턴 설명이 필요하면 여기에 추가
+            return "알 수 없는 패턴: " + pattern.ToString();
+        }
+
+        public List<Regex> GetRegexPatterns()
+        {
+            var patterns = new List<Regex>();
+
+            // 모든 폴더 경로에서 공통된 부분을 찾아서 정규식 패턴으로 변환
+            var folderPaths = _fileDataList.Select(f => f.FolderPath).Distinct().ToList();
+            var commonPatterns = folderPaths
+                .Select(fp => FindCommonPattern(fp, _fileDataList))
+                .Where(cp => cp != null && cp.Count >= 20) // 같은 패턴의 파일이 20개 이상인 경우만
+                .Select(cp => new Regex(cp.Pattern))
+                .ToList();
+
+            return commonPatterns;
+        }
+
+        private List<CommonPattern> FindCommonPattern(string folderPath, List<FileRecord> fileDataList)
+        {
+            var filesInFolder = fileDataList.Where(f => f.FolderPath == folderPath).ToList();
+            if (filesInFolder.Count < 20)
+            {
+                return null;
+            }
+
+            // 공통된 부분을 정규식 패턴으로 변환
+            var lcs = FindLCS(filesInFolder.Select(f => f.FilePath).ToList());
+            if (string.IsNullOrEmpty(lcs))
+            {
+                return null;
+            }
+
+            var regexPattern = Regex.Escape(lcs).Replace("\\*", ".*").Replace("\\?", ".");
+            return new List<CommonPattern> { new CommonPattern { FolderPath = folderPath, Pattern = regexPattern } };
+        }
+
+        private string FindLCS(List<string> strs)
+        {
+            if (strs == null || strs.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var lcs = strs[0];
+            foreach (var str in strs)
+            {
+                lcs = FindLCS(lcs, str);
+            }
+
+            return lcs;
+        }
+
+        private string FindLCS(string str1, string str2)
+        {
+            var lengths = new int[str1.Length, str2.Length];
+            var greatestLength = 0;
+            var output = string.Empty;
+
+            for (int i = 0; i < str1.Length; i++)
+            {
+                for (int j = 0; j < str2.Length; j++)
+                {
+                    if (str1[i] == str2[j])
+                    {
+                        lengths[i, j] = (i == 0 || j == 0) ? 1 : lengths[i - 1, j - 1] + 1;
+                        if (lengths[i, j] > greatestLength)
+                        {
+                            greatestLength = lengths[i, j];
+                            output = str1.Substring(i - greatestLength + 1, greatestLength);
+                        }
+                    }
+                }
+            }
+
+            return output;
         }
     }
 
-    updateFolderStatistics(currentFolderSize, folderPath);
+    public class FilePrediction
+    {
+        [ColumnName("PredictedLabel")]
+        public uint PredictedClusterId { get; set; }
+    }
+
+    public class CommonPattern
+    {
+        public string FolderPath { get; set; }
+        public string Pattern { get; set; }
+    }
 }
-이제 하드 용량이 부족할 때 목표 용량인 20GB를 확보할 때까지 파일을 삭제하고, 목표 용량에 도달하면 삭제를 중지하도록 수정되었습니다. 이 코드를 사용하여 설정된 용량만큼 확보되면 삭제를 중지할 수 있습니다
+위 코드에서, GetRegexPatterns 함수는 같은 패턴의 파일이 20개 이상인 경우에만 그 패턴을 반환하도록 수정되었습니다. 이제 학습된 패턴은 최소 20개의 파일이 존
