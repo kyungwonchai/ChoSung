@@ -1,25 +1,145 @@
-겠습니다. XAML 파일에 정규식 입력란을 추가하고, 해당 정규식을 저장하고 적용하는 기능을 구현하겠습니다. 이후, FileCleaner 클래스에서 이 저장된 정규식을 참조하도록 하겠습니다.
+정규식 체크를 파일 목록을 가져올 때 하는 것이 성능 면에서 더 효율적입니다. 이렇게 하면 불필요한 파일을 미리 걸러낼 수 있습니다.
 
-1. MainWindow.xaml
-정규식 입력란과 적용 버튼 추가
-xml
+기존의 FileCleaner 클래스를 수정하여 파일 목록을 가져올 때 정규식을 체크하도록 하겠습니다.
+
+수정된 FileCleaner.cs
+csharp
 코드 복사
-<Window x:Class="SMDFileCleaner.MainWindow"
-        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SMD File Cleaner" Height="350" Width="525">
-    <Grid>
-        <TextBox x:Name="txtFolderPath" HorizontalAlignment="Left" Height="23" Margin="10,10,0,0" VerticalAlignment="Top" Width="400" IsReadOnly="True"/>
-        <Button x:Name="btnSelectFolder" Content="Select Folder" HorizontalAlignment="Left" Margin="420,10,0,0" VerticalAlignment="Top" Width="75" Click="btnSelectFolder_Click"/>
-        
-        <TextBox x:Name="txtRegexPattern" HorizontalAlignment="Left" Height="23" Margin="10,50,0,0" VerticalAlignment="Top" Width="400"/>
-        <Button x:Name="btnApplyRegex" Content="Apply Regex" HorizontalAlignment="Left" Margin="420,50,0,0" VerticalAlignment="Top" Width="75" Click="btnApplyRegex_Click"/>
-        
-        <Button x:Name="btnStart" Content="Start" HorizontalAlignment="Left" Margin="10,90,0,0" VerticalAlignment="Top" Width="75" Click="btnStart_Click"/>
-    </Grid>
-</Window>
-2. MainWindow.xaml.cs
-폴더 경로와 정규식을 저장하고 참조하는 로직 추가
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace SMDFileCleaner
+{
+    public class FileCleaner
+    {
+        private const long MinimumFreeSpace = 25L * 1024 * 1024 * 1024; // 25 GB
+        private const long MaxFolderSize = 8L * 1024 * 1024 * 1024; // 8 GB
+        private readonly string logDirectory;
+        private readonly MLModelBuilder mlModelBuilder;
+        private readonly Dispatcher dispatcher;
+        private readonly Logger logger;
+        private readonly Action<long, string> updateFolderStatistics;
+
+        public FileCleaner(string logDirectory, MLModelBuilder mlModelBuilder, Dispatcher dispatcher, Logger logger, Action<long, string> updateFolderStatistics)
+        {
+            this.logDirectory = logDirectory;
+            this.mlModelBuilder = mlModelBuilder;
+            this.dispatcher = dispatcher;
+            this.logger = logger;
+            this.updateFolderStatistics = updateFolderStatistics;
+        }
+
+        public long GetDriveFreeSpace(string driveName)
+        {
+            try
+            {
+                DriveInfo drive = new DriveInfo(driveName);
+                return drive.AvailableFreeSpace;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get drive free space: " + ex.Message);
+                return 0;
+            }
+        }
+
+        public List<FileInfo> GetFilesToDelete(string folderPath, Regex regex, bool forceDelete = false)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, regex);
+                var filesToDelete = files.Where(file => forceDelete || file.CreationTime < DateTime.Now.AddDays(-35)).OrderBy(file => file.CreationTime).ToList();
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(files.Sum(f => f.Length), folderPath);
+                });
+
+                return filesToDelete;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to get files to delete: " + ex.Message);
+                return new List<FileInfo>();
+            }
+        }
+
+        private IEnumerable<FileInfo> GetFiles(string folderPath, Regex regex)
+        {
+            var files = new List<FileInfo>();
+            try
+            {
+                var directory = new DirectoryInfo(folderPath);
+                files.AddRange(directory.GetFiles("*", SearchOption.AllDirectories)
+                    .Where(f => f.Length > 500 * 1024 && regex.IsMatch(f.FullName))); // 500KB 이상의 파일 중 정규식과 일치하는 파일
+
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                logger.LogError("Access denied to folder: " + folderPath + " - " + ex.Message);
+            }
+            return files;
+        }
+
+        public async Task DeleteFilesAsync(List<FileInfo> files, string folderPath, bool forceDelete = false)
+        {
+            long currentFolderSize = files.Sum(f => f.Length);
+            long freeSpace = GetDriveFreeSpace(folderPath.Split('\\')[0] + "\\");
+
+            foreach (var file in files)
+            {
+                if (currentFolderSize <= MaxFolderSize && !forceDelete)
+                {
+                    logger.LogRecentActivity("현재 폴더 크기가 8GB 이하입니다.");
+                    break;
+                }
+
+                if (freeSpace > MinimumFreeSpace && !forceDelete)
+                {
+                    logger.LogRecentActivity($"용량이 {freeSpace / (1024 * 1024 * 1024)} GB 남아서 삭제를 하지 않습니다.");
+                    break;
+                }
+
+                try
+                {
+                    file.Delete();
+                    currentFolderSize -= file.Length;
+                    logger.LogDeletionActivity($"파일 삭제됨: {file.FullName}");
+                    await Task.Delay(100); // 파일 삭제 시 딜레이 추가
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError("Failed to delete file: " + ex.Message);
+                }
+            }
+
+            updateFolderStatistics(currentFolderSize, folderPath);
+        }
+
+        public void UpdateFolderStatistics(string folderPath, string fileExtension)
+        {
+            try
+            {
+                var files = GetFiles(folderPath, new Regex($".*\\.{fileExtension}$"));
+                long totalSize = files.Sum(f => f.Length);
+
+                dispatcher.Invoke(() =>
+                {
+                    updateFolderStatistics(totalSize, folderPath);
+                });
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to update folder statistics: " + ex.Message);
+            }
+        }
+    }
+}
+MainWindow.xaml.cs 수정
+정규식 적용 로직 추가 및 파일 삭제 시 정규식 적용
 csharp
 코드 복사
 using System;
@@ -78,7 +198,8 @@ namespace SMDFileCleaner
             try
             {
                 var regex = new Regex(_regexPattern);
-                _fileCleaner.DeleteFiles(_folderPath, regex);
+                var filesToDelete = _fileCleaner.GetFilesToDelete(_folderPath, regex);
+                _fileCleaner.DeleteFilesAsync(filesToDelete, _folderPath).Wait();
                 MessageBox.Show("파일 삭제 완료.", "완료", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
@@ -113,69 +234,8 @@ namespace SMDFileCleaner
         }
     }
 }
-3. FileCleaner.cs
-정규식과 일치하는 파일을 삭제하도록 수정
-csharp
-코드 복사
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-
-namespace SMDFileCleaner
-{
-    public class FileCleaner
-    {
-        public void DeleteFiles(string folderPath, Regex regex)
-        {
-            var files = GetFiles(folderPath);
-
-            foreach (var file in files)
-            {
-                if (regex.IsMatch(file.FullName))
-                {
-                    try
-                    {
-                        file.Delete();
-                        LogDeletionActivity($"파일 삭제됨: {file.FullName}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogError("Failed to delete file: " + ex.Message);
-                    }
-                }
-            }
-        }
-
-        private List<FileInfo> GetFiles(string folderPath)
-        {
-            var files = new List<FileInfo>();
-            try
-            {
-                var directory = new DirectoryInfo(folderPath);
-                files.AddRange(directory.GetFiles("*", SearchOption.AllDirectories));
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                LogError("폴더 접근 거부됨: " + folderPath + " - " + ex.Message);
-            }
-            return files;
-        }
-
-        private void LogDeletionActivity(string message)
-        {
-            // 삭제 로그를 남기는 로직
-        }
-
-        private void LogError(string message)
-        {
-            // 에러 로그를 남기는 로직
-        }
-    }
-}
 이제 프로그램은 다음과 같이 동작합니다:
 
 사용자가 폴더와 정규식을 입력하고 적용 버튼을 눌러 설정을 저장합니다.
 프로그램 시작 시 저장된 폴더와 정규식을 불러옵니다.
-시작 버튼을 누르면 저장된 정규식을 사용하여 지정된 폴더 내의 파일을 삭제합니다.
-위 코드에서 정규식을 저장하고 불러오는 기능을 추가하여, 파일 삭제 시 저장된 정규식을 참조하도록 수정하였습
+시작 버튼을 누르면 저장된 정규식을 사용하여 지정된 폴더 내의 파일을 삭제합니다. 파일 목록을 가져올 때 정규식을 체크하여, 삭제할 파일 목록을 필터링합
