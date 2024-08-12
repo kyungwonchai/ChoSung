@@ -1,28 +1,206 @@
-아니라, ImageProxy 클래스에서 Image를 직접 가져올 수 있습니다. ImageProxy의 image 속성은 android.media.Image 객체를 반환합니다. 이를 처리하는 방법을 수정하겠습니다.
+습니다. ImageProxy를 Bitmap으로 변환하는 과정에서 발생하는 문제를 해결하고, 전체 코드를 수정하여 제공하겠습니다. ImageProxy는 YUV_420_888 형식의 이미지를 제공하므로 이를 Bitmap으로 변환하는 올바른 방법을 사용해야 합니다.
 
-수정된 코드:
-ImageProxy에서 Bitmap을 생성하는 방법을 올바르게 적용한 코드는 다음과 같습니다:
+수정된 전체 코드
+아래는 CameraX와 ML Kit을 사용하여 실시간으로 QR 코드 및 바코드를 3배 확대하여 인식하는 전체 코드입니다.
 
 kotlin
 코드 복사
+package com.dxmxsmd.mobilechecker
+
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.media.Image
+import android.os.Bundle
+import android.util.Log
+import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
-private fun toBitmap(image: ImageProxy): Bitmap {
-    val imageBuffer = image.planes[0].buffer
-    val bytes = ByteArray(imageBuffer.capacity())
-    imageBuffer.get(bytes)
+class MainActivity : ComponentActivity() {
 
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, null)
+    private lateinit var viewFinder: PreviewView
+    private lateinit var cameraExecutor: ExecutorService
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        viewFinder = findViewById(R.id.viewFinder)
+
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+
+        cameraExecutor = Executors.newSingleThreadExecutor()
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder()
+                .build()
+                .also {
+                    it.setSurfaceProvider(viewFinder.surfaceProvider)
+                }
+
+            val barcodeScanner = BarcodeScanning.getClient()
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, { imageProxy ->
+                        processImageProxy(barcodeScanner, imageProxy)
+                    })
+                }
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageAnalysis
+                )
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun processImageProxy(barcodeScanner: BarcodeScanner, imageProxy: ImageProxy) {
+        val mediaImage = imageProxy.image
+        if (mediaImage != null) {
+            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+            val bitmap = mediaImage.toBitmap()
+            val scaledBitmap = scaleBitmap(bitmap, 3.0f) // 3배 확대
+            val image = InputImage.fromBitmap(scaledBitmap, rotationDegrees)
+
+            barcodeScanner.process(image)
+                .addOnSuccessListener { barcodes ->
+                    for (barcode in barcodes) {
+                        val rawValue = barcode.rawValue
+                        findViewById<TextView>(R.id.text_view_result).text = rawValue
+                    }
+                }
+                .addOnFailureListener {
+                    // Handle failure
+                }
+                .addOnCompleteListener {
+                    imageProxy.close()
+                }
+        }
+    }
+
+    private fun Image.toBitmap(): Bitmap {
+        val nv21 = yuv420888ToNv21(this)
+        return nv21ToBitmap(nv21, this.width, this.height)
+    }
+
+    private fun yuv420888ToNv21(image: Image): ByteArray {
+        val width = image.width
+        val height = image.height
+        val ySize = width * height
+        val uvSize = width * height / 4
+        val nv21 = ByteArray(ySize + uvSize * 2)
+
+        val yBuffer = image.planes[0].buffer
+        val uBuffer = image.planes[1].buffer
+        val vBuffer = image.planes[2].buffer
+
+        var rowStride = image.planes[0].rowStride
+        var pos = 0
+
+        if (rowStride == width) {
+            yBuffer[nv21, 0, ySize]
+            pos += ySize
+        } else {
+            val yBufferRow = ByteArray(rowStride)
+            for (i in 0 until height) {
+                yBuffer[yBufferRow, 0, rowStride]
+                System.arraycopy(yBufferRow, 0, nv21, pos, width)
+                pos += width
+            }
+        }
+
+        rowStride = image.planes[1].rowStride
+        val pixelStride = image.planes[1].pixelStride
+        val uvBufferRow = ByteArray(rowStride)
+
+        for (i in 0 until height / 2) {
+            uBuffer[uvBufferRow, 0, rowStride]
+            for (j in 0 until width / 2) {
+                nv21[pos++] = uvBufferRow[j * pixelStride]
+                nv21[pos++] = vBuffer[j * pixelStride]
+            }
+        }
+
+        return nv21
+    }
+
+    private fun nv21ToBitmap(nv21: ByteArray, width: Int, height: Int): Bitmap {
+        val yuvImage = android.graphics.YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        val out = java.io.ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
+    private fun scaleBitmap(bitmap: Bitmap, scaleFactor: Float): Bitmap {
+        val width = (bitmap.width * scaleFactor).toInt()
+        val height = (bitmap.height * scaleFactor).toInt()
+        return Bitmap.createScaledBitmap(bitmap, width, height, true)
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(
+            baseContext, it
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+    }
+
+    companion object {
+        private const val TAG = "CameraXApp"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    }
 }
-이 메서드를 통해 ImageProxy에서 Bitmap을 생성할 수 있습니다. 주의해야 할 점은, 카메라에서 캡처된 이미지는 일반적으로 YUV 포맷으로 제공되며, 이를 RGB로 변환하는 과정이 필요할 수 있습니다.
+주요 변경 사항:
+toBitmap 함수:
 
-추가 설명:
-YUV_420_888 포맷 처리: 기본적으로 카메라 프레임은 YUV 포맷으로 제공되며, 이 경우 단순히 BitmapFactory.decodeByteArray를 사용할 수 없습니다. 이런 경우 YUV_420_888 포맷을 처리하기 위한 변환이 필요합니다.
+Image 객체를 Bitmap으로 변환하는 toBitmap 함수를 추가했습니다.
+YUV_420_888 형식의 이미지를 NV21로 변환한 다음, 이를 Bitmap으로 변환하는 과정을 포함했습니다.
+이미지 확대 및 인식:
 
-이미지 처리 속도: 이미지를 Bitmap으로 변환하고 확대하는 과정이 성능에 영향을 미칠 수 있습니다. 따라서 성능이 중요할 경우, 이 부분을 최적화하거나 GPU 가속을 사용하는 것이 좋습니다.
-
-위 코드로 ImageProxy 객체를 Bitmap으로 변환한 후, 이를 ML Kit에 전달하여 QR 코드 및 바코드를 인식할 수
+이미지를 scaleBitmap 함수를 사용해 3배 확대하고, 이를 ML Kit에서 처리하도록 설정했습니다.
+설명:
+yuv420888ToNv21: YUV_420_888 형식의 이미지를 NV21 형식으로 변환하는 함수입니다. NV21 형식은 안드로이드에서 Bitmap으로 쉽게 변환할 수 있는 형식입니다.
+nv21ToBitmap: NV21 데이터를 Bitmap으로 변환하는 함수입니다.
+scaleBitmap: 변환된 Bitmap을 3배 확대하는 함수입니다.
+이 코드는 CameraX를 사용해 실시간으로 카메라 이미지를 캡처하고, 이를 ML Kit에서 QR 코드 및 바코드 인식에 사용하는 기능을 제공합니다. 이미지를 3배 확대하여 인식 성
