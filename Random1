@@ -1,183 +1,21 @@
-NetworkOnMainThreadException은 네트워크 작업이 메인 스레드(UI 스레드)에서 수행될 때 발생하는 예외입니다. Android에서는 메인 스레드에서 네트워크 작업을 실행하는 것을 금지하고 있습니다. 이를 해결하려면 네트워크 작업을 별도의 스레드에서 실행해야 합니다.
+송합니다. NetworkOnMainThreadException이 isQrCodeInDatabase 메서드 내에서 발생하는 것으로, 이 메서드에서 데이터베이스 연결을 시도할 때 발생한 것입니다. 이 문제를 해결하려면 isQrCodeInDatabase 메서드 내에서 네트워크 작업이 메인 스레드에서 실행되지 않도록 해야 합니다.
 
-해결 방법
-네트워크 작업을 백그라운드 스레드에서 실행하기 위해 AsyncTask, Thread, ExecutorService, Coroutine 등을 사용할 수 있습니다. 여기서는 간단하게 ExecutorService를 사용하여 네트워크 작업을 백그라운드 스레드에서 수행하는 방법을 보여드리겠습니다.
+이 문제를 해결하기 위해, isQrCodeInDatabase 메서드를 비동기 방식으로 실행하고, catch 블록에서 발생한 예외를 제대로 처리하도록 수정하겠습니다.
 
-수정된 코드 (MainActivity.kt)
-아래 코드에서는 네트워크 작업(즉, 데이터베이스 접근)을 백그라운드 스레드에서 수행하고, 결과를 메인 스레드로 전달하여 UI를 업데이트합니다.
+아래는 수정된 코드입니다.
+
+1. isQrCodeInDatabase 메서드의 수정
+isQrCodeInDatabase 메서드를 dbExecutor를 사용해 백그라운드에서 실행하고, 결과를 callback으로 전달하도록 수정했습니다.
 
 kotlin
 코드 복사
-package com.dxmxsmd.mobilechecker
-
-import android.Manifest
-import android.content.Context
-import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.provider.Settings
-import android.util.Log
-import android.widget.RelativeLayout
-import android.widget.TextView
-import androidx.activity.ComponentActivity
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import com.google.mlkit.vision.barcode.BarcodeScanner
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.common.InputImage
-import java.net.InetAddress
-import java.sql.Connection
-import java.sql.DriverManager
-import java.sql.ResultSet
-import java.sql.Statement
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-
-class MainActivity : ComponentActivity() {
-
-    private lateinit var viewFinder: PreviewView
-    private lateinit var cameraContainer: RelativeLayout
-    private lateinit var deviceInfo: TextView
-    private lateinit var cameraExecutor: ExecutorService
-    private lateinit var handler: Handler
-    private lateinit var dbExecutor: ExecutorService
-
-    private lateinit var deviceIp: String
-    private lateinit var deviceId: String
-
-    // MSSQL 연결 정보
-    private val dbUrl = "jdbc:sqlserver://<SERVER>:<PORT>;databaseName=<DATABASE>"
-    private val dbUser = "<USERNAME>"
-    private val dbPassword = "<PASSWORD>"
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        viewFinder = findViewById(R.id.viewFinder)
-        cameraContainer = findViewById(R.id.camera_container)
-        deviceInfo = findViewById(R.id.device_info)
-
-        // 기기 IP 주소와 ID 가져오기
-        deviceIp = getDeviceIpAddress()
-        deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-
-        // IP 주소와 기기 ID 표시
-        deviceInfo.text = "IP: $deviceIp\nID: $deviceId"
-
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
-        }
-
-        cameraExecutor = Executors.newSingleThreadExecutor()
-        dbExecutor = Executors.newSingleThreadExecutor()
-        handler = Handler(Looper.getMainLooper())
-    }
-
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
-        cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-
-            val previewBuilder = Preview.Builder()
-
-            // Camera2Interop을 사용하여 연속 자동 초점 모드 설정
-            val camera2Interop = Camera2Interop.Extender(previewBuilder)
-            camera2Interop.setCaptureRequestOption(
-                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
-                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            )
-
-            val preview = previewBuilder.build().also {
-                it.setSurfaceProvider(viewFinder.surfaceProvider)
-            }
-
-            val barcodeScanner = BarcodeScanning.getClient()
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_16_9) // 장치의 최대 해상도 사용
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetRotation(viewFinder.display.rotation) // 디스플레이 회전에 맞춤
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, { imageProxy ->
-                        processImageProxy(barcodeScanner, imageProxy)
-                    })
-                }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalysis
-                )
-
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
-            }
-
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun processImageProxy(barcodeScanner: BarcodeScanner, imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage != null) {
-            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-            barcodeScanner.process(image)
-                .addOnSuccessListener { barcodes ->
-                    for (barcode in barcodes) {
-                        val rawValue = barcode.rawValue
-                        findViewById<TextView>(R.id.text_view_result).text = rawValue
-
-                        // 데이터베이스 쿼리를 백그라운드에서 실행
-                        dbExecutor.execute {
-                            val isInDatabase = isQrCodeInDatabase(rawValue)
-                            // UI 업데이트를 위해 메인 스레드로 이동
-                            handler.post {
-                                if (isInDatabase) {
-                                    // QR 코드가 DB에 존재할 경우 테두리를 녹색으로 변경
-                                    cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_green_light))
-                                    // 5분 후에 다시 주황색으로 변경
-                                    handler.postDelayed({
-                                        cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_orange_light))
-                                    }, TimeUnit.MINUTES.toMillis(5))
-                                } else {
-                                    // QR 코드가 DB에 존재하지 않을 경우 주황색 테두리 유지
-                                    cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_orange_light))
-                                }
-                            }
-                        }
-                    }
-                }
-                .addOnFailureListener {
-                    // Handle failure
-                }
-                .addOnCompleteListener {
-                    imageProxy.close()
-                }
-        }
-    }
-
-    private fun isQrCodeInDatabase(qrCode: String): Boolean {
+private fun isQrCodeInDatabase(qrCode: String, callback: (Boolean) -> Unit) {
+    dbExecutor.execute {
         var connection: Connection? = null
         var statement: Statement? = null
         var resultSet: ResultSet? = null
-        return try {
+        var result = false
+        try {
             // JDBC 드라이버 로드
             Class.forName("com.microsoft.sqlserver.jdbc.SQLServerDriver")
 
@@ -185,10 +23,7 @@ class MainActivity : ComponentActivity() {
             connection = DriverManager.getConnection(dbUrl, dbUser, dbPassword)
 
             // 쿼리 실행
-            statement = connection.createStatement()
             val query = "SELECT COUNT(*) FROM QRCodeData WHERE QRCode = ?"
-            
-            // Prepare statement to prevent SQL injection
             val preparedStatement = connection.prepareStatement(query)
             preparedStatement.setString(1, qrCode)
             
@@ -196,13 +31,10 @@ class MainActivity : ComponentActivity() {
 
             // 결과 처리
             if (resultSet.next()) {
-                resultSet.getInt(1) > 0
-            } else {
-                false
+                result = resultSet.getInt(1) > 0
             }
         } catch (e: Exception) {
             e.printStackTrace()
-            false
         } finally {
             try {
                 resultSet?.close()
@@ -212,52 +44,56 @@ class MainActivity : ComponentActivity() {
                 e.printStackTrace()
             }
         }
-    }
-
-    private fun getDeviceIpAddress(): String {
-        try {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val ipAddress = wifiManager.connectionInfo.ipAddress
-            return InetAddress.getByAddress(
-                byteArrayOf(
-                    (ipAddress and 0xff).toByte(),
-                    (ipAddress shr 8 and 0xff).toByte(),
-                    (ipAddress shr 16 and 0xff).toByte(),
-                    (ipAddress shr 24 and 0xff).toByte()
-                )
-            ).hostAddress ?: "IP not found"
-        } catch (ex: Exception) {
-            return "IP not found"
+        // 콜백으로 결과 전달
+        handler.post {
+            callback(result)
         }
     }
+}
+2. processImageProxy에서의 호출 방식 수정
+이제 processImageProxy 메서드 내에서 isQrCodeInDatabase를 호출할 때, 콜백을 사용하여 결과를 처리합니다.
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(
-            baseContext, it
-        ) == PackageManager.PERMISSION_GRANTED
-    }
+kotlin
+코드 복사
+private fun processImageProxy(barcodeScanner: BarcodeScanner, imageProxy: ImageProxy) {
+    val mediaImage = imageProxy.image
+    if (mediaImage != null) {
+        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        barcodeScanner.process(image)
+            .addOnSuccessListener { barcodes ->
+                for (barcode in barcodes) {
+                    val rawValue = barcode.rawValue
+                    findViewById<TextView>(R.id.text_view_result).text = rawValue
 
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        dbExecutor.shutdown()
-        handler.removeCallbacksAndMessages(null) // 모든 핸들러 작업 중지
-    }
-
-    companion object {
-        private const val TAG = "CameraXApp"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+                    // 데이터베이스 쿼리를 비동기로 실행하고 콜백으로 결과 처리
+                    isQrCodeInDatabase(rawValue) { isInDatabase ->
+                        if (isInDatabase) {
+                            // QR 코드가 DB에 존재할 경우 테두리를 녹색으로 변경
+                            cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_green_light))
+                            // 5분 후에 다시 주황색으로 변경
+                            handler.postDelayed({
+                                cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_orange_light))
+                            }, TimeUnit.MINUTES.toMillis(5))
+                        } else {
+                            // QR 코드가 DB에 존재하지 않을 경우 주황색 테두리 유지
+                            cameraContainer.setBackgroundColor(ContextCompat.getColor(this, android.R.color.holo_orange_light))
+                        }
+                    }
+                }
+            }
+            .addOnFailureListener {
+                // Handle failure
+            }
+            .addOnCompleteListener {
+                imageProxy.close()
+            }
     }
 }
 주요 변경 사항:
-dbExecutor 추가:
+비동기 데이터베이스 호출:
 
-데이터베이스 쿼리를 백그라운드에서 실행하기 위해 dbExecutor를 추가했습니다. Executors.newSingleThreadExecutor()를 사용해 별도의 스레드에서 데이터베이스 작업을 수행합니다.
-네트워크 작업의 백그라운드 실행:
+isQrCodeInDatabase 함수가 메인 스레드가 아닌 dbExecutor에서 실행되도록 수정되었습니다. 이 메서드는 이제 결과를 callback으로 전달합니다.
+콜백 방식으로 결과 처리:
 
-dbExecutor.execute {} 블록을 사용해 isQrCodeInDatabase 호출을 백그라운드 스레드에서 실행합니다.
-UI 업데이트:
-
-데이터베이스 작업이 완료되면 handler.post를 사용해 UI 업데이트를 메인 스레드에서 수행합니다.
-이 방법을 사용하면 NetworkOnMainThreadException을 피하고, 네트워크 작업이 백그라운드에서 안전하게 실행되도록 할 수 있습니다
+processImageProxy에서 데이터베이스 쿼리 결과를 콜백으로 받아서 UI를 업데이트합니다. 이로 인해 네트워크 작업이 메인 스레드에서 발생하지 않으며, NetworkOnMainThreadException을 피할 수 있습니다.
+이 수정으로 인해 isQrCodeInDatabase에서 발생하는 NetworkOnMainThreadException이 해결될 것입니다. 네트워크 작업은 백그라운드에서 실행되고, 결과는 메인 스레드에서 처리되어 UI를 업데이트합
