@@ -1,142 +1,195 @@
-폰이 가진 최대 해상도를 설정하려면, ImageAnalysis.Builder에서 setTargetResolution() 대신 setTargetAspectRatio()를 사용하고, setTargetRotation()을 통해 자동으로 최적의 해상도를 선택하도록 설정할 수 있습니다. 이렇게 하면, 사용 중인 장치에서 지원하는 최대 해상도를 사용하게 됩니다.
+ 데이터베이스에서 각 IP에 대해 최근 두 개의 QR 코드만 유지되도록 FIFO(First-In, First-Out) 방식으로 구현해보겠습니다. 이 방식에서는 새로운 QR 코드가 추가될 때, 기존의 가장 오래된 QR 코드가 삭제되거나 덮어쓰여야 합니다.
 
-수정된 Kotlin 코드 (MainActivity.kt)
-kotlin
+1. 데이터베이스 스크립트
+먼저 테이블 구조를 조금 변경하여 각 QR 코드에 대한 시간 정보를 관리하고, FIFO 방식으로 처리할 수 있도록 합니다.
+
+sql
 코드 복사
-package com.dxmxsmd.mobilechecker
+CREATE TABLE QRCodeData (
+    ID INT PRIMARY KEY IDENTITY(1,1),
+    IPAddress VARCHAR(15) NOT NULL,
+    QRCode VARCHAR(20) NOT NULL,
+    CreatedAt DATETIME DEFAULT GETDATE()
+);
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Bundle
-import android.util.Log
-import android.widget.TextView
-import androidx.activity.ComponentActivity
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import com.google.mlkit.vision.barcode.BarcodeScanner
-import com.google.mlkit.vision.barcode.BarcodeScanning
-import com.google.mlkit.vision.common.InputImage
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+-- Index to ensure uniqueness and efficient lookup
+CREATE INDEX IDX_QRCodeData_IPAddress_CreatedAt ON QRCodeData(IPAddress, CreatedAt);
+2. QR 코드 생성 및 표시 로직 (C#)
+이제 코드를 수정하여 데이터베이스에 최신 두 개의 QR 코드를 유지하도록 합니다.
 
-class MainActivity : ComponentActivity() {
+csharp
+코드 복사
+using System;
+using System.Data.SqlClient;
+using System.Drawing;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using ZXing;
 
-    private lateinit var viewFinder: PreviewView
-    private lateinit var cameraExecutor: ExecutorService
+public class MainForm : Form
+{
+    private NotifyIcon trayIcon;
+    private ContextMenu trayMenu;
+    private PictureBox qrPictureBox;
+    private string connectionString = "YourConnectionStringHere";
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+    public MainForm()
+    {
+        this.Text = "QR Code Generator";
+        this.Size = new Size(300, 300);
+        this.StartPosition = FormStartPosition.CenterScreen;
 
-        viewFinder = findViewById(R.id.viewFinder)
+        qrPictureBox = new PictureBox
+        {
+            Dock = DockStyle.Fill,
+            SizeMode = PictureBoxSizeMode.StretchImage
+        };
+        this.Controls.Add(qrPictureBox);
 
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
-        }
+        trayMenu = new ContextMenu();
+        trayMenu.MenuItems.Add("Exit", OnExit);
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        trayIcon = new NotifyIcon();
+        trayIcon.Text = "QR Code Generator";
+        trayIcon.Icon = new Icon(SystemIcons.Application, 40, 40);
+        trayIcon.ContextMenu = trayMenu;
+        trayIcon.Visible = true;
+        trayIcon.DoubleClick += (sender, e) => this.Show();
+
+        this.FormClosing += (sender, e) => { e.Cancel = true; this.Hide(); };
+
+        Thread qrThread = new Thread(new ThreadStart(UpdateQRCode));
+        qrThread.IsBackground = true;
+        qrThread.Start();
     }
 
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+    private void UpdateQRCode()
+    {
+        while (true)
+        {
+            string ipAddress = GetLocalIPAddress();
+            string qrCode = QRCodeGenerator.GenerateQRCode(20);
+            Bitmap qrBitmap = GenerateQRCodeBitmap(qrCode);
 
-        cameraProviderFuture.addListener({
-            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+            this.Invoke((MethodInvoker)delegate
+            {
+                qrPictureBox.Image = qrBitmap;
+            });
 
-            val previewBuilder = Preview.Builder()
-
-            // Camera2Interop을 사용하여 연속 자동 초점 모드 설정
-            val camera2Interop = Camera2Interop.Extender(previewBuilder)
-            camera2Interop.setCaptureRequestOption(
-                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
-                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            )
-
-            val preview = previewBuilder.build().also {
-                it.setSurfaceProvider(viewFinder.surfaceProvider)
-            }
-
-            val barcodeScanner = BarcodeScanning.getClient()
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_16_9) // 장치의 최대 해상도 사용
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setTargetRotation(viewFinder.display.rotation) // 디스플레이 회전에 맞춤
-                .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor, { imageProxy ->
-                        processImageProxy(barcodeScanner, imageProxy)
-                    })
-                }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageAnalysis
-                )
-
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
-            }
-
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun processImageProxy(barcodeScanner: BarcodeScanner, imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        if (mediaImage != null) {
-            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-            barcodeScanner.process(image)
-                .addOnSuccessListener { barcodes ->
-                    for (barcode in barcodes) {
-                        val rawValue = barcode.rawValue
-                        findViewById<TextView>(R.id.text_view_result).text = rawValue
-                    }
-                }
-                .addOnFailureListener {
-                    // Handle failure
-                }
-                .addOnCompleteListener {
-                    imageProxy.close()
-                }
+            UpdateDatabase(ipAddress, qrCode);
+            Thread.Sleep(3000);
         }
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(
-            baseContext, it
-        ) == PackageManager.PERMISSION_GRANTED
+    private string GetLocalIPAddress()
+    {
+        var host = Dns.GetHostEntry(Dns.GetHostName());
+        foreach (var ip in host.AddressList)
+        {
+            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                return ip.ToString();
+            }
+        }
+        throw new Exception("Local IP Address Not Found!");
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
+    private void UpdateDatabase(string ipAddress, string qrCode)
+    {
+        using (SqlConnection connection = new SqlConnection(connectionString))
+        {
+            connection.Open();
+
+            // Insert new QR code
+            string insertQuery = @"
+                INSERT INTO QRCodeData (IPAddress, QRCode)
+                VALUES (@IPAddress, @QRCode)";
+            using (SqlCommand command = new SqlCommand(insertQuery, connection))
+            {
+                command.Parameters.AddWithValue("@IPAddress", ipAddress);
+                command.Parameters.AddWithValue("@QRCode", qrCode);
+                command.ExecuteNonQuery();
+            }
+
+            // Remove the oldest QR code if more than two entries exist
+            string deleteQuery = @"
+                DELETE FROM QRCodeData
+                WHERE IPAddress = @IPAddress
+                AND ID NOT IN (
+                    SELECT TOP 2 ID
+                    FROM QRCodeData
+                    WHERE IPAddress = @IPAddress
+                    ORDER BY CreatedAt DESC
+                )";
+            using (SqlCommand command = new SqlCommand(deleteQuery, connection))
+            {
+                command.Parameters.AddWithValue("@IPAddress", ipAddress);
+                command.ExecuteNonQuery();
+            }
+        }
     }
 
-    companion object {
-        private const val TAG = "CameraXApp"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    private Bitmap GenerateQRCodeBitmap(string qrCode)
+    {
+        var writer = new BarcodeWriter
+        {
+            Format = BarcodeFormat.QR_CODE,
+            Options = new ZXing.Common.EncodingOptions
+            {
+                Width = 250,
+                Height = 250
+            }
+        };
+        return writer.Write(qrCode);
+    }
+
+    private void OnExit(object sender, EventArgs e)
+    {
+        Application.Exit();
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        StartupManager.EnsureStartup();
+        Application.Run(new MainForm());
     }
 }
-주요 변경 사항:
-최대 해상도 사용:
 
-setTargetAspectRatio(AspectRatio.RATIO_16_9)을 사용하여 장치의 최대 해상도를 사용하도록 설정했습니다. 이 설정은 대부분의 스마트폰에서 최대 해상도 비율을 제공하는 16:9 비율을 사용하게 합니다.
-setTargetRotation(viewFinder.display.rotation)을 사용해 디스플레이 회전에 맞춰 해상도를 조정합니다.
-연속 자동 초점 모드:
+public static class QRCodeGenerator
+{
+    private static Random random = new Random();
 
-기존 코드에서 Camera2Interop을 사용하여 연속 자동 초점 모드를 유지합니다.
-이 코드는 장치에서 지원하는 최대 해상도를 사용하여 작은 바코드나 QR 코드를 더 잘 인식할 수 있게 합니다. 해상도를 극대화하면서 성능에 미치는 영향을 테스트하여 최적의 설정을 찾는 것이 중요
+    public static string GenerateQRCode(int length)
+    {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        StringBuilder result = new StringBuilder(length);
+        for (int i = 0; i < length; i++)
+        {
+            result.Append(chars[random.Next(chars.Length)]);
+        }
+        return result.ToString();
+    }
+}
+
+public static class StartupManager
+{
+    private const string StartupKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+    private const string AppName = "QR Code Generator";
+    private const string AppPath = "C:\\Agent\\MobileQR.exe";
+
+    public static void EnsureStartup()
+    {
+        RegistryKey key = Registry.CurrentUser.OpenSubKey(StartupKey, true);
+        if (key.GetValue(AppName) == null)
+        {
+            key.SetValue(AppName, AppPath);
+        }
+    }
+}
+설명
+데이터베이스: 테이블 QRCodeData는 IP 주소, QR 코드, 그리고 생성 시간을 기록합니다. 각 IP 주소에 대해 최대 두 개의 QR 코드가 유지되도록 하는 구조입니다.
+코드 업데이트: 새로운 QR 코드가 생성되면 데이터베이스에 삽입됩니다. 삽입 후, 해당 IP 주소에 대해 가장 오래된 QR 코드를 삭제하는 쿼리가 실행됩니다. 이로써 최신 두 개의 QR 코드만 유지되게 됩니다.
+이제 이 코드로 실행하면
