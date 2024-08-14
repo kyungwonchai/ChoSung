@@ -1,264 +1,37 @@
-청하신 내용을 반영하여 코드를 수정했습니다. 이번 코드는 두 가지 상황에 따라 다르게 동작합니다:
+QL에서 특정 테이블의 행을 주기적으로 삭제하는 작업을 수행하려면 이벤트 스케줄러를 사용할 수 있습니다. 요청하신 작업을 수행하는 이벤트를 설정하는 방법은 다음과 같습니다.
 
-QR 코드에 ^가 포함된 경우:
+1. 이벤트 스케줄러 활성화
+먼저 MySQL의 이벤트 스케줄러가 활성화되어 있는지 확인해야 합니다. 이벤트 스케줄러가 비활성화되어 있으면 다음 명령어를 사용하여 활성화할 수 있습니다:
 
-^로 나눈 첫 번째 값(a1)이 MSSQL의 QRCodeData 테이블에 있는지 확인합니다.
-확인된 경우, 두 번째 값(a2)를 MySQL의 checksheet 테이블에 인서트합니다.
-QR 코드에 ^가 포함되지 않은 경우:
-
-MySQL의 management_mobile_deviceid 테이블에서 deviceID가 존재하는지 확인합니다.
-존재하면, 해당 행의 modelnumber를 가져와서 checkname으로 사용합니다.
-deviceID가 존재하지 않으면, 데이터를 인서트하지 않습니다.
-수정된 checkAndInsertModel 함수
-kotlin
+sql
 코드 복사
-import java.sql.Connection
-import java.sql.DriverManager
-import java.sql.ResultSet
-import java.sql.SQLException
-import java.sql.Timestamp
-import java.time.LocalDateTime
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+SET GLOBAL event_scheduler = ON;
+이 명령어를 실행하면 MySQL 이벤트 스케줄러가 활성화됩니다.
 
-private var isExecuting = false
+2. 1개월이 지난 데이터를 삭제하는 이벤트 생성
+이제 요청하신 대로 smd.management_mobile_deviceid 테이블에서 time 컬럼의 값이 1개월이 지난 행을 삭제하는 이벤트를 생성할 수 있습니다. 아래 쿼리를 사용하세요:
 
-suspend fun checkAndInsertModel(qrCode: String, deviceId: String): String? {
-    return withContext(Dispatchers.IO) {
-        if (isExecuting) {
-            return@withContext null
-        }
+sql
+코드 복사
+CREATE EVENT IF NOT EXISTS delete_old_records
+ON SCHEDULE EVERY 1 HOUR
+DO
+BEGIN
+    DELETE FROM smd.management_mobile_deviceid
+    WHERE time < NOW() - INTERVAL 1 MONTH;
+END;
+이 쿼리의 구성 요소를 설명드리면:
 
-        isExecuting = true
-        var mssqlConnection: Connection? = null
-        var mysqlConnection: Connection? = null
-        var preparedStatement: java.sql.PreparedStatement? = null
-        var resultSet: ResultSet? = null
-        var result: String? = null
+CREATE EVENT IF NOT EXISTS delete_old_records: delete_old_records라는 이름의 이벤트를 생성합니다. 이미 존재하는 경우에는 새로 생성하지 않습니다.
+ON SCHEDULE EVERY 1 HOUR: 이 이벤트는 1시간마다 한 번씩 실행됩니다.
+DO BEGIN ... END;: 이벤트의 본문입니다. 이 안에 포함된 SQL 구문이 주기적으로 실행됩니다.
+DELETE FROM smd.management_mobile_deviceid WHERE time < NOW() - INTERVAL 1 MONTH;: time 컬럼의 값이 현재 시간에서 1개월 이전인 모든 행을 삭제합니다.
+3. 이벤트 상태 확인
+이벤트가 정상적으로 등록되었는지 확인하려면 다음 쿼리를 사용할 수 있습니다:
 
-        try {
-            // QR 코드에 ^가 포함되어 있는지 확인
-            if (qrCode.contains("^")) {
-                // QR 코드를 ^로 분리
-                val parts = qrCode.split("^")
-                val a1 = parts[0] // 첫 번째 값
-                val a2 = parts.getOrNull(1) // 두 번째 값
+sql
+코드 복사
+SHOW EVENTS LIKE 'delete_old_records';
+이 쿼리를 실행하면 방금 생성한 이벤트의 정보를 확인할 수 있습니다.
 
-                if (a2 == null) {
-                    result = "QR code format is invalid. No second part found."
-                    return@withContext result
-                }
-
-                // MSSQL 데이터베이스 연결
-                Class.forName("com.microsoft.sqlserver.jdbc.SQLServerDriver")
-                mssqlConnection = DriverManager.getConnection(
-                    "jdbc:sqlserver://your_mssql_server:1433;databaseName=your_database_name;user=your_username;password=your_password;"
-                )
-
-                // 첫 번째 값 a1이 MSSQL의 QRCodeData 테이블에 있는지 확인
-                val mssqlQuery = "SELECT COUNT(*) FROM QRCodeData WHERE QRCode = ?"
-                preparedStatement = mssqlConnection.prepareStatement(mssqlQuery)
-                preparedStatement.setString(1, a1)
-
-                resultSet = preparedStatement.executeQuery()
-
-                if (resultSet.next() && resultSet.getInt(1) > 0) {
-                    // a1이 존재할 때, a2를 MySQL에 인서트
-
-                    // MySQL 데이터베이스 연결
-                    Class.forName("com.mysql.cj.jdbc.Driver")
-                    mysqlConnection = DriverManager.getConnection(
-                        "jdbc:mysql://10.244.122.122:3306/your_database_name?useSSL=false&serverTimezone=UTC",
-                        "abc", "1233445"
-                    )
-
-                    // mainsheet에서 데이터를 가져옴
-                    val mainSheetQuery = """
-                        SELECT depart, part, floor, district, at, model, modelnumber 
-                        FROM smd.management_mobile_mainseet 
-                        WHERE modelnumber = ?
-                    """.trimIndent()
-                    preparedStatement = mysqlConnection.prepareStatement(mainSheetQuery)
-                    preparedStatement.setString(1, a2)
-                    resultSet = preparedStatement.executeQuery()
-
-                    if (resultSet.next()) {
-                        val depart = resultSet.getString("depart")
-                        val part = resultSet.getString("part")
-                        val floor = resultSet.getString("floor")
-                        val district = resultSet.getString("district")
-                        val at = resultSet.getString("at")
-                        val model = resultSet.getString("model")
-                        val modelnumber = resultSet.getString("modelnumber")
-
-                        // 최근 10분 이내에 해당 modelnumber로 체크된 기록이 있는지 확인 (DB 시간 기준)
-                        val checkQuery = """
-                            SELECT COUNT(*) as count FROM smd.management_mobile_checksheet 
-                            WHERE modelnumber = ? AND check_time > (NOW() - INTERVAL 10 MINUTE)
-                        """.trimIndent()
-                        preparedStatement = mysqlConnection.prepareStatement(checkQuery)
-                        preparedStatement.setString(1, modelnumber)
-
-                        val countResultSet = preparedStatement.executeQuery()
-
-                        var shouldInsert = true
-
-                        if (countResultSet.next()) {
-                            val count = countResultSet.getInt("count")
-                            if (count > 0) {
-                                shouldInsert = false
-                            }
-                        }
-
-                        if (shouldInsert) {
-                            val insertQuery = """
-                                INSERT INTO smd.management_mobile_checksheet 
-                                (depart, part, floor, district, at, model, modelnumber, type, checkidnum, checkname, check_time) 
-                                VALUES (?, ?, ?, ?, ?, ?, ?, '00000000', 'mobile', '00000000', NOW())
-                            """.trimIndent()
-
-                            preparedStatement = mysqlConnection.prepareStatement(insertQuery)
-                            preparedStatement.setString(1, depart)
-                            preparedStatement.setString(2, part)
-                            preparedStatement.setString(3, floor)
-                            preparedStatement.setString(4, district)
-                            preparedStatement.setString(5, at)
-                            preparedStatement.setString(6, model)
-                            preparedStatement.setString(7, modelnumber)
-
-                            preparedStatement.executeUpdate()
-                            result = "New record inserted for modelnumber: $modelnumber"
-                        } else {
-                            result = "No insertion needed, recent check_time is within 10 minutes"
-                        }
-                    } else {
-                        result = "No record found in mainsheet for modelnumber: $a2"
-                    }
-                } else {
-                    result = "First part of QR code not found in MSSQL"
-                }
-
-            } else {
-                // ^가 포함되지 않은 경우
-
-                // MySQL 데이터베이스 연결
-                Class.forName("com.mysql.cj.jdbc.Driver")
-                mysqlConnection = DriverManager.getConnection(
-                    "jdbc:mysql://10.244.122.122:3306/your_database_name?useSSL=false&serverTimezone=UTC",
-                    "abc", "1233445"
-                )
-
-                // deviceID가 management_mobile_deviceid 테이블에 있는지 확인
-                val deviceIdQuery = """
-                    SELECT modelnumber FROM management_mobile_deviceid WHERE deviceid = ?
-                """.trimIndent()
-                preparedStatement = mysqlConnection.prepareStatement(deviceIdQuery)
-                preparedStatement.setString(1, deviceId)
-                resultSet = preparedStatement.executeQuery()
-
-                if (resultSet.next()) {
-                    val modelnumber = resultSet.getString("modelnumber")
-
-                    // mainsheet에서 데이터를 가져옴
-                    val mainSheetQuery = """
-                        SELECT depart, part, floor, district, at, model 
-                        FROM smd.management_mobile_mainseet 
-                        WHERE modelnumber = ?
-                    """.trimIndent()
-                    preparedStatement = mysqlConnection.prepareStatement(mainSheetQuery)
-                    preparedStatement.setString(1, modelnumber)
-                    resultSet = preparedStatement.executeQuery()
-
-                    if (resultSet.next()) {
-                        val depart = resultSet.getString("depart")
-                        val part = resultSet.getString("part")
-                        val floor = resultSet.getString("floor")
-                        val district = resultSet.getString("district")
-                        val at = resultSet.getString("at")
-                        val model = resultSet.getString("model")
-
-                        // 최근 10분 이내에 해당 modelnumber로 체크된 기록이 있는지 확인 (DB 시간 기준)
-                        val checkQuery = """
-                            SELECT COUNT(*) as count FROM smd.management_mobile_checksheet 
-                            WHERE modelnumber = ? AND check_time > (NOW() - INTERVAL 10 MINUTE)
-                        """.trimIndent()
-                        preparedStatement = mysqlConnection.prepareStatement(checkQuery)
-                        preparedStatement.setString(1, modelnumber)
-
-                        val countResultSet = preparedStatement.executeQuery()
-
-                        var shouldInsert = true
-
-                        if (countResultSet.next()) {
-                            val count = countResultSet.getInt("count")
-                            if (count > 0) {
-                                shouldInsert = false
-                            }
-                        }
-
-                        if (shouldInsert) {
-                            val insertQuery = """
-                                INSERT INTO smd.management_mobile_checksheet 
-                                (depart, part, floor, district, at, model, modelnumber, type, checkidnum, checkname, check_time) 
-                                VALUES (?, ?, ?, ?, ?, ?, ?, '00000000', 'mobile', ?, NOW())
-                            """.trimIndent()
-
-                            preparedStatement = mysqlConnection.prepareStatement(insertQuery)
-                            preparedStatement.setString(1, depart)
-                            preparedStatement.setString(2, part)
-                            preparedStatement.setString(3, floor)
-                            preparedStatement.setString(4, district)
-                            preparedStatement.setString(5, at)
-                            preparedStatement.setString(6, model)
-                            preparedStatement.setString(7, modelnumber)
-                            preparedStatement.setString(8, modelnumber)
-
-                            preparedStatement.executeUpdate()
-                            result = "New record inserted for modelnumber: $modelnumber"
-                        } else {
-                            result = "No insertion needed, recent check_time is within 10 minutes"
-                        }
-                    } else {
-                        result = "No record found in mainsheet for modelnumber: $modelnumber"
-                    }
-                } else {
-                    result = "Device ID $deviceId not found in management_mobile_deviceid"
-                }
-            }
-
-        } catch (e: SQLException) {
-            e.printStackTrace()
-            result = "SQL error: ${e.message}"
-        } catch (e: ClassNotFoundException) {
-            e.printStackTrace()
-            result = "JDBC Driver not found: ${e.message}"
-        } catch (e: Exception) {
-            e.printStackTrace()
-            result = "Unexpected error: ${e.message}"
-        } finally {
-            try {
-                resultSet?.close()
-                preparedStatement?.close()
-                mssqlConnection?.close()
-                mysqlConnection?.close()
-            } catch (e: SQLException) {
-                e.printStackTrace()
-            }
-            isExecuting = false // 작업 완료 후 플래그를 다시 false로 설정
-        }
-
-        return@withContext result
-    }
-}
-주요 수정 사항:
-QR 코드에 ^가 포함된 경우:
-
-^로 나눈 첫 번째 값(a1)이 MSSQL의 QRCodeData 테이블에 있는지 확인합니다.
-확인되면, 두 번째 값(a2)를 MySQL의 checksheet 테이블에 삽입합니다.
-QR 코드에 ^가 포함되지 않은 경우:
-
-deviceID가 MySQL의 management_mobile_deviceid 테이블에 존재하는지 확인합니다.
-존재하면 해당 행의 modelnumber를 가져와 checkname으로 사용하여 checksheet 테이블에 인서트합니다.
-deviceID가 존재하지 않으면 스캔된 데이터는 무시되고 삽입이 이루어지지 않습니다.
-결론
-이 수정된 코드는 QR 코드에 ^가 포함된 경우와 그렇지 않은 경우 각각의 처리를 올바르게 수행할 수 있습니다. 필요한 데이터베이스 체크와 조건에 따른 삽입 작업을 정확하게 수행하도록 구성되었습니다. 추가적인 질문이 있으면 언제든지 말씀해 주세
+이와 같이 설정하면, smd.management_mobile_deviceid 테이블에서 time 컬럼의 값이 1개월이 지난 행이 1시간마다 자동으로 삭제됩니
