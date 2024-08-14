@@ -1,4 +1,4 @@
- 작업을 수행하기 위해, 먼저 checkModelInMySQL 함수에서 smd.management_mobile_checksheet 테이블에서 가장 최근의 check_time을 조회한 다음, 해당 시간이 10분이 지났는지 확인하고, 조건에 따라 새 레코드를 삽입하는 로직을 추가할 수 있습니다.
+청하신 대로 최근 10분 이내에 modelnumber에 해당하는 값이 존재하는지 행 수를 확인하여 판단하는 방식으로 수정한 checkModelInMySQL 함수입니다. 또한, isExecuting 플래그를 사용하여 중복 실행을 방지하도록 했습니다.
 
 수정된 checkModelInMySQL 함수
 kotlin
@@ -9,10 +9,17 @@ import java.sql.ResultSet
 import java.sql.SQLException
 import java.sql.Timestamp
 import java.time.LocalDateTime
-import java.time.temporal.ChronoUnit
+
+private var isExecuting = false
 
 private suspend fun checkModelInMySQL(qrCode: String): String? {
     return withContext(Dispatchers.IO) {
+        if (isExecuting) {
+            Log.d("MySQLConnection", "Already executing, skipping this call.")
+            return@withContext null
+        }
+
+        isExecuting = true
         var connection: Connection? = null
         var preparedStatement: PreparedStatement? = null
         var resultSet: ResultSet? = null
@@ -38,26 +45,27 @@ private suspend fun checkModelInMySQL(qrCode: String): String? {
                 val modelnumber = resultSet.getString("modelnumber")
                 result = "District: $district, At: $at, Model: $modelnumber"
 
-                // 두 번째 쿼리: smd.management_mobile_checksheet에서 가장 최근의 check_time 조회
-                val query2 = "SELECT check_time FROM smd.management_mobile_checksheet WHERE modelnumber = ? ORDER BY check_time DESC LIMIT 1"
+                // 두 번째 쿼리: 최근 10분 이내에 해당 modelnumber로 체크된 기록이 있는지 확인
+                val query2 = """
+                    SELECT COUNT(*) as count FROM smd.management_mobile_checksheet 
+                    WHERE modelnumber = ? AND check_time > ?
+                """.trimIndent()
                 preparedStatement = connection.prepareStatement(query2)
                 preparedStatement.setString(1, modelnumber)
-                val checkTimeResultSet = preparedStatement.executeQuery()
+                preparedStatement.setTimestamp(2, Timestamp.valueOf(LocalDateTime.now().minusMinutes(10)))
+
+                val countResultSet = preparedStatement.executeQuery()
 
                 var shouldInsert = true
 
-                if (checkTimeResultSet.next()) {
-                    val lastCheckTime = checkTimeResultSet.getTimestamp("check_time")
-                    val now = Timestamp.valueOf(LocalDateTime.now())
-
-                    // 10분이 지났는지 확인
-                    val minutesElapsed = ChronoUnit.MINUTES.between(lastCheckTime.toLocalDateTime(), now.toLocalDateTime())
-                    if (minutesElapsed < 10) {
+                if (countResultSet.next()) {
+                    val count = countResultSet.getInt("count")
+                    if (count > 0) {
                         shouldInsert = false
                     }
                 }
 
-                // 10분이 지났다면 새로운 레코드를 삽입
+                // 10분 이내에 기록이 없다면 새로운 레코드를 삽입
                 if (shouldInsert) {
                     val insertQuery = """
                         INSERT INTO smd.management_mobile_checksheet 
@@ -95,26 +103,23 @@ private suspend fun checkModelInMySQL(qrCode: String): String? {
             } catch (e: SQLException) {
                 e.printStackTrace()
             }
+            isExecuting = false // 작업 완료 후 플래그를 다시 false로 설정
         }
 
         return@withContext result
     }
 }
-코드 설명:
-Model Number 조회:
+주요 변경 사항:
+최근 10분 이내의 기록 확인:
 
-먼저 smd.management_mobile_mainseet 테이블에서 modelnumber를 조회합니다.
-최근 check_time 조회:
+SELECT COUNT(*) as count 쿼리를 사용하여 modelnumber에 대해 최근 10분 이내의 check_time이 존재하는지 확인합니다.
+check_time > ? 조건을 사용하여 최근 10분 내의 데이터를 조회합니다.
+삽입 조건 판단:
 
-smd.management_mobile_checksheet 테이블에서 modelnumber에 해당하는 가장 최근의 check_time을 조회합니다.
-10분 확인:
+count 값이 0보다 크면 최근 10분 내에 이미 기록이 있는 것이므로 shouldInsert를 false로 설정합니다.
+기록이 없다면(count == 0), 새 레코드를 삽입합니다.
+isExecuting 플래그:
 
-ChronoUnit.MINUTES.between을 사용해 현재 시간과 check_time을 비교하여 10분이 지났는지 확인합니다.
-조건에 따른 삽입:
-
-10분이 지났다면 새 레코드를 삽입하고, 그렇지 않으면 삽입하지 않습니다.
-결과 반환:
-
-함수는 최종 결과를 문자열로 반환하며, 새 레코드가 삽입되었는지 여부를 포함합니다.
+함수가 실행 중인지 확인하고, 실행 중이라면 중복 실행을 방지합니다.
 결론
-이 코드는 10분 간격으로 smd.management_mobile_checksheet 테이블에 데이터를 삽입하는 작업을 자동으로 처리합니다. 필요한 경우 수정해서 사용할 수 
+이 코드는 modelnumber에 대해 최근 10분 이내에 기록이 있는지 확인하고, 기록이 없는 경우에만 데이터를 삽입합니다. 이를 통해 중복 삽입을 방지할 수 있습니다. 추가적인 질문이 있거나 더 도움이 필요하시면 언제든지 말씀해 주
