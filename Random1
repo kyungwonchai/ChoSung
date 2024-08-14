@@ -1,103 +1,120 @@
-니다. 현재 상황에서 DriverManager와 MysqlDataSource를 통한 연결이 모두 실패한다면, 문제를 해결하기 위해 다른 접근 방식을 시도해야 합니다. 그중 하나는 네이티브 JDBC 접근 방식을 피하고, HTTP API 또는 ORM을 사용하는 방법입니다.
+ 작업을 수행하기 위해, 먼저 checkModelInMySQL 함수에서 smd.management_mobile_checksheet 테이블에서 가장 최근의 check_time을 조회한 다음, 해당 시간이 10분이 지났는지 확인하고, 조건에 따라 새 레코드를 삽입하는 로직을 추가할 수 있습니다.
 
-1. HTTP API로 MySQL 접근
-이 방법은 MySQL 데이터베이스와 통신하기 위해 백엔드 서버를 통해 요청을 보내는 방법입니다. Android에서 HTTP 클라이언트를 사용하여 MySQL 데이터베이스와 직접 통신하지 않고, 백엔드 서버(API 서버)가 중간에서 데이터베이스와 통신하도록 합니다.
-
-1.1. 백엔드 서버 설정 (Node.js 예시)
-Node.js 또는 다른 서버를 사용하여 RESTful API를 구축하고, 이 API가 MySQL과 통신하도록 설정합니다.
-javascript
-코드 복사
-const express = require('express');
-const mysql = require('mysql');
-
-const app = express();
-const port = 3000;
-
-const db = mysql.createConnection({
-    host: '10.244.122.122',
-    user: 'abc',
-    password: '1233445',
-    database: 'your_database_name'
-});
-
-db.connect(err => {
-    if (err) {
-        console.error('Database connection failed: ' + err.stack);
-        return;
-    }
-    console.log('Connected to database.');
-});
-
-app.get('/getData', (req, res) => {
-    const query = "SELECT district, at, modelnumber FROM smd.management_mobile_mainseet WHERE modelnumber = ?";
-    db.query(query, [req.query.qrCode], (err, results) => {
-        if (err) {
-            res.status(500).send({error: "Database query failed"});
-        } else {
-            res.send(results);
-        }
-    });
-});
-
-app.listen(port, () => {
-    console.log(`App running on port ${port}`);
-});
-1.2. Android에서 HTTP 요청 보내기
-Android에서 Retrofit 또는 OkHttp 같은 HTTP 클라이언트를 사용하여 API 서버에 요청을 보냅니다.
+수정된 checkModelInMySQL 함수
 kotlin
 코드 복사
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.ResultSet
+import java.sql.SQLException
+import java.sql.Timestamp
+import java.time.LocalDateTime
+import java.time.temporal.ChronoUnit
 
-fun getDataFromServer(qrCode: String): String? {
-    val client = OkHttpClient()
+private suspend fun checkModelInMySQL(qrCode: String): String? {
+    return withContext(Dispatchers.IO) {
+        var connection: Connection? = null
+        var preparedStatement: PreparedStatement? = null
+        var resultSet: ResultSet? = null
+        var result: String? = null
 
-    val request = Request.Builder()
-        .url("http://<API_SERVER_IP>:3000/getData?qrCode=$qrCode")
-        .build()
+        try {
+            // MySQL JDBC 드라이버 로드
+            Class.forName("com.mysql.cj.jdbc.Driver")
 
-    return try {
-        val response: Response = client.newCall(request).execute()
-        if (response.isSuccessful) {
-            response.body?.string()
-        } else {
-            null
+            // MySQL 서버에 연결
+            val url = "jdbc:mysql://10.244.122.122:3306/your_database_name?useSSL=false&serverTimezone=UTC"
+            connection = DriverManager.getConnection(url, "abc", "1233445")
+
+            // 첫 번째 쿼리: smd.management_mobile_mainseet에서 modelnumber 정보 조회
+            val query1 = "SELECT district, at, modelnumber FROM smd.management_mobile_mainseet WHERE modelnumber = ?"
+            preparedStatement = connection.prepareStatement(query1)
+            preparedStatement.setString(1, qrCode)
+            resultSet = preparedStatement.executeQuery()
+
+            if (resultSet.next()) {
+                val district = resultSet.getString("district")
+                val at = resultSet.getString("at")
+                val modelnumber = resultSet.getString("modelnumber")
+                result = "District: $district, At: $at, Model: $modelnumber"
+
+                // 두 번째 쿼리: smd.management_mobile_checksheet에서 가장 최근의 check_time 조회
+                val query2 = "SELECT check_time FROM smd.management_mobile_checksheet WHERE modelnumber = ? ORDER BY check_time DESC LIMIT 1"
+                preparedStatement = connection.prepareStatement(query2)
+                preparedStatement.setString(1, modelnumber)
+                val checkTimeResultSet = preparedStatement.executeQuery()
+
+                var shouldInsert = true
+
+                if (checkTimeResultSet.next()) {
+                    val lastCheckTime = checkTimeResultSet.getTimestamp("check_time")
+                    val now = Timestamp.valueOf(LocalDateTime.now())
+
+                    // 10분이 지났는지 확인
+                    val minutesElapsed = ChronoUnit.MINUTES.between(lastCheckTime.toLocalDateTime(), now.toLocalDateTime())
+                    if (minutesElapsed < 10) {
+                        shouldInsert = false
+                    }
+                }
+
+                // 10분이 지났다면 새로운 레코드를 삽입
+                if (shouldInsert) {
+                    val insertQuery = """
+                        INSERT INTO smd.management_mobile_checksheet 
+                        (depart, part, floor, district, at, model, modelnumber, type, checkidnum, checkname, check_time) 
+                        VALUES ('00000000', '00000000', '00000000', ?, ?, '00000000', ?, '00000000', '00000000', 'mobile', ?)
+                    """.trimIndent()
+
+                    preparedStatement = connection.prepareStatement(insertQuery)
+                    preparedStatement.setString(1, district)
+                    preparedStatement.setString(2, at)
+                    preparedStatement.setString(3, modelnumber)
+                    preparedStatement.setTimestamp(4, Timestamp.valueOf(LocalDateTime.now()))
+                    preparedStatement.executeUpdate()
+
+                    result += " - New record inserted"
+                } else {
+                    result += " - No insertion, recent check_time is within 10 minutes"
+                }
+            }
+
+        } catch (e: SQLException) {
+            e.printStackTrace()
+            result = "SQL error: ${e.message}"
+        } catch (e: ClassNotFoundException) {
+            e.printStackTrace()
+            result = "JDBC Driver not found: ${e.message}"
+        } catch (e: Exception) {
+            e.printStackTrace()
+            result = "Unexpected error: ${e.message}"
+        } finally {
+            try {
+                resultSet?.close()
+                preparedStatement?.close()
+                connection?.close()
+            } catch (e: SQLException) {
+                e.printStackTrace()
+            }
         }
-    } catch (e: Exception) {
-        e.printStackTrace()
-        null
+
+        return@withContext result
     }
 }
-2. ORM (Object-Relational Mapping) 사용
-이 방법은 JDBC와 같은 네이티브 접근 방식을 피하고, Kotlin이나 Java의 ORM 라이브러리를 사용하는 방법입니다. ORM 라이브러리는 객체 지향 프로그래밍 방식으로 데이터베이스에 접근하는 것을 도와줍니다.
+코드 설명:
+Model Number 조회:
 
-2.1. Room Database (Android용 SQLite)
-Android에서 MySQL을 직접 사용하는 대신, 앱 내부에서 SQLite 데이터베이스를 사용하도록 설계할 수 있습니다. Google의 Room 라이브러리를 사용하여 간단하게 SQLite를 관리할 수 있습니다. 그러나 이는 로컬 데이터베이스에 적합하며, MySQL과는 다른 접근 방식입니다.
+먼저 smd.management_mobile_mainseet 테이블에서 modelnumber를 조회합니다.
+최근 check_time 조회:
 
-kotlin
-코드 복사
-// Entity
-@Entity
-data class ModelInfo(
-    @PrimaryKey val modelnumber: String,
-    val district: String,
-    val at: String
-)
+smd.management_mobile_checksheet 테이블에서 modelnumber에 해당하는 가장 최근의 check_time을 조회합니다.
+10분 확인:
 
-// DAO
-@Dao
-interface ModelInfoDao {
-    @Query("SELECT * FROM ModelInfo WHERE modelnumber = :modelnumber")
-    fun getModelInfo(modelnumber: String): ModelInfo?
-}
+ChronoUnit.MINUTES.between을 사용해 현재 시간과 check_time을 비교하여 10분이 지났는지 확인합니다.
+조건에 따른 삽입:
 
-// Database
-@Database(entities = [ModelInfo::class], version = 1)
-abstract class AppDatabase : RoomDatabase() {
-    abstract fun modelInfoDao(): ModelInfoDao
-}
+10분이 지났다면 새 레코드를 삽입하고, 그렇지 않으면 삽입하지 않습니다.
+결과 반환:
+
+함수는 최종 결과를 문자열로 반환하며, 새 레코드가 삽입되었는지 여부를 포함합니다.
 결론
-네이티브 JDBC 연결이 계속 실패하는 상황에서는, 직접적인 데이터베이스 연결 대신 HTTP API를 통해 데이터베이스에 접근하거나, ORM을 사용해 로컬 데이터베이스를 관리하는 방법을 고려해보세요.
-
-이 방법들이 문제 해결에 도움이 되기를 바랍니다. 다른 추가적인 지원이 필요하면 언제든지
+이 코드는 10분 간격으로 smd.management_mobile_checksheet 테이블에 데이터를 삽입하는 작업을 자동으로 처리합니다. 필요한 경우 수정해서 사용할 수 
