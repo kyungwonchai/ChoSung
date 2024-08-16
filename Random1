@@ -1,27 +1,44 @@
-. CONTROL_AF_REGIONS 설정을 통한 초점 영역 조정
-카메라 센서의 특정 영역에 초점을 맞추기 위해 CONTROL_AF_REGIONS를 설정하는 방법을 더 상세히 설명하겠습니다. 이 방법은 MeteringRectangle을 사용하여 포커스 영역을 설정하고, 해당 영역에 대해 자동 초점을 수행합니다.
+ameraControl과 관련된 부분에서 오류가 발생하는 경우, 특히 cameraControl이 빨간 글씨로 표시되는 경우는 카메라 설정이나 초기화에 문제가 있을 가능성이 큽니다. 아래에서 CameraX와 Camera2Interop을 사용하여 카메라 컨트롤을 설정하는 방법을 다시 한번 살펴보겠습니다.
 
-예제 코드: 초점 영역 설정
+코드 예시 (수정된 MainActivity.kt)
+이 코드는 카메라를 초기화하고, 초점 영역을 설정하며, 포커싱 속도를 최적화하기 위한 설정을 포함합니다.
+
 kotlin
 코드 복사
+package com.example.myapp
+
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.MeteringRectangle
+import android.os.Bundle
+import android.util.Log
+import android.view.ScaleGestureDetector
+import androidx.activity.ComponentActivity
+import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var previewView: PreviewView
+    private lateinit var cameraExecutor: ExecutorService
+    private var cameraControl: Camera2CameraControl? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         previewView = findViewById(R.id.previewView)
+        cameraExecutor = Executors.newSingleThreadExecutor()
 
         if (allPermissionsGranted()) {
             startCamera()
@@ -30,6 +47,8 @@ class MainActivity : ComponentActivity() {
                 this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
             )
         }
+
+        setupPinchToZoom()
     }
 
     private fun startCamera() {
@@ -37,45 +56,47 @@ class MainActivity : ComponentActivity() {
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
 
-            val preview = Preview.Builder().build()
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
 
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-            // Camera2Interop을 사용하여 추가 설정 적용
-            val camera2Interop = Camera2Interop.Extender(preview)
-
-            // 포커싱 영역을 설정하기 위해 사용될 Rect (중앙에 20% 영역을 설정하는 예시)
-            val sensorArraySize = cameraProvider.getAvailableCameraInfos()[0]
-                .cameraControl.cameraInfo.sensorInfo.pixelArraySize
-
-            // 중앙 영역을 계산 (전체의 20% 크기)
-            val focusArea = Rect(
-                (sensorArraySize.width * 0.4).toInt(),
-                (sensorArraySize.height * 0.4).toInt(),
-                (sensorArraySize.width * 0.6).toInt(),
-                (sensorArraySize.height * 0.6).toInt()
-            )
-
-            // 초점 영역을 MeteringRectangle로 설정
-            val meteringRectangle = MeteringRectangle(focusArea, MeteringRectangle.METERING_WEIGHT_MAX)
-            
-            camera2Interop.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AF_REGIONS,
-                arrayOf(meteringRectangle)
-            )
-
-            // 오토포커스 모드 설정
-            camera2Interop.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AF_MODE,
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            )
 
             try {
                 cameraProvider.unbindAll()
                 val camera = cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview
                 )
-                preview.setSurfaceProvider(previewView.surfaceProvider)
+
+                // Camera2Interop을 통해 Camera2 API에 접근
+                val camera2Interop = Camera2Interop.Extender(preview)
+                cameraControl = Camera2CameraControl.from(camera.cameraControl)
+
+                // 포커스 영역을 설정하기 위한 센서 크기 가져오기
+                val sensorArraySize = camera.cameraInfo.sensorInfo?.pixelArraySize
+                if (sensorArraySize != null) {
+                    val focusArea = Rect(
+                        (sensorArraySize.width * 0.4).toInt(),
+                        (sensorArraySize.height * 0.4).toInt(),
+                        (sensorArraySize.width * 0.6).toInt(),
+                        (sensorArraySize.height * 0.6).toInt()
+                    )
+
+                    val meteringRectangle = MeteringRectangle(focusArea, MeteringRectangle.METERING_WEIGHT_MAX)
+                    cameraControl?.startFocusAndMetering(
+                        Camera2CameraControl.AutoFocusMetering(meteringRectangle)
+                    )
+
+                    // CaptureRequest 설정
+                    camera2Interop.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    )
+                    camera2Interop.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_REGIONS,
+                        arrayOf(meteringRectangle)
+                    )
+                }
 
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
@@ -83,10 +104,45 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private fun setupPinchToZoom() {
+        val scaleGestureDetector = ScaleGestureDetector(this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val currentZoomRatio = cameraControl?.camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
+                    val delta = detector.scaleFactor
+                    cameraControl?.setZoomRatio(currentZoomRatio * delta)
+                    return true
+                }
+            })
+
+        previewView.setOnTouchListener { _, event ->
+            scaleGestureDetector.onTouchEvent(event)
+            return@setOnTouchListener true
+        }
+    }
+
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(
             baseContext, it
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                startCamera()
+            } else {
+                // 권한이 거부된 경우 처리
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
     }
 
     companion object {
@@ -97,38 +153,37 @@ class MainActivity : ComponentActivity() {
         )
     }
 }
-코드 설명:
-Sensor Array Size:
+코드 상세 설명:
+Camera2CameraControl 사용:
 
-카메라 센서의 전체 크기를 가져오기 위해 cameraInfo.sensorInfo.pixelArraySize를 사용합니다.
-이 값은 카메라 센서의 전체 이미지 크기를 나타내며, 초점 영역을 설정할 때 기준으로 사용됩니다.
-포커스 영역 (Rect):
+Camera2CameraControl은 CameraX의 CameraControl을 확장하여 Camera2 API와 상호작용을 할 수 있도록 합니다.
+Camera2CameraControl.from(camera.cameraControl)을 통해 Camera2CameraControl 객체를 초기화합니다.
+포커스 영역 설정:
 
-중앙 영역에 초점을 맞추기 위해 전체 이미지의 20% 크기(중앙에 위치한)를 사용하여 Rect 객체를 생성합니다.
-이 Rect 객체는 포커스 영역을 정의하는 데 사용됩니다.
-MeteringRectangle:
+카메라의 센서 크기(sensorArraySize)를 기준으로 포커스 영역을 설정합니다.
+MeteringRectangle 객체를 사용하여 특정 영역에 초점을 맞춥니다.
+자동 포커스 모드 설정:
 
-MeteringRectangle은 Rect와 가중치(MeteringRectangle.METERING_WEIGHT_MAX)를 사용해 초점 영역을 지정합니다.
-가중치 값은 초점 영역의 우선순위를 결정하며, 최대값을 사용하면 해당 영역에 우선적으로 초점을 맞춥니다.
-Camera2Interop 설정:
+Camera2Interop.Extender를 사용해 CaptureRequest.CONTROL_AF_MODE와 CaptureRequest.CONTROL_AF_REGIONS를 설정합니다.
+줌 기능 구현:
 
-Camera2Interop.Extender를 사용해 CaptureRequest.CONTROL_AF_REGIONS를 설정하고, MeteringRectangle 배열을 전달하여 초점 영역을 지정합니다.
-CaptureRequest.CONTROL_AF_MODE를 CONTROL_AF_MODE_CONTINUOUS_PICTURE로 설정하여, 지속적인 자동 초점을 활성화합니다.
-다른 설정 조합:
-CONTROL_AF_MODE는 한 번에 하나의 모드만 지정할 수 있습니다. 그러나 CONTROL_AF_REGIONS와 CONTROL_AE_REGIONS(노출 영역)를 조합하여 더 세밀한 제어를 할 수 있습니다.
-kotlin
+ScaleGestureDetector를 사용해 사용자가 화면을 핀치할 때 줌 기능을 제공합니다.
+cameraControl?.setZoomRatio() 메서드를 사용하여 줌 레벨을 조정합니다.
+에러 해결 팁:
+의존성 확인:
+
+CameraX와 Camera2Interop 라이브러리가 제대로 설정되어 있는지 확인하세요. 아래와 같은 의존성을 build.gradle(:app) 파일에 추가해야 합니다.
+gradle
 코드 복사
-// 예시: AF 및 AE 영역을 동시에 설정
-camera2Interop.setCaptureRequestOption(
-    CaptureRequest.CONTROL_AF_REGIONS,
-    arrayOf(meteringRectangle)
-)
+dependencies {
+    implementation "androidx.camera:camera-core:1.1.0"
+    implementation "androidx.camera:camera-camera2:1.1.0"
+    implementation "androidx.camera:camera-lifecycle:1.1.0"
+    implementation "androidx.camera:camera-view:1.0.0-alpha31"
+    implementation "androidx.camera:camera-extensions:1.0.0-alpha31" // 필요시 추가
+}
+클린 및 리빌드:
 
-camera2Interop.setCaptureRequestOption(
-    CaptureRequest.CONTROL_AE_REGIONS,
-    arrayOf(meteringRectangle)
-)
+코드 수정 후 Build > Clean Project와 Build > Rebuild Project를 통해 프로젝트를 클린하고 다시 빌드합니다.
 결론:
-AF 영역 설정: 초점 영역을 명확하게 지정함으로써, 카메라가 초점을 더 빠르게 잡을 수 있습니다.
-포커스 최적화: CONTROL_AF_TRIGGER와 CONTROL_AF_REGIONS를 적절히 사용하여 포커싱 속도를 최적화할 수 있습니다.
-이 코드와 설명을 통해 포커스 영역을 더 세밀하게 제어할 수 있습니다. 추가적
+이 코드는 Camera2Interop과 CameraX를 사용하여 포커스 영역을 설정하고, 자동 포커스 속도를 최적화하는 방법을 보여줍니다. 줌 기능을 제공하고, 필요한 경우 추가적으로 포커스 설정을 미세하게 조정할 수 있습니다. 추가적인 문제나 도움이 필요하시면 언제든지 알려주세
