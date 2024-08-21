@@ -1,375 +1,251 @@
-서, 입력이 3분 동안 없으면 자동으로 포커스를 해제하고, 남은 시간을 실시간으로 표시하는 기능을 구현할 수 있습니다. 이를 위해 타이머를 사용하여 입력이 없는 시간을 추적하고, 3분이 지나면 포커스를 해제하는 로직을 추가할 수 있습니다.
+이 기능을 구현하기 위해서 다음과 같은 단계로 코드를 작성할 수 있습니다:
 
-1. XAML 수정
-텍스트 박스 옆에 남은 시간을 표시할 TextBlock을 추가합니다.
+QR 코드를 스캔하고 필요한 값을 전역 변수에 저장.
+MySQL의 view_management_mobile_mainsheet에서 조건에 맞는 데이터를 조회.
+조회된 데이터를 qr_code_list 레이아웃에 표시.
+1. 전역 변수 선언 및 QR 코드 스캔
+먼저, part, district, floor 값을 저장할 전역 변수를 선언하고, QR 코드를 스캔할 때 이 변수들에 값을 저장합니다.
+
+kotlin
+코드 복사
+package com.example.myapp
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.Log
+import android.widget.ArrayAdapter
+import android.widget.ListView
+import androidx.activity.ComponentActivity
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.ResultSet
+import java.sql.Statement
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var previewView: PreviewView
+    private lateinit var cameraExecutor: ExecutorService
+    private var camera: Camera? = null
+    private lateinit var barcodeScanner: BarcodeScanner
+    private lateinit var qrCodeListView: ListView
+
+    // 전역 변수로 선언된 부분
+    private var part: String? = null
+    private var district: String? = null
+    private var floor: String? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        previewView = findViewById(R.id.previewView)
+        qrCodeListView = findViewById(R.id.qr_code_list) // ListView의 ID가 qr_code_list라고 가정
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // BarcodeScanner 초기화
+        barcodeScanner = BarcodeScanning.getClient()
+
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+    }
+
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val previewBuilder = Preview.Builder()
+
+            val preview = previewBuilder.build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            // 이미지 분석을 위한 설정
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, { imageProxy ->
+                        processImageProxy(imageProxy)
+                    })
+                }
+
+            try {
+                cameraProvider.unbindAll()
+                camera = cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, imageAnalysis
+                )
+
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun processImageProxy(imageProxy: ImageAnalysis.ImageProxy) {
+        val mediaImage = imageProxy.image
+        if (mediaImage != null) {
+            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+            barcodeScanner.process(image)
+                .addOnSuccessListener { barcodes ->
+                    for (barcode in barcodes) {
+                        val rawValue = barcode.rawValue
+                        if (rawValue != null) {
+                            // QR 코드 값을 처리하고 전역 변수에 저장
+                            val values = rawValue.split("^")
+                            if (values.size >= 3) {
+                                part = values[0]
+                                district = values[1]
+                                floor = values[2]
+                                
+                                // MySQL 데이터 조회 및 ListView 업데이트
+                                queryAndDisplayData()
+                            }
+                        }
+                    }
+                }
+                .addOnFailureListener {
+                    Log.e(TAG, "Barcode scanning failed", it)
+                }
+                .addOnCompleteListener {
+                    imageProxy.close()
+                }
+        } else {
+            imageProxy.close()
+        }
+    }
+
+    private fun queryAndDisplayData() {
+        val dataList = mutableListOf<String>()
+        val jdbcUrl = "jdbc:mysql://<DB_HOST>:<DB_PORT>/<DB_NAME>"
+        val connectionProps = Properties().apply {
+            put("user", "<DB_USER>")
+            put("password", "<DB_PASSWORD>")
+        }
+
+        var connection: Connection? = null
+        var statement: Statement? = null
+        var resultSet: ResultSet? = null
+
+        try {
+            // MySQL 연결
+            connection = DriverManager.getConnection(jdbcUrl, connectionProps)
+            statement = connection.createStatement()
+
+            // SQL 쿼리 작성 및 실행
+            val query = """
+                SELECT at, modelnumber
+                FROM view_management_mobile_mainsheet
+                WHERE part = '$part' AND district = '$district' AND floor = '$floor' AND read1 IS NULL
+            """
+            resultSet = statement.executeQuery(query)
+
+            // 결과 처리 및 ListView 업데이트
+            while (resultSet.next()) {
+                val at = resultSet.getString("at")
+                val modelNumber = resultSet.getString("modelnumber")
+                dataList.add("AT: $at, Model: $modelNumber")
+            }
+
+            // ListView에 데이터를 설정
+            val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, dataList)
+            qrCodeListView.adapter = adapter
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Database query failed", e)
+        } finally {
+            // 리소스 정리
+            resultSet?.close()
+            statement?.close()
+            connection?.close()
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(
+            baseContext, it
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                startCamera()
+            } else {
+                // 권한이 거부된 경우 처리
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor.shutdown()
+    }
+
+    companion object {
+        private const val TAG = "CameraXApp"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.CAMERA
+        )
+    }
+}
+2. 코드 설명
+전역 변수 저장: QR 코드를 스캔한 후 part, district, floor 값을 전역 변수에 저장합니다.
+
+MySQL 쿼리: QR 코드를 스캔한 후 view_management_mobile_mainsheet 테이블에서 part, district, floor 값에 해당하는 행을 조회합니다. read1 컬럼이 NULL인 데이터만 조회하여, AT와 ModelNumber를 가져옵니다.
+
+리스트 뷰 업데이트: 조회된 결과를 ListView에 표시합니다.
+
+3. ListView 설정
+activity_main.xml 파일에서 ListView를 정의합니다.
 
 xml
 코드 복사
-<dxg:GridControl Name="gridControlReports" AutoGenerateColumns="None" Grid.Row="1">
-    <dxg:GridControl.View>
-        <dxg:TableView ShowGroupPanel="False" AutoWidth="False"/>
-    </dxg:GridControl.View>
-    <dxg:GridControl.Columns>
-        <dxg:GridColumn FieldName="Area" Header="구역" Width="100" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" IsReadOnly="True"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-        <dxg:GridColumn FieldName="Line" Header="라인" Width="100" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" IsReadOnly="True"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-        <dxg:GridColumn FieldName="DayShift" Header="주" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" LostFocus="TextBox_LostFocus" GotFocus="TextBox_GotFocus"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-        <dxg:GridColumn FieldName="EveningShift" Header="후" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" LostFocus="TextBox_LostFocus" GotFocus="TextBox_GotFocus"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-        <dxg:GridColumn FieldName="NightShift" Header="야" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" LostFocus="TextBox_LostFocus" GotFocus="TextBox_GotFocus"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-        <dxg:GridColumn FieldName="CommonReport" Header="공통인계사항" HorizontalHeaderContentAlignment="Center">
-            <dxg:GridColumn.EditSettings>
-                <dxe:TextEditSettings HorizontalContentAlignment="Center" LostFocus="TextBox_LostFocus" GotFocus="TextBox_GotFocus"/>
-            </dxg:GridColumn.EditSettings>
-        </dxg:GridColumn>
-    </dxg:GridControl.Columns>
-</dxg:GridControl>
-<TextBlock Name="RemainingTimeTextBlock" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="10" FontSize="16"/>
-2. C# 코드 수정
-C# 코드에서 타이머를 사용하여 남은 시간을 계산하고, 타이머가 종료되면 포커스를 해제하는 로직을 추가합니다.
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
 
-csharp
-코드 복사
-using System;
-using System.Data;
-using System.Data.SqlClient;
-using System.Net;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Threading;
-using DevExpress.Xpf.Editors;
-using DevExpress.Xpf.Grid;
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
 
-namespace ShiftReportApp
-{
-    public partial class ShiftReportPage : Page
-    {
-        private string connectionString;
-        private DispatcherTimer inputTimer;
-        private TimeSpan remainingTime;
-        private const int MaxInactivityMinutes = 3;
+    <ListView
+        android:id="@+id/qr_code_list"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:divider="@android:color/darker_gray"
+        android:dividerHeight="1dp" />
 
-        public ShiftReportPage(string connectionString)
-        {
-            InitializeComponent();
-            this.connectionString = connectionString;
-            Loaded += ShiftReportPage_Loaded;
-
-            inputTimer = new DispatcherTimer();
-            inputTimer.Interval = TimeSpan.FromSeconds(1);
-            inputTimer.Tick += OnInputTimerTick;
-        }
-
-        private void ShiftReportPage_Loaded(object sender, RoutedEventArgs e)
-        {
-            LoadTodayReport(null, null);
-        }
-
-        private void LoadTodayReport(object sender, RoutedEventArgs e)
-        {
-            DateTime today = GetShiftStartDateTime(DateTime.Now);
-            LoadReport(today.ToString("yyyy-MM-dd"));
-        }
-
-        private void LoadYesterdayReport(object sender, RoutedEventArgs e)
-        {
-            DateTime yesterday = GetShiftStartDateTime(DateTime.Now).AddDays(-1);
-            LoadReport(yesterday.ToString("yyyy-MM-dd"));
-        }
-
-        private DateTime GetShiftStartDateTime(DateTime currentDateTime)
-        {
-            DateTime shiftStartDateTime;
-
-            if (currentDateTime.Hour < 7)
-            {
-                // If the current time is before 7 AM, use the previous day's 7 AM as the shift start
-                shiftStartDateTime = currentDateTime.Date.AddDays(-1).AddHours(7);
-            }
-            else
-            {
-                // If the current time is 7 AM or after, use today's 7 AM as the shift start
-                shiftStartDateTime = currentDateTime.Date.AddHours(7);
-            }
-
-            return shiftStartDateTime;
-        }
-
-        private void LoadReport(string date)
-        {
-            DataTable dataTable = new DataTable();
-
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                SqlCommand cmd = new SqlCommand("GetReportsByDate", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@Date", date);
-
-                SqlDataAdapter adapter = new SqlDataAdapter(cmd);
-                adapter.Fill(dataTable);
-            }
-
-            if (dataTable.Rows.Count == 0)
-            {
-                AddEmptyReportsForDate(date);
-                using (SqlConnection conn = new SqlConnection(connectionString))
-                {
-                    SqlCommand cmd = new SqlCommand("GetReportsByDate", conn);
-                    cmd.CommandType = CommandType.StoredProcedure;
-                    cmd.Parameters.AddWithValue("@Date", date);
-
-                    SqlDataAdapter adapter = new SqlDataAdapter(cmd);
-                    adapter.Fill(dataTable);
-                }
-            }
-
-            gridControlReports.ItemsSource = dataTable.DefaultView;
-        }
-
-        private void AddEmptyReportsForDate(string date)
-        {
-            DataTable linesTable = new DataTable();
-
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                SqlCommand cmd = new SqlCommand("GetLines", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-
-                SqlDataAdapter adapter = new SqlDataAdapter(cmd);
-                adapter.Fill(linesTable);
-            }
-
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                conn.Open();
-                foreach (DataRow row in linesTable.Rows)
-                {
-                    string area = row["Area"].ToString();
-                    string line = row["Line"].ToString();
-
-                    SqlCommand cmd = new SqlCommand("SaveReport", conn);
-                    cmd.CommandType = CommandType.StoredProcedure;
-                    cmd.Parameters.AddWithValue("@Date", date);
-                    cmd.Parameters.AddWithValue("@Area", area);
-                    cmd.Parameters.AddWithValue("@Line", line);
-                    cmd.Parameters.AddWithValue("@DayShift", "");
-                    cmd.Parameters.AddWithValue("@EveningShift", "");
-                    cmd.Parameters.AddWithValue("@NightShift", "");
-                    cmd.Parameters.AddWithValue("@CommonReport", "");
-                    cmd.Parameters.AddWithValue("@IPAddress", GetLocalIPAddress());
-                    cmd.ExecuteNonQuery();
-                }
-            }
-        }
-
-        private void TextBox_GotFocus(object sender, RoutedEventArgs e)
-        {
-            ResetInputTimer();
-        }
-
-        private void TextBox_LostFocus(object sender, RoutedEventArgs e)
-        {
-            TextBox textBox = sender as TextBox;
-            string report = textBox.Text;
-            DataRowView row = (DataRowView)gridControlReports.GetRow(gridControlReports.View.FocusedRowHandle);
-            string area = row["Area"].ToString();
-            string line = row["Line"].ToString();
-            string date = row["Date"].ToString();
-            string shiftType = "";
-
-            if (textBox.Name.Contains("DayShift"))
-            {
-                shiftType = "주";
-            }
-            else if (textBox.Name.Contains("EveningShift"))
-            {
-                shiftType = "후";
-            }
-            else if (textBox.Name.Contains("NightShift"))
-            {
-                shiftType = "야";
-            }
-            else if (textBox.Name.Contains("CommonReport"))
-            {
-                shiftType = "공통";
-            }
-
-            string ipAddress = GetLocalIPAddress();
-            SaveReport(date, area, line, shiftType, report, ipAddress);
-            StopInputTimer();
-        }
-
-        private void ResetInputTimer()
-        {
-            remainingTime = TimeSpan.FromMinutes(MaxInactivityMinutes);
-            inputTimer.Start();
-        }
-
-        private void StopInputTimer()
-        {
-            inputTimer.Stop();
-            RemainingTimeTextBlock.Text = string.Empty;
-        }
-
-        private void OnInputTimerTick(object sender, EventArgs e)
-        {
-            remainingTime = remainingTime.Subtract(TimeSpan.FromSeconds(1));
-            RemainingTimeTextBlock.Text = $"남은 시간: {remainingTime.Minutes}:{remainingTime.Seconds}";
-
-            if (remainingTime <= TimeSpan.Zero)
-            {
-                inputTimer.Stop();
-                Keyboard.ClearFocus();
-                RemainingTimeTextBlock.Text = "포커스가 해제되었습니다.";
-            }
-        }
-
-        private void SaveReport(string date, string area, string line, string shiftType, string report, string ipAddress)
-        {
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                conn.Open();
-                SqlCommand cmd = new SqlCommand("SaveReport", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@Date", date);
-                cmd.Parameters.AddWithValue("@Area", area);
-                cmd.Parameters.AddWithValue("@Line", line);
-                cmd.Parameters.AddWithValue("@ShiftType", shiftType);
-                cmd.Parameters.AddWithValue("@Report", report);
-                cmd.Parameters.AddWithValue("@IPAddress", ipAddress);
-
-                cmd.ExecuteNonQuery();
-
-                SaveLog(date, area, line, shiftType, report, ipAddress);
-            }
-        }
-
-        private void SaveLog(string date, string area, string line, string shiftType, string report, string ipAddress)
-        {
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                conn.Open();
-                SqlCommand cmd = new SqlCommand("SaveLog", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@Date", date);
-                cmd.Parameters.AddWithValue("@Area", area);
-                cmd.Parameters.AddWithValue("@Line", line);
-                cmd.Parameters.AddWithValue("@ShiftType", shiftType);
-                cmd.Parameters.AddWithValue("@Report", report);
-                cmd.Parameters.AddWithValue("@IPAddress", ipAddress);
-                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
-
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        private string GetLocalIPAddress()
-        {
-            string localIP = "127.0.0.1";
-            try
-            {
-                var host = Dns.GetHostEntry(Dns.GetHostName());
-                foreach (var ip in host.AddressList)
-                {
-                    if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                    {
-                        localIP = ip.ToString();
-                        break;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("IP 주소를 가져오는 중 오류가 발생했습니다: " + ex.Message);
-            }
-            return localIP;
-        }
-
-        private void OnSearchReports(object sender, RoutedEventArgs e)
-        {
-            DateTime? startDate = startDatePicker.DateTime;
-            DateTime? endDate = endDatePicker.DateTime;
-
-            if (startDate.HasValue && endDate.HasValue)
-            {
-                LoadSearchReports(startDate.Value.ToString("yyyy-MM-dd"), endDate.Value.ToString("yyyy-MM-dd"));
-            }
-        }
-
-        private void LoadSearchReports(string startDate, string endDate)
-        {
-            DataTable searchTable = new DataTable();
-
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                SqlCommand cmd = new SqlCommand("GetReportsByDateRange", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@StartDate", startDate);
-                cmd.Parameters.AddWithValue("@EndDate", endDate);
-
-                SqlDataAdapter adapter = new SqlDataAdapter(cmd);
-                adapter.Fill(searchTable);
-            }
-
-            gridControlSearch.ItemsSource = searchTable.DefaultView;
-        }
-
-        private void OnLogSearch(object sender, RoutedEventArgs e)
-        {
-            string searchText = logSearchTextBox.Text.Trim();
-            if (!string.IsNullOrEmpty(searchText))
-            {
-                LoadLogReport(searchText);
-            }
-        }
-
-        private void OnLogSearchKeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Enter)
-            {
-                OnLogSearch(sender, e);
-            }
-        }
-
-        private void LoadLogReport(string searchText)
-        {
-            DataTable logTable = new DataTable();
-
-            using (SqlConnection conn = new SqlConnection(connectionString))
-            {
-                SqlCommand cmd = new SqlCommand("SearchLogs", conn);
-                cmd.CommandType = CommandType.StoredProcedure;
-                cmd.Parameters.AddWithValue("@SearchText", searchText);
-
-                SqlDataAdapter adapter = new SqlDataAdapter(cmd);
-                adapter.Fill(logTable);
-            }
-
-            gridControlLog.ItemsSource = logTable.DefaultView;
-        }
-    }
-}
-주요 변경 사항 요약:
-타이머 기능 추가: DispatcherTimer를 사용해 입력이 없는 시간을 추적합니다. 3분 동안 입력이 없으면 포커스가 자동으로 해제됩니다.
-실시간 남은 시간 표시: TextBlock을 사용해 남은 시간을 실시간으로 표시합니다.
-포커스 이벤트 처리: TextBox_GotFocus 이벤트와 TextBox_LostFocus 이벤트를 통해 입력 중 타이머를 초기화하고, 입력이 없으면 타이머를 종료합니다.
-이 코드는 입력 중이 아닐 때 3분 후 자동으로 포커스를 해제하고, 남은 시간을 실시간으로 표시하는 기능을 포함합니다. 추가적인 문제가 발생하면 알려주세요
+</LinearLayout>
+4. 결론
+이 코드는 QR 코드가 스캔될 때마다 view_management_mobile_mainsheet 테이블에서 조건에 맞는 데이터를 조회하고, 이를 ListView에 표시합니다. 이로써 스캔된 QR 코드에 맞는 데이터를 실시간으로 확인할 수 있습니다. 추가적인 질문이 있거나 더 필요한 기능이 있으면 언제든지 도와드리겠습니
