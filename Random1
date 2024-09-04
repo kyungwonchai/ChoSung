@@ -1,51 +1,131 @@
-RouterMiddleACRService 클래스에서 LogService의 인스턴스를 생성할 때 보호 수준(protection level) 오류가 발생하는 이유는 LogService의 생성자가 private로 되어 있기 때문입니다. LogService 클래스는 싱글톤(Singleton) 패턴을 사용하여 하나의 인스턴스만 존재하도록 설계되어 있으므로, 외부에서 직접 new LogService()로 인스턴스를 생성할 수 없습니다.
+_pipeServer.WaitForConnection() 메서드는 네임드 파이프 서버(NamedPipeServerStream)가 클라이언트의 연결을 기다리는 동작을 수행합니다. 이 메서드는 클라이언트가 연결될 때까지 무기한으로 대기하는 "차단(blocking)" 메서드입니다.
 
-대신, LogService의 인스턴스를 얻기 위해 LogService.Instance를 사용해야 합니다. LogService.Instance는 싱글톤 인스턴스를 반환하는 정적(static) 프로퍼티입니다.
+즉, 클라이언트가 연결되기 전까지 서버는 이 지점에서 멈춰 있으며, 이후의 코드는 실행되지 않습니다.
 
-수정된 RouterMiddleACRService 클래스
-RouterMiddleACRService 클래스에서 LogService의 인스턴스를 생성하는 대신 싱글톤 인스턴스를 가져오도록 코드를 수정해야 합니다.
+WaitForConnection() 메서드의 작동 방식
+무기한 대기:
+
+_pipeServer.WaitForConnection()는 클라이언트가 연결될 때까지 무기한으로 대기합니다. 클라이언트가 연결을 시도하지 않으면 이 메서드 다음의 코드는 실행되지 않습니다.
+차단 상태:
+
+WaitForConnection()는 차단 메서드이기 때문에, 클라이언트가 연결되기 전까지는 다른 작업이 진행되지 않습니다. 서버가 클라이언트 연결을 기다리며 멈춰있는 상태라고 할 수 있습니다.
+클라이언트가 연결되면:
+
+클라이언트가 연결되면 WaitForConnection() 메서드가 완료되고, 이후의 코드(예: 로그 출력)가 실행됩니다.
+문제의 원인과 해결 방법
+클라이언트가 연결되지 않음:
+
+클라이언트가 연결되지 않는 경우, 서버는 _pipeServer.WaitForConnection()에서 무기한 대기하게 됩니다. 이 경우 로그를 찍어도 아무런 변화가 없으며, 해당 지점 이후의 코드는 실행되지 않습니다.
+네임드 파이프 클라이언트가 없는 경우:
+
+네임드 파이프 클라이언트(메인 애플리케이션)가 실행되지 않거나, 클라이언트에서 네임드 파이프 연결을 시도하지 않는 경우 서버는 계속 대기 상태에 있습니다.
+클라이언트-서버 통신 문제:
+
+네임드 파이프의 이름이 서버와 클라이언트 간에 다르거나, 네트워크 보안 문제로 인해 클라이언트가 서버에 연결되지 못하는 경우에도 같은 현상이 발생할 수 있습니다.
+해결 방법
+1. 타임아웃 설정
+WaitForConnection() 메서드는 기본적으로 타임아웃을 제공하지 않지만, Connect 메서드와 달리 명시적인 타임아웃을 설정하는 방법은 없습니다. 다만, 연결 시도가 너무 오래 걸리지 않도록 별도의 타이머를 설정하여 타임아웃을 관리할 수 있습니다.
+
+2. 타이머와 비동기 처리 사용
+네임드 파이프 서버가 연결 대기 중인 동안 타임아웃을 설정하거나 별도의 비동기 작업으로 타이머를 설정할 수 있습니다. 예를 들어, CancellationTokenSource를 사용하여 일정 시간이 지나면 연결을 취소하도록 할 수 있습니다.
 
 csharp
 코드 복사
-using System.ServiceProcess;
-
-namespace RouterMiddleACRService
+private async Task StartPipeServer(CancellationToken cancellationToken)
 {
-    public partial class RouterMiddleACRService : ServiceBase
+    try
     {
-        private LogService _logService;
+        _pipeServer = new NamedPipeServerStream(_pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Message, PipeOptions.Asynchronous);
 
-        public RouterMiddleACRService()
+        // 비동기 연결 대기 및 타임아웃 설정
+        var connectTask = _pipeServer.WaitForConnectionAsync(cancellationToken);
+        if (await Task.WhenAny(connectTask, Task.Delay(10000, cancellationToken)) == connectTask) // 10초 타임아웃 설정
         {
-            InitializeComponent();
-            _logService = LogService.Instance; // LogService 싱글톤 인스턴스를 가져옵니다.
-        }
+            // 연결이 성공한 경우
+            if (cancellationToken.IsCancellationRequested)
+            {
+                Console.WriteLine("Connection canceled.");
+                return;
+            }
 
-        protected override void OnStart(string[] args)
-        {
-            // 서비스가 시작될 때 LogService를 시작합니다.
-            _logService.Start();
-        }
+            Console.WriteLine("Client connected to pipe.");
+            _pipeWriter = new StreamWriter(_pipeServer) { AutoFlush = true };
 
-        protected override void OnStop()
-        {
-            // 서비스가 중지될 때 LogService를 중지합니다.
-            _logService.Stop();
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                string logMessage = $"Log message at {DateTime.Now}";
+                _pipeWriter.WriteLine(logMessage);
+                await Task.Delay(1000, cancellationToken); // 1초 대기
+            }
         }
+        else
+        {
+            // 타임아웃 발생한 경우
+            Console.WriteLine("Timeout occurred waiting for pipe connection.");
+            _pipeServer.Dispose();
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Pipe server error: {ex.Message}");
+    }
+    finally
+    {
+        _pipeWriter?.Dispose();
+        _pipeServer?.Dispose();
     }
 }
 코드 설명
-_logService = LogService.Instance:
+비동기 연결 대기:
+WaitForConnectionAsync(cancellationToken) 메서드를 사용하여 비동기적으로 클라이언트 연결을 기다립니다.
+타임아웃 설정:
+Task.Delay(10000, cancellationToken)을 통해 10초 타임아웃을 설정합니다. await Task.WhenAny(connectTask, Task.Delay(10000, cancellationToken)) == connectTask는 연결 시도와 타임아웃 중 먼저 완료된 작업을 기다립니다.
+타임아웃 또는 취소 처리:
+타임아웃이 발생하거나, 연결이 취소된 경우 로그를 출력하고 파이프 서버를 정리합니다.
+3. 클라이언트 실행 확인
+클라이언트 애플리케이션(메인 애플리케이션)이 실행 중이며, 네임드 파이프 서버에 올바르게 연결을 시도하는지 확인해야 합니다.
 
-RouterMiddleACRService 클래스의 생성자에서 LogService.Instance를 사용하여 LogService의 싱글톤 인스턴스를 가져옵니다. 이 방법을 사용하면 LogService 클래스 내부의 private 생성자를 우회하고 인스턴스를 얻을 수 있습니다.
-OnStart 메서드:
+클라이언트 코드 확인 (예시)
+csharp
+코드 복사
+private void StartListeningToLogs()
+{
+    Task.Run(() =>
+    {
+        try
+        {
+            _pipeClient = new NamedPipeClientStream(".", "RouterMiddleACRLogPipe", PipeDirection.In);
+            _pipeClient.Connect(10000); // 10초 타임아웃 설정
 
-서비스가 시작될 때 호출되는 메서드로, 여기서 LogService의 Start 메서드를 호출하여 네임드 파이프 서버를 시작하고 로그 기록을 시작합니다.
-OnStop 메서드:
-
-서비스가 중지될 때 호출되는 메서드로, 여기서 LogService의 Stop 메서드를 호출하여 네임드 파이프 서버를 중지하고 리소스를 정리합니다.
-요약
-LogService는 싱글톤 패턴으로 구현되어 있기 때문에 직접 new LogService()로 인스턴스를 생성할 수 없습니다.
-대신 LogService.Instance를 사용하여 싱글톤 인스턴스를 가져와야 합니다.
-RouterMiddleACRService 클래스의 생성자에서 _logService = LogService.Instance로 설정하여 싱글톤 인스턴스를 사용하도록 수정했습니다.
-이제 RouterMiddleACRService 클래스는 LogService 싱글톤 인스턴스를 사용하여 로그 서비스를 관리할 수 있습니다.
+            Dispatcher.Invoke(() => _viewModel.LogMessages.Add("Named pipe connected successfully."));
+            
+            _pipeReader = new StreamReader(_pipeClient);
+            while (true)
+            {
+                var message = _pipeReader.ReadLine();
+                if (message != null)
+                {
+                    Dispatcher.Invoke(() => _viewModel.LogMessages.Add(message));
+                }
+            }
+        }
+        catch (TimeoutException)
+        {
+            Dispatcher.Invoke(() => _viewModel.LogMessages.Add("ERROR: Timeout while attempting to connect to named pipe."));
+        }
+        catch (UnauthorizedAccessException)
+        {
+            Dispatcher.Invoke(() => _viewModel.LogMessages.Add("ERROR: Unauthorized access when attempting to connect to named pipe."));
+        }
+        catch (Exception ex)
+        {
+            Dispatcher.Invoke(() => _viewModel.LogMessages.Add($"ERROR: Exception occurred while connecting to named pipe: {ex.Message}"));
+        }
+    });
+}
+결론
+WaitForConnection이 무기한으로 대기: 클라이언트가 연결되지 않으면 무기한 대기합니다.
+타임아웃 설정: 타임아웃을 설정하여 연결이 너무 오래 걸리지 않도록 합니다.
+클라이언트가 연결되는지 확인: 클라이언트 애플리케이션이 제대로 실행되고, 서버에 연결을 시도하는지 확인합니다.
+디버깅: 타임아웃이나 연결 상태에 따라 적절한 로그를 출력하여 문제를 파악할 수 있습니다.
+이 방법을 통해 문제를 해결하고, 네임드 파이프 서버와 클라이언트 간의 통신이 원활하게 이루어질 수 있도록 합니
