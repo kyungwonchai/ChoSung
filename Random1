@@ -1,103 +1,165 @@
-. UserControl의 바인딩 수정
-StatusIndicatorControl.xaml에서 ServiceName 속성이 올바르게 바인딩되어 있는지 확인합니다.
+네트워크 스트림 상태 확인: 데이터를 전송하기 전에 NetworkStream이 유효한지 확인합니다.
+에러 처리 추가: SendLogMessage 메서드에서 예외가 발생할 때 추가적인 로그를 통해 문제를 진단할 수 있게 합니다.
+연결 상태 검사: 클라이언트가 서버에 연결된 후 로그를 보내도록 개선합니다.
+개선된 LogService.cs
+다음은 위의 문제 해결 방안을 반영하여 수정한 LogService.cs의 예제입니다.
 
-수정된 StatusIndicatorControl.xaml
-xml
-코드 복사
-<UserControl x:Class="RouterMiddleACR.Controls.StatusIndicatorControl"
-             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-             mc:Ignorable="d"
-             d:DesignHeight="100" d:DesignWidth="100">
-    <StackPanel Orientation="Vertical" HorizontalAlignment="Center" VerticalAlignment="Center">
-        <!-- 상태를 표시할 원형 도형 -->
-        <Ellipse x:Name="IndicatorEllipse" Width="30" Height="30" Fill="Gray" />
-        <!-- 서비스 이름을 표시할 텍스트 블록 -->
-        <TextBlock Text="{Binding ServiceName, Converter={StaticResource EnumToStringConverter}}" 
-                   FontSize="14" FontWeight="Bold" HorizontalAlignment="Center" Margin="5"/>
-        <!-- 상태 설명을 표시할 텍스트 블록 -->
-        <TextBlock Text="{Binding StatusDescription}" 
-                   FontSize="12" HorizontalAlignment="Center" Margin="5"/>
-    </StackPanel>
-</UserControl>
-3. MainWindow.xaml에서 바인딩 수정
-MainWindow.xaml에서 ItemsControl의 ItemTemplate을 수정하여 ServiceName을 올바르게 바인딩합니다.
-
-수정된 MainWindow.xaml
-xml
-코드 복사
-<Window x:Class="RouterMiddleACR.MainWindow"
-        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:local="clr-namespace:RouterMiddleACR.Controls"
-        Title="RouterMiddleACR" Height="450" Width="800">
-    <Grid>
-        <!-- ItemsControl을 사용하여 서비스 상태를 동적으로 표시 -->
-        <ItemsControl ItemsSource="{Binding ServiceStatuses}">
-            <ItemsControl.ItemsPanel>
-                <ItemsPanelTemplate>
-                    <StackPanel Orientation="Horizontal" />
-                </ItemsPanelTemplate>
-            </ItemsControl.ItemsPanel>
-            <ItemsControl.ItemTemplate>
-                <DataTemplate>
-                    <!-- 유저 컨트롤 사용 -->
-                    <local:StatusIndicatorControl 
-                        Status="{Binding Status}" 
-                        ServiceName="{Binding ServiceName}" 
-                        StatusDescription="{Binding Description}" />
-                </DataTemplate>
-            </ItemsControl.ItemTemplate>
-        </ItemsControl>
-    </Grid>
-</Window>
-4. EnumToStringConverter 추가
-만약 ServiceName이 열거형으로 정의되어 있고 이를 문자열로 변환해야 하는 경우, EnumToStringConverter를 추가할 수 있습니다.
-
-EnumToStringConverter.cs
 csharp
 코드 복사
 using System;
-using System.Globalization;
-using System.Windows.Data;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace RouterMiddleACR.Converters
+namespace RouterMiddleACRService
 {
-    public class EnumToStringConverter : IValueConverter
+    public class LogService
     {
-        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        private static LogService _instance;
+        private readonly string _logDirectory;
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+        private string _serverIp = "127.0.0.1"; // 메인 UI 서버 IP
+        private int _serverPort = 9000; // 메인 UI 서버 포트
+        private CancellationTokenSource _cancellationTokenSource;
+        private bool _isConnected = false;
+        private Queue<string> _logQueue = new Queue<string>(); // 로그 메시지 큐
+
+        public static LogService Instance
         {
-            if (value is Enum)
+            get
             {
-                return value.ToString();
+                if (_instance == null)
+                {
+                    _instance = new LogService();
+                }
+                return _instance;
             }
-            return string.Empty;
         }
 
-        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        private LogService()
         {
-            throw new NotImplementedException();
+            _logDirectory = Path.Combine("C:\\Logs", "RouterMiddleACRService", DateTime.Now.ToString("yyyyMM"));
+            Directory.CreateDirectory(_logDirectory);
+        }
+
+        public void Start()
+        {
+            _cancellationTokenSource = new CancellationTokenSource();
+            Task.Run(() => ConnectToServer(_cancellationTokenSource.Token)); // 서버 연결을 시작
+        }
+
+        public void Stop()
+        {
+            _cancellationTokenSource.Cancel();
+            _networkStream?.Close();
+            _tcpClient?.Close();
+        }
+
+        private async Task ConnectToServer(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (!_isConnected)
+                {
+                    try
+                    {
+                        _tcpClient = new TcpClient();
+                        await _tcpClient.ConnectAsync(_serverIp, _serverPort); // 서버에 연결
+                        _networkStream = _tcpClient.GetStream();
+                        _isConnected = true;
+                        Console.WriteLine("Connected to main UI server.");
+                        
+                        // 재연결 후 로그 큐에 저장된 메시지 전송
+                        await SendQueuedLogs();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error connecting to server: {ex.Message}");
+                        _isConnected = false;
+                        await Task.Delay(5000); // 5초 후 재연결 시도
+                    }
+                }
+                else
+                {
+                    await Task.Delay(1000); // 연결이 되어 있을 때 1초마다 상태 체크
+                }
+            }
+        }
+
+        public async Task LogMessage(string message)
+        {
+            try
+            {
+                string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}";
+                string logFilePath = Path.Combine(_logDirectory, $"{DateTime.Now:yyyyMMdd}_ServiceLog.txt");
+
+                File.AppendAllText(logFilePath, logEntry + Environment.NewLine);
+
+                if (_isConnected && _tcpClient != null && _tcpClient.Connected)
+                {
+                    await SendLogMessage(logEntry); // await 키워드를 사용하여 비동기 전송 대기
+                }
+                else
+                {
+                    _logQueue.Enqueue(logEntry); // 연결되지 않은 경우 로그 큐에 저장
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error logging message: {ex.Message}");
+            }
+        }
+
+        private async Task SendLogMessage(string message)
+        {
+            try
+            {
+                // 네트워크 스트림과 TCP 클라이언트가 유효한지 확인
+                if (_networkStream != null && _tcpClient != null && _tcpClient.Connected)
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(message);
+                    await _networkStream.WriteAsync(data, 0, data.Length); // 메시지 전송
+                    Console.WriteLine("Log message sent to main UI server.");
+                }
+                else
+                {
+                    throw new InvalidOperationException("Network stream or TCP client is not connected.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending log message: {ex.Message}");
+                _isConnected = false; // 전송 실패 시 연결 끊김으로 처리
+                // 재시도 로직을 추가할 수 있음
+            }
+        }
+
+        private async Task SendQueuedLogs()
+        {
+            while (_logQueue.Count > 0 && _isConnected)
+            {
+                var logMessage = _logQueue.Dequeue();
+                await SendLogMessage(logMessage); // 큐에 저장된 로그 메시지 전송
+            }
         }
     }
 }
-App.xaml
-App.xaml에서 EnumToStringConverter를 리소스로 추가합니다.
+주요 변경점
+네트워크 상태 확인:
 
-xml
-코드 복사
-<Application x:Class="RouterMiddleACR.App"
-             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:local="clr-namespace:RouterMiddleACR.Converters"
-             StartupUri="MainWindow.xaml">
-    <Application.Resources>
-        <local:EnumToStringConverter x:Key="EnumToStringConverter"/>
-    </Application.Resources>
-</Application>
-요약
-ServiceName 열거형 설정: ServiceStatus 객체를 초기화할 때 각 객체의 ServiceName을 고유하게 설정합니다.
-Binding 확인: UserControl과 MainWindow.xaml에서 바인딩을 올바르게 설정하여 각 서비스 상태가 제대로 표시되도록 합니다.
-Converter 추가: 열거형을 문자열로 변환할 때 EnumToStringConverter를 사용하여 UI에 문자열로 표시되도록 합니다.
-이제 각 서비스 상태가 제대로 표시될
+SendLogMessage 메서드에서 _networkStream과 _tcpClient가 유효한지, 연결되어 있는지 확인하는 조건을 추가했습니다.
+연결이 끊겼거나 _networkStream이 null인 경우 예외를 발생시켜 에러를 처리합니다.
+에러 처리 개선:
+
+SendLogMessage 메서드에서 에러 발생 시 _isConnected 플래그를 false로 설정하여, 재연결을 시도하게끔 합니다.
+LogMessage 비동기 처리:
+
+LogMessage 메서드에서 로그 메시지를 전송하기 전에 연결 상태를 확인하고, 연결이 안 되어 있으면 큐에 저장하도록 했습니다.
+추가 개선점
+재연결 로직: SendLogMessage 메서드에서 전송 실패 시 일정 시간 후 재연결을 시도하는 로직을 추가할 수 있습니다.
+TCP 서버 확인: 클라이언트가 시작되기 전에 서버가 제대로 실행 중인지 확인하는 절차를 추가할 수 있습니다.
+이렇게 수정하면, TCP 연결 문제가 발생했을 때도
