@@ -1,165 +1,99 @@
-네트워크 스트림 상태 확인: 데이터를 전송하기 전에 NetworkStream이 유효한지 확인합니다.
-에러 처리 추가: SendLogMessage 메서드에서 예외가 발생할 때 추가적인 로그를 통해 문제를 진단할 수 있게 합니다.
-연결 상태 검사: 클라이언트가 서버에 연결된 후 로그를 보내도록 개선합니다.
-개선된 LogService.cs
-다음은 위의 문제 해결 방안을 반영하여 수정한 LogService.cs의 예제입니다.
+되는 문제는 일반적으로 다음과 같은 원인으로 발생할 수 있습니다:
+
+메시지 버퍼링 문제: NetworkStream.WriteAsync 메서드가 비동기적으로 데이터를 쓰기 때문에, 여러 개의 메시지가 동시에 전송될 수 있습니다. 이 경우, 메시지 경계가 분리되지 않아 여러 개의 메시지가 한 번에 처리될 수 있습니다.
+
+클라이언트-서버 통신 문제: 클라이언트가 서버에 메시지를 보낼 때, 적절한 메시지 구분자(예: 줄바꿈 문자 \n 또는 특수 구분자)를 사용하지 않으면, 여러 메시지가 결합되어 전송될 수 있습니다.
+
+버퍼 크기 문제: 클라이언트가 서버에서 데이터를 수신할 때, 수신 버퍼가 너무 커서 여러 개의 메시지를 한 번에 읽어버릴 수 있습니다.
+
+해결 방안
+메시지 구분자 추가: 각 메시지 끝에 줄바꿈 문자(\n) 또는 특수 구분자를 추가하여 서버가 메시지를 구분할 수 있게 합니다.
+
+수신 측에서 메시지 분할 처리: 서버는 수신한 데이터를 구분자로 분할하여 개별 메시지로 처리해야 합니다.
+
+수정된 LogService.cs
+SendLogMessage 메서드를 수정하여 각 메시지 끝에 줄바꿈 문자를 추가합니다.
 
 csharp
 코드 복사
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace RouterMiddleACRService
+private async Task SendLogMessage(string message)
 {
-    public class LogService
+    try
     {
-        private static LogService _instance;
-        private readonly string _logDirectory;
-        private TcpClient _tcpClient;
-        private NetworkStream _networkStream;
-        private string _serverIp = "127.0.0.1"; // 메인 UI 서버 IP
-        private int _serverPort = 9000; // 메인 UI 서버 포트
-        private CancellationTokenSource _cancellationTokenSource;
-        private bool _isConnected = false;
-        private Queue<string> _logQueue = new Queue<string>(); // 로그 메시지 큐
-
-        public static LogService Instance
+        // 네트워크 스트림과 TCP 클라이언트가 유효한지 확인
+        if (_networkStream != null && _tcpClient != null && _tcpClient.Connected)
         {
-            get
+            // 메시지 끝에 줄바꿈 문자를 추가하여 메시지 구분
+            string messageWithDelimiter = message + "\n";
+            byte[] data = Encoding.UTF8.GetBytes(messageWithDelimiter);
+            await _networkStream.WriteAsync(data, 0, data.Length); // 메시지 전송
+            Console.WriteLine("Log message sent to main UI server.");
+        }
+        else
+        {
+            throw new InvalidOperationException("Network stream or TCP client is not connected.");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error sending log message: {ex.Message}");
+        _isConnected = false; // 전송 실패 시 연결 끊김으로 처리
+        // 재시도 로직을 추가할 수 있음
+    }
+}
+수신 측 처리
+수신 측에서 메시지를 수신할 때, 데이터를 구분자로 분할하여 개별 메시지로 처리합니다.
+
+MainWindow.xaml.cs에서 수신 처리 수정
+csharp
+코드 복사
+private void StartListeningToLogs()
+{
+    Task.Run(async () =>
+    {
+        try
+        {
+            _tcpClient = new TcpClient("127.0.0.1", 9000); // 로컬호스트의 포트 9000에 연결
+            _networkStream = _tcpClient.GetStream();
+
+            byte[] buffer = new byte[1024];
+            int bytesRead;
+            StringBuilder messageBuilder = new StringBuilder();
+
+            // 로그 메시지를 지속적으로 수신하여 UI에 표시
+            while ((bytesRead = await _networkStream.ReadAsync(buffer, 0, buffer.Length)) != 0)
             {
-                if (_instance == null)
+                string receivedData = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                messageBuilder.Append(receivedData);
+
+                // 메시지 구분자로 분할하여 개별 메시지로 처리
+                string[] messages = messageBuilder.ToString().Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < messages.Length - 1; i++)
                 {
-                    _instance = new LogService();
+                    Dispatcher.Invoke(() => _viewModel.LogMessages.Add(messages[i])); // UI에 로그 메시지 추가
                 }
-                return _instance;
+
+                // 마지막 부분은 아직 완성되지 않은 메시지일 수 있으므로 저장
+                messageBuilder.Clear();
+                messageBuilder.Append(messages.Last());
             }
         }
-
-        private LogService()
+        catch (Exception ex)
         {
-            _logDirectory = Path.Combine("C:\\Logs", "RouterMiddleACRService", DateTime.Now.ToString("yyyyMM"));
-            Directory.CreateDirectory(_logDirectory);
+            Dispatcher.Invoke(() => _viewModel.LogMessages.Add($"ERROR: {ex.Message}"));
         }
-
-        public void Start()
+        finally
         {
-            _cancellationTokenSource = new CancellationTokenSource();
-            Task.Run(() => ConnectToServer(_cancellationTokenSource.Token)); // 서버 연결을 시작
-        }
-
-        public void Stop()
-        {
-            _cancellationTokenSource.Cancel();
             _networkStream?.Close();
             _tcpClient?.Close();
         }
-
-        private async Task ConnectToServer(CancellationToken cancellationToken)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                if (!_isConnected)
-                {
-                    try
-                    {
-                        _tcpClient = new TcpClient();
-                        await _tcpClient.ConnectAsync(_serverIp, _serverPort); // 서버에 연결
-                        _networkStream = _tcpClient.GetStream();
-                        _isConnected = true;
-                        Console.WriteLine("Connected to main UI server.");
-                        
-                        // 재연결 후 로그 큐에 저장된 메시지 전송
-                        await SendQueuedLogs();
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error connecting to server: {ex.Message}");
-                        _isConnected = false;
-                        await Task.Delay(5000); // 5초 후 재연결 시도
-                    }
-                }
-                else
-                {
-                    await Task.Delay(1000); // 연결이 되어 있을 때 1초마다 상태 체크
-                }
-            }
-        }
-
-        public async Task LogMessage(string message)
-        {
-            try
-            {
-                string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}";
-                string logFilePath = Path.Combine(_logDirectory, $"{DateTime.Now:yyyyMMdd}_ServiceLog.txt");
-
-                File.AppendAllText(logFilePath, logEntry + Environment.NewLine);
-
-                if (_isConnected && _tcpClient != null && _tcpClient.Connected)
-                {
-                    await SendLogMessage(logEntry); // await 키워드를 사용하여 비동기 전송 대기
-                }
-                else
-                {
-                    _logQueue.Enqueue(logEntry); // 연결되지 않은 경우 로그 큐에 저장
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error logging message: {ex.Message}");
-            }
-        }
-
-        private async Task SendLogMessage(string message)
-        {
-            try
-            {
-                // 네트워크 스트림과 TCP 클라이언트가 유효한지 확인
-                if (_networkStream != null && _tcpClient != null && _tcpClient.Connected)
-                {
-                    byte[] data = Encoding.UTF8.GetBytes(message);
-                    await _networkStream.WriteAsync(data, 0, data.Length); // 메시지 전송
-                    Console.WriteLine("Log message sent to main UI server.");
-                }
-                else
-                {
-                    throw new InvalidOperationException("Network stream or TCP client is not connected.");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error sending log message: {ex.Message}");
-                _isConnected = false; // 전송 실패 시 연결 끊김으로 처리
-                // 재시도 로직을 추가할 수 있음
-            }
-        }
-
-        private async Task SendQueuedLogs()
-        {
-            while (_logQueue.Count > 0 && _isConnected)
-            {
-                var logMessage = _logQueue.Dequeue();
-                await SendLogMessage(logMessage); // 큐에 저장된 로그 메시지 전송
-            }
-        }
-    }
+    });
 }
-주요 변경점
-네트워크 상태 확인:
+주요 변경점 설명
+메시지 구분자 추가: SendLogMessage 메서드에서 각 메시지 끝에 줄바꿈 문자(\n)를 추가하여 메시지 구분자를 명확히 합니다.
 
-SendLogMessage 메서드에서 _networkStream과 _tcpClient가 유효한지, 연결되어 있는지 확인하는 조건을 추가했습니다.
-연결이 끊겼거나 _networkStream이 null인 경우 예외를 발생시켜 에러를 처리합니다.
-에러 처리 개선:
+수신 측 메시지 분할 처리:
 
-SendLogMessage 메서드에서 에러 발생 시 _isConnected 플래그를 false로 설정하여, 재연결을 시도하게끔 합니다.
-LogMessage 비동기 처리:
-
-LogMessage 메서드에서 로그 메시지를 전송하기 전에 연결 상태를 확인하고, 연결이 안 되어 있으면 큐에 저장하도록 했습니다.
-추가 개선점
-재연결 로직: SendLogMessage 메서드에서 전송 실패 시 일정 시간 후 재연결을 시도하는 로직을 추가할 수 있습니다.
-TCP 서버 확인: 클라이언트가 시작되기 전에 서버가 제대로 실행 중인지 확인하는 절차를 추가할 수 있습니다.
-이렇게 수정하면, TCP 연결 문제가 발생했을 때도
+수신 측에서는 messageBuilder를 사용하여 받은 데이터를 계속 추가하고, 줄바꿈 문자(\n)를 기준으로 메시지를 분할합니다.
+분할된 메시지 배열에서 마지막 메시지는 완성되지 않은 메시지일 수 있으므로 messageBuilder에 다시 추가하여 다음 수신 시 완성합니다.
+이 변경 사항을 적용하면, 여러 메시지가 한 줄에 겹쳐서 전송되는 문제를 해결할 수 있으며, 메시지 경계를 명확히 구분할 수 있습니다
