@@ -1,10 +1,98 @@
-기존 LogService 클래스에 TCP 서버 기능을 추가하여, 클라이언트와 서버 기능을 모두 수행할 수 있도록 수정하겠습니다. 이 클래스는 기존의 로그 메시지를 전송하는 클라이언트 역할을 유지하면서, 새로 추가된 서버 기능을 통해 메인 UI 애플리케이션으로부터 명령을 수신할 수 있게 됩니다.
+네, 요청하신 내용을 바탕으로 MainViewModel과 LogService를 최적화하고 ComPortManager를 효과적으로 활용하는 방안을 정리하겠습니다.
 
-주요 기능 설명
-클라이언트 기능: LogService는 여전히 클라이언트로서 메인 UI 서버에 로그 메시지를 전송합니다.
-서버 기능: 이제 LogService는 TCP 서버 기능도 포함하여, 메인 UI 애플리케이션으로부터 연결을 수신하고, 데이터를 처리할 수 있습니다.
-PLC 통신: 수신된 명령을 PLC로 전송하는 기능을 포함합니다.
-수정된 LogService.cs 전체 코드
+목표
+MainViewModel: PLC로 데이터를 전송하는 기능을 추가하며, 버튼을 통해 명령을 전달할 수 있도록 합니다.
+LogService: 기존 TCP 서버 및 클라이언트 기능을 유지하면서, PLC와의 통신 기능을 ComPortManager를 활용하여 분리합니다.
+ComPortManager: PLC 통신 관련 기능을 전담하여, 메인 서비스가 독립적으로 관리할 수 있도록 합니다.
+설계 개요
+MainViewModel:
+
+버튼 명령을 통해 서비스에 데이터를 전송하는 기능을 추가합니다.
+소켓을 통해 서비스를 호출하여 데이터를 전송하도록 합니다.
+LogService:
+
+ComPortManager를 활용하여 PLC와의 시리얼 통신을 담당합니다.
+소켓 통신을 통해 UI에서 받은 명령을 PLC로 전달합니다.
+ComPortManager:
+
+PLC와의 시리얼 통신을 처리하고, 필요한 경우 데이터를 전송합니다.
+최적화된 코드 구현
+1. MainViewModel.cs 수정
+MainViewModel에 새로운 명령을 추가하여, UI에서 입력된 데이터를 서비스에 전송하는 기능을 구현합니다.
+
+csharp
+코드 복사
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Net.Sockets;
+using System.Text;
+using System.Windows.Input;
+
+namespace RouterMiddleACR.ViewModels
+{
+    public class MainViewModel : INotifyPropertyChanged
+    {
+        // PLC에 전송할 데이터의 매핑
+        public ObservableCollection<ButtonMapping> ButtonMappings { get; } = new ObservableCollection<ButtonMapping>
+        {
+            new ButtonMapping { Number = 0, DisplayName = "Zero" },
+            new ButtonMapping { Number = 1, DisplayName = "One" },
+            new ButtonMapping { Number = 2, DisplayName = "Two" },
+            new ButtonMapping { Number = 3, DisplayName = "Three" },
+            new ButtonMapping { Number = 4, DisplayName = "Four" }
+        };
+
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+
+        public ICommand SendToPLCCommand { get; }
+
+        public MainViewModel()
+        {
+            SendToPLCCommand = new RelayCommand<int>(SendToPLC);
+            ConnectToService();
+        }
+
+        private void ConnectToService()
+        {
+            try
+            {
+                _tcpClient = new TcpClient("127.0.0.1", 9000);
+                _networkStream = _tcpClient.GetStream();
+            }
+            catch (Exception ex)
+            {
+                // 에러 처리 로직
+            }
+        }
+
+        private async void SendToPLC(int number)
+        {
+            if (_networkStream != null)
+            {
+                string message = $"%01#WDD0230002300{number:D2}00**\r"; // Mewtocol 메시지 형식
+                byte[] data = Encoding.ASCII.GetBytes(message);
+                await _networkStream.WriteAsync(data, 0, data.Length);
+            }
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        protected virtual void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+    }
+
+    public class ButtonMapping
+    {
+        public int Number { get; set; }
+        public string DisplayName { get; set; }
+    }
+}
+2. LogService.cs 수정
+LogService에서 PLC 통신을 ComPortManager로 위임하고, 서버와 클라이언트 기능을 유지합니다.
+
 csharp
 코드 복사
 using System;
@@ -30,6 +118,7 @@ namespace RouterMiddleACRService
         private CancellationTokenSource _cancellationTokenSource;
         private bool _isConnected = false;
         private Queue<string> _logQueue = new Queue<string>(); // 로그 메시지 큐
+        private ComPortManager _comPortManager; // ComPortManager 인스턴스
 
         // 싱글톤 패턴을 위한 인스턴스 접근자
         public static LogService Instance
@@ -50,6 +139,10 @@ namespace RouterMiddleACRService
             // 로그 파일이 저장될 디렉터리 설정
             _logDirectory = Path.Combine("C:\\Logs", "RouterMiddleACRService", DateTime.Now.ToString("yyyyMM"));
             Directory.CreateDirectory(_logDirectory);
+
+            // ComPortManager 인스턴스 초기화
+            _comPortManager = new ComPortManager();
+            _comPortManager.ConfigurePort("COM1"); // 기본 포트 설정
         }
 
         // 서비스 시작 메서드
@@ -138,22 +231,8 @@ namespace RouterMiddleACRService
                 {
                     string message = Encoding.ASCII.GetString(buffer, 0, bytesRead);
                     Console.WriteLine($"Received message: {message}");
-                    SendToPLC(message); // 수신된 메시지를 PLC로 전송
+                    _comPortManager.SendDataToPLC(message); // ComPortManager를 통해 메시지를 PLC로 전송
                 }
-            }
-        }
-
-        // PLC에 메시지를 전송하는 메서드
-        private void SendToPLC(string message)
-        {
-            try
-            {
-                // PLC와의 시리얼 통신 코드 구현 (예: 시리얼 포트로 데이터 전송)
-                Console.WriteLine($"Sending to PLC: {message}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error sending to PLC: {ex.Message}");
             }
         }
 
@@ -218,18 +297,83 @@ namespace RouterMiddleACRService
         }
     }
 }
-설명
-싱글톤 패턴: LogService 클래스는 싱글톤 패턴을 사용하여 전역 인스턴스를 제공합니다. 이 패턴은 애플리케이션 전역에서 로그 서비스를 쉽게 사용할 수 있게 합니다.
+3. ComPortManager.cs 구현
+ComPortManager는 PLC와의 통신을 전담하며, LogService에서 호출됩니다.
 
-TCP 클라이언트 및 서버:
+csharp
+코드 복사
+using System;
+using System.IO.Ports;
+using System.Threading.Tasks;
 
-클라이언트 기능: ConnectToMainUIServer 메서드는 메인 UI 서버에 연결하여 로그 메시지를 전송합니다.
-서버 기능: StartTcpListener 메서드는 TCP 서버를 시작하여 메인 UI 애플리케이션으로부터 명령을 수신합니다.
-PLC 통신: SendToPLC 메서드는 수신된 명령을 Mewtocol 형식으로 변환하여 PLC로 전송합니다. 실제 시리얼 통신 코드는 여기에 추가되어야 합니다.
+namespace RouterMiddleACRService
+{
+    public class ComPortManager
+    {
+        private SerialPort _port; // 시리얼 포트 객체
+        private string _currentPortName; // 현재 사용 중인 포트 이름
 
-로그 전송 및 처리:
+        // 포트를 설정하는 메서드
+        public void ConfigurePort(string portName, int baudRate = 9600, Parity parity = Parity.None, int dataBits = 8, StopBits stopBits = StopBits.One)
+        {
+            _currentPortName = portName; // 현재 포트 이름 저장
 
-로그 메시지 전송: LogMessage 메서드는 로그 메시지를 파일에 저장하고, 메인 UI 서버에 전송합니다. 연결이 끊어진 경우 메시지를 큐에 저장하여 나중에 전송합니다.
-큐 메시지 전송: SendQueuedLogs 메서드는 큐에 저장된 메시지를 다시 전송합니다.
-요약
-이제 LogService 클래스는 클라이언트와 서버 기능을 모두 갖추고 있으며, 메인 UI 애플리케이션과 통신하여
+            if (_port != null && _port.IsOpen) // 이미 포트가 열려 있는 경우
+            {
+                _port.Close(); // 포트 닫기
+            }
+
+            _port = new SerialPort(portName, baudRate, parity, dataBits, stopBits); // 새 포트 설정
+        }
+
+        // 데이터를 비동기적으로 전송하는 메서드
+        public async Task<bool> SendDataToPLC(string data)
+        {
+            try
+            {
+                if (_port == null || !_port.IsOpen) // 포트가 설정되지 않았거나 열려 있지 않은 경우
+                {
+                    _port.Open(); // 포트 열기
+                }
+
+                _port.WriteLine(data); // 데이터 전송
+                await Task.Delay(100); // 통신 대기 시간
+
+                string response = _port.ReadLine(); // 응답 수신
+                Console.WriteLine($"전송 데이터: {data}, 응답: {response}"); // 로그 기록
+
+                return response.Contains("OK"); // 응답 확인
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"COM 포트 전송 중 오류 발생: {ex.Message}"); // 오류 로그 기록
+                return false; // 실패 반환
+            }
+            finally
+            {
+                if (_port != null && _port.IsOpen)
+                {
+                    _port.Close(); // 포트 닫기
+                }
+            }
+        }
+
+        // 포트 설정을 저장하는 메서드
+        public void SavePortSettings(string key, string portName)
+        {
+            // 설정 저장 로직 구현 필요
+        }
+
+        // 포트 설정을 불러오는 메서드
+        public string LoadPortSettings(string key)
+        {
+            // 설정 불러오기 로직 구현 필요
+            return string.Empty;
+        }
+    }
+}
+최적화된 설계 요약
+MainViewModel: PLC로 데이터를 전송하는 명령을 정의하고, 소켓을 통해 서비스를 호출합니다.
+LogService: 기존 TCP 서버 및 클라이언트 기능을 유지하면서, PLC와의 통신 기능을 ComPortManager로 분리하여 관리합니다.
+ComPortManager: PLC와의 시리얼 통신을 전담하여, LogService가 독립적으로 관리할 수 있도록 합니다.
+이 구조는 각 기능이 명확히 분리되어 있으며, 유지보수와 확장이 용이한 설계를 제공합
