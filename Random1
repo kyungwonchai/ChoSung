@@ -1,8 +1,10 @@
-당신의 요구사항에 맞춰 MainViewModel에서 PLC에 값을 쓴 후, 3초 대기 후부터 해당 값이 PLC로부터 수신될 때까지 최대 30초간 기다리는 로직을 구현하겠습니다. 만약 30초 안에 기대한 값이 수신되지 않으면 오류 로그를 메인 UI에 전송하도록 하겠습니다.
+래는 요구사항을 충족하기 위해 수정된 MainViewModel과 ComPortManager 코드입니다.
 
-1. MainViewModel.cs 수정
-아래는 MainViewModel에서 변경된 코드입니다.
+변경 사항은 다음과 같습니다:
 
+DT2330 값 확인: 3초 후 DT2330에 내가 보낸 값이 그대로 쓰여졌는지 확인합니다. 다른 값이 쓰여지면 오류 로그를 기록합니다.
+Mewtocol 응답 확인: PLC로 데이터를 전송한 후, Mewtocol 기본 응답을 항상 체크합니다. 올바른 응답을 받지 못하면 에러를 로그에 기록합니다.
+1. 수정된 MainViewModel.cs
 csharp
 코드 복사
 using System;
@@ -79,25 +81,38 @@ namespace RouterMiddleACR.ViewModels
         {
             // Step 1: Write value to DT2300
             string writeCommand = $"%01#WDD0230000230{number:D2}00**\r";
-            await _comPortManager.SendDataToPLCAsync(writeCommand);
-            LogMessage($"Sent {number} to DT2300");
+            string response = await _comPortManager.SendDataToPLCAsync(writeCommand);
+
+            // Check Mewtocol response
+            if (!CheckMewtocolResponse(response))
+            {
+                LogMessage($"ERROR: Failed to write to PLC. Mewtocol response: {response}");
+                return;
+            }
+
+            LogMessage($"Sent {number} to DT2300, waiting for response...");
 
             // Step 2: Wait for 3 seconds
             await Task.Delay(3000);
 
-            // Step 3: Read from DT2330 with a 30-second timeout
+            // Step 3: Check if DT2330 has the correct value within 30 seconds
             bool success = false;
             DateTime startTime = DateTime.Now;
 
             while ((DateTime.Now - startTime).TotalSeconds < 30)
             {
-                string response = await _comPortManager.ReadFromPLCAsync("023300");
+                string dt2330Response = await _comPortManager.ReadFromPLCAsync("023300");
 
-                if (response.Contains(number.ToString()))
+                if (dt2330Response.Contains(number.ToString()))
                 {
-                    LogMessage($"Operation completed successfully. Value {number} received from DT2330.");
+                    LogMessage($"Operation completed successfully. Value {number} correctly received from DT2330.");
                     success = true;
                     await _comPortManager.ClearPLCValueAsync("023300");
+                    break;
+                }
+                else if (dt2330Response != "0000") // 다른 값이 쓰여진 경우
+                {
+                    LogMessage($"ERROR: Unexpected value {dt2330Response} found in DT2330. Expected {number}.");
                     break;
                 }
 
@@ -115,7 +130,14 @@ namespace RouterMiddleACR.ViewModels
             if (int.TryParse(value, out int intValue))
             {
                 string command = $"%01#WDD0230000230{intValue:D2}00**\r";
-                await _comPortManager.SendDataToPLCAsync(command);
+                string response = await _comPortManager.SendDataToPLCAsync(command);
+
+                if (!CheckMewtocolResponse(response))
+                {
+                    LogMessage($"ERROR: Failed to write to PLC. Mewtocol response: {response}");
+                    return;
+                }
+
                 LogMessage($"Sent {value} from TextBox to PLC");
             }
             else
@@ -133,7 +155,6 @@ namespace RouterMiddleACR.ViewModels
 
         private void ProcessPLCValue(string value)
         {
-            // DT2330 값에 따라 상태 설명을 업데이트
             LogMessage($"Processed value from DT2330: {value}");
         }
 
@@ -156,6 +177,12 @@ namespace RouterMiddleACR.ViewModels
             Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}");
         }
 
+        private bool CheckMewtocolResponse(string response)
+        {
+            // Mewtocol의 기본 응답을 확인하여 올바른지 확인
+            return response.Contains("%01");
+        }
+
         public event PropertyChangedEventHandler PropertyChanged;
 
         protected virtual void OnPropertyChanged(string propertyName)
@@ -164,20 +191,120 @@ namespace RouterMiddleACR.ViewModels
         }
     }
 }
-주요 변경 사항 및 설명
-PLC에 값 쓰기 (WriteToPLCAndCheckResponse 메서드):
+2. 수정된 ComPortManager.cs
+ComPortManager 클래스에서 PLC로 데이터를 전송하고 응답을 확인하는 메서드를 추가합니다.
 
-PLC의 DT2300 주소에 1부터 4까지의 값을 씁니다.
-SendDataToPLCAsync를 통해 값을 PLC로 전송하고, 로그 메시지를 기록합니다.
-3초 대기:
+csharp
+코드 복사
+using System;
+using System.IO.Ports;
+using System.Text;
+using System.Threading.Tasks;
 
-Task.Delay(3000)을 사용하여 3초간 대기합니다.
-DT2330 값 확인 및 30초 타임아웃:
+namespace RouterMiddleACRService
+{
+    public class ComPortManager
+    {
+        private SerialPort _port;
 
-3초 대기 후, DT2330의 값을 읽기 시작합니다.
-1초마다 DT2330의 값을 확인하고, 기대한 값이 도착하면 성공 로그를 기록하고 값을 0으로 초기화합니다.
-DateTime.Now를 이용하여 30초 타임아웃을 설정하며, 30초 안에 기대한 값이 수신되지 않으면 오류 로그를 기록합니다.
+        public void ConfigurePort(string portName, int baudRate = 9600, Parity parity = Parity.None, int dataBits = 8, StopBits stopBits = StopBits.One)
+        {
+            _port = new SerialPort(portName, baudRate, parity, dataBits, stopBits);
+        }
+
+        public async Task<string> SendDataToPLCAsync(string command)
+        {
+            if (_port == null || !_port.IsOpen)
+            {
+                throw new InvalidOperationException("The serial port is not open.");
+            }
+
+            try
+            {
+                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
+                _port.Write(commandBytes, 0, commandBytes.Length);
+
+                // PLC의 응답을 비동기적으로 읽음
+                string response = await Task.Run(() => _port.ReadLine());
+                return response;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending data to PLC: {ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        public async Task<string> ReadFromPLCAsync(string address)
+        {
+            if (_port == null || !_port.IsOpen)
+            {
+                throw new InvalidOperationException("The serial port is not open.");
+            }
+
+            try
+            {
+                string command = $"%01#RDD{address}**\r";
+                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
+                _port.Write(commandBytes, 0, commandBytes.Length);
+                
+                var response = await Task.Run(() => _port.ReadLine());
+                return response;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error reading from PLC: {ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        public async Task ClearPLCValueAsync(string address)
+        {
+            if (_port == null || !_port.IsOpen)
+            {
+                throw new InvalidOperationException("The serial port is not open.");
+            }
+
+            try
+            {
+                string command = $"%01#WDD{address}0000**\r";
+                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
+                await Task.Run(() => _port.Write(commandBytes, 0, commandBytes.Length));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error clearing PLC value: {ex.Message}");
+            }
+        }
+
+        public void OpenPort()
+        {
+            if (_port != null && !_port.IsOpen)
+            {
+                _port.Open();
+            }
+        }
+
+        public void ClosePort()
+        {
+            if (_port != null && _port.IsOpen)
+            {
+                _port.Close();
+            }
+        }
+    }
+}
+설명
+PLC로 데이터 전송 및 응답 확인:
+
+SendDataToPLCAsync 메서드는 PLC로 데이터를 전송하고 응답을 읽어오는 메서드입니다.
+Mewtocol 프로토콜을 사용하여 PLC로 명령을 전송하고 응답을 기다립니다.
+응답을 받아서 제대로 전송이 되었는지 확인합니다. Mewtocol의 기본 응답은 %01로 시작하므로, 이를 확인하여 성공 여부를 판단합니다.
+DT2330 값 확인 및 초기화:
+
+WriteToPLCAndCheckResponse 메서드는 PLC에 값을 쓴 후 3초 후부터 최대 30초간 DT2330의 값을 확인합니다.
+기대한 값이 맞는지 확인하고, 그렇지 않으면 오류 로그를 기록합니다. 제대로 확인된 경우에는 값을 초기화합니다.
 로깅:
 
-각 단계에서 로그를 기록하여 작업의 진행 상황을 파악할 수 있습니다. 오류가 발생할 경우에도 로그가 남도록 합니다.
-이 코드 구조를 사용하면, PLC와의 통신이 안정적으로 수행되며, 작업 실패 시 오류 로그를 통해 디버깅이 가능합니다. 서비스 측에서 로그 메시지를 전송할 때는 소켓이나 다른 통신 방식을 사용할 수 있으며, 메인 UI에서 이를 수신하여 사용자에게 알릴 수 있습니다
+각 단계마다 로그를 남겨 작업의 흐름과 오류 발생 시점을 명확히 파악할 수 있습니다.
+위의 수정된 코드를 사용하면, PLC로 데이터를 전송한 후 응답을 확인하고, DT2330에 기대한 값이 쓰여졌는지 확인하는 로직을 구현할 수 있습니다. 또한, 예상치 못한 값이 쓰여졌을 때도 오류를 기록하여 디버깅을 돕습니다
