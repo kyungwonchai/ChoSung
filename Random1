@@ -1,122 +1,234 @@
-omPortManager 클래스에서 ReadFromPLCAsync와 같이 PLC로부터 데이터를 읽어오는 비동기 메서드를 추가하려면, 아래와 같이 코드를 작성할 수 있습니다. 이 메서드는 시리얼 포트를 통해 PLC로부터 데이터를 읽어와 반환하는 기능을 제공합니다.
+이 요구사항을 충족하기 위해, ComPortManager와 MainViewModel에 몇 가지 수정과 추가 작업이 필요합니다. 여기서는 PLC에 1부터 4까지의 값을 쓰고, 3초 후 DT2330에 해당 값이 들어오는지 확인하는 로직을 추가합니다. 그런 다음 로그를 남기고 DT2330의 값을 0으로 초기화하는 절차를 구현합니다.
 
-ComPortManager.cs 수정
+1. MainViewModel.cs 수정
+먼저 MainViewModel에 로직을 추가하여 값을 쓰고, 3초 후에 값을 확인하는 작업을 합니다.
+
 csharp
 코드 복사
 using System;
-using System.IO.Ports;
-using System.Text;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Threading.Tasks;
+using System.Windows.Input;
+using RouterMiddleACRService;
 
-namespace RouterMiddleACRService
+namespace RouterMiddleACR.ViewModels
 {
-    public class ComPortManager
+    public class MainViewModel : INotifyPropertyChanged
     {
-        private SerialPort _port;
+        private readonly ComPortManager _comPortManager;
+        private string _r520Status;
+        private string _r521Status;
 
-        public void ConfigurePort(string portName, int baudRate = 9600, Parity parity = Parity.None, int dataBits = 8, StopBits stopBits = StopBits.One)
+        public string R520Status
         {
-            _port = new SerialPort(portName, baudRate, parity, dataBits, stopBits);
-        }
-
-        public async Task<string> ReadFromPLCAsync(string address)
-        {
-            if (_port == null || !_port.IsOpen)
+            get => _r520Status;
+            set
             {
-                throw new InvalidOperationException("The serial port is not open.");
-            }
-
-            try
-            {
-                // Mewtocol 프로토콜에 맞는 명령어 생성
-                string command = $"%01#RDD{address}**\r";
-                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-
-                // PLC에 명령어 전송
-                _port.Write(commandBytes, 0, commandBytes.Length);
-
-                // 응답을 읽어옴
-                var response = await Task.Run(() => _port.ReadLine());
-                return response;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading from PLC: {ex.Message}");
-                return string.Empty;
+                _r520Status = value;
+                OnPropertyChanged(nameof(R520Status));
             }
         }
 
-        public async Task SendDataToPLCAsync(string command)
+        public string R521Status
         {
-            if (_port == null || !_port.IsOpen)
+            get => _r521Status;
+            set
             {
-                throw new InvalidOperationException("The serial port is not open.");
-            }
-
-            try
-            {
-                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-                await Task.Run(() => _port.Write(commandBytes, 0, commandBytes.Length));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error sending data to PLC: {ex.Message}");
+                _r521Status = value;
+                OnPropertyChanged(nameof(R521Status));
             }
         }
 
-        public async Task ClearPLCValueAsync(string address)
-        {
-            if (_port == null || !_port.IsOpen)
-            {
-                throw new InvalidOperationException("The serial port is not open.");
-            }
+        // Zero부터 4까지 버튼 명령들
+        public ObservableCollection<KeyValuePair<string, ICommand>> ButtonCommands { get; set; }
 
-            try
+        // DT2330 버튼 명령들
+        public ObservableCollection<KeyValuePair<string, ICommand>> DT2330Commands { get; set; }
+
+        // 명령 생성
+        public ICommand SendTextBoxValueCommand { get; }
+        public ICommand ProcessDT2330Command { get; }
+
+        public MainViewModel()
+        {
+            _comPortManager = new ComPortManager();
+            _comPortManager.ConfigurePort("COM1");
+
+            ButtonCommands = new ObservableCollection<KeyValuePair<string, ICommand>>();
+            DT2330Commands = new ObservableCollection<KeyValuePair<string, ICommand>>();
+            InitializeCommands();
+            InitializeDT2330Commands();
+
+            // 명령 초기화
+            SendTextBoxValueCommand = new RelayCommand<string>(async (value) => await SendTextBoxValueToPLC(value));
+            ProcessDT2330Command = new RelayCommand(async () => await ReadAndClearDT2330Data());
+
+            // 주기적으로 PLC 상태를 확인하는 작업 시작
+            Task.Run(UpdatePLCStatusAsync);
+        }
+
+        private void InitializeCommands()
+        {
+            for (int i = 1; i <= 4; i++)
             {
-                // 값 초기화 명령어 생성 (예: %01#WDD02300002300000**\r)
-                string command = $"%01#WDD{address}0000**\r";
-                byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-                await Task.Run(() => _port.Write(commandBytes, 0, commandBytes.Length));
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error clearing PLC value: {ex.Message}");
+                int value = i;
+                ButtonCommands.Add(new KeyValuePair<string, ICommand>(
+                    $"Send {i} to PLC",
+                    new RelayCommand(async () => await WriteToPLCAndCheckResponse(value))));
             }
         }
 
-        public void OpenPort()
+        private void InitializeDT2330Commands()
         {
-            if (_port != null && !_port.IsOpen)
+            for (int i = 0; i <= 4; i++)
             {
-                _port.Open();
+                int value = i;
+                DT2330Commands.Add(new KeyValuePair<string, ICommand>(
+                    $"Process DT2330 - {i}",
+                    new RelayCommand(async () => await ProcessDT2330Value(value))));
             }
         }
 
-        public void ClosePort()
+        public async Task WriteToPLCAndCheckResponse(int number)
         {
-            if (_port != null && _port.IsOpen)
+            // Step 1: Write value to DT2300
+            string writeCommand = $"%01#WDD0230000230{number:D2}00**\r";
+            await _comPortManager.SendDataToPLCAsync(writeCommand);
+            LogMessage($"Sent {number} to DT2300");
+
+            // Step 2: Wait for 3 seconds
+            await Task.Delay(3000);
+
+            // Step 3: Read from DT2330
+            string response = await _comPortManager.ReadFromPLCAsync("023300");
+            if (response.Contains(number.ToString()))
             {
-                _port.Close();
+                LogMessage($"Operation completed successfully. Value {number} received from DT2330.");
+                await _comPortManager.ClearPLCValueAsync("023300");
             }
+            else
+            {
+                LogMessage($"Operation failed. Expected value {number} not received.");
+            }
+        }
+
+        public async Task SendTextBoxValueToPLC(string value)
+        {
+            if (int.TryParse(value, out int intValue))
+            {
+                string command = $"%01#WDD0230000230{intValue:D2}00**\r";
+                await _comPortManager.SendDataToPLCAsync(command);
+                LogMessage($"Sent {value} from TextBox to PLC");
+            }
+            else
+            {
+                LogMessage("Invalid value.");
+            }
+        }
+
+        public async Task ProcessDT2330Value(int value)
+        {
+            // DT2330 값을 처리하고, 특정 작업을 수행합니다
+            LogMessage($"Processed value from DT2330: {value}");
+
+            // 필요에 따라 값을 초기화하거나 다른 작업을 수행할 수 있습니다
+            await _comPortManager.ClearPLCValueAsync("023300");
+        }
+
+        public async Task ReadAndClearDT2330Data()
+        {
+            string value = await _comPortManager.ReadFromPLCAsync("023300");
+            ProcessPLCValue(value);
+            await _comPortManager.ClearPLCValueAsync("023300");
+        }
+
+        private void ProcessPLCValue(string value)
+        {
+            // DT2330 값에 따라 상태 설명을 업데이트
+            LogMessage($"Processed value from DT2330: {value}");
+        }
+
+        private async Task UpdatePLCStatusAsync()
+        {
+            while (true)
+            {
+                string r520 = await _comPortManager.ReadFromPLCAsync("005200");
+                string r521 = await _comPortManager.ReadFromPLCAsync("005201");
+
+                R520Status = r520.Contains("1") ? "R520: 정상" : "R520: 오류";
+                R521Status = r521.Contains("1") ? "R521: 정상" : "R521: 오류";
+
+                await Task.Delay(1000);
+            }
+        }
+
+        private void LogMessage(string message)
+        {
+            Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}");
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        protected virtual void OnPropertyChanged(string propertyName)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
     }
 }
-설명
-ReadFromPLCAsync 메서드:
+2. ComPortManager.cs 추가
+PLC로부터 값을 읽어오고 값을 초기화하는 메서드는 이미 이전에 제공된 코드를 기반으로 작성되었습니다. 여기서는 추가 수정 없이 기존 코드에서 제공된 ReadFromPLCAsync 및 ClearPLCValueAsync 메서드를 사용하면 됩니다.
 
-이 메서드는 PLC로부터 데이터를 읽어오는 비동기 메서드입니다.
-address 파라미터는 PLC의 메모리 주소를 의미하며, Mewtocol 프로토콜에 맞게 명령어를 생성합니다.
-명령어를 PLC에 전송한 후, 응답을 읽어옵니다.
-await Task.Run()을 사용하여 비동기적으로 데이터를 읽어옵니다.
-SendDataToPLCAsync 메서드:
+csharp
+코드 복사
+public async Task<string> ReadFromPLCAsync(string address)
+{
+    if (_port == null || !_port.IsOpen)
+    {
+        throw new InvalidOperationException("The serial port is not open.");
+    }
 
-이 메서드는 PLC로 데이터를 전송하는 비동기 메서드입니다.
-명령어를 PLC에 전송하고, 오류가 발생할 경우 콘솔에 에러 메시지를 출력합니다.
-ClearPLCValueAsync 메서드:
+    try
+    {
+        string command = $"%01#RDD{address}**\r";
+        byte[] commandBytes = Encoding.ASCII.GetBytes(command);
+        _port.Write(commandBytes, 0, commandBytes.Length);
+        var response = await Task.Run(() => _port.ReadLine());
+        return response;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error reading from PLC: {ex.Message}");
+        return string.Empty;
+    }
+}
 
-이 메서드는 PLC의 특정 주소의 값을 초기화하는 비동기 메서드입니다.
-주소와 초기화할 값을 포함한 명령어를 생성하여 PLC에 전송합니다.
-OpenPort 및 ClosePort 메서드:
+public async Task ClearPLCValueAsync(string address)
+{
+    if (_port == null || !_port.IsOpen)
+    {
+        throw new InvalidOperationException("The serial port is not open.");
+    }
 
-시리얼 포트를 열고 닫는 메서드입니다. OpenPort 메서드는 시리얼 포트가 설정되어 있고 닫혀 있을 경우 열고, ClosePort 메서드는 시리얼 포트가 열려 있을 경우 닫습니다.
-이 수정된 ComPortManager 클래스는 PLC와의 시리얼 통신을 관리하며, 데이터를 읽어오고 전송할 수 있는 기능을 제공합니다. 위의 메서드를 사용하여 원하는 데이터 읽
+    try
+    {
+        string command = $"%01#WDD{address}0000**\r";
+        byte[] commandBytes = Encoding.ASCII.GetBytes(command);
+        await Task.Run(() => _port.Write(commandBytes, 0, commandBytes.Length));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error clearing PLC value: {ex.Message}");
+    }
+}
+3. 설명
+PLC에 값 쓰기: WriteToPLCAndCheckResponse 메서드는 DT2300에 1부터 4까지의 값을 쓰는 역할을 합니다.
+
+3초 대기 후 확인: 값을 쓴 후 Task.Delay(3000)를 사용하여 3초간 대기합니다.
+
+DT2330 값 확인 및 초기화: 대기 후, ReadFromPLCAsync 메서드를 사용하여 DT2330에서 값을 읽고, 받은 값이 전송된 값과 일치하는지 확인합니다. 값이 일치하면 로그를 찍고, ClearPLCValueAsync 메서드를 사용하여 DT2330의 값을 0으로 초기화합니다.
+
+로깅: 각 단계마다 로그를 찍어 작업 상태를 기록합니다. 작업이 실패하거나 성공한 경우도 로그로 남기게 됩니다.
+
+이 코드 수정으로 인해 PLC와의 통신이 보다 안정적이고 명확하게 관리될 것입니다. 또한, 각 작업의 결과가 로그로 남기 때문에 문제를 디버깅하거나 상태를 모니터링하는 데 도움이 됩니
