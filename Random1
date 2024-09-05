@@ -1,7 +1,7 @@
-이 요구사항을 충족하기 위해, ComPortManager와 MainViewModel에 몇 가지 수정과 추가 작업이 필요합니다. 여기서는 PLC에 1부터 4까지의 값을 쓰고, 3초 후 DT2330에 해당 값이 들어오는지 확인하는 로직을 추가합니다. 그런 다음 로그를 남기고 DT2330의 값을 0으로 초기화하는 절차를 구현합니다.
+당신의 요구사항에 맞춰 MainViewModel에서 PLC에 값을 쓴 후, 3초 대기 후부터 해당 값이 PLC로부터 수신될 때까지 최대 30초간 기다리는 로직을 구현하겠습니다. 만약 30초 안에 기대한 값이 수신되지 않으면 오류 로그를 메인 UI에 전송하도록 하겠습니다.
 
 1. MainViewModel.cs 수정
-먼저 MainViewModel에 로직을 추가하여 값을 쓰고, 3초 후에 값을 확인하는 작업을 합니다.
+아래는 MainViewModel에서 변경된 코드입니다.
 
 csharp
 코드 복사
@@ -44,9 +44,6 @@ namespace RouterMiddleACR.ViewModels
         // Zero부터 4까지 버튼 명령들
         public ObservableCollection<KeyValuePair<string, ICommand>> ButtonCommands { get; set; }
 
-        // DT2330 버튼 명령들
-        public ObservableCollection<KeyValuePair<string, ICommand>> DT2330Commands { get; set; }
-
         // 명령 생성
         public ICommand SendTextBoxValueCommand { get; }
         public ICommand ProcessDT2330Command { get; }
@@ -57,9 +54,7 @@ namespace RouterMiddleACR.ViewModels
             _comPortManager.ConfigurePort("COM1");
 
             ButtonCommands = new ObservableCollection<KeyValuePair<string, ICommand>>();
-            DT2330Commands = new ObservableCollection<KeyValuePair<string, ICommand>>();
             InitializeCommands();
-            InitializeDT2330Commands();
 
             // 명령 초기화
             SendTextBoxValueCommand = new RelayCommand<string>(async (value) => await SendTextBoxValueToPLC(value));
@@ -80,17 +75,6 @@ namespace RouterMiddleACR.ViewModels
             }
         }
 
-        private void InitializeDT2330Commands()
-        {
-            for (int i = 0; i <= 4; i++)
-            {
-                int value = i;
-                DT2330Commands.Add(new KeyValuePair<string, ICommand>(
-                    $"Process DT2330 - {i}",
-                    new RelayCommand(async () => await ProcessDT2330Value(value))));
-            }
-        }
-
         public async Task WriteToPLCAndCheckResponse(int number)
         {
             // Step 1: Write value to DT2300
@@ -101,16 +85,28 @@ namespace RouterMiddleACR.ViewModels
             // Step 2: Wait for 3 seconds
             await Task.Delay(3000);
 
-            // Step 3: Read from DT2330
-            string response = await _comPortManager.ReadFromPLCAsync("023300");
-            if (response.Contains(number.ToString()))
+            // Step 3: Read from DT2330 with a 30-second timeout
+            bool success = false;
+            DateTime startTime = DateTime.Now;
+
+            while ((DateTime.Now - startTime).TotalSeconds < 30)
             {
-                LogMessage($"Operation completed successfully. Value {number} received from DT2330.");
-                await _comPortManager.ClearPLCValueAsync("023300");
+                string response = await _comPortManager.ReadFromPLCAsync("023300");
+
+                if (response.Contains(number.ToString()))
+                {
+                    LogMessage($"Operation completed successfully. Value {number} received from DT2330.");
+                    success = true;
+                    await _comPortManager.ClearPLCValueAsync("023300");
+                    break;
+                }
+
+                await Task.Delay(1000); // 1초마다 체크
             }
-            else
+
+            if (!success)
             {
-                LogMessage($"Operation failed. Expected value {number} not received.");
+                LogMessage($"ERROR: Operation failed. Expected value {number} not received from DT2330 within 30 seconds.");
             }
         }
 
@@ -126,15 +122,6 @@ namespace RouterMiddleACR.ViewModels
             {
                 LogMessage("Invalid value.");
             }
-        }
-
-        public async Task ProcessDT2330Value(int value)
-        {
-            // DT2330 값을 처리하고, 특정 작업을 수행합니다
-            LogMessage($"Processed value from DT2330: {value}");
-
-            // 필요에 따라 값을 초기화하거나 다른 작업을 수행할 수 있습니다
-            await _comPortManager.ClearPLCValueAsync("023300");
         }
 
         public async Task ReadAndClearDT2330Data()
@@ -177,58 +164,20 @@ namespace RouterMiddleACR.ViewModels
         }
     }
 }
-2. ComPortManager.cs 추가
-PLC로부터 값을 읽어오고 값을 초기화하는 메서드는 이미 이전에 제공된 코드를 기반으로 작성되었습니다. 여기서는 추가 수정 없이 기존 코드에서 제공된 ReadFromPLCAsync 및 ClearPLCValueAsync 메서드를 사용하면 됩니다.
+주요 변경 사항 및 설명
+PLC에 값 쓰기 (WriteToPLCAndCheckResponse 메서드):
 
-csharp
-코드 복사
-public async Task<string> ReadFromPLCAsync(string address)
-{
-    if (_port == null || !_port.IsOpen)
-    {
-        throw new InvalidOperationException("The serial port is not open.");
-    }
+PLC의 DT2300 주소에 1부터 4까지의 값을 씁니다.
+SendDataToPLCAsync를 통해 값을 PLC로 전송하고, 로그 메시지를 기록합니다.
+3초 대기:
 
-    try
-    {
-        string command = $"%01#RDD{address}**\r";
-        byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-        _port.Write(commandBytes, 0, commandBytes.Length);
-        var response = await Task.Run(() => _port.ReadLine());
-        return response;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error reading from PLC: {ex.Message}");
-        return string.Empty;
-    }
-}
+Task.Delay(3000)을 사용하여 3초간 대기합니다.
+DT2330 값 확인 및 30초 타임아웃:
 
-public async Task ClearPLCValueAsync(string address)
-{
-    if (_port == null || !_port.IsOpen)
-    {
-        throw new InvalidOperationException("The serial port is not open.");
-    }
+3초 대기 후, DT2330의 값을 읽기 시작합니다.
+1초마다 DT2330의 값을 확인하고, 기대한 값이 도착하면 성공 로그를 기록하고 값을 0으로 초기화합니다.
+DateTime.Now를 이용하여 30초 타임아웃을 설정하며, 30초 안에 기대한 값이 수신되지 않으면 오류 로그를 기록합니다.
+로깅:
 
-    try
-    {
-        string command = $"%01#WDD{address}0000**\r";
-        byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-        await Task.Run(() => _port.Write(commandBytes, 0, commandBytes.Length));
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error clearing PLC value: {ex.Message}");
-    }
-}
-3. 설명
-PLC에 값 쓰기: WriteToPLCAndCheckResponse 메서드는 DT2300에 1부터 4까지의 값을 쓰는 역할을 합니다.
-
-3초 대기 후 확인: 값을 쓴 후 Task.Delay(3000)를 사용하여 3초간 대기합니다.
-
-DT2330 값 확인 및 초기화: 대기 후, ReadFromPLCAsync 메서드를 사용하여 DT2330에서 값을 읽고, 받은 값이 전송된 값과 일치하는지 확인합니다. 값이 일치하면 로그를 찍고, ClearPLCValueAsync 메서드를 사용하여 DT2330의 값을 0으로 초기화합니다.
-
-로깅: 각 단계마다 로그를 찍어 작업 상태를 기록합니다. 작업이 실패하거나 성공한 경우도 로그로 남기게 됩니다.
-
-이 코드 수정으로 인해 PLC와의 통신이 보다 안정적이고 명확하게 관리될 것입니다. 또한, 각 작업의 결과가 로그로 남기 때문에 문제를 디버깅하거나 상태를 모니터링하는 데 도움이 됩니
+각 단계에서 로그를 기록하여 작업의 진행 상황을 파악할 수 있습니다. 오류가 발생할 경우에도 로그가 남도록 합니다.
+이 코드 구조를 사용하면, PLC와의 통신이 안정적으로 수행되며, 작업 실패 시 오류 로그를 통해 디버깅이 가능합니다. 서비스 측에서 로그 메시지를 전송할 때는 소켓이나 다른 통신 방식을 사용할 수 있으며, 메인 UI에서 이를 수신하여 사용자에게 알릴 수 있습니다
