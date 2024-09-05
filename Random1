@@ -1,7 +1,9 @@
-PLC 시뮬레이터의 동작을 디버깅하고 모든 상태를 자세히 로깅하려면 각 주요 동작과 메서드에 디버그 로그를 추가해야 합니다. 이를 통해 PLC 시뮬레이터가 어떤 작업을 수행 중인지, 그리고 각 단계에서 어떤 데이터가 처리되고 있는지를 확인할 수 있습니다.
+PLC 시뮬레이터를 수정하여 상대가 D2300에 값을 쓰면 해당 값을 D2330에 복사해 넣고, D2310에는 최대 20글자의 문자열 데이터를 처리하도록 하겠습니다.
+
+이 수정된 시뮬레이터는 D2300에서 데이터를 수신하고 그 값을 D2330에 복사하며, D2310에 문자열 데이터를 수신하고 표시합니다.
 
 수정된 PLCSimulator.cs
-PLCSimulator 클래스에 디버그 로그를 추가하여 동작 상태를 상세히 기록하도록 수정했습니다.
+아래는 요구 사항을 반영하여 수정된 PLCSimulator.cs 코드입니다:
 
 csharp
 코드 복사
@@ -15,9 +17,12 @@ namespace PLCPanaSimul.Services
     public class PLCSimulator
     {
         private Dictionary<string, int> _memory; // PLC의 메모리 시뮬레이션
+        private Dictionary<string, string> _stringMemory; // 문자열을 저장하는 메모리 시뮬레이션
         private Action<string> _logCallback; // 로그 출력 콜백
+        private ComPortManager _comPortManager; // 시리얼 포트 관리자
+        private int _checkInterval = 1000; // 메모리 값 체크 간격 (밀리초)
 
-        public PLCSimulator(Action<string> logCallback)
+        public PLCSimulator(Action<string> logCallback, string comPort)
         {
             _memory = new Dictionary<string, int>
             {
@@ -26,7 +31,15 @@ namespace PLCPanaSimul.Services
                 { "R520", 0 },
                 { "R521", 0 }
             };
+
+            _stringMemory = new Dictionary<string, string>
+            {
+                { "D2310", string.Empty }
+            };
+
             _logCallback = logCallback;
+            _comPortManager = new ComPortManager(comPort, ProcessReceivedData);
+            _comPortManager.OpenPort();
 
             Debug.WriteLine("PLC 시뮬레이터 초기화 완료."); // 디버그 로그
         }
@@ -42,14 +55,33 @@ namespace PLCPanaSimul.Services
             {
                 Debug.WriteLine($"WDD 명령 발견. 데이터: {data}"); // 디버그 로그
 
-                // 예시: D2330에 쓰기 명령이 포함된 경우 처리
-                if (data.Contains("D2330"))
+                // 예시: D2300에 쓰기 명령이 포함된 경우 처리
+                if (data.Contains("D2300"))
                 {
-                    Debug.WriteLine($"D2330 쓰기 명령 발견."); // 디버그 로그
+                    Debug.WriteLine($"D2300 쓰기 명령 발견."); // 디버그 로그
 
-                    // 명령에서 값을 추출하여 D2330에 저장
+                    // 명령에서 값을 추출하여 D2300에 저장
                     var value = ExtractValueFromCommand(data);
+                    WriteDataToPLC("D2300", value);
+
+                    // D2300의 값을 D2330으로 복사하여 상대방이 읽을 수 있도록 준비
                     WriteDataToPLC("D2330", value);
+                }
+            }
+
+            // 문자열 데이터 쓰기 명령 처리 (예: D2310)
+            if (data.Contains("WDS"))
+            {
+                Debug.WriteLine($"WDS 명령 발견. 데이터: {data}"); // 디버그 로그
+
+                // 예시: D2310에 문자열 쓰기 명령이 포함된 경우 처리
+                if (data.Contains("D2310"))
+                {
+                    Debug.WriteLine($"D2310 문자열 쓰기 명령 발견."); // 디버그 로그
+
+                    // 명령에서 문자열을 추출하여 D2310에 저장
+                    var value = ExtractStringFromCommand(data);
+                    WriteStringToPLC("D2310", value);
                 }
             }
         }
@@ -65,18 +97,40 @@ namespace PLCPanaSimul.Services
             }
         }
 
-        // PLC로 데이터를 전송하는 메서드 (시뮬레이션)
-        public void SendDataToPLC(string address, string value)
+        // PLC 메모리에 문자열 데이터를 쓰는 메서드
+        public void WriteStringToPLC(string address, string value)
         {
-            if (_memory.ContainsKey(address))
+            if (_stringMemory.ContainsKey(address))
             {
-                _memory[address] = int.Parse(value);
-                _logCallback?.Invoke($"Data sent to {address}: {value}");
-                Debug.WriteLine($"{address}에 데이터 {value} 전송 완료."); // 디버그 로그
+                // 문자열은 최대 20글자로 제한
+                _stringMemory[address] = value.Length > 20 ? value.Substring(0, 20) : value;
+                _logCallback?.Invoke($"String written to {address}: {_stringMemory[address]}");
+                Debug.WriteLine($"{address}에 문자열 '{_stringMemory[address]}' 기록 완료."); // 디버그 로그
+            }
+        }
 
-                // 동작 완료를 시뮬레이션하기 위해 3초 후에 D2330에 동작 완료 값을 씀
-                Task.Delay(3000).ContinueWith(_ => CompleteOperation("D2330"));
-                Debug.WriteLine("3초 후 D2330에 동작 완료 값을 쓸 예정."); // 디버그 로그
+        // PLC 메모리 값을 주기적으로 체크하는 메서드
+        public async void StartCheckingMemory()
+        {
+            while (true)
+            {
+                if (_memory.ContainsKey("D2330"))
+                {
+                    int currentValue = _memory["D2330"];
+                    Debug.WriteLine($"현재 D2330 값: {currentValue}"); // 디버그 로그
+
+                    // 여기서 현재 값이 필요한 작업을 수행
+                    // 예: 특정 값일 때 로그 출력
+                    if (currentValue != 0)
+                    {
+                        _logCallback?.Invoke($"Checking D2330, value: {currentValue}");
+
+                        // 작업이 끝난 후 값을 다시 0으로 초기화
+                        WriteDataToPLC("D2330", 0);
+                    }
+                }
+
+                await Task.Delay(_checkInterval); // 지정된 간격으로 체크
             }
         }
 
@@ -113,28 +167,48 @@ namespace PLCPanaSimul.Services
             Debug.WriteLine($"명령에서 추출된 값: {extractedValue}"); // 디버그 로그
             return extractedValue;
         }
+
+        // 명령에서 문자열을 추출하는 메서드 (예시로, 문자열에서 값 부분을 추출)
+        private string ExtractStringFromCommand(string command)
+        {
+            Debug.WriteLine($"명령에서 문자열 추출 시작: {command}"); // 디버그 로그
+            // 명령의 형식에 따라 문자열을 추출하는 로직 구현 필요
+            // 예시로, "WDS2310HelloWorld" 형식에서 'HelloWorld' 문자열을 추출한다고 가정
+            string valueString = command.Substring(8); // 문자열 시작 위치 조정 필요
+            Debug.WriteLine($"명령에서 추출된 문자열: {valueString}"); // 디버그 로그
+            return valueString;
+        }
     }
 }
-수정된 내용 설명
+주요 변경 사항 및 설명
+_stringMemory 초기화:
+
+D2310과 같은 문자열 데이터를 저장할 메모리 공간을 추가했습니다.
+ProcessReceivedData 메서드:
+
+D2300에 값을 쓰면, 해당 값을 D2330에 복사하도록 했습니다. 이렇게 하면 상대방이 D2330을 읽을 수 있습니다.
+D2310에 문자열 쓰기 명령을 처리하는 로직을 추가했습니다. WDS 명령을 통해 문자열 데이터를 수신하고 이를 D2310에 저장합니다.
+WriteStringToPLC 메서드:
+
+D2310과 같은 메모리 주소에 문자열 데이터를 쓰는 메서드를 추가했습니다. 문자열은 최대 20글자로 제한하며, 초과할 경우 잘라내어 저장합니다.
+ExtractStringFromCommand 메서드:
+
+문자열 데이터 명령에서 값을 추출하는 메서드를 추가했습니다. 예를 들어, 명령에서 'HelloWorld'와 같은 문자열을 추출합니다.
 디버그 로그 추가:
 
-각 메서드의 시작 부분, 주요 로직 실행 전후, 그리고 조건문 안에서 디버그 로그를 추가했습니다. 이를 통해 프로그램의 실행 흐름을 자세히 추적할 수 있습니다.
-Debug.WriteLine 메서드를 사용하여 디버그 창에 로그 메시지를 출력합니다. 이를 통해 디버깅 시 현재 프로그램이 어떤 동작을 하고 있는지, 어떤 데이터를 처리하고 있는지를 실시간으로 확인할 수 있습니다.
-디버그 로그 메시지 내용:
+각 메서드와 주요 조건문에 디버그 로그를 추가하여 현재 상태와 처리 중인 데이터를 상세히 기록합니다.
+사용 방법
+PLC 시뮬레이터 실행:
 
-한글로 작성하여 각 동작이 무엇을 의미하는지 쉽게 이해할 수 있도록 했습니다. 예를 들어, "D2330 쓰기 명령 발견."과 같은 메시지는 프로그램이 해당 명령을 인식했음을 알려줍니다.
-값 추출이나 데이터 쓰기 등 중요한 동작이 수행될 때마다 해당 동작을 명시적으로 기록합니다.
-용도:
+프로그램을 실행하면 PLC 시뮬레이터가 초기화되고, COM 포트가 열립니다.
+데이터 전송 및 응답 시뮬레이션:
 
-이 코드를 실행할 때 Visual Studio의 디버그 창을 통해 출력되는 로그를 확인할 수 있습니다. 이를 통해 프로그램이 예상대로 작동하는지, 또는 특정 명령이 제대로 처리되지 않는지 등을 확인할 수 있습니다.
-디버깅 방법
-디버그 모드 실행:
+상대방(테스트 장비 또는 다른 시뮬레이터)에서 COM 포트를 통해 D2300에 데이터를 전송하면, PLCSimulator가 이를 받아 D2330에 동일한 값을 씁니다.
+문자열 데이터를 D2310에 전송하면, 해당 문자열이 저장되고 로그로 출력됩니다.
+메모리 확인:
 
-Visual Studio에서 프로젝트를 디버그 모드로 실행합니다.
+StartCheckingMemory 메서드를 통해 주기적으로 메모리 값을 확인하며, 특정 조건에 맞는 동작을 수행합니다.
 디버그 로그 확인:
 
-프로그램을 실행한 후, Visual Studio의 "출력(Output)" 창에서 "디버그(Debug)" 드롭다운을 선택하여 Debug.WriteLine으로 출력된 로그 메시지를 확인합니다.
-테스트:
-
-PLC 시뮬레이터에서 신호를 보내거나 데이터를 쓰고 나서 출력 창에 로그가 제대로 나오는지 확인합니다. 이 과정을 통해 PLC 시뮬레이터의 동작을 정확히 이해하고 필요한 부분을 수정할 수 있습니다.
-이와 같은 디버깅 로그를 사용하면 PLC 시뮬레이터의 상태를 더 명확하게 이해하고, 예상치 못한 동작이나 에러를 빠르게 찾을 수 있습니
+Visual Studio에서 프로그램을 디버그 모드로 실행하여 디버그 창에서 로그를 확인할 수 있습니다. 이를 통해 시뮬레이터의 동작을 상세히 확인하고 필요한 수정 작업을 수행할 수 있습니다.
+이 수정된 코드로 PLC 시뮬레이터는 COM 포트를 통해 데이터를 수신하고, 특정 메모리 주소에 값을 저장하며, 그 값을 주기적으로 확인하여 필요한 작업을 수행하게 됩
