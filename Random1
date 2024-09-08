@@ -1,437 +1,67 @@
-선된 요구사항 요약:
-작업이 완료된 후에만 "out" 또는 "stack" 상태를 ProductOrderModel의 POStatus에 갱신합니다.
-큐에 작업이 쌓인 경우 미완료 작업 목록만 실시간으로 보여주며, 완료된 작업은 리스트에서 제거됩니다.
-큐에서 작업이 완료되면 그 결과를 표에 갱신해야 합니다.
-수정된 전체 코드 (상세 주석 포함)
+정된 EnqueueTask() 함수:
 csharp
 코드 복사
-using System;
-using System.Collections.Concurrent;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-
-namespace GumiChecker
+// 큐에 작업 추가 후 바로 작업 실행
+private void EnqueueTask(string taskType, ProductOrderModel order)
 {
-    public class FileCheckerMES20
+    _taskQueue.Enqueue((taskType, order)); // 작업을 큐에 추가
+
+    // 큐에 추가한 후 즉시 큐 작업 실행
+    if (!_isProcessingTask) // 이미 다른 작업을 처리 중이지 않을 때만 실행
     {
-        private readonly string _logDirectory = @"C:\G-MES2.0\GUMI_WEB\log"; // 로그 파일 경로
-        private readonly string _filePattern = @"^\d{1,3}(\.\d{1,3}){3}_M4OI[A-Za-z0-9]+_gumi[A-Za-z0-9]+_(\d{2})\.log$"; // 로그 파일 이름 패턴
-        private string _currentMonitoredFile; // 현재 감시 중인 파일 경로
-        private long _lastPlanSelectedPosition = 0; // 파일 내 마지막 PLAN Selected 위치
-        private DateTime _lastWriteTime; // 파일이 마지막으로 수정된 시간
-        private bool _isProcessingTask = false; // 현재 작업 처리 중인지 여부
-
-        private ProductOrderModel _currentProductOrder; // 현재 처리 중인 주문 정보
-        private ProductOrderModel _previousProductOrder; // 이전에 처리된 주문 정보
-
-        private ObservableCollection<ProductOrderModel> _productOrders; // 주문 목록 (UI와 바인딩됨)
-        private ObservableCollection<string> _taskList; // 미완료 작업 상태 목록 (UI와 바인딩됨)
-        private ConcurrentQueue<(string taskType, ProductOrderModel order)> _taskQueue = new ConcurrentQueue<(string, ProductOrderModel)>(); // 비동기 작업 큐
-        private ComportManager _comPortPLC; // PLC와의 통신 매니저
-        private const int _R520SensorTimeout = 180000; // R520/R521 센서 감지 타임아웃 (3분)
-
-        // 생성자: 의존성을 주입하고 초기 설정을 수행
-        public FileCheckerMES20(ObservableCollection<ProductOrderModel> productOrders, ComportManager comPortManager, ObservableCollection<string> taskList)
-        {
-            _productOrders = productOrders; // 주문 목록 초기화
-            _comPortPLC = comPortManager; // PLC 통신 객체 초기화
-            _taskList = taskList; // 작업 상태 리스트 초기화
-
-            // 현재 감시할 최신 로그 파일 설정
-            _currentMonitoredFile = GetLatestLogFile();
-            _lastWriteTime = _currentMonitoredFile != null
-                ? File.GetLastWriteTime(_currentMonitoredFile)
-                : DateTime.MinValue;
-
-            // 첫 실행 시 로그 파일 내 PLAN Selected 위치 찾기
-            FindLastPlanSelected(_currentMonitoredFile);
-        }
-
-        // 최신 로그 파일을 가져오는 메소드
-        private string GetLatestLogFile()
-        {
-            var logFiles = new DirectoryInfo(_logDirectory).GetFiles("*.log")
-                .Where(f => Regex.IsMatch(f.Name, _filePattern))
-                .OrderByDescending(f => f.LastWriteTime)
-                .ToList();
-
-            return logFiles.FirstOrDefault()?.FullName;
-        }
-
-        // 파일에서 마지막 PLAN Selected 위치를 찾는 메소드
-        private void FindLastPlanSelected(string filePath)
-        {
-            if (filePath == null) return; // 파일이 없으면 바로 종료
-
-            using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var streamReader = new StreamReader(fileStream))
-            {
-                string line;
-                long currentPosition = 0;
-
-                while ((line = streamReader.ReadLine()) != null)
-                {
-                    currentPosition = fileStream.Position; // 현재 파일 포인터 위치
-
-                    if (line.Contains("PLAN Selected"))
-                    {
-                        _lastPlanSelectedPosition = currentPosition; // PLAN Selected 위치 저장
-                    }
-
-                    ProcessLogLine(line, filePath, false); // 첫 실행 시 실제 작업 처리 없이 표에만 표시
-                }
-            }
-        }
-
-        // 로그 파일의 각 줄을 처리하는 메소드 (비동기 방식으로 처리)
-        private async Task ProcessLogLineAsync(string line, string filePath)
-        {
-            string fileName = Path.GetFileNameWithoutExtension(filePath);
-            string dayString = fileName.Substring(fileName.Length - 2); // 파일명에서 날짜 추출
-            string currentYearMonth = DateTime.Now.ToString("yyyyMM"); // 현재 연도 및 월
-            string fullDate = currentYearMonth + dayString; // yyyyMMdd 형식으로 날짜 조합
-
-            // 로그 행에서 시간값(시분초.밀리초)을 추출
-            string timestamp = ExtractTimestamp(line);
-
-            if (line.Contains("PLAN Selected"))
-            {
-                var splitLine = line.Split(' ');
-                string productOrder = splitLine[1];
-
-                if (timestamp != null)
-                {
-                    string fullDateTime = fullDate + " " + timestamp;
-
-                    // 새로운 주문이거나 다른 주문일 경우 처리
-                    if (_currentProductOrder == null || _currentProductOrder.ProductOrder != productOrder)
-                    {
-                        // 이전 주문이 있는 경우 배출 처리
-                        if (_previousProductOrder != null)
-                        {
-                            // 배출 함수는 센서 체크 이후에 동작하도록 함
-                            if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
-                            {
-                                EnqueueTask("배출", _previousProductOrder); // 배출 작업 큐에 추가
-                            }
-                            else
-                            {
-                                _taskList.Add("센서 체크 실패로 배출 중단");
-                            }
-                        }
-
-                        // 새로운 주문 생성 및 상태 추가
-                        _currentProductOrder = new ProductOrderModel
-                        {
-                            ProductOrder = productOrder,
-                            PDate = fullDateTime,
-                            POStatus = "wait"
-                        };
-
-                        _previousProductOrder = _currentProductOrder; // 현재 주문을 이전 주문으로 설정
-                        _productOrders.Add(_currentProductOrder); // 주문 목록에 추가
-                    }
-                }
-            }
-            else if (line.Contains("FNL^") && _currentProductOrder != null)
-            {
-                _currentProductOrder.POStatus = "stack";
-
-                // 적재 함수는 센서 체크 이후에 동작하도록 함
-                if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
-                {
-                    EnqueueTask("적재", _currentProductOrder); // 적재 작업 큐에 추가
-                }
-                else
-                {
-                    _taskList.Add("센서 체크 실패로 적재 중단");
-                }
-            }
-            else if (line.Contains("BasicModel") && _currentProductOrder != null)
-            {
-                var modelData = line.Split(':')[1].Trim();
-                _currentProductOrder.BasicModel = modelData;
-            }
-            else if (line.Contains("MB^") && _currentProductOrder != null)
-            {
-                var mbData = line.Split('^');
-                _currentProductOrder.PORemain = int.Parse(mbData[1]);
-                _currentProductOrder.MGCount = int.Parse(mbData[2]);
-            }
-            else if (line.Contains("JB^") && _currentProductOrder != null)
-            {
-                _currentProductOrder.PCount++;
-            }
-        }
-
-        // 시간값을 추출하는 함수 (시분초와 밀리초 분리)
-        private string ExtractTimestamp(string line)
-        {
-            var match = Regex.Match(line, @"\[(\d{6})\.(\d{3})\]");
-            if (match.Success)
-            {
-                string timePart = match.Groups[1].Value;
-                string millisPart = match.Groups[2].Value;
-
-                string hours = timePart.Substring(0, 2);
-                string minutes = timePart.Substring(2, 2);
-                string seconds = timePart.Substring(4, 2);
-
-                return $"{hours}:{minutes}:{seconds}.{millisPart}";
-            }
-            return null;
-        }
-
-        // 배출 작업을 처리하는 비동기 메소드 (센서 체크 후 배출)
-        private async Task ExecuteOutFunction(ProductOrderModel order)
-        {
-            _taskQueue.Enqueue(("배출", order)); // 작업을 큐에 넣음
-            await ProcessQueueAsync(); // 큐 작업 처리
-        }
-
-        // 적재 작업을 처리하는 비동기 메소드 (센서 체크 후 적재)
-        private async Task ExecuteStackFunction(ProductOrderModel order)
-        {
-            _taskQueue.Enqueue(("적재", order)); // 작업을 큐에 넣음
-            await ProcessQueueAsync(); // 큐 작업 처리
-        }
-
-        // 큐에서 작업을 처리하는 비동기 메소드
-        private async Task ProcessQueueAsync()
-        {
-            _isProcessingTask = true;
-
-            while (_taskQueue.TryDequeue(out (string taskType, ProductOrderModel order) task))
-            {
-                _taskList.Add($"처리 중: {task.taskType}: {task.order.ProductOrder}");
-
-                if (task.taskType == "적재")
-                {
-                    await ProcessStackAsync(task.order); // 적재 작업 처리
-                }
-                else if (task.taskType == "배출")
-                {
-                    await ProcessOutAsync(task.order); // 배출 작업 처리
-                }
-
-                // 완료된 작업을 리스트에서 삭제
-                _taskList.Remove($"처리 중: {task.taskType}: {task.order.ProductOrder}");
-
-                // 완료된 작업에 따라 상태를 갱신 (out 또는 stack)
-                task.order.POStatus = task.taskType == "적재" ? "stack" : "out";
-            }
-
-            _isProcessingTask = false;
-        }
-
-        // 적재 작업을 처리하는 메소드 (비동기)
-        private async Task ProcessStackAsync(ProductOrderModel order)
-        {
-            _taskList.Add($"PLC 적재 신호 전송: {order.ProductOrder}");
-
-            bool isCommandSent = SendStackCommandToPLC();
-
-            if (isCommandSent)
-            {
-                _taskList.Add($"WD13 응답 대기: {order.ProductOrder}");
-                bool isWD13Response = await WaitForWD13ResponseAsync();
-                if (isWD13Response)
-                {
-                    _taskList.Add($"WD13 응답 완료: {order.ProductOrder}");
-                    bool isSensorSuccess = await MonitorSensorsAsync();
-                    if (isSensorSuccess)
-                    {
-                        _taskList.Add($"적재 완료: {order.ProductOrder}");
-                    }
-                    else
-                    {
-                        _taskList.Add($"적재 실패(3분 초과): {order.ProductOrder}");
-                        ShowError($"적재 실패: {order.ProductOrder} (3분 내 감지되지 않음)");
-                    }
-                }
-                else
-                {
-                    _taskList.Add($"WD13 응답 실패: {order.ProductOrder}");
-                    ShowError($"WD13 응답 실패: {order.ProductOrder}");
-                }
-            }
-
-            // 완료된 작업 제거
-            _taskList.Remove($"PLC 적재 신호 전송: {order.ProductOrder}");
-        }
-
-        // 배출 작업을 처리하는 메소드 (비동기)
-        private async Task ProcessOutAsync(ProductOrderModel order)
-        {
-            _taskList.Add($"PLC 배출 신호 전송: {order.ProductOrder}");
-
-            // 배출 로직 처리 (생략된 부분은 필요에 맞게 추가 가능)
-            await Task.Delay(1000); // 예시로 1초 지연
-
-            _taskList.Add($"배출 완료: {order.ProductOrder}");
-
-            // 완료된 작업 제거
-            _taskList.Remove($"PLC 배출 신호 전송: {order.ProductOrder}");
-        }
-
-        // 센서 감시 함수 (R520, R521 센서 감시)
-        private async Task<bool> MonitorSensorsAsync()
-        {
-            var startTime = DateTime.Now;
-
-            while ((DateTime.Now - startTime).TotalMilliseconds < _R520SensorTimeout)
-            {
-                bool isR520Detected = ReadSensor("R520");
-                bool isR521Detected = ReadSensor("R521");
-
-                if (isR520Detected)
-                {
-                    _taskList.Add("R520 감지됨");
-
-                    while (!ReadSensor("R520"))
-                    {
-                        await Task.Delay(100);
-                    }
-
-                    _taskList.Add("R520 꺼짐 확인");
-
-                    if (isR521Detected)
-                    {
-                        _taskList.Add("R521 감지됨");
-                        return true;
-                    }
-                }
-
-                await Task.Delay(100);
-            }
-
-            return false;
-        }
-
-        // PLC에 적재 신호 전송 함수 (가정된 구현)
-        private bool SendStackCommandToPLC()
-        {
-            return true;
-        }
-
-        // WD13 응답 대기 함수 (비동기)
-        private async Task<bool> WaitForWD13ResponseAsync()
-        {
-            await Task.Delay(2000); // 예시로 2초 대기
-            return true;
-        }
-
-        // 에러 처리 함수
-        private void ShowError(string message)
-        {
-            msgvs.Instance.LogT2(message); // 에러 메시지 기록
-        }
-
-        // 큐에 작업 추가
-        private void EnqueueTask(string taskType, ProductOrderModel order)
-        {
-            _taskQueue.Enqueue((taskType, order)); // 작업을 큐에 추가
-        }
-    }
-
-    // ProductOrderModel: 제품 주문 정보를 담고 있으며 UI와 데이터 바인딩을 지원
-    public class ProductOrderModel : INotifyPropertyChanged
-    {
-        private string _productOrder;
-        private string _basicModel;
-        private int _poRemain;
-        private int _mgCount;
-        private int _pCount;
-        private string _poStatus;
-        private string _pDate;
-
-        public string ProductOrder
-        {
-            get => _productOrder;
-            set
-            {
-                _productOrder = value;
-                OnPropertyChanged(nameof(ProductOrder));
-            }
-        }
-
-        public string BasicModel
-        {
-            get => _basicModel;
-            set
-            {
-                _basicModel = value;
-                OnPropertyChanged(nameof(BasicModel));
-            }
-        }
-
-        public int PORemain
-        {
-            get => _poRemain;
-            set
-            {
-                _poRemain = value;
-                OnPropertyChanged(nameof(PORemain));
-            }
-        }
-
-        public int MGCount
-        {
-            get => _mgCount;
-            set
-            {
-                _mgCount = value;
-                OnPropertyChanged(nameof(MGCount));
-            }
-        }
-
-        public int PCount
-        {
-            get => _pCount;
-            set
-            {
-                _pCount = value;
-                OnPropertyChanged(nameof(PCount));
-            }
-        }
-
-        public string POStatus
-        {
-            get => _poStatus;
-            set
-            {
-                _poStatus = value;
-                OnPropertyChanged(nameof(POStatus));
-            }
-        }
-
-        public string PDate
-        {
-            get => _pDate;
-            set
-            {
-                _pDate = value;
-                OnPropertyChanged(nameof(PDate));
-            }
-        }
-
-        public event PropertyChangedEventHandler PropertyChanged;
-
-        protected void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
+        _ = ProcessQueueAsync(); // 큐 처리 시작
     }
 }
-주요 변경 사항:
-작업 큐 처리 구조: 이제 작업이 완료된 후에만 표(ProductOrderModel)에 POStatus를 "out" 또는 "stack"으로 갱신하도록 했습니다. 즉, 적재 또는 배출 작업이 끝난 후에야 그 상태가 UI에 반영됩니다.
+전체 흐름 설명:
+**EnqueueTask()**는 작업을 큐에 넣고 바로 **ProcessQueueAsync()**를 호출하여 큐에 있는 작업을 처리합니다.
 
-미완료 작업만 taskList에 표시: 작업이 완료되면 해당 작업은 taskList에서 제거되고, 미완료 작업만 리스트에 남도록 처리되었습니다.
+**ProcessQueueAsync()**는 큐에서 작업을 하나씩 꺼내어 처리하며, 작업이 끝날 때까지 큐에서 다른 작업이 처리되지 않도록 합니다.
 
-큐 처리 로직: EnqueueTask() 함수로 적재/배출 작업을 큐에 넣고, 큐에서 순차적으로 작업을 처리합니다. 큐에서 작업이 완료된 후에만 POStatus가 업데이트됩니다.
+수정된 전체 코드 (주요 부분):
+csharp
+코드 복사
+// 큐에 작업 추가 후 바로 작업 실행
+private void EnqueueTask(string taskType, ProductOrderModel order)
+{
+    _taskQueue.Enqueue((taskType, order)); // 작업을 큐에 추가
 
-이 구조로 적재 또는 배출 작업이 완료된 후에만 UI에 반영되며, 큐에서 미완료된 작업만 실시간으로 보여질 것입니다.
+    // 큐에 추가한 후 즉시 큐 작업 실행
+    if (!_isProcessingTask) // 이미 다른 작업을 처리 중이지 않을 때만 실행
+    {
+        _ = ProcessQueueAsync(); // 큐 처리 시작
+    }
+}
+
+// 큐에서 작업을 처리하는 비동기 메소드
+private async Task ProcessQueueAsync()
+{
+    _isProcessingTask = true; // 작업 처리 중 플래그 설정
+
+    while (_taskQueue.TryDequeue(out (string taskType, ProductOrderModel order) task))
+    {
+        _taskList.Add($"처리 중: {task.taskType}: {task.order.ProductOrder}");
+
+        if (task.taskType == "적재")
+        {
+            await ProcessStackAsync(task.order); // 적재 작업 처리
+        }
+        else if (task.taskType == "배출")
+        {
+            await ProcessOutAsync(task.order); // 배출 작업 처리
+        }
+
+        // 완료된 작업을 리스트에서 삭제
+        _taskList.Remove($"처리 중: {task.taskType}: {task.order.ProductOrder}");
+
+        // 완료된 작업에 따라 상태를 갱신 (out 또는 stack)
+        task.order.POStatus = task.taskType == "적재" ? "stack" : "out";
+    }
+
+    _isProcessingTask = false; // 작업 처리 완료
+}
+추가 설명:
+_isProcessingTask 플래그: 큐에서 동시에 두 개 이상의 작업이 실행되는 것을 방지하기 위해 ProcessQueueAsync()가 실행 중일 때는 _isProcessingTask 플래그를 true로 설정합니다. 작업이 완료되면 다시 false로 설정합니다.
+
+실시간 동기화: 미완료된 작업은 taskList에 실시간으로 표시되며, 작업이 완료되면 taskList에서 제거되고, 해당 주문의 POStatus가 업데이트되어 UI에 반영됩니다.
+
+이제 큐에 작업이 들어가면 바로 처리되며, 작업이 완료되면 POStatus도 적절히 업데이트되고, 작업 목록에서 제거됩니다.
