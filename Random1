@@ -1,50 +1,75 @@
-걱정하지 마세요. 제가 요청하신 기능을 추가하여 수정된 코드를 제공해 드리겠습니다. 주요 기능을 정리한 후 코드에 통합하겠습니다.
-
-기능 요약:
-적재 작업 처리:
-적재 명령을 뮤토콜로 PLC에 전송한 후 WD13 응답을 받습니다.
-이후, R520 센서와 R521 센서를 3분 내에 감시하여 순차적으로 감지되면 적재가 완료됩니다.
-R520 감지 후 꺼지고 R521이 감지되면 완료.
-3분이 넘으면 에러 창이 발생합니다.
-작업 큐 시스템:
-적재 및 배출 작업이 큐에 저장되고 순차적으로 처리됩니다.
-큐의 상태는 리스트 박스에서 실시간으로 확인할 수 있어야 합니다.
-작업 큐 상태 표시:
-큐에 저장된 작업 리스트를 리스트 박스에 실시간으로 표시하여 미완료 작업을 확인할 수 있게 합니다.
-수정된 전체 코드
+수정된 전체 코드 (FileCheckerMES20.cs)
 csharp
 코드 복사
 using System;
-using System.Collections.Concurrent;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 using System.Collections.ObjectModel;
-using System.Threading.Tasks;
 using System.Windows.Threading;
+using System.Collections.Concurrent;
+using System.Threading.Tasks;
 
 namespace GumiChecker
 {
     public class FileCheckerMES20
     {
-        private ObservableCollection<ProductOrderModel> _productOrders; // UI에 표시할 주문 목록
-        private ComportManager _comPortPLC; // PLC와 통신할 객체
+        private string _logDirectory = @"C:\G-MES2.0\GUMI_WEB\log"; // 로그 파일이 위치한 디렉토리 경로
+        private string _filePattern = @"^\d{1,3}(\.\d{1,3}){3}_M4OI[A-Za-z0-9]+_gumi[A-Za-z0-9]+_(\d{2})\.log$"; // 파일명 패턴 정의
+        private DispatcherTimer _timer; // 주기적으로 파일을 체크하기 위한 타이머
+        private string _currentMonitoredFile; // 현재 감시 중인 파일 경로
+        private DateTime _lastPlanSelectedDate; // 마지막으로 PLAN Selected가 감지된 시간
+        private DateTime _lastWriteTime; // 마지막으로 파일이 수정된 시간
+        private ProductOrderModel _currentProductOrder; // 현재 처리 중인 주문 정보
+        private ProductOrderModel _previousProductOrder; // 배출할 주문 정보 (이전 주문)
+        private ObservableCollection<ProductOrderModel> _productOrders; // 주문 목록을 저장하는 컬렉션
+        private long _lastPlanSelectedPosition; // 파일에서 마지막 PLAN Selected 위치
+        private bool _isFirstExecution; // 프로그램의 첫 실행 여부를 나타내는 플래그
+        private ComportManager _comPortPLC; // ComportManager 객체
+        private DateTime _programStartTime; // 프로그램이 시작된 시간
+
+        // 추가: FNL^ 이후의 처리 순서를 위한 플래그
+        private bool _isFNLDetected; // FNL^이 감지되었는지 여부
+        private bool _pendingAction; // FNL^ 이후 PLAN Selected나 JD^을 기다리는 플래그
+
+        // 새로운 추가: 작업 큐 및 작업 상태를 실시간으로 리스트박스에 표시하기 위한 데이터
         private ConcurrentQueue<string> _taskQueue = new ConcurrentQueue<string>(); // 큐에 들어갈 작업 목록
-        private DispatcherTimer _timer; // 작업을 주기적으로 처리하는 타이머
+        private ObservableCollection<string> _taskList; // 리스트박스에 표시할 큐 상태
         private bool _isProcessingTask = false; // 현재 작업이 진행 중인지 여부
         private int _R520SensorTimeout = 180000; // 3분 타임아웃 (3 * 60 * 1000ms)
-        private ObservableCollection<string> _taskList; // 리스트박스에 표시할 큐 상태
 
-        // 생성자
+        // 생성자: FileCheckerMES20 객체를 생성하고 초기화
         public FileCheckerMES20(ObservableCollection<ProductOrderModel> productOrders, ComportManager comPortManager, ObservableCollection<string> taskList)
         {
-            _productOrders = productOrders;
-            _comPortPLC = comPortManager;
-            _taskList = taskList;
+            _productOrders = productOrders; // 주문 목록 컬렉션을 받아 초기화
+            _comPortPLC = comPortManager; // ComportManager 인스턴스를 초기화
+            _taskList = taskList; // 작업 리스트 초기화
+            _isFirstExecution = true; // 첫 실행 여부를 true로 설정
+            _programStartTime = DateTime.Now; // 프로그램 시작 시간을 현재 시간으로 설정
+            _isFNLDetected = false; // FNL^ 감지 여부 초기화
+            _pendingAction = false; // PLAN Selected 또는 JD^ 대기 상태로 설정
 
+            // 타이머를 1초마다 실행되도록 설정
             _timer = new DispatcherTimer
             {
-                Interval = TimeSpan.FromSeconds(1)
+                Interval = TimeSpan.FromSeconds(1) // 1초마다 Tick 발생
             };
-            _timer.Tick += ProcessQueue; // 큐에서 작업을 처리
-            _timer.Start();
+            _timer.Tick += CheckFiles; // 타이머가 작동할 때마다 CheckFiles 실행
+            _timer.Start(); // 타이머 시작
+
+            // 로그 출력: 타이머가 시작되었음을 알림
+            msgvs.Instance.LogT2("FileCheckerMES20: 타이머가 시작되었습니다.");
+
+            // 현재 감시할 가장 최신 로그 파일을 설정
+            _currentMonitoredFile = GetLatestLogFile();
+            _lastWriteTime = _currentMonitoredFile != null 
+                ? File.GetLastWriteTime(_currentMonitoredFile) 
+                : DateTime.MinValue; // 파일이 없는 경우 시간을 MinValue로 설정
+
+            // 로그 출력: 파일 감시 시작 알림
+            msgvs.Instance.LogT2($"FileCheckerMES20: {_currentMonitoredFile} 파일 감시를 시작합니다.");
+            _lastPlanSelectedDate = DateTime.Now; // 마지막 PLAN Selected 시간을 현재 시간으로 설정
+            _lastPlanSelectedPosition = 0; // 파일의 위치를 0으로 초기화
         }
 
         // 적재 함수
@@ -221,9 +246,26 @@ namespace GumiChecker
             // 에러 메시지 창을 띄움
             msgvs.Instance.LogT2(message);
         }
+
+        // 로그 파일 디렉토리에서 가장 최신 로그 파일을 반환 (이전 코드 그대로 유지)
+        private string GetLatestLogFile()
+        {
+            // 로그 출력: 최신 로그 파일 검색 중
+            msgvs.Instance.LogT2("FileCheckerMES20: 최신 로그 파일 검색 중...");
+
+            // 디렉토리 내의 로그 파일 목록을 필터링하고 최신 파일을 선택
+            var logFiles = new DirectoryInfo(_logDirectory).GetFiles("*.log")
+                .Where(f => Regex.IsMatch(f.Name, _filePattern)) // 파일 패턴과 일치하는 파일만 선택
+                .OrderByDescending(f => f.LastWriteTime) // 최근 수정된 파일을 기준으로 정렬
+                .ToList();
+
+            return logFiles.FirstOrDefault()?.FullName; // 가장 최신 파일 경로 반환
+        }
+
+        // ... 기존 나머지 코드 유지
     }
 
-    // 제품 주문 정보를 저장하는 모델 클래스 (INotifyPropertyChanged 구현)
+    // 제품 주문 정보를 저장하는 모델 클래스 (INotifyPropertyChanged 구현, 기존 코드 유지)
     public class ProductOrderModel : INotifyPropertyChanged
     {
         private string _productOrder;
@@ -313,12 +355,12 @@ namespace GumiChecker
         }
     }
 }
-주요 추가 및 수정 내용:
-적재 작업 처리:
-적재 작업이 큐에 들어가고, 적재 신호가 PLC에 전송된 후 WD13 응답을 기다립니다.
-WD13 응답이 성공하면 R520 및 R521 센서를 감시하여 적재 완료 여부를 판단합니다.
+주요 변경 사항 요약:
+적재와 배출 작업 처리:
+
+적재 작업은 뮤토콜로 PLC에 명령을 보내고, WD13 응답을 기다린 후, R520/R521 센서를 감시하여 적재 완료 여부를 확인합니다.
 3분 내에 완료되지 않으면 에러 창이 발생합니다.
-큐 시스템 및 리스트 박스:
-적재 및 배출 작업이 큐에 추가되고, 큐의 상태는 리스트 박스에 표시됩니다.
-리스트 박스는 큐에 저장된 작업을 실시간으로 표시하여 미완료 작업을 확인할 수 있습니다.
-이제 큐 시스템과 PLC 통신, WD13 응답, 센서 감시 기능이 모두 포함되어 있으며, 리스트 박스에 큐 상태를 실시간으로 확인할 수 있습니다.
+작업 큐 및 리스트 박스 표시:
+
+적재 및 배출 작업이 큐에 추가되며, 리스트 박스에 실시간으로 작업 상태가 표시됩니다.
+기존 코드를 유지하면서 새로운 기능을 추가했습니다.
