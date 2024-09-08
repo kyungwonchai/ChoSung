@@ -1,351 +1,106 @@
-겠습니다. 지금 말씀하신 내용은 실시간으로 데이터가 갱신되어야 한다는 것이 핵심입니다. 즉, 새로운 주문을 추가하는 것뿐만 아니라, **JB^**나 다른 이벤트가 감지될 때마다 기존에 추가된 데이터가 실시간으로 갱신되어야 합니다.
+아, 이해했습니다. 말씀하신 대로 시분초.밀리초 형식의 시간 값을 추출하여, PLAN Selected 행을 만났을 때 **연월일(yyyyMMdd)**과 결합하는 부분을 수정하겠습니다.
 
-현재 코드는 새로운 주문이 감지되었을 때만 ProductOrderModel을 **_productOrders**에 추가하는 구조입니다. 하지만 JB^ 같은 이벤트가 발생하면 해당 주문의 수량이나 상태를 실시간으로 업데이트해야 합니다.
-
-해결 방안:
-**_productOrders에 있는 기존의 ProductOrderModel**을 수정할 때마다 UI가 즉시 갱신되도록 해야 합니다.
-JB^, MB^, FNL^, JD^ 등의 이벤트가 발생할 때마다 해당 주문의 상태나 수량을 실시간으로 업데이트합니다.
-ObservableCollection과 INotifyPropertyChanged가 올바르게 구현되어 있다면, 프로퍼티가 수정될 때마다 UI가 자동으로 갱신됩니다.
-
-수정된 FileCheckerMES20 코드
+목표:
+로그 행의 앞부분에 있는 [시분초.밀리초] 값을 추출하여, PLAN Selected 행에서 연월일과 함께 붙여서 전체 시간 값을 생성합니다.
+PLAN Selected 행을 만나면 앞부분에 있는 시간값을 사용해 ProductOrderModel의 날짜 필드에 추가합니다.
+수정된 함수 (ExtractTimestamp와 ProcessLogLine)
 csharp
 코드 복사
-using System;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
-using System.Collections.ObjectModel;
-using System.Windows.Threading;
-
-namespace GumiChecker
+// 시간값을 추출하는 함수 (시분초.밀리초 형태의 값을 추출)
+private string ExtractTimestamp(string line)
 {
-    public class FileCheckerMES20
+    // 로그 행의 가장 앞에 [시분초.밀리초] 형태로 존재하는지 확인
+    var match = Regex.Match(line, @"\[(\d{2}:\d{2}:\d{2}\.\d{3})");
+    if (match.Success)
     {
-        private string _logDirectory = @"C:\G-MES2.0\GUMI_WEB\log";
-        private string _filePattern = @"^\d{1,3}(\.\d{1,3}){3}_M4OI[A-Za-z0-9]+_gumi[A-Za-z0-9]+_(\d{2})\.log$";
-        private DispatcherTimer _timer;
-        private string _currentMonitoredFile;
-        private DateTime _lastPlanSelectedDate;
-        private DateTime _lastWriteTime;
-        private ProductOrderModel _currentProductOrder;
-        private ObservableCollection<ProductOrderModel> _productOrders;
-        private long _lastPlanSelectedPosition;
-        private bool _isFirstExecution;
-        private ComportManager _comPortPLC;
-
-        public FileCheckerMES20(ObservableCollection<ProductOrderModel> productOrders, ComportManager comPortManager)
-        {
-            _productOrders = productOrders;
-            _comPortPLC = comPortManager;
-            _isFirstExecution = true;
-
-            _timer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromSeconds(1)
-            };
-            _timer.Tick += CheckFiles;
-            _timer.Start();
-
-            msgvs.Instance.LogT2("FileCheckerMES20: 타이머가 시작되었습니다.");
-            _currentMonitoredFile = GetLatestLogFile();
-            _lastWriteTime = _currentMonitoredFile != null 
-                ? File.GetLastWriteTime(_currentMonitoredFile) 
-                : DateTime.MinValue;
-
-            msgvs.Instance.LogT2($"FileCheckerMES20: {_currentMonitoredFile} 파일 감시를 시작합니다.");
-            _lastPlanSelectedDate = DateTime.Now;
-            _lastPlanSelectedPosition = 0;
-        }
-
-        private void CheckFiles(object sender, EventArgs e)
-        {
-            string latestFile = GetLatestLogFile();
-
-            if (_currentMonitoredFile == null || latestFile != _currentMonitoredFile)
-            {
-                _currentMonitoredFile = latestFile;
-                _lastWriteTime = File.GetLastWriteTime(_currentMonitoredFile);
-                msgvs.Instance.LogT2($"FileCheckerMES20: 새로운 파일 감시 시작 -> {_currentMonitoredFile}");
-            }
-
-            if (_isFirstExecution)
-            {
-                FindLastPlanSelected(_currentMonitoredFile);
-                _isFirstExecution = false;
-                msgvs.Instance.LogT2("FileCheckerMES20: PLAN Selected 탐색 완료.");
-            }
-
-            DateTime latestWriteTime = File.GetLastWriteTime(_currentMonitoredFile);
-
-            if (latestWriteTime > _lastWriteTime)
-            {
-                _lastWriteTime = latestWriteTime;
-                ReadLogFileFromPosition(_currentMonitoredFile);
-                msgvs.Instance.LogT2($"FileCheckerMES20: 파일 수정 감지 -> {_currentMonitoredFile}");
-            }
-        }
-
-        private string GetLatestLogFile()
-        {
-            msgvs.Instance.LogT2("FileCheckerMES20: 최신 로그 파일 검색 중...");
-            var logFiles = new DirectoryInfo(_logDirectory).GetFiles("*.log")
-                .Where(f => Regex.IsMatch(f.Name, _filePattern))
-                .OrderByDescending(f => f.LastWriteTime)
-                .ToList();
-            return logFiles.FirstOrDefault()?.FullName;
-        }
-
-        private void FindLastPlanSelected(string filePath)
-        {
-            if (filePath == null) return;
-
-            try
-            {
-                using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var streamReader = new StreamReader(fileStream))
-                {
-                    string line;
-                    long currentPosition = 0;
-                    _lastPlanSelectedPosition = 0;
-
-                    while ((line = streamReader.ReadLine()) != null)
-                    {
-                        currentPosition = fileStream.Position;
-                        if (line.Contains("PLAN Selected"))
-                        {
-                            _lastPlanSelectedPosition = currentPosition;
-                            msgvs.Instance.LogT2($"FileCheckerMES20: PLAN Selected 감지 (위치: {currentPosition})");
-                        }
-                        ProcessLogLine(line, filePath);
-                    }
-                }
-            }
-            catch (IOException ex)
-            {
-                msgvs.Instance.LogT2($"FileCheckerMES20: 파일 읽기 중 오류 발생 -> {ex.Message}");
-            }
-        }
-
-        private void ReadLogFileFromPosition(string filePath)
-        {
-            if (filePath == null) return;
-
-            try
-            {
-                using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var streamReader = new StreamReader(fileStream))
-                {
-                    fileStream.Seek(_lastPlanSelectedPosition, SeekOrigin.Begin);
-                    string line;
-                    
-                    while ((line = streamReader.ReadLine()) != null)
-                    {
-                        ProcessLogLine(line, filePath);
-                    }
-
-                    _lastPlanSelectedPosition = fileStream.Position;
-                    msgvs.Instance.LogT2($"FileCheckerMES20: 파일 처리 완료 -> {_currentMonitoredFile}");
-                }
-            }
-            catch (IOException ex)
-            {
-                msgvs.Instance.LogT2($"FileCheckerMES20: 파일 읽기 중 오류 발생 -> {ex.Message}");
-            }
-        }
-
-        private void ProcessLogLine(string line, string filePath)
-        {
-            string fileName = Path.GetFileNameWithoutExtension(filePath);
-            string dayString = fileName.Substring(fileName.Length - 2);
-            string currentYearMonth = DateTime.Now.ToString("yyyyMM");
-            string fullDate = currentYearMonth + dayString;
-
-            if (line.Contains("PLAN Selected"))
-            {
-                var splitLine = line.Split(' ');
-                string productOrder = splitLine[1];
-
-                string timestamp = ExtractTimestamp(line);
-                string pDate = fullDate + " " + timestamp;
-
-                msgvs.Instance.LogT2($"FileCheckerMES20: PLAN Selected 감지 (주문 번호: {productOrder}, 시간: {timestamp})");
-
-                if (_currentProductOrder == null || _currentProductOrder.ProductOrder != productOrder)
-                {
-                    _currentProductOrder = new ProductOrderModel
-                    {
-                        ProductOrder = productOrder,
-                        PDate = pDate, 
-                        POStatus = "wait"
-                    };
-
-                    _productOrders.Add(_currentProductOrder);
-
-                    msgvs.Instance.LogT2($"FileCheckerMES20: 새로운 주문 추가 -> 주문 번호: {productOrder}");
-                    msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-                }
-
-                _lastPlanSelectedDate = DateTime.Now;
-            }
-            else if (line.Contains("BasicModel") && _currentProductOrder != null)
-            {
-                var modelData = line.Split(':')[1].Trim();
-                _currentProductOrder.BasicModel = modelData;
-
-                msgvs.Instance.LogT2($"FileCheckerMES20: BasicModel 처리 -> {modelData}");
-
-                // UI 갱신을 위한 로그 추가
-                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-            }
-            else if (line.Contains("MB^") && _currentProductOrder != null)
-            {
-                var mbData = line.Split('^');
-                _currentProductOrder.PORemain = int.Parse(mbData[1]);
-                _currentProductOrder.MGCount = int.Parse(mbData[2]);
-
-                msgvs.Instance.LogT2($"FileCheckerMES20: MB^ 처리 -> 잔여 수량: {_currentProductOrder.PORemain}, 매거진 수량: {_currentProductOrder.MGCount}");
-
-                // UI 갱신을 위한 로그 추가
-                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-            }
-            else if (line.Contains("JB^") && _currentProductOrder != null)
-            {
-                _currentProductOrder.PCount++;
-
-                msgvs.Instance.LogT2($"FileCheckerMES20: JB^ 처리 -> 생산된 제품 개수: {_currentProductOrder.PCount}");
-
-                // UI 갱신을 위한 로그 추가
-                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-            }
-            else if (line.Contains("FNL^") && _currentProductOrder != null)
-            {
-                _currentProductOrder.POStatus = "stack";
-                msgvs.Instance.LogT2($"FileCheckerMES20: FNL^ 처리 -> 상태: {_currentProductOrder.POStatus}");
-
-                // UI 갱신을 위한 로그 추가
-                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-            }
-            else if (line.Contains("JD^") && _currentProductOrder != null)
-            {
-                _currentProductOrder.POStatus = "out";
-                ExecuteOutFunction();
-
-                msgvs.Instance.LogT2($"FileCheckerMES20: JD^ 처리 -> 상태: {_currentProductOrder.POStatus}");
-
-                // UI 갱신을 위한 로그 추가
-                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
-            }
-        }
-
-        private string ExtractTimestamp(string line)
-        {
-            var match = Regex.Match(line, @"\[(\d{2}:\d{2}:\d{2}\.\d{3})");
-            if (match.Success)
-            {
-                return match.Groups[1].Value;
-            }
-            return "00:00:00.000";
-        }
-
-        private void ExecuteOutFunction()
-        {
-            msgvs.Instance.LogT2("FileCheckerMES20: 배출 처리 완료.");
-        }
+        return match.Groups[1].Value; // 시간값 반환
     }
+    return null; // 시간값이 없을 경우 null 반환
+}
 
-    public class ProductOrderModel : INotifyPropertyChanged
+// 로그 파일의 각 줄을 처리하는 메소드
+private void ProcessLogLine(string line, string filePath)
+{
+    string fileName = Path.GetFileNameWithoutExtension(filePath);
+    string dayString = fileName.Substring(fileName.Length - 2); // 파일 이름의 마지막 두 글자를 날짜로 사용
+    string currentYearMonth = DateTime.Now.ToString("yyyyMM");  // 현재 연도와 월을 yyyyMM 형식으로 가져옴
+    string fullDate = currentYearMonth + dayString; // yyyyMMdd 형식으로 날짜 조합
+
+    // 시간값을 추출
+    string timestamp = ExtractTimestamp(line);
+
+    // PLAN Selected 감지 시 처리
+    if (line.Contains("PLAN Selected"))
     {
-        private string _productOrder;
-        private string _basicModel;
-        private int _poRemain;
-        private int _mgCount;
-        private int _pCount;
-        private string _poStatus;
-        private string _pDate;
+        var splitLine = line.Split(' ');
+        string productOrder = splitLine[1]; // 주문 번호 추출
 
-        public string ProductOrder
+        if (timestamp != null)
         {
-            get => _productOrder;
-            set
+            // 시분초.밀리초 값이 존재하면 연월일과 결합하여 최종 시간 생성
+            string fullDateTime = fullDate + " " + timestamp;
+
+            msgvs.Instance.LogT2($"FileCheckerMES20: PLAN Selected 감지 (주문 번호: {productOrder}, 시간: {fullDateTime})");
+
+            // 새로운 주문이거나 다른 주문일 경우 처리
+            if (_currentProductOrder == null || _currentProductOrder.ProductOrder != productOrder)
             {
-                _productOrder = value;
-                OnPropertyChanged(nameof(ProductOrder));
+                _currentProductOrder = new ProductOrderModel
+                {
+                    ProductOrder = productOrder,
+                    PDate = fullDateTime, // yyyyMMdd HH:mm:ss.밀리초 형식으로 날짜 설정
+                    POStatus = "wait" // 주문 상태를 "대기(wait)"로 설정
+                };
+
+                // ProductOrderModel 추가
+                _productOrders.Add(_currentProductOrder);
+
+                // 로그: 새로운 주문 추가 및 UI 갱신
+                msgvs.Instance.LogT2($"FileCheckerMES20: 새로운 주문 추가 -> 주문 번호: {productOrder}");
+                msgvs.Instance.LogT2("FileCheckerMES20: 표를 갱신합니다.");
             }
         }
 
-        public string BasicModel
-        {
-            get => _basicModel;
-            set
-            {
-                _basicModel = value;
-                OnPropertyChanged(nameof(BasicModel));
-            }
-        }
-
-        public int PORemain
-        {
-            get => _poRemain;
-            set
-            {
-                _poRemain = value;
-                OnPropertyChanged(nameof(PORemain));
-            }
-        }
-
-        public int MGCount
-        {
-            get => _mgCount;
-            set
-            {
-                _mgCount = value;
-                OnPropertyChanged(nameof(MGCount));
-            }
-        }
-
-        public int PCount
-        {
-            get => _pCount;
-            set
-            {
-                _pCount = value;
-                OnPropertyChanged(nameof(PCount));
-            }
-        }
-
-        public string POStatus
-        {
-            get => _poStatus;
-            set
-            {
-                _poStatus = value;
-                OnPropertyChanged(nameof(POStatus));
-            }
-        }
-
-        public string PDate
-        {
-            get => _pDate;
-            set
-            {
-                _pDate = value;
-                OnPropertyChanged(nameof(PDate));
-            }
-        }
-
-        public event PropertyChangedEventHandler PropertyChanged;
-
-        protected void OnPropertyChanged(string propertyName)
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
+        _lastPlanSelectedDate = DateTime.Now;
+    }
+    // 나머지 로그 처리
+    else if (line.Contains("BasicModel") && _currentProductOrder != null)
+    {
+        var modelData = line.Split(':')[1].Trim();
+        _currentProductOrder.BasicModel = modelData;
+        msgvs.Instance.LogT2($"FileCheckerMES20: BasicModel 처리 -> {modelData}");
+    }
+    else if (line.Contains("MB^") && _currentProductOrder != null)
+    {
+        var mbData = line.Split('^');
+        _currentProductOrder.PORemain = int.Parse(mbData[1]);
+        _currentProductOrder.MGCount = int.Parse(mbData[2]);
+        msgvs.Instance.LogT2($"FileCheckerMES20: MB^ 처리 -> 잔여 수량: {_currentProductOrder.PORemain}, 매거진 수량: {_currentProductOrder.MGCount}");
+    }
+    else if (line.Contains("JB^") && _currentProductOrder != null)
+    {
+        _currentProductOrder.PCount++;
+        msgvs.Instance.LogT2($"FileCheckerMES20: JB^ 처리 -> 생산된 제품 개수: {_currentProductOrder.PCount}");
+    }
+    else if (line.Contains("FNL^") && _currentProductOrder != null)
+    {
+        _currentProductOrder.POStatus = "stack";
+        msgvs.Instance.LogT2($"FileCheckerMES20: FNL^ 처리 -> 상태: {_currentProductOrder.POStatus}");
+    }
+    else if (line.Contains("JD^") && _currentProductOrder != null)
+    {
+        _currentProductOrder.POStatus = "out";
+        ExecuteOutFunction();
+        msgvs.Instance.LogT2($"FileCheckerMES20: JD^ 처리 -> 상태: {_currentProductOrder.POStatus}");
     }
 }
 주요 변경 사항:
-실시간 갱신: 각 이벤트(PLAN Selected, JB^, MB^, FNL^, JD^)에서 값이 변경될 때마다 해당 ProductOrderModel의 속성을 수정하고, 그 변경 사항이 UI에 즉시 반영되도록 구현했습니다.
+ExtractTimestamp 함수:
 
-INotifyPropertyChanged 구현: ProductOrderModel에 **INotifyPropertyChanged**를 사용하여 프로퍼티가 변경될 때마다 UI가 갱신됩니다.
+로그 행의 시분초.밀리초 형태의 시간값을 추출하는 함수입니다.
+정규식을 사용하여 **[00:00:00.000]**와 같은 형태의 시간 값을 찾아 반환합니다.
+ProcessLogLine 수정:
 
-로그 추가: 각 이벤트가 발생할 때마다 UI가 갱신되었음을 로그로 출력하여 확인할 수 있게 했습니다. (예: "표를 갱신합니다.")
-
-이제 PLAN Selected뿐만 아니라, JB^, MB^ 등 이벤트가 발생할 때마다 실시간으로 UI가 갱신됩니다.
+PLAN Selected 행을 만났을 때, 시분초.밀리초 값과 연월일을 결합하여 최종 시간 값을 생성합니다.
+그 값을 **ProductOrderModel.PDate**에 설정합니다.
+이제 **PLAN Selected**가 검출되었을 때, 시분초.밀리초 값을 **연월일(yyyyMMdd)**과 결합하여 최종 날짜와 시간을 ProductOrderModel에 반영하고, 실시간으로 갱신할 수 있습니다
