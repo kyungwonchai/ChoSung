@@ -1,10 +1,8 @@
- 작업은 제거하여 UI에 실시간으로 동기화되도록 하는 방식으로 코드를 수정하겠습니다. 이를 위해 아래와 같은 조치를 추가할 것입니다:
-
-완료된 작업을 taskList에서 제거.
-UI와 실시간 동기화를 유지하여, 완료된 작업은 즉시 제거되고 미완료 작업만 리스트에 남도록 처리.
-다음은 수정된 전체 코드입니다.
-
-수정된 전체 코드 (완료된 작업 제거 및 실시간 동기화)
+선된 요구사항 요약:
+작업이 완료된 후에만 "out" 또는 "stack" 상태를 ProductOrderModel의 POStatus에 갱신합니다.
+큐에 작업이 쌓인 경우 미완료 작업 목록만 실시간으로 보여주며, 완료된 작업은 리스트에서 제거됩니다.
+큐에서 작업이 완료되면 그 결과를 표에 갱신해야 합니다.
+수정된 전체 코드 (상세 주석 포함)
 csharp
 코드 복사
 using System;
@@ -32,7 +30,7 @@ namespace GumiChecker
 
         private ObservableCollection<ProductOrderModel> _productOrders; // 주문 목록 (UI와 바인딩됨)
         private ObservableCollection<string> _taskList; // 미완료 작업 상태 목록 (UI와 바인딩됨)
-        private ConcurrentQueue<string> _taskQueue = new ConcurrentQueue<string>(); // 비동기 작업 큐
+        private ConcurrentQueue<(string taskType, ProductOrderModel order)> _taskQueue = new ConcurrentQueue<(string, ProductOrderModel)>(); // 비동기 작업 큐
         private ComportManager _comPortPLC; // PLC와의 통신 매니저
         private const int _R520SensorTimeout = 180000; // R520/R521 센서 감지 타임아웃 (3분)
 
@@ -118,8 +116,7 @@ namespace GumiChecker
                             // 배출 함수는 센서 체크 이후에 동작하도록 함
                             if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
                             {
-                                _previousProductOrder.POStatus = "out";
-                                await ExecuteOutFunction(_previousProductOrder); // 배출 작업 처리
+                                EnqueueTask("배출", _previousProductOrder); // 배출 작업 큐에 추가
                             }
                             else
                             {
@@ -147,7 +144,7 @@ namespace GumiChecker
                 // 적재 함수는 센서 체크 이후에 동작하도록 함
                 if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
                 {
-                    await ExecuteStackFunction(_currentProductOrder); // 적재 작업 처리
+                    EnqueueTask("적재", _currentProductOrder); // 적재 작업 큐에 추가
                 }
                 else
                 {
@@ -192,14 +189,14 @@ namespace GumiChecker
         // 배출 작업을 처리하는 비동기 메소드 (센서 체크 후 배출)
         private async Task ExecuteOutFunction(ProductOrderModel order)
         {
-            _taskQueue.Enqueue($"배출: {order.ProductOrder}"); // 작업을 큐에 넣음
+            _taskQueue.Enqueue(("배출", order)); // 작업을 큐에 넣음
             await ProcessQueueAsync(); // 큐 작업 처리
         }
 
         // 적재 작업을 처리하는 비동기 메소드 (센서 체크 후 적재)
         private async Task ExecuteStackFunction(ProductOrderModel order)
         {
-            _taskQueue.Enqueue($"적재: {order.ProductOrder}"); // 작업을 큐에 넣음
+            _taskQueue.Enqueue(("적재", order)); // 작업을 큐에 넣음
             await ProcessQueueAsync(); // 큐 작업 처리
         }
 
@@ -208,77 +205,77 @@ namespace GumiChecker
         {
             _isProcessingTask = true;
 
-            while (_taskQueue.TryDequeue(out string task))
+            while (_taskQueue.TryDequeue(out (string taskType, ProductOrderModel order) task))
             {
-                _taskList.Add($"처리 중: {task}");
-                string[] taskParts = task.Split(':');
-                string taskType = taskParts[0].Trim();
-                string productOrder = taskParts[1].Trim();
+                _taskList.Add($"처리 중: {task.taskType}: {task.order.ProductOrder}");
 
-                if (taskType == "적재")
+                if (task.taskType == "적재")
                 {
-                    await ProcessStackAsync(productOrder); // 적재 작업 처리
+                    await ProcessStackAsync(task.order); // 적재 작업 처리
                 }
-                else if (taskType == "배출")
+                else if (task.taskType == "배출")
                 {
-                    await ProcessOutAsync(productOrder); // 배출 작업 처리
+                    await ProcessOutAsync(task.order); // 배출 작업 처리
                 }
 
-                // 작업 완료 후 리스트에서 삭제 (완료된 작업은 표시되지 않도록 제거)
-                _taskList.Remove($"처리 중: {task}");
+                // 완료된 작업을 리스트에서 삭제
+                _taskList.Remove($"처리 중: {task.taskType}: {task.order.ProductOrder}");
+
+                // 완료된 작업에 따라 상태를 갱신 (out 또는 stack)
+                task.order.POStatus = task.taskType == "적재" ? "stack" : "out";
             }
 
             _isProcessingTask = false;
         }
 
         // 적재 작업을 처리하는 메소드 (비동기)
-        private async Task ProcessStackAsync(string productOrder)
+        private async Task ProcessStackAsync(ProductOrderModel order)
         {
-            _taskList.Add($"PLC 적재 신호 전송: {productOrder}");
+            _taskList.Add($"PLC 적재 신호 전송: {order.ProductOrder}");
 
             bool isCommandSent = SendStackCommandToPLC();
 
             if (isCommandSent)
             {
-                _taskList.Add($"WD13 응답 대기: {productOrder}");
+                _taskList.Add($"WD13 응답 대기: {order.ProductOrder}");
                 bool isWD13Response = await WaitForWD13ResponseAsync();
                 if (isWD13Response)
                 {
-                    _taskList.Add($"WD13 응답 완료: {productOrder}");
+                    _taskList.Add($"WD13 응답 완료: {order.ProductOrder}");
                     bool isSensorSuccess = await MonitorSensorsAsync();
                     if (isSensorSuccess)
                     {
-                        _taskList.Add($"적재 완료: {productOrder}");
+                        _taskList.Add($"적재 완료: {order.ProductOrder}");
                     }
                     else
                     {
-                        _taskList.Add($"적재 실패(3분 초과): {productOrder}");
-                        ShowError($"적재 실패: {productOrder} (3분 내 감지되지 않음)");
+                        _taskList.Add($"적재 실패(3분 초과): {order.ProductOrder}");
+                        ShowError($"적재 실패: {order.ProductOrder} (3분 내 감지되지 않음)");
                     }
                 }
                 else
                 {
-                    _taskList.Add($"WD13 응답 실패: {productOrder}");
-                    ShowError($"WD13 응답 실패: {productOrder}");
+                    _taskList.Add($"WD13 응답 실패: {order.ProductOrder}");
+                    ShowError($"WD13 응답 실패: {order.ProductOrder}");
                 }
             }
 
             // 완료된 작업 제거
-            _taskList.Remove($"PLC 적재 신호 전송: {productOrder}");
+            _taskList.Remove($"PLC 적재 신호 전송: {order.ProductOrder}");
         }
 
         // 배출 작업을 처리하는 메소드 (비동기)
-        private async Task ProcessOutAsync(string productOrder)
+        private async Task ProcessOutAsync(ProductOrderModel order)
         {
-            _taskList.Add($"PLC 배출 신호 전송: {productOrder}");
+            _taskList.Add($"PLC 배출 신호 전송: {order.ProductOrder}");
 
             // 배출 로직 처리 (생략된 부분은 필요에 맞게 추가 가능)
             await Task.Delay(1000); // 예시로 1초 지연
 
-            _taskList.Add($"배출 완료: {productOrder}");
+            _taskList.Add($"배출 완료: {order.ProductOrder}");
 
             // 완료된 작업 제거
-            _taskList.Remove($"PLC 배출 신호 전송: {productOrder}");
+            _taskList.Remove($"PLC 배출 신호 전송: {order.ProductOrder}");
         }
 
         // 센서 감시 함수 (R520, R521 센서 감시)
@@ -332,6 +329,12 @@ namespace GumiChecker
         private void ShowError(string message)
         {
             msgvs.Instance.LogT2(message); // 에러 메시지 기록
+        }
+
+        // 큐에 작업 추가
+        private void EnqueueTask(string taskType, ProductOrderModel order)
+        {
+            _taskQueue.Enqueue((taskType, order)); // 작업을 큐에 추가
         }
     }
 
@@ -425,7 +428,10 @@ namespace GumiChecker
     }
 }
 주요 변경 사항:
-_taskList에서 완료된 작업 제거: 작업이 완료되면 _taskList에서 해당 작업을 제거하여 미완료 작업만 남도록 처리했습니다.
-실시간 동기화: ObservableCollection<string>과 UI 바인딩이 되어 있기 때문에, 완료된 작업이 제거되면 UI에서도 실시간으로 갱신됩니다.
-각 작업의 시작과 완료 상태 로그 추가: 작업이 어떻게 처리되는지 로그에 기록되어 작업 흐름을 파악할 수 있습니다.
-이제 미완료 작업만 taskList에 남고, 작업 완료 시 UI에서도 해당 작업이 사라지며, 작업 상태가 실시간으로 동기화됩니다.
+작업 큐 처리 구조: 이제 작업이 완료된 후에만 표(ProductOrderModel)에 POStatus를 "out" 또는 "stack"으로 갱신하도록 했습니다. 즉, 적재 또는 배출 작업이 끝난 후에야 그 상태가 UI에 반영됩니다.
+
+미완료 작업만 taskList에 표시: 작업이 완료되면 해당 작업은 taskList에서 제거되고, 미완료 작업만 리스트에 남도록 처리되었습니다.
+
+큐 처리 로직: EnqueueTask() 함수로 적재/배출 작업을 큐에 넣고, 큐에서 순차적으로 작업을 처리합니다. 큐에서 작업이 완료된 후에만 POStatus가 업데이트됩니다.
+
+이 구조로 적재 또는 배출 작업이 완료된 후에만 UI에 반영되며, 큐에서 미완료된 작업만 실시간으로 보여질 것입니다.
