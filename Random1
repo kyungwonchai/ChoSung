@@ -1,33 +1,33 @@
-아, 이해했습니다. DataReceived 이벤트를 사용하지 않고, 대신 명령을 보내고 직접 수신 대기하면서 **TaskCompletionSource**로 처리하는 방식으로 하라는 말씀이군요. 즉, 시리얼 포트의 DataReceived 이벤트 없이 데이터를 직접 읽어와서 비동기적으로 응답을 처리하는 방식으로 구현해드리겠습니다.
+askCompletionSource와 응답 매핑 관리를 적용하여, 명령을 보낸 후 정확한 응답을 비동기적으로 처리할 수 있도록 하겠습니다. 이 방식은 여러 명령을 동시에 보낼 때 각 명령에 대한 응답을 정확하게 처리하고 싶을 때 유용합니다.
 
-SerialPort의 ReadLine 또는 Read 메서드를 사용하여 명령을 전송한 후 응답을 수동으로 기다리고 읽는 방식을 사용하겠습니다.
-
-구현 개요:
-명령 전송 후 수신 대기: 명령을 보내고, TaskCompletionSource를 사용하여 응답이 올 때까지 비동기적으로 대기.
-수동으로 응답 읽기: 이벤트 없이 시리얼 포트에서 직접 데이터를 읽어서 처리.
-수정된 코드:
+수정된 ComPort 클래스 예시:
 csharp
 코드 복사
 using System;
 using System.IO.Ports;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 
-public class ComPort
+public class ComPort : INotifyPropertyChanged
 {
     private SerialPort _serialPort;
+    public ObservableCollection<SensorModel> Sensors { get; set; }
     private ConcurrentDictionary<string, TaskCompletionSource<string>> _pendingRequests;
+
+    public event PropertyChangedEventHandler PropertyChanged;
 
     public ComPort(string portName)
     {
-        // SerialPort 초기화
         _serialPort = new SerialPort(portName, 9600, Parity.None, 8, StopBits.One);
         _pendingRequests = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
+        Sensors = new ObservableCollection<SensorModel>();
+        InitializeSensors();
     }
 
     public void Open()
     {
-        // 포트 열기
         if (!_serialPort.IsOpen)
         {
             _serialPort.Open();
@@ -36,102 +36,75 @@ public class ComPort
 
     public void Close()
     {
-        // 포트 닫기
         if (_serialPort.IsOpen)
         {
             _serialPort.Close();
         }
     }
 
-    // 명령을 보내고 응답을 대기하는 비동기 메서드
-    public async Task<string> SendCommandAsync(string command)
+    // 센서 목록 초기화 (R520 ~ R540)
+    private void InitializeSensors()
     {
-        string requestId = GenerateRequestId(command); // 요청 ID 생성
+        for (int i = 0; i < 18; i++)
+        {
+            Sensors.Add(new SensorModel
+            {
+                SensorName = $"R{520 + i:X}",
+                IsDetected = false
+            });
+        }
+    }
+
+    // 명령을 보내고 해당 명령에 대한 응답을 비동기로 기다림
+    public Task<string> SendCommandAsync(string command)
+    {
+        string requestId = GenerateRequestId();  // 고유 요청 ID 생성
         var tcs = new TaskCompletionSource<string>();
 
-        _pendingRequests.TryAdd(requestId, tcs);  // 요청 ID와 TaskCompletionSource를 매핑
+        // 요청 ID와 TaskCompletionSource를 매핑
+        _pendingRequests.TryAdd(requestId, tcs);
 
-        _serialPort.WriteLine(command);  // 명령 전송
+        // 명령 전송 (요청 ID를 포함하여 명령을 구성)
+        _serialPort.WriteLine($"{requestId}{command}");
 
-        // 시리얼 포트로부터 응답을 직접 수신
-        string response = await ReadResponseAsync();
+        // 응답을 비동기적으로 읽어올 Task 시작
+        Task.Run(async () => {
+            string response = await ReadResponseAsync();
+            if (response.StartsWith(requestId))
+            {
+                _pendingRequests.TryRemove(requestId, out var tempTcs);
+                tempTcs.SetResult(response.Substring(requestId.Length));
+            }
+        });
 
-        // 응답을 받은 후 TaskCompletionSource를 완료
-        if (response != null && _pendingRequests.TryGetValue(requestId, out var request))
-        {
-            _pendingRequests.TryRemove(requestId, out _);
-            request.SetResult(response);  // 응답을 TaskCompletionSource에 전달
-        }
-
-        return await tcs.Task;  // 응답 반환
+        return tcs.Task;
     }
 
     // 시리얼 포트로부터 응답을 수동으로 읽는 비동기 메서드
     private Task<string> ReadResponseAsync()
     {
-        return Task.Run(() =>
-        {
-            try
-            {
-                return _serialPort.ReadLine();  // 시리얼 포트에서 한 줄씩 응답을 읽음
-            }
-            catch (TimeoutException)
-            {
-                return null;  // 타임아웃 발생 시 null 반환
-            }
-        });
+        return Task.Run(() => _serialPort.ReadLine());
     }
 
-    // 요청 ID를 생성하는 메서드 (명령에 따라 고유한 ID를 생성)
-    private string GenerateRequestId(string command)
+    // 고유 요청 ID를 생성하는 메서드
+    private string GenerateRequestId()
     {
-        // 명령어의 첫 4글자를 요청 ID로 간주 (필요에 따라 다른 방식 사용 가능)
-        return command.Substring(0, 4);
+        return Guid.NewGuid().ToString("N");  // GUID를 요청 ID로 사용
+    }
+
+    // 센서 데이터를 파싱하고 업데이트하는 메서드
+    public void ParseAndUpdateSensorData(string data)
+    {
+        // 예: 데이터 처리 로직
+    }
+
+    protected void OnPropertyChanged(string name)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
 }
-주요 변경점 및 설명:
-SendCommandAsync:
-
-명령을 전송하고 응답을 수동으로 읽어오는 비동기 작업을 수행합니다.
-TaskCompletionSource를 사용하여 응답이 올 때까지 대기하고, 응답이 오면 응답을 Task에 전달하여 비동기 작업을 완료합니다.
-ReadResponseAsync:
-
-DataReceived 이벤트를 사용하지 않고, 명령을 보낸 후 직접 응답을 읽는 방식으로 변경되었습니다.
-비동기로 시리얼 포트에서 응답을 읽어와, 타임아웃 발생 시 null을 반환합니다. 이는 응답을 수동으로 처리하고, 이벤트 없이 데이터를 읽어올 수 있는 방식입니다.
-GenerateRequestId:
-
-명령과 응답을 매핑하기 위한 요청 ID를 생성하는 메서드입니다. 명령에 따라 요청 ID를 다르게 설정할 수 있으며, 예시에서는 명령어의 첫 4글자를 요청 ID로 사용했습니다.
-메인 프로그램 사용 예시:
-csharp
-코드 복사
-class Program
-{
-    static async Task Main(string[] args)
-    {
-        // ComPort 인스턴스 생성
-        ComPort comPort = new ComPort("COM1");
-        comPort.Open();
-
-        // 명령을 전송하고 응답을 비동기로 기다림
-        string command = "%01#RCCR00520054**";  // 예시 명령어
-        string response = await comPort.SendCommandAsync(command);
-
-        // 응답 출력
-        Console.WriteLine($"응답: {response}");
-
-        comPort.Close();
-    }
-}
-설명:
-명령 전송 및 응답 대기:
-
-SendCommandAsync 메서드를 통해 명령을 전송하고, TaskCompletionSource를 사용하여 응답이 올 때까지 비동기적으로 대기합니다.
-응답이 도착하면, **TaskCompletionSource**를 완료하여 명령과 응답의 매핑을 해제하고, 결과를 반환합니다.
-응답 처리:
-
-ReadResponseAsync 메서드를 통해 시리얼 포트에서 응답을 직접 읽어옵니다. 이벤트 기반 방식 없이 데이터를 수동으로 처리할 수 있습니다.
-요약:
-DataReceived 이벤트를 사용하지 않고, 명령 전송 후 직접 응답을 읽어오는 방식으로 구현하였습니다.
-TaskCompletionSource를 사용하여 비동기적으로 작업을 처리하며, 정확하게 보낸 명령에 대한 응답을 받을 수 있습니다.
-명령과 응답 매핑을 통해 여러 명령을 동시에 보내도 각각의 응답을 정확하게 처리할 수 있습니다.
-이 방식은 시리얼 포트 통신에서 수동으로 데이터를 읽어오는 구조로, 명령과 응답을 정확하게 매핑하여 처리할 수 있는 예시입니다. 추가적으로 궁금한 점이 있으면 언제든지 질문해 주세요!
+핵심 변경 사항:
+요청-응답 매핑: 각 명령마다 고유한 requestId를 부여하여 응답을 처리합니다.
+비동기 응답 처리: SendCommandAsync 메서드에서 명령을 보내고, 별도의 태스크(Task.Run)에서 ReadResponseAsync 메서드를 호출하여 응답을 비동기적으로 수신합니다. 수신된 응답이 해당 요청 ID와 일치할 경우, 매핑된 TaskCompletionSource를 완료시켜 응답을 반환합니다.
+센서 데이터 파싱 및 업데이트: ParseAndUpdateSensorData 메서드에서 수신된 데이터를 파싱하여 센서의 상태를 업데이트합니다.
+사용
