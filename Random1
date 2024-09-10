@@ -1,89 +1,96 @@
-ISensorDataService 인터페이스를 통해 특정 인덱스의 센서의 IsDetected 상태를 설정할 수 있도록 인터페이스를 확장하고 해당 기능을 구현하는 방법을 설명하겠습니다. 이를 위해 인터페이스에 센서 상태 변경 메서드를 추가하고, SensorViewModel에서 이 메서드를 구현하겠습니다.
+작업이 완료될 때 taskList에서 작업을 제거하고, 완료되지 않은 작업만 목록에 유지하도록 처리됩니다. 또한, 적재 및 배출 작업이 모두 센서 체크 후에 이루어지며, 작업 큐에 쌓인 순서대로 처리됩니다.
 
-1. ISensorDataService 인터페이스 수정
-센서의 IsDetected 값을 설정할 수 있는 메서드를 인터페이스에 추가합니다.
-
+최종 ProcessLogLineAsync 함수:
 csharp
 코드 복사
-// ISensorDataService.cs
-public interface ISensorDataService
+// 로그 파일의 각 줄을 처리하는 메소드 (비동기 방식으로 처리)
+private async Task ProcessLogLineAsync(string line, string filePath)
 {
-    IEnumerable<SensorModel> GetAllSensors();
-    SensorModel GetSensorByIndex(int index);
-    void SetSensorDetection(int index, bool isDetected); // 센서의 감지 상태 설정 메서드 추가
-}
-2. SensorViewModel에 새 메서드 구현
-SensorViewModel 클래스에 SetSensorDetection 메서드를 추가하여 인터페이스를 완전히 구현합니다. 이 메서드는 지정된 인덱스에 있는 센서의 IsDetected 속성을 설정합니다.
+    string fileName = Path.GetFileNameWithoutExtension(filePath);
+    string dayString = fileName.Substring(fileName.Length - 2); // 파일명에서 날짜 추출
+    string currentYearMonth = DateTime.Now.ToString("yyyyMM"); // 현재 연도 및 월
+    string fullDate = currentYearMonth + dayString; // yyyyMMdd 형식으로 날짜 조합
 
-csharp
-코드 복사
-// SensorViewModel.cs
-public class SensorViewModel : INotifyPropertyChanged, ISensorDataService
-{
-    public ObservableCollection<SensorModel> Sensors { get; private set; }
+    // 로그 행에서 시간값(시분초.밀리초)을 추출
+    string timestamp = ExtractTimestamp(line);
 
-    public SensorViewModel()
+    // 새로운 주문이 선택된 경우 (PLAN Selected)
+    if (line.Contains("PLAN Selected"))
     {
-        Sensors = new ObservableCollection<SensorModel>();
-        LoadSensors(); // 센서 데이터 로드
-    }
+        var splitLine = line.Split(' ');
+        string productOrder = splitLine[1];
 
-    private void LoadSensors()
-    {
-        // 초기 센서 데이터 로드 (예시 데이터)
-        for (int i = 0; i < 20; i++)
+        if (timestamp != null)
         {
-            Sensors.Add(new SensorModel { SensorName = $"Sensor {i+1}", IsDetected = false });
+            string fullDateTime = fullDate + " " + timestamp;
+
+            // 새로운 주문이거나 다른 주문일 경우 처리
+            if (_currentProductOrder == null || _currentProductOrder.ProductOrder != productOrder)
+            {
+                // 이전 주문이 있는 경우 배출 처리
+                if (_previousProductOrder != null)
+                {
+                    // 배출 작업은 센서 체크 이후에 수행
+                    if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
+                    {
+                        _previousProductOrder.POStatus = "out";
+                        await ExecuteOutFunction(_previousProductOrder); // 배출 작업 처리
+                    }
+                    else
+                    {
+                        _taskList.Add("센서 체크 실패로 배출 중단");
+                    }
+                }
+
+                // 새로운 주문 생성 및 상태 추가
+                _currentProductOrder = new ProductOrderModel
+                {
+                    ProductOrder = productOrder,
+                    PDate = fullDateTime,
+                    POStatus = "wait"
+                };
+
+                _previousProductOrder = _currentProductOrder; // 현재 주문을 이전 주문으로 설정
+                _productOrders.Add(_currentProductOrder); // 주문 목록에 추가
+            }
         }
     }
-
-    public IEnumerable<SensorModel> GetAllSensors()
+    // FNL^ 감지 시 적재 작업 처리
+    else if (line.Contains("FNL^") && _currentProductOrder != null)
     {
-        return Sensors;
-    }
+        _currentProductOrder.POStatus = "stack";
 
-    public SensorModel GetSensorByIndex(int index)
-    {
-        return Sensors[index];
-    }
-
-    public void SetSensorDetection(int index, bool isDetected)
-    {
-        if (index >= 0 && index < Sensors.Count)
+        // 적재 작업은 센서 체크 이후에 수행
+        if (await MonitorSensorsAsync()) // 센서 체크 먼저 수행
         {
-            Sensors[index].IsDetected = isDetected;
-            OnPropertyChanged("Sensors");
+            await ExecuteStackFunction(_currentProductOrder); // 적재 작업 처리
         }
         else
         {
-            throw new ArgumentOutOfRangeException("Index is out of range.");
+            _taskList.Add("센서 체크 실패로 적재 중단");
         }
     }
-
-    public event PropertyChangedEventHandler PropertyChanged;
-
-    protected virtual void OnPropertyChanged(string propertyName)
+    // BasicModel 감지 시 주문의 모델 정보를 업데이트
+    else if (line.Contains("BasicModel") && _currentProductOrder != null)
     {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        var modelData = line.Split(':')[1].Trim();
+        _currentProductOrder.BasicModel = modelData;
+    }
+    // MB^ 감지 시 잔여 수량 및 매거진 수량 업데이트
+    else if (line.Contains("MB^") && _currentProductOrder != null)
+    {
+        var mbData = line.Split('^');
+        _currentProductOrder.PORemain = int.Parse(mbData[1]);
+        _currentProductOrder.MGCount = int.Parse(mbData[2]);
+    }
+    // JB^ 감지 시 생산된 제품 개수 증가
+    else if (line.Contains("JB^") && _currentProductOrder != null)
+    {
+        _currentProductOrder.PCount++;
     }
 }
-3. 센서 상태 변경 사용 예
-다음은 SensorViewModel을 사용하여 특정 센서의 IsDetected 값을 변경하는 예제입니다.
-
-csharp
-코드 복사
-class Program
-{
-    static void Main()
-    {
-        var sensorViewModel = new SensorViewModel();
-        sensorViewModel.SetSensorDetection(10, true); // 11번째 센서의 IsDetected를 true로 설정
-
-        foreach (var sensor in sensorViewModel.GetAllSensors())
-        {
-            Console.WriteLine($"Sensor: {sensor.SensorName}, Detected: {sensor.IsDetected}");
-        }
-    }
-}
-요약
-위와 같이 인터페이스를 확장하고 SensorViewModel에서 해당 메서드를 구현함으로써, 인터페이스를 통해 센서 데이터의 상태를 안전하고 유연하게 관리할 수 있습니다. 이 구조는 의존성 관리를 간소화하고 코드의 유지보수를 용이하게 만들며, 다양한 테스트 시나리오에 적합한 구조를 제공합니다.
+주요 사항:
+센서 체크 후 작업 수행: 모든 적재 및 배출 작업은 MonitorSensorsAsync() 함수를 통해 센서 감지 여부를 먼저 확인한 후에 작업이 이루어집니다.
+작업 큐 처리: 작업은 큐에 쌓이고, 각 작업이 완료되면 taskList에서 제거되어 UI에 실시간으로 동기화됩니다.
+실시간 로그 업데이트: 주문의 상태나 모델 정보, 잔여 수량 등의 정보가 실시간으로 UI에 바인딩되며, 로그가 변경될 때마다 적절하게 업데이트됩니다.
+이 최종 코드는 요청하신 센서 체크와 작업 큐, 작업 완료 시 tas
