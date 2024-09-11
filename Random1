@@ -1,116 +1,50 @@
-using System;
-using System.IO;
-using System.Linq;
-
-class LogFileReader
+public static long GetActualPosition(StreamReader reader)
 {
-    private string _targetDirectory = @"C:\YourLogDirectory"; // 로그 파일이 저장된 디렉토리 경로
-    private string _searchTerm = "pppoo"; // 찾을 문자열
-    private long _baseline = 0; // 파일의 마지막으로 읽은 위치 저장 (seek 사용)
+    System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.DeclaredOnly | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.GetField;
 
-    // 가장 최근에 수정된 파일에서 'pppoo'를 찾아서 마지막 수정 시간을 반환
-    private DateTime FindLastFileWithSearchTerm()
+    // The current buffer of decoded characters
+    char[] charBuffer = (char[])reader.GetType().InvokeMember("charBuffer", flags, null, reader, null);
+
+    // The index of the next char to be read from charBuffer
+    int charPos = (int)reader.GetType().InvokeMember("charPos", flags, null, reader, null);
+
+    // The number of decoded chars presently used in charBuffer
+    int charLen = (int)reader.GetType().InvokeMember("charLen", flags, null, reader, null);
+
+    // The current buffer of read bytes (byteBuffer.Length = 1024; this is critical).
+    byte[] byteBuffer = (byte[])reader.GetType().InvokeMember("byteBuffer", flags, null, reader, null);
+
+    // The number of bytes read while advancing reader.BaseStream.Position to (re)fill charBuffer
+    int byteLen = (int)reader.GetType().InvokeMember("byteLen", flags, null, reader, null);
+
+    // The number of bytes the remaining chars use in the original encoding.
+    int numBytesLeft = reader.CurrentEncoding.GetByteCount(charBuffer, charPos, charLen - charPos);
+
+    // For variable-byte encodings, deal with partial chars at the end of the buffer
+    int numFragments = 0;
+    if (byteLen > 0 && !reader.CurrentEncoding.IsSingleByte)
     {
-        var logFiles = Directory.GetFiles(_targetDirectory, "*.log")
-            .OrderByDescending(f => File.GetLastWriteTime(f)) // 파일 수정 시간 순으로 정렬
-            .ToList();
-
-        foreach (var logFile in logFiles)
+        if (reader.CurrentEncoding.CodePage == 65001) // UTF-8
         {
-            using (var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read))
-            using (var sr = new StreamReader(fs))
-            {
-                string line;
-                while ((line = sr.ReadLine()) != null)
-                {
-                    if (line.Contains(_searchTerm))
-                    {
-                        Console.WriteLine($"'{_searchTerm}' found in file: {logFile}");
-                        return File.GetLastWriteTime(logFile); // 마지막 수정 시간을 반환
-                    }
-                }
-            }
+            byte byteCountMask = 0;
+            while ((byteBuffer[byteLen - numFragments - 1] >> 6) == 2) // if the byte is "10xx xxxx", it's a continuation-byte
+                byteCountMask |= (byte)(1 << ++numFragments); // count bytes & build the "complete char" mask
+            if ((byteBuffer[byteLen - numFragments - 1] >> 6) == 3) // if the byte is "11xx xxxx", it starts a multi-byte char.
+                byteCountMask |= (byte)(1 << ++numFragments); // count bytes & build the "complete char" mask
+            // see if we found as many bytes as the leading-byte says to expect
+            if (numFragments > 1 && ((byteBuffer[byteLen - numFragments] >> 7 - numFragments) == byteCountMask))
+                numFragments = 0; // no partial-char in the byte-buffer to account for
         }
-
-        return DateTime.MinValue; // 해당 문자열이 포함된 파일이 없는 경우
-    }
-
-    // 마지막 수정 시간 이후에 수정된 파일을 처리
-    private void ProcessFilesAfter(DateTime lastWriteTime)
-    {
-        var logFiles = Directory.GetFiles(_targetDirectory, "*.log")
-            .Where(f => File.GetLastWriteTime(f) > lastWriteTime) // 지정된 시간 이후에 수정된 파일 필터링
-            .OrderBy(f => File.GetLastWriteTime(f)) // 오래된 순서대로 정렬
-            .ToList();
-
-        foreach (var logFile in logFiles)
+        else if (reader.CurrentEncoding.CodePage == 1200) // UTF-16LE
         {
-            Console.WriteLine($"Processing file: {logFile}");
-            ProcessFile(logFile);
+            if (byteBuffer[byteLen - 1] >= 0xd8) // high-surrogate
+                numFragments = 2; // account for the partial character
         }
-    }
-
-    // 지정된 파일에서 'pppoo'를 찾아 그 이후부터 파일 끝까지 읽어 처리
-    private void ProcessFile(string filePath)
-    {
-        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+        else if (reader.CurrentEncoding.CodePage == 1201) // UTF-16BE
         {
-            fs.Seek(_baseline, SeekOrigin.Begin); // 파일의 마지막 읽은 위치로 이동
-            using (var sr = new StreamReader(fs))
-            {
-                string line;
-                long currentPosition = _baseline; // 현재 파일에서의 읽기 위치 저장
-
-                while ((line = sr.ReadLine()) != null)
-                {
-                    currentPosition = fs.Position; // 현재 읽고 있는 위치를 저장
-
-                    if (line.Contains(_searchTerm))
-                    {
-                        Console.WriteLine($"'{_searchTerm}' found at position {currentPosition} in file {filePath}");
-                        _baseline = currentPosition; // 첫 번째 발견 위치 저장
-                        break; // 문자열을 찾았으면 루프를 종료
-                    }
-                }
-
-                // 'pppoo' 이후 줄부터 파일의 끝까지 읽음
-                while ((line = sr.ReadLine()) != null)
-                {
-                    // 여기서 처리 로직을 실행
-                    HandleLine(line); // 특정 함수를 통해 줄을 처리
-                }
-            }
+            if (byteBuffer[byteLen - 2] >= 0xd8) // high-surrogate
+                numFragments = 2; // account for the partial character
         }
     }
-
-    // 읽은 줄을 처리하는 함수
-    private void HandleLine(string line)
-    {
-        // 읽은 줄을 처리하는 코드 (예: 로그 출력)
-        Console.WriteLine($"Processing line: {line}");
-    }
-
-    // 실행 함수
-    public void Run()
-    {
-        DateTime lastWriteTime = FindLastFileWithSearchTerm(); // 마지막 'pppoo'가 포함된 파일의 수정 시간
-        if (lastWriteTime != DateTime.MinValue)
-        {
-            Console.WriteLine($"Last file with '{_searchTerm}' was modified at {lastWriteTime}");
-            ProcessFilesAfter(lastWriteTime); // 수정 시간 이후의 파일 처리
-        }
-        else
-        {
-            Console.WriteLine($"No file contains '{_searchTerm}'");
-        }
-    }
-}
-
-class Program
-{
-    static void Main(string[] args)
-    {
-        LogFileReader reader = new LogFileReader();
-        reader.Run(); // 로그 파일 읽기 실행
-    }
+    return reader.BaseStream.Position - numBytesLeft - numFragments;
 }
