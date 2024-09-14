@@ -1,67 +1,9 @@
-알겠습니다! 이미 메인 ViewModel이 존재하는 상황에서, Command Queue 시스템을 어떻게 통합할 수 있는지 파일 구조와 코드 통합 방법을 설명드리겠습니다.
+맞습니다! 현재 방식은 하나의 작업이 완료될 때까지 다음 작업을 시작하지 않는 구조이므로, 비동기로 처리해도 전혀 문제가 없습니다. 오히려 비동기 처리를 사용하면 UI 스레드를 차단하지 않고, 작업이 완료될 때까지 다른 작업(예: UI 업데이트 등)을 계속할 수 있습니다. 특히 WPF 같은 UI 애플리케이션에서는 비동기 처리가 더 적합합니다.
 
-파일 및 클래스 구조
-MainViewModel.cs:
+따라서, 모든 명령을 비동기 함수로 처리하고, 작업이 끝날 때까지 기다리는 방식으로 코드를 작성하겠습니다. 비동기 작업 처리에 초점을 맞춘 전체 코드를 제공하겠습니다.
 
-기존에 사용하고 있는 메인 뷰모델 파일입니다.
-이 파일에서 CommandQueueViewModel을 참조하여 명령 큐 관련 기능을 연결합니다.
-CommandQueueViewModel.cs:
-
-명령 큐 관리에 필요한 기능을 담당하는 별도의 ViewModel입니다.
-메인 ViewModel에서 이 CommandQueueViewModel을 인스턴스화하여 사용합니다.
-CommandItem.cs:
-
-명령 정보를 담는 데이터 모델로, 큐에 저장되는 각 명령의 상태와 데이터를 관리합니다.
-MainWindow.xaml:
-
-명령 큐와 UI가 바인딩될 수 있도록 XAML을 수정합니다.
-파일 구조
-sql
-코드 복사
-- ViewModels
-   |-- MainViewModel.cs         // 기존 메인 뷰모델
-   |-- CommandQueueViewModel.cs // 명령 큐 관리 뷰모델
-- Models
-   |-- CommandItem.cs           // 명령의 상태와 정보를 담는 모델
-- Views
-   |-- MainWindow.xaml          // 기존의 WPF UI
-   |-- MainWindow.xaml.cs       // UI 관련 코드
-- SQL
-   |-- CommandLog.sql           // DB 테이블 생성 스크립트
-통합 방식
-MainViewModel에서 CommandQueueViewModel 참조:
-기존 MainViewModel에 CommandQueueViewModel의 인스턴스를 추가하여 명령 큐 시스템과 통합합니다.
-외부에서 명령 추가:
-MainViewModel에서 언제든지 명령을 추가할 수 있도록 CommandQueueViewModel을 통해 명령 추가 메서드를 호출합니다.
-1. MainViewModel.cs (기존 메인 뷰모델과 통합)
-csharp
-코드 복사
-using System.Windows.Input;
-
-public class MainViewModel : INotifyPropertyChanged
-{
-    public CommandQueueViewModel CommandQueue { get; set; }
-
-    public MainViewModel()
-    {
-        // CommandQueueViewModel 인스턴스 생성
-        CommandQueue = new CommandQueueViewModel();
-    }
-
-    // 명령 추가 예제 (외부에서 이벤트 발생 시 호출 가능)
-    public void AddExternalCommand()
-    {
-        CommandQueue.AddCommandExternally("READ 520-540");
-    }
-
-    // PropertyChanged 이벤트 핸들러
-    public event PropertyChangedEventHandler PropertyChanged;
-    protected void OnPropertyChanged(string propertyName)
-    {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-    }
-}
-2. CommandQueueViewModel.cs (명령 큐 시스템 관리)
+비동기 처리 적용한 전체 코드
+1. CommandQueueViewModel.cs
 csharp
 코드 복사
 using System;
@@ -69,12 +11,11 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using System.ComponentModel;
-using System.Data.SqlClient;
 using System.Collections.Generic;
 
 public class CommandQueueViewModel : INotifyPropertyChanged
 {
-    // 명령을 저장하는 큐 (FIFO 방식)
+    // 명령을 저장하는 큐 (비동기 작업을 처리)
     private Queue<Func<Task>> commandQueue = new Queue<Func<Task>>();
 
     // 남아 있는 명령을 표시할 ObservableCollection (리스트박스에 바인딩)
@@ -82,12 +23,6 @@ public class CommandQueueViewModel : INotifyPropertyChanged
 
     // 처리된 명령을 기록할 ObservableCollection (처리된 명령은 기록만 하고 삭제)
     public ObservableCollection<CommandItem> ProcessedCommands { get; set; } = new ObservableCollection<CommandItem>();
-
-    // 최대 재시도 횟수
-    private int maxRetryCount = 3;
-
-    // 데이터베이스 연결 문자열
-    private string connectionString = "your_connection_string_here"; 
 
     // INotifyPropertyChanged 이벤트를 사용해 UI 업데이트
     public event PropertyChangedEventHandler PropertyChanged;
@@ -100,21 +35,44 @@ public class CommandQueueViewModel : INotifyPropertyChanged
         set { _progress = value; OnPropertyChanged(nameof(Progress)); }
     }
 
-    // 외부에서 명령을 추가하는 함수
-    public void AddCommandExternally(string commandText)
+    // 비동기 작업 추가 (Task 반환하는 함수)
+    public void AddAsyncTaskCommand(Func<Task> asyncTask)
     {
-        EnqueueCommand(commandText); // 명령을 내부적으로 처리
+        // 비동기 작업을 큐에 추가
+        EnqueueTask(asyncTask);
     }
 
-    // 명령을 큐에 추가하고 리스트박스에 반영하는 함수
-    private async void EnqueueCommand(string commandText)
+    // 매개변수가 있는 비동기 작업 추가 (예: 매개변수 전달 Func)
+    public void AddParameterizedAsyncTask(Func<string, Task> asyncTask, string param)
     {
-        // 남아 있는 명령 리스트에 새 명령 추가
-        var newCommand = new CommandItem { CommandText = commandText };
-        RemainingCommands.Add(newCommand); // 리스트박스에 추가
+        // 매개변수가 있는 작업을 큐에 추가
+        EnqueueTask(() => asyncTask(param));
+    }
 
-        // 큐에 추가
-        commandQueue.Enqueue(() => ExecuteCommand(newCommand));
+    // 동기 작업을 비동기로 감싸서 처리하는 함수 (Action 형태)
+    public void AddSyncTask(Action action)
+    {
+        // 동기 작업을 비동기 작업으로 래핑하여 큐에 추가
+        EnqueueTask(() =>
+        {
+            action(); // 동기 작업 실행
+            return Task.CompletedTask; // 비동기로 처리될 수 있도록 Task 반환
+        });
+    }
+
+    // 명령을 큐에 추가하고 처리하는 비동기 함수
+    private async void EnqueueTask(Func<Task> taskFunc)
+    {
+        // 남아 있는 명령 리스트에 새 명령 추가 (UI에 반영)
+        var newCommand = new CommandItem { CommandText = "Custom Task" };
+        RemainingCommands.Add(newCommand);
+
+        // 큐에 비동기 함수 추가
+        commandQueue.Enqueue(async () =>
+        {
+            await taskFunc(); // 비동기 함수 실행
+            newCommand.Result = 1; // 명령 성공으로 처리
+        });
 
         // 큐에 첫 번째 명령이 추가된 경우에만 명령 처리 시작
         if (commandQueue.Count == 1)
@@ -122,120 +80,28 @@ public class CommandQueueViewModel : INotifyPropertyChanged
             await ProcessCommandQueue();
         }
 
-        // 프로그레스바 업데이트 (큐에 남은 명령 개수 반영)
+        // 프로그레스바 업데이트 (남은 명령 개수 업데이트)
         UpdateProgress();
     }
 
-    // 큐에 쌓인 명령을 순차적으로 처리하는 함수
+    // 큐에 있는 명령을 순차적으로 처리하는 비동기 함수
     private async Task ProcessCommandQueue()
     {
         // 큐에 명령이 남아 있는 동안 계속 처리
         while (commandQueue.Count > 0)
         {
-            // 큐에서 명령을 꺼내어 실행
-            var command = commandQueue.Dequeue();
-            await command();
+            var command = commandQueue.Dequeue(); // 큐에서 명령을 꺼냄
+            await command(); // 비동기 명령 실행
 
             // 프로그레스바 업데이트 (남은 명령 개수 반영)
             UpdateProgress();
         }
     }
 
-    // 프로그레스바 상태 업데이트 (큐에 남아 있는 명령의 개수 반영)
+    // 프로그레스바 상태 업데이트
     private void UpdateProgress()
     {
-        Progress = commandQueue.Count; // 큐에 남은 명령의 수를 UI에 반영
-    }
-
-    // PLC에 명령을 전송하고 응답을 처리하는 함수
-    private async Task ExecuteCommand(CommandItem command)
-    {
-        int retryCount = 0; // 재시도 횟수 카운트
-        bool success = false; // 명령 성공 여부
-        string response = string.Empty; // PLC에서 받은 응답
-        Stopwatch stopwatch = new Stopwatch(); // 응답 시간을 측정하기 위한 스톱워치
-
-        // 재시도 횟수가 남아 있고 아직 성공하지 못한 경우 반복
-        while (retryCount < maxRetryCount && !success)
-        {
-            stopwatch.Restart(); // 응답 시간 측정 시작
-            response = await SendCommandToPLC(command.CommandText); // PLC로 명령 전송 및 응답 대기
-            stopwatch.Stop(); // 응답 시간 측정 완료
-
-            success = ValidateResponse(response); // 응답이 올바른지 확인
-
-            // 응답이 실패하면 1초 대기 후 재시도
-            if (!success)
-            {
-                retryCount++;
-                await Task.Delay(1000); // 1초 대기 후 재시도
-            }
-        }
-
-        // 명령이 완료되었으므로 리스트에서 제거하고, 처리된 명령에 추가
-        RemainingCommands.Remove(command);
-        command.ResponseText = response;
-        command.Result = success ? 1 : 0;
-        command.RetryCount = retryCount;
-        command.ResponseTime = stopwatch.ElapsedMilliseconds;
-
-        // 처리된 명령 리스트에 추가 (기록만 하고 화면에 반영하지 않을 수도 있음)
-        ProcessedCommands.Add(command);
-
-        // DB에 명령, 응답, 성공 여부, 재시도 횟수, 응답 시간 기록
-        await LogCommandToDatabase(command.CommandText, response, success ? 1 : 0, retryCount, stopwatch.ElapsedMilliseconds);
-    }
-
-    // PLC에 명령을 전송하는 가상 함수 (실제 PLC와 통신하는 로직 필요)
-    private async Task<string> SendCommandToPLC(string commandText)
-    {
-        await Task.Delay(500); // 실제 PLC 통신 시간을 가정 (500ms 대기)
-        return "OK"; // 가상 응답 (실제 PLC 응답을 처리하는 코드로 변경 필요)
-    }
-
-    // 응답을 검증하는 함수 (응답이 올바른지 확인)
-    private bool ValidateResponse(string response)
-    {
-        return response == "OK"; // 응답이 "OK"이면 성공으로 간주 (필요 시 수정 가능)
-    }
-
-    // DB에 명령과 응답을 기록하는 함수
-    private async Task LogCommandToDatabase(string commandText, string response, int result, int retryCount, long responseTime)
-    {
-        using (SqlConnection connection = new SqlConnection(connectionString))
-        {
-            await connection.OpenAsync(); // 비동기로 DB 연결
-            using (SqlCommand command = new SqlCommand(
-                "INSERT INTO CommandLog (CommandText, ResponseText, Result, RetryCount, ResponseTime) " +
-                "VALUES (@CommandText, @ResponseText, @Result, @RetryCount, @ResponseTime)", connection))
-            {
-                // SQL 파라미터 설정 (SQL 인젝션 방지)
-                command.Parameters.AddWithValue("@CommandText", commandText);
-                command.Parameters.AddWithValue("@ResponseText", response);
-                command.Parameters.AddWithValue("@Result", result);
-                command.Parameters.AddWithValue("@RetryCount", retryCount
-
-
-
-
-
-나의 말:
-이어서
-
-2/2
-
-ChatGPT의 말:
-ChatGPT
-다시 이어서 전체 코드를 제공드리겠습니다.
-
-2. CommandQueueViewModel.cs (명령 큐 시스템 관리) 이어서
-csharp
-코드 복사
-                command.Parameters.AddWithValue("@ResponseTime", responseTime);
-
-                await command.ExecuteNonQueryAsync(); // SQL 명령 실행
-            }
-        }
+        Progress = commandQueue.Count; // 큐에 남은 명령 수를 UI에 반영
     }
 
     // UI 업데이트를 위한 이벤트 트리거 함수
@@ -244,16 +110,61 @@ csharp
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 }
-3. CommandItem.cs (명령 데이터 모델)
+2. CommandItem.cs (명령 데이터 모델)
 csharp
 코드 복사
 public class CommandItem
 {
-    public string CommandText { get; set; } // 보낸 명령어
-    public string ResponseText { get; set; } // 받은 응답
+    public string CommandText { get; set; } // 보낸 명령어 (예: "Custom Task")
     public int Result { get; set; } // 성공 여부 (1: 성공, 0: 실패)
-    public int RetryCount { get; set; } // 재시도 횟수
-    public long ResponseTime { get; set; } // 응답 시간 (밀리초)
+}
+3. MainViewModel.cs (명령 큐와 통합한 메인 뷰모델)
+csharp
+코드 복사
+public class MainViewModel : INotifyPropertyChanged
+{
+    // CommandQueueViewModel 인스턴스 생성
+    public CommandQueueViewModel CommandQueue { get; set; }
+
+    public MainViewModel()
+    {
+        CommandQueue = new CommandQueueViewModel();
+    }
+
+    // 비동기 작업을 추가 (예: 1초 지연 작업)
+    public void AddCustomAsyncCommand()
+    {
+        CommandQueue.AddAsyncTaskCommand(async () =>
+        {
+            await Task.Delay(1000); // 1초 대기
+            Console.WriteLine("Async Task Completed!");
+        });
+    }
+
+    // 매개변수를 가진 비동기 작업을 추가
+    public void AddParameterizedCommand(string param)
+    {
+        CommandQueue.AddParameterizedAsyncTask(async (input) =>
+        {
+            await Task.Delay(500); // 0.5초 대기
+            Console.WriteLine($"Task with param {input} completed!");
+        }, param);
+    }
+
+    // 동기 작업을 비동기로 감싸서 추가
+    public void AddSyncCommand()
+    {
+        CommandQueue.AddSyncTask(() =>
+        {
+            Console.WriteLine("Sync Action Executed!");
+        });
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+    protected void OnPropertyChanged(string propertyName)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }
 4. MainWindow.xaml (UI 정의)
 xml
@@ -268,75 +179,34 @@ xml
             <ListBox.ItemTemplate>
                 <DataTemplate>
                     <StackPanel Orientation="Horizontal">
-                        <!-- 보낸 명령 텍스트 -->
+                        <!-- 명령 텍스트 -->
                         <TextBlock Text="{Binding CommandText}" Width="200"/>
-                        <!-- 재시도 횟수 -->
-                        <TextBlock Text=" 재시도: " Width="70"/>
-                        <TextBlock Text="{Binding RetryCount}" Width="50"/>
+                        <!-- 성공 여부 (명령 완료 후 결과 표시) -->
+                        <TextBlock Text=" 결과: " Width="50"/>
+                        <TextBlock Text="{Binding Result}" Width="50"/>
                     </StackPanel>
                 </DataTemplate>
             </ListBox.ItemTemplate>
         </ListBox>
 
-        <!-- 세로형 프로그레스바 (큐에 쌓인 명령의 수를 시각적으로 표시) -->
+        <!-- 세로형 프로그레스바 (큐에 남아 있는 명령 수 시각적으로 표시) -->
         <ProgressBar VerticalAlignment="Top" Height="300" Width="30" Orientation="Vertical" Value="{Binding CommandQueue.Progress}" Maximum="10" HorizontalAlignment="Right" Margin="0,0,50,0"/>
     </Grid>
 </Window>
-5. MainWindow.xaml.cs
-csharp
-코드 복사
-using System.Windows;
+설명
+비동기 처리:
 
-namespace CommandQueueApp
-{
-    public partial class MainWindow : Window
-    {
-        private MainViewModel viewModel;
+모든 작업이 비동기로 처리되므로, 작업이 완료될 때까지 UI가 멈추지 않고 자연스럽게 동작합니다.
+명령은 비동기 함수(Func<Task>)로 큐에 추가되며, 순차적으로 실행됩니다.
+동기 작업을 비동기로 래핑:
 
-        public MainWindow()
-        {
-            InitializeComponent();
-            // MainViewModel 인스턴스 생성 및 DataContext 설정
-            viewModel = new MainViewModel();
-            DataContext = viewModel;
-        }
+동기 작업(Action)을 비동기로 래핑하여 큐에서 처리할 수 있습니다.
+AddSyncTask 함수는 동기 작업을 비동기 구조로 처리하여 UI 스레드를 차단하지 않습니다.
+매개변수 있는 비동기 작업:
 
-        // 다른 코드나 이벤트에서 명령 추가를 실행할 수 있는 메서드
-        public void TriggerExternalCommand()
-        {
-            // MainViewModel을 통해 명령을 추가
-            viewModel.AddExternalCommand();
-        }
-    }
-}
-6. SQL 테이블 생성 스크립트
-sql
-코드 복사
-CREATE TABLE CommandLog (
-    Id INT PRIMARY KEY IDENTITY(1,1), -- 자동 증가 ID
-    CommandText NVARCHAR(255),        -- 보낸 명령어
-    ResponseText NVARCHAR(255),       -- 받은 응답
-    Result INT,                       -- 결과 (1: 성공, 0: 실패)
-    RetryCount INT,                   -- 재시도 횟수
-    ResponseTime INT,                 -- 응답 시간 (밀리초)
-    Timestamp DATETIME DEFAULT GETDATE() -- 명령 발생 시간 (기본값: 현재 시간)
-);
-설명 요약
-MainViewModel:
+AddParameterizedAsyncTask는 매개변수를 가진 비동기 작업을 처리할 수 있도록 설계되었습니다.
+UI 업데이트:
 
-기존의 메인 뷰모델에서 CommandQueueViewModel을 인스턴스화하여 명령 큐 시스템을 통합합니다.
-AddExternalCommand()를 통해 외부에서 명령을 추가할 수 있습니다.
-CommandQueueViewModel:
-
-명령 큐 처리를 담당하며, 외부에서 명령을 추가할 수 있도록 설계되었습니다.
-큐에 남은 명령만 UI에 표시되며, 처리된 명령은 기록만 하고 UI에서 제거됩니다.
-CommandItem:
-
-각 명령의 상태를 저장하는 모델입니다.
-MainWindow.xaml:
-
-리스트박스는 남아 있는 명령을 표시하고, 프로그레스바는 큐에 남은 명령 개수를 실시간으로 반영합니다.
-SQL 테이블:
-
-명령 로그 기록을 위한 SQL 테이블을 생성하여, 각 명령과 그 결과를 DB에 기록할 수 있습니다.
-이 구조는 기존 메인 ViewModel과 통합할 수 있도록 설계되었으며, Command Queue 시스템을 명확하게 관리하고, 외부 이벤트를 통해 명령을 추가하고 처리할 수 있게 만들어졌습니다
+리스트박스는 남아 있는 명령을 표시하며, 각 명령의 결과는 작업이 완료된 후 표시됩니다.
+프로그레스바는 큐에 남은 명령의 수를 실시간으로 업데이트하여 시각적으로 표시합니다.
+이 코드는 비동기 작업을 처리하는 데 최적화되어 있으며, 동기 작업도 비동기로 래핑하여 처리할 수 있도록 설계되었습니다. 이 방식은 UI를 차단하지 않고 작업을 처리
