@@ -1,16 +1,17 @@
-이 설명한 시나리오에 따르면, 파일 감지 클래스가 있고, COM 포트 처리 클래스가 생성자를 통해 전달되어 파일이 감지되면 COM 포트의 특정 함수를 실행하는 구조입니다. 이때, COM 포트의 함수를 명령 큐에 추가하여 처리하는 방식으로 명령 큐 시스템과 접목할 수 있습니다. 파일이 감지되면 그 작업을 큐에 추가하고, 큐에서 순차적으로 COM 포트 작업을 처리하게 되는 구조로 변경할 수 있습니다.
+알겠습니다. 이전 코드에서 더 상세한 작업 처리 및 누락된 부분 없이 명령 큐 시스템과 COM 포트 통신, 그리고 파일 감지 시스템을 접목한 전체 코드를 다시 제공해 드리겠습니다. 또한, DB 처리까지 포함하여 완전한 코드로 제공하겠습니다.
 
-다음은 이 구조를 설명하고, 전체 코드를 수정해 드리겠습니다.
-
-작업 흐름
-파일 감지 클래스는 파일을 감지하면 COM 포트 클래스의 특정 함수를 호출합니다.
-COM 포트 함수는 CommandQueueViewModel에 작업으로 큐에 추가되고, 순차적으로 처리됩니다.
-파일이 여러 개 감지되면, 큐에 작업이 차곡차곡 쌓이고 FIFO 방식으로 COM 포트 작업이 실행됩니다.
-전체 파일 구조
-CommandQueueViewModel.cs: 명령 큐를 관리하는 파일. 이 클래스에 작업을 추가하여 COM 포트 작업을 처리합니다.
-ComPortHandler.cs: COM 포트를 처리하는 클래스. 이 클래스의 특정 함수가 명령 큐에 추가됩니다.
-FileWatcher.cs: 파일을 감지하는 클래스. 파일이 감지되면 COM 포트의 함수를 실행하며, 이 함수는 명령 큐를 통해 처리됩니다.
-MainViewModel.cs: 전체 시스템을 조율하는 메인 뷰모델로, 파일 감지와 명령 큐 처리를 연결합니다.
+작업 흐름 요약
+파일 감지 시스템이 파일 변경을 감지하면, COM 포트 처리 클래스에 명령을 전달합니다.
+명령은 명령 큐 시스템에 추가되고, FIFO 방식으로 처리됩니다.
+각 작업이 완료되면 DB에 로그를 기록하여 작업 이력을 관리합니다.
+파일 및 클래스 구조
+CommandQueueViewModel.cs: 명령 큐 관리 클래스.
+ComPortHandler.cs: COM 포트 처리 클래스.
+FileWatcher.cs: 파일 감지 클래스.
+MainViewModel.cs: 전체 시스템을 관리하는 메인 뷰모델.
+CommandItem.cs: 명령의 상태를 관리하는 모델 클래스.
+DatabaseHelper.cs: DB 처리를 위한 헬퍼 클래스.
+SQL 테이블 생성 스크립트: DB에 로그를 기록하기 위한 SQL 테이블 생성.
 1. CommandQueueViewModel.cs (명령 큐 관리)
 csharp
 코드 복사
@@ -25,7 +26,6 @@ public class CommandQueueViewModel : INotifyPropertyChanged
     private Queue<Func<Task>> commandQueue = new Queue<Func<Task>>();
 
     public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>();
-
     public event PropertyChangedEventHandler PropertyChanged;
 
     private int _progress;
@@ -35,56 +35,69 @@ public class CommandQueueViewModel : INotifyPropertyChanged
         set { _progress = value; OnPropertyChanged(nameof(Progress)); }
     }
 
-    // 비동기 작업 추가 (Task 반환하는 함수)
-    public void AddAsyncTaskCommand(Func<Task> asyncTask)
+    // DB 헬퍼 인스턴스
+    private readonly DatabaseHelper _dbHelper;
+
+    public CommandQueueViewModel()
     {
-        EnqueueTask(asyncTask);
+        _dbHelper = new DatabaseHelper();
     }
 
-    private async void EnqueueTask(Func<Task> taskFunc)
+    // 비동기 작업을 큐에 추가하는 함수 (Task 반환)
+    public void AddAsyncTaskCommand(Func<Task> asyncTask, string commandText)
     {
-        var newCommand = new CommandItem { CommandText = "Custom Task" };
+        EnqueueTask(asyncTask, commandText);
+    }
+
+    // 명령을 큐에 추가하는 내부 함수
+    private async void EnqueueTask(Func<Task> taskFunc, string commandText)
+    {
+        // 명령 상태 저장 (UI에 반영하기 위해 CommandItem 사용)
+        var newCommand = new CommandItem { CommandText = commandText, Status = "Pending" };
         RemainingCommands.Add(newCommand);
 
         commandQueue.Enqueue(async () =>
         {
-            await taskFunc(); // 비동기 함수 실행
-            newCommand.Result = 1; // 명령 성공으로 처리
+            newCommand.Status = "Processing";
+            await taskFunc(); // 비동기 작업 실행
+            newCommand.Status = "Completed";
+            newCommand.Result = 1; // 작업 성공 처리
+
+            // DB에 작업 로그 저장
+            await _dbHelper.LogCommandToDatabase(newCommand.CommandText, "Success", newCommand.Result);
         });
 
+        // 첫 번째 작업이 실행 중이 아니면 바로 처리 시작
         if (commandQueue.Count == 1)
         {
             await ProcessCommandQueue();
         }
 
+        // 프로그레스바 업데이트
         UpdateProgress();
     }
 
+    // 명령 큐를 순차적으로 처리하는 함수
     private async Task ProcessCommandQueue()
     {
         while (commandQueue.Count > 0)
         {
-            var command = commandQueue.Dequeue();
-            await command(); // 비동기 명령 실행
-            UpdateProgress();
+            var command = commandQueue.Dequeue(); // 큐에서 작업을 꺼냄
+            await command(); // 작업 실행
+            UpdateProgress(); // 프로그레스바 상태 업데이트
         }
     }
 
+    // 프로그레스바 상태 업데이트
     private void UpdateProgress()
     {
-        Progress = commandQueue.Count; // 큐에 남은 명령 수를 UI에 반영
+        Progress = commandQueue.Count;
     }
 
     protected void OnPropertyChanged(string propertyName)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
-}
-
-public class CommandItem
-{
-    public string CommandText { get; set; }
-    public int Result { get; set; }
 }
 2. ComPortHandler.cs (COM 포트 처리 클래스)
 csharp
@@ -94,7 +107,7 @@ using System.Threading.Tasks;
 
 public class ComPortHandler
 {
-    // COM 포트와 통신하는 예시 함수 (실제 구현에서는 COM 포트 관련 코드)
+    // COM 포트 통신 함수 (실제 구현에서는 COM 포트 관련 코드)
     public async Task SendDataAsync(string data)
     {
         Console.WriteLine($"Sending data to COM port: {data}");
@@ -113,7 +126,7 @@ public class FileWatcher
     private readonly ComPortHandler _comPortHandler;
     private readonly CommandQueueViewModel _commandQueue;
 
-    // 생성자에서 COM 포트 핸들러와 명령 큐를 주입받음
+    // 생성자에서 COM 포트 핸들러와 명령 큐를 받음
     public FileWatcher(ComPortHandler comPortHandler, CommandQueueViewModel commandQueue)
     {
         _comPortHandler = comPortHandler;
@@ -122,24 +135,24 @@ public class FileWatcher
         // 파일 감지 설정
         var watcher = new FileSystemWatcher(@"C:\watched_folder");
         watcher.Filter = "*.txt"; // 텍스트 파일 감지
-        watcher.Changed += OnFileChanged;
+        watcher.Changed += OnFileChanged; // 파일 변경 이벤트 핸들러
         watcher.EnableRaisingEvents = true;
     }
 
-    // 파일이 변경될 때 실행되는 함수
+    // 파일 변경 시 호출되는 함수
     private void OnFileChanged(object sender, FileSystemEventArgs e)
     {
         Console.WriteLine($"File detected: {e.Name}");
         
-        // 파일 감지 시, COM 포트 핸들러의 작업을 명령 큐에 추가
+        // 파일 감지 시 COM 포트 핸들러 작업을 큐에 추가
         _commandQueue.AddAsyncTaskCommand(async () =>
         {
-            string dataToSend = File.ReadAllText(e.FullPath);
+            string dataToSend = File.ReadAllText(e.FullPath); // 파일 내용 읽기
             await _comPortHandler.SendDataAsync(dataToSend); // COM 포트에 데이터 전송
-        });
+        }, $"Send {e.Name} to COM port"); // 큐에 추가된 작업 설명
     }
 }
-4. MainViewModel.cs (전체 시스템 조율)
+4. MainViewModel.cs (전체 시스템 관리)
 csharp
 코드 복사
 public class MainViewModel : INotifyPropertyChanged
@@ -149,10 +162,11 @@ public class MainViewModel : INotifyPropertyChanged
 
     public MainViewModel()
     {
+        // 명령 큐와 COM 포트 핸들러 인스턴스 생성
         CommandQueue = new CommandQueueViewModel();
         var comPortHandler = new ComPortHandler();
-        
-        // FileWatcher에 COM 포트 핸들러와 명령 큐를 전달
+
+        // FileWatcher에 COM 포트 핸들러와 명령 큐 전달
         FileWatcher = new FileWatcher(comPortHandler, CommandQueue);
     }
 
@@ -162,24 +176,82 @@ public class MainViewModel : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 }
-파일별 변경 사항 설명
+5. CommandItem.cs (명령 상태 관리 모델)
+csharp
+코드 복사
+public class CommandItem
+{
+    public string CommandText { get; set; } // 명령어 또는 작업 설명
+    public string Status { get; set; } // 작업 상태 (Pending, Processing, Completed)
+    public int Result { get; set; } // 결과 (1: 성공, 0: 실패)
+}
+6. DatabaseHelper.cs (DB 처리 헬퍼 클래스)
+csharp
+코드 복사
+using System;
+using System.Data.SqlClient;
+using System.Threading.Tasks;
+
+public class DatabaseHelper
+{
+    private string connectionString = "your_connection_string_here"; // DB 연결 문자열
+
+    // 명령과 결과를 DB에 기록하는 함수
+    public async Task LogCommandToDatabase(string commandText, string status, int result)
+    {
+        using (SqlConnection connection = new SqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+
+            string query = "INSERT INTO CommandLog (CommandText, Status, Result, Timestamp) " +
+                           "VALUES (@CommandText, @Status, @Result, GETDATE())";
+
+            using (SqlCommand command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@CommandText", commandText);
+                command.Parameters.AddWithValue("@Status", status);
+                command.Parameters.AddWithValue("@Result", result);
+
+                await command.ExecuteNonQueryAsync();
+            }
+        }
+    }
+}
+7. SQL 테이블 생성 스크립트
+sql
+코드 복사
+CREATE TABLE CommandLog (
+    Id INT PRIMARY KEY IDENTITY(1,1),
+    CommandText NVARCHAR(255),
+    Status NVARCHAR(50),
+    Result INT,
+    Timestamp DATETIME DEFAULT GETDATE()
+);
+설명
 CommandQueueViewModel.cs:
 
-비동기 작업 큐 관리를 담당합니다. 각 작업을 순차적으로 실행하고, 큐에 남은 작업 개수를 관리하여 UI에 반영합니다.
+명령 큐에 비동기 작업을 추가하고, 작업이 완료되면 DB에 로그를 남깁니다.
+각 명령은 CommandItem으로 관리되며, 상태(Pending, Processing, Completed)를 UI에 반영할 수 있습니다.
 ComPortHandler.cs:
 
-COM 포트 통신을 처리하는 클래스입니다. 파일이 감지되었을 때, 파일의 내용을 읽고 COM 포트를 통해 데이터를 전송하는 작업을 합니다.
+COM 포트로 데이터를 전송하는 역할을 합니다. 실제 COM 포트와의 통신 코드를 여기에 구현할 수 있습니다.
 FileWatcher.cs:
 
-파일 감지를 담당하는 클래스입니다. 감지된 파일의 내용을 읽고, COM 포트로 데이터를 전송하는 작업을 명령 큐에 추가하여 순차적으로 처리합니다.
+파일을 감지하면 COM 포트로 데이터를 전송하는 작업을 큐에 추가합니다.
+큐에 추가된 작업은 순차적으로 처리됩니다.
 MainViewModel.cs:
 
-CommandQueueViewModel과 FileWatcher를 조율하는 메인 뷰모델입니다. FileWatcher에서 파일이 감지되면 COM 포트 작업을 큐에 추가합니다.
-작동 방식 설명
-파일 감지: FileWatcher가 텍스트 파일을 감지하면, OnFileChanged 메서드가 호출되어 감지된 파일의 데이터를 읽습니다.
+전체 시스템을 조율하는 메인 뷰모델로, 명령 큐와 파일 감지 시스템을 연결합니다.
+DatabaseHelper.cs:
 
-명령 큐에 작업 추가: 파일의 데이터를 읽은 후, COM 포트로 데이터를 전송하는 작업을 CommandQueueViewModel에 비동기 작업으로 추가합니다.
+명령과 그 결과를 DB에 기록하는 헬퍼 클래스입니다.
+SQL 테이블 생성 스크립트:
 
-큐 처리: CommandQueueViewModel은 FIFO 방식으로 큐에 쌓인 작업을 처리하며, 한 작업이 끝나면 다음 작업을 실행합니다.
+명령 로그를 기록할 CommandLog 테이블을 생성합니다. 각 명령의 상태와 결과가 기록됩니다.
+이 코드는 파일 감지 작업과 COM 포트 통신을 명령 큐 시스템과 DB 로깅까지 연결하여 처리합니다. 비동기적으로 작업을 처리하면서 로그를 남기고, UI에 작업 상태를 반영할 수 있도록 설계되어 있습니다.
 
-이 방식은 파일 감지 작업과 COM 포트 처리를 명령 큐에 넣어 순차적으로 처리할 수 있도록 구성되어 있어, 파일이 여러 개 감지되더라도 COM 포트 작업이 안정적으로 처리됩니다.
+
+
+
+
+
