@@ -1,198 +1,187 @@
-using System;
-using System.Collections.ObjectModel;
-using System.Threading.Tasks;
-using System.ComponentModel;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Windows.Threading; // Dispatcher 사용을 위해 필요
+리스트박스에 재시도 정보, 제한 시간, 응답 시간, 몇 번째 재시도인지를 표시하고, ProgressBar에는 최대 큐 크기만큼의 칸을 그려서 큐의 현재 상태를 직관적으로 확인할 수 있도록 하겠습니다. 또한 각 프로그레스 칸마다 번호를 매겨 몇 개의 작업이 쌓였는지 직관적으로 확인할 수 있게 해보겠습니다.
 
-public class CommandQueueViewModel : INotifyPropertyChanged
+변경 사항 요약:
+ListBox:
+작업의 상태에 대한 정보를 표시 (재시도 횟수, 제한 시간, 응답 시간).
+각 작업이 몇 번째 재시도인지도 함께 표시.
+ProgressBar:
+최대 큐 크기만큼 프로그레스 바를 채우고, 각 칸에 번호를 매겨서 쌓인 작업 개수를 직관적으로 볼 수 있도록 함.
+CommandQueueViewModel.cs 수정
+1. 작업 정보 확장 (CommandItem에 추가)
+우선 CommandItem에 재시도 정보와 응답 시간을 추가해, 리스트박스에 표시될 때 정보를 쉽게 접근할 수 있도록 수정합니다.
+
+csharp
+코드 복사
+public class CommandItem
 {
-    // 명령 큐
-    private Queue<Func<Task<CommandResult>>> commandQueue = new Queue<Func<Task<CommandResult>>>();
-    
-    // UI에 표시할 명령 리스트
-    public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>();
-
-    // INotifyPropertyChanged 인터페이스 구현
-    public event PropertyChangedEventHandler PropertyChanged;
-
-    // 처리 중 여부 플래그
-    private bool _isProcessing; 
-    
-    // DB 헬퍼 클래스
-    private readonly DatabaseHelper _dbHelper;
-
-    // 기본 재시도 횟수와 재시도 간격
-    public int RetryLimit { get; set; } = 3; // 기본 재시도 횟수 3회
-    public int RetryInterval { get; set; } = 2000; // 기본 재시도 간격 2초 (2000ms)
-
-    // 응답 제한 시간 (기본값: 5초)
-    public int ResponseTimeout { get; set; } = 5000; // 밀리초 단위 (5000ms = 5초)
-
-    // 최대 큐 크기 (기본값: 10개)
-    public int MaximumQueueSize { get; set; } = 10;
-
-    // Progress 속성 추가 (ProgressBar를 위한 속성)
-    private int _progress;
-    public int Progress
-    {
-        get => _progress;
-        set
-        {
-            if (_progress != value)
-            {
-                _progress = value;
-                OnPropertyChanged(nameof(Progress)); // Progress 변경 시 UI 업데이트
-            }
-        }
-    }
-
-    public CommandQueueViewModel()
-    {
-        _dbHelper = new DatabaseHelper();
-        _isProcessing = false; // 처리 중 상태 플래그 초기화
-        Progress = 0; // 초기값 0
-    }
-
-    // 비동기 작업을 큐에 추가하는 함수 (보낸 명령, 응답 검사 포함)
-    public void AddAsyncTaskCommand(Func<Task<string>> asyncTask, string commandText, string sentCommand, Func<string, bool> responseValidator)
-    {
-        // 작업이 N개 이상 쌓이면 더 이상 큐에 추가하지 않고 함수 실행 취소
-        if (commandQueue.Count >= MaximumQueueSize)
-        {
-            ShowAlarm($"Queue limit reached: {MaximumQueueSize} items. New command canceled.");
-            return; // 큐에 추가하지 않고 취소
-        }
-
-        EnqueueTask(asyncTask, commandText, sentCommand, responseValidator);
-    }
-
-    // 명령을 큐에 추가하고 처리하는 함수
-    private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
-    {
-        var newCommand = new CommandItem { CommandText = commandText, Status = "Pending" };
-
-        // RemainingCommands는 UI 바인딩된 컬렉션이므로 Dispatcher로 UI 스레드에서 접근
-        App.Current.Dispatcher.Invoke(() =>
-        {
-            RemainingCommands.Add(newCommand);
-        });
-
-        commandQueue.Enqueue(async () =>
-        {
-            newCommand.Status = "Processing";
-            int retryCount = 0;
-            Stopwatch stopwatch = new Stopwatch(); // 응답 시간 측정용 스톱워치
-
-            while (retryCount < RetryLimit) // 재시도 횟수가 최대 재시도 횟수보다 적을 때까지 반복
-            {
-                try
-                {
-                    stopwatch.Restart(); // 응답 시간 측정 시작
-                    string result = await taskFunc(); // 비동기 작업 실행
-                    stopwatch.Stop(); // 응답 시간 측정 완료
-
-                    int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간 계산
-
-                    // 응답 시간이 N초를 초과하면 감지하고 새로운 작업을 중단
-                    if (responseTime > ResponseTimeout)
-                    {
-                        newCommand.Status = "Timeout"; // 응답 시간 초과
-                        ShowAlarm($"Warning: Response took longer than {ResponseTimeout / 1000} seconds. All further commands will be canceled.");
-                        StopProcessing(); // 큐 처리 중단
-                        return new CommandResult { Success = false, Message = "Response Timeout" };
-                    }
-
-                    newCommand.Output = result; // 받은 응답 저장
-
-                    if (responseValidator(result)) // 정상 응답 검증
-                    {
-                        newCommand.Status = "Completed"; // 성공 처리
-                        newCommand.Result = 1; // 성공 플래그
-                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, newCommand.Output);
-                        UpdateProgress(); // 작업 완료 시 Progress 업데이트
-                        return new CommandResult { Success = true, Message = result };
-                    }
-                    else
-                    {
-                        retryCount++;
-                        if (retryCount >= RetryLimit)
-                        {
-                            newCommand.Status = "Failed";
-                            newCommand.Result = 0; // 실패 플래그
-                            await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, result);
-                            ShowAlarm("Failed after maximum retries: " + result);
-                            StopProcessing(); // 큐 처리 중단
-                            UpdateProgress(); // 작업 실패 시에도 Progress 업데이트
-                            return new CommandResult { Success = false, Message = result };
-                        }
-                        await Task.Delay(RetryInterval); // 재시도 간격 대기
-                    }
-                }
-                catch (Exception ex)
-                {
-                    newCommand.Status = "Failed";
-                    newCommand.Result = 0; // 실패 플래그
-                    stopwatch.Stop(); // 예외 시에도 응답 시간 측정 종료
-                    int responseTime = (int)stopwatch.ElapsedMilliseconds;
-
-                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
-                    ShowAlarm("Error occurred: " + ex.Message); // 오류 알람
-                    UpdateProgress(); // 예외 시에도 Progress 업데이트
-                    return new CommandResult { Success = false, Message = ex.Message };
-                }
-            }
-            UpdateProgress(); // 최종적으로 Progress 업데이트
-            return new CommandResult { Success = false };
-        });
-
-        // 작업이 처리 중이 아닌 경우 즉시 처리 시작
-        if (!_isProcessing)
-        {
-            _isProcessing = true;
-            await ProcessCommandQueue();
-        }
-
-        UpdateProgress(); // 프로그레스바 상태 업데이트
-    }
-
-    // 명령 큐를 순차적으로 처리하는 함수
-    private async Task ProcessCommandQueue()
-    {
-        while (commandQueue.Count > 0)
-        {
-            var command = commandQueue.Dequeue(); // 큐에서 작업을 꺼냄
-            await command(); // 큐에 있는 작업 실행
-            UpdateProgress(); // 프로그레스바 상태 업데이트
-        }
-
-        _isProcessing = false; // 모든 작업 완료 후 처리 중 상태 해제
-    }
-
-    // 큐 처리 중단 함수
-    private void StopProcessing()
-    {
-        commandQueue.Clear(); // 큐를 비우고 처리 중단
-        _isProcessing = false; // 처리 중 상태 해제
-        ShowAlarm("All processing stopped due to timeout or queue limit.");
-    }
-
-    // 알람 표시 (실제 구현은 UI 관련 코드로 연결)
-    private void ShowAlarm(string message)
-    {
-        Console.WriteLine("ALARM: " + message); // 콘솔에 알람 출력 (UI에서 알람 처리 필요)
-    }
-
-    // 프로그레스바 상태 업데이트
-    private void UpdateProgress()
-    {
-        Progress = commandQueue.Count; // 남은 명령의 수에 따라 Progress 값 업데이트
-    }
-
-    // INotifyPropertyChanged 인터페이스 구현
-    protected void OnPropertyChanged(string propertyName)
-    {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-    }
+    public string CommandText { get; set; } // 명령어 또는 작업 설명
+    public string Status { get; set; } // 작업 상태 (Pending, Processing, Completed, Failed)
+    public string Output { get; set; } // 명령의 출력 또는 오류 메시지
+    public int Result { get; set; } // 결과 (1: 성공, 0: 실패)
+    public int RetryCount { get; set; } // 재시도 횟수
+    public int ResponseTime { get; set; } // 응답 시간 (밀리초)
+    public int MaxRetryLimit { get; set; } // 최대 재시도 제한 시간
 }
+2. EnqueueTask에서 정보 업데이트
+명령이 처리될 때 재시도 횟수, 응답 시간, 제한 시간을 CommandItem에 업데이트하여 리스트박스에 표시할 수 있도록 수정합니다.
+
+csharp
+코드 복사
+private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
+{
+    var newCommand = new CommandItem 
+    { 
+        CommandText = commandText, 
+        Status = "Pending", 
+        MaxRetryLimit = RetryLimit, // 최대 재시도 횟수 설정
+        RetryCount = 0 // 초기 재시도 횟수는 0
+    };
+
+    // RemainingCommands는 UI 바인딩된 컬렉션이므로 Dispatcher로 UI 스레드에서 접근
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        RemainingCommands.Add(newCommand);
+    });
+
+    commandQueue.Enqueue(async () =>
+    {
+        newCommand.Status = "Processing";
+        int retryCount = 0;
+        Stopwatch stopwatch = new Stopwatch(); // 응답 시간 측정용 스톱워치
+
+        while (retryCount < RetryLimit) // 재시도 횟수가 최대 재시도 횟수보다 적을 때까지 반복
+        {
+            try
+            {
+                stopwatch.Restart(); // 응답 시간 측정 시작
+                string result = await taskFunc(); // 비동기 작업 실행
+                stopwatch.Stop(); // 응답 시간 측정 완료
+
+                int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간 계산
+                newCommand.ResponseTime = responseTime; // 응답 시간 저장
+                newCommand.RetryCount = retryCount; // 재시도 횟수 업데이트
+
+                // 응답 시간이 N초를 초과하면 감지하고 새로운 작업을 중단
+                if (responseTime > ResponseTimeout)
+                {
+                    newCommand.Status = "Timeout"; // 응답 시간 초과
+                    ShowAlarm($"Warning: Response took longer than {ResponseTimeout / 1000} seconds. All further commands will be canceled.");
+                    StopProcessing(); // 큐 처리 중단
+                    return new CommandResult { Success = false, Message = "Response Timeout" };
+                }
+
+                newCommand.Output = result; // 받은 응답 저장
+
+                if (responseValidator(result)) // 정상 응답 검증
+                {
+                    newCommand.Status = "Completed"; // 성공 처리
+                    newCommand.Result = 1; // 성공 플래그
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, newCommand.Output);
+                    UpdateProgress(); // 작업 완료 시 Progress 업데이트
+                    return new CommandResult { Success = true, Message = result };
+                }
+                else
+                {
+                    retryCount++;
+                    if (retryCount >= RetryLimit)
+                    {
+                        newCommand.Status = "Failed";
+                        newCommand.Result = 0; // 실패 플래그
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, result);
+                        ShowAlarm("Failed after maximum retries: " + result);
+                        StopProcessing(); // 큐 처리 중단
+                        UpdateProgress(); // 작업 실패 시에도 Progress 업데이트
+                        return new CommandResult { Success = false, Message = result };
+                    }
+                    await Task.Delay(RetryInterval); // 재시도 간격 대기
+                }
+            }
+            catch (Exception ex)
+            {
+                newCommand.Status = "Failed";
+                newCommand.Result = 0; // 실패 플래그
+                stopwatch.Stop(); // 예외 시에도 응답 시간 측정 종료
+                int responseTime = (int)stopwatch.ElapsedMilliseconds;
+
+                newCommand.ResponseTime = responseTime; // 예외 발생 시에도 응답 시간 기록
+                await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
+                ShowAlarm("Error occurred: " + ex.Message); // 오류 알람
+                UpdateProgress(); // 예외 시에도 Progress 업데이트
+                return new CommandResult { Success = false, Message = ex.Message };
+            }
+        }
+        UpdateProgress(); // 최종적으로 Progress 업데이트
+        return new CommandResult { Success = false };
+    });
+
+    // 작업이 처리 중이 아닌 경우 즉시 처리 시작
+    if (!_isProcessing)
+    {
+        _isProcessing = true;
+        await ProcessCommandQueue();
+    }
+
+    UpdateProgress(); // 프로그레스바 상태 업데이트
+}
+ListBox와 ProgressBar에 정보 표시
+XAML 코드 수정:
+ListBox에 표시할 정보에는 재시도 횟수, 제한 시간, 응답 시간이 포함됩니다.
+ProgressBar는 큐에 쌓인 작업 수와 함께 최대 큐 크기만큼 칸을 나누어 표시됩니다.
+xml
+코드 복사
+<Window x:Class="CommandQueueApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Command Queue" Height="450" Width="800">
+    <Grid>
+        <!-- 남아 있는 명령을 표시하는 리스트박스 -->
+        <ListBox ItemsSource="{Binding CommandQueue.RemainingCommands}" HorizontalAlignment="Left" Height="300" VerticalAlignment="Top" Width="600">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <StackPanel Orientation="Horizontal">
+                        <!-- 명령 텍스트 -->
+                        <TextBlock Text="{Binding CommandText}" Width="200"/>
+                        <!-- 작업 상태 -->
+                        <TextBlock Text=" 상태: " Width="50"/>
+                        <TextBlock Text="{Binding Status}" Width="100"/>
+                        <!-- 재시도 횟수 표시 -->
+                        <TextBlock Text=" 재시도: " Width="70"/>
+                        <TextBlock Text="{Binding RetryCount}" Width="30"/>
+                        <!-- 응답 시간 -->
+                        <TextBlock Text=" 응답 시간: " Width="100"/>
+                        <TextBlock Text="{Binding ResponseTime}" Width="70"/>
+                        <!-- 제한 시간 -->
+                        <TextBlock Text=" 제한 시간: " Width="100"/>
+                        <TextBlock Text="{Binding MaxRetryLimit}" Width="30"/>
+                    </StackPanel>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <!-- 세로형 프로그레스바 (큐에 남아 있는 명령 수 시각적으로 표시, 각 칸에 번호 추가) -->
+        <StackPanel Orientation="Vertical" HorizontalAlignment="Right" Width="100" VerticalAlignment="Top" Height="300" Margin="0,0,50,0">
+            <ProgressBar VerticalAlignment="Top" Height="300" Width="30" Orientation="Vertical" 
+                         Value="{Binding CommandQueue.Progress}" Maximum="{Binding CommandQueue.MaximumQueueSize}"/>
+            <ItemsControl ItemsSource="{Binding CommandQueue.RemainingCommands}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock Text="{Binding CommandText}" HorizontalAlignment="Center"/>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </StackPanel>
+    </Grid>
+</Window>
+설명:
+ListBox:
+
+CommandText: 명령의 텍스트를 표시.
+Status: 명령의 상태 (Pending, Processing, Completed, Failed 등).
+RetryCount: 재시도 횟수 표시.
+ResponseTime: 명령 응답 시간을 밀리초 단위로 표시.
+MaxRetryLimit: 명령의 최대 재시도 횟수를 표시.
+ProgressBar:
+
+큐의 남은 작업 개수와 최대 큐 크기만큼 표시.
+각 칸에는 남은 작업을 직관적으로 볼 수 있도록 번호가 표시됩니다.
+이렇게 수정된 구조는 재시도 정보, 응답 시간, 제한 시간 등을 ListBox에 표시하며, ProgressBar에는 최대 큐 크기만큼 칸이 그려지고 각 칸에 번호가 매겨져서 남은 작업 수를 직관적으로 확인할 수 있습니다.
