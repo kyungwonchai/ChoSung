@@ -1,39 +1,197 @@
-<Grid>
-    <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="9*"/>
-        <ColumnDefinition Width="1*"/>
-    </Grid.ColumnDefinitions>
+드의 문제를 해결하기 위해 다음 사항을 수정해야 합니다:
 
-    <Grid.RowDefinitions>
-        <RowDefinition Height="1*"/>
-        <RowDefinition Height="1*"/>
-    </Grid.RowDefinitions>
+큐가 10개 이상일 때 추가 작업을 중단해야 합니다.
+작업이 순차적으로 실행되어야 하고, 응답 시간이 초과되면 모든 작업을 중지해야 합니다.
+응답이 잘못되었을 경우 3초 후 재시도가 되어야 하며, 이때 다른 작업이 대기해야 합니다.
+재시도 횟수를 리스트박스에 표시해야 하며, 재시도가 진행될 때마다 업데이트되어야 합니다.
+에러가 발생할 때 에러 메시지와 발생 시간을 표시하고, 에러가 20개 이상이면 더 이상 에러를 추가하지 않아야 합니다.
+프로그레스바에 쌓인 작업 수를 시각적으로 표시해야 합니다.
+이 문제를 해결하려면 EnqueueTask 함수, 큐 처리 로직, 재시도 로직, 에러 처리 로직 등을 수정해야 합니다.
 
-    <!-- DataGrid for Command Queue -->
-    <DataGrid Grid.Row="0" Grid.Column="0" ItemsSource="{Binding RemainingCommands}" AutoGenerateColumns="False" Margin="10">
-        <DataGrid.Columns>
-            <DataGridTextColumn Header="Command Text" Binding="{Binding CommandText}" Width="*"/>
-            <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="*"/>
-            <DataGridTextColumn Header="Retry Count" Binding="{Binding RetryCount}" Width="*"/>
-            <DataGridTextColumn Header="Response Time" Binding="{Binding ResponseTime}" Width="*"/>
-        </DataGrid.Columns>
-        <!-- 에러 행의 배경색을 노랑으로 설정하는 부분 -->
-        <DataGrid.RowStyle>
-            <Style TargetType="DataGridRow">
-                <Style.Triggers>
-                    <DataTrigger Binding="{Binding Status}" Value="Failed">
-                        <Setter Property="Background" Value="Yellow"/>
-                    </DataTrigger>
-                </Style.Triggers>
-            </Style>
-        </DataGrid.RowStyle>
-    </DataGrid>
+수정된 EnqueueTask 함수 및 관련 메서드
+csharp
+코드 복사
+private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
+{
+    // 큐가 멈춘 상태이거나 최대 큐 크기를 초과한 경우 작업을 추가하지 않음
+    if (_isQueueStopped || commandQueue.Count >= MaximumQueueSize)
+    {
+        ShowAlarm("Queue limit reached or stopped. No further commands can be added.");
+        return;
+    }
 
-    <!-- ProgressBar -->
-    <StackPanel Grid.Column="1" VerticalAlignment="Stretch" Margin="10">
-        <TextBlock Text="Progress" HorizontalAlignment="Center"/>
-        <ProgressBar VerticalAlignment="Top" Height="300" Width="30" Orientation="Vertical"
-                     Value="{Binding Progress}" Maximum="{Binding MaximumQueueSize}" Margin="10"/>
-        <TextBlock Text="{Binding Progress, StringFormat='Current Tasks: {0}'}" HorizontalAlignment="Center"/>
-    </StackPanel>
-</Grid>
+    var newCommand = new CommandItem 
+    { 
+        CommandText = commandText, 
+        Status = "Pending", 
+        MaxRetryLimit = RetryLimit,
+        RetryCount = 0,
+        ResponseTime = 0,
+        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff") // 명령이 추가된 시간을 기록
+    };
+
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        RemainingCommands.Add(newCommand); // 리스트박스에 작업을 추가
+    });
+
+    commandQueue.Enqueue(async () =>
+    {
+        newCommand.Status = "Processing";
+        int retryCount = 0;
+        Stopwatch stopwatch = new Stopwatch();
+
+        _isProcessing = true;
+
+        while (retryCount < RetryLimit) // 재시도 횟수가 최대 재시도 횟수보다 적을 때까지
+        {
+            try
+            {
+                stopwatch.Restart(); // 응답 시간 측정 시작
+                string result = await taskFunc();
+                stopwatch.Stop();
+
+                int responseTime = (int)stopwatch.ElapsedMilliseconds;
+                newCommand.ResponseTime = responseTime;
+                newCommand.RetryCount = retryCount;
+
+                if (responseTime > ResponseTimeout)
+                {
+                    newCommand.Status = "Timeout";
+                    ShowAlarm("Timeout occurred. All tasks stopped.");
+                    newCommand.Result = 0;
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, "Timeout", "Failed", newCommand.Result, retryCount, responseTime, "Response Timeout");
+                    StopQueueProcessing(newCommand);
+                    return new CommandResult { Success = false, Message = "Response Timeout" };
+                }
+
+                if (responseValidator(result))
+                {
+                    newCommand.Status = "Completed";
+                    newCommand.Result = 1;
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, newCommand.Output);
+                    UpdateProgress();
+                    _isProcessing = false;
+                    return new CommandResult { Success = true, Message = result };
+                }
+                else
+                {
+                    retryCount++;
+                    newCommand.Status = $"Retrying {retryCount}/{RetryLimit}";
+                    ShowAlarm($"Retrying {retryCount}/{RetryLimit} due to incorrect response.");
+
+                    if (retryCount >= RetryLimit)
+                    {
+                        newCommand.Status = "Failed";
+                        newCommand.Result = 0;
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, result);
+                        ShowAlarm("Queue has been stopped over retry count.");
+                        StopQueueProcessing(newCommand);
+                        return new CommandResult { Success = false, Message = result };
+                    }
+                    await Task.Delay(RetryInterval);
+                }
+            }
+            catch (Exception ex)
+            {
+                newCommand.Status = "Failed";
+                newCommand.Result = 0;
+                stopwatch.Stop();
+                int responseTime = (int)stopwatch.ElapsedMilliseconds;
+
+                newCommand.ResponseTime = responseTime;
+                await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
+                ShowAlarm("Error occurred. All tasks stopped.");
+                StopQueueProcessing(newCommand);
+                return new CommandResult { Success = false, Message = ex.Message };
+            }
+        }
+
+        UpdateProgress();
+        _isProcessing = false;
+        return new CommandResult { Success = false };
+    });
+
+    if (!_isProcessing)
+    {
+        _isProcessing = true;
+        await ProcessCommandQueue();
+    }
+
+    UpdateProgress();
+}
+
+private void StopQueueProcessing(CommandItem errorCommand)
+{
+    _isQueueStopped = true;
+
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        if (ErrorCommands.Count < 20) // 에러 목록이 20개 미만일 때만 추가
+        {
+            errorCommand.Status = "Failed";
+            errorCommand.CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff"); // 에러 발생 시간 기록
+            ErrorCommands.Add(errorCommand);
+        }
+    });
+    ShowAlarm("Queue has been stopped due to a Timeout or failure.");
+}
+
+private void ShowAlarm(string message)
+{
+    var errorCommand = new CommandItem
+    {
+        CommandText = message,
+        Status = "Error",
+        Result = 0,
+        RetryCount = 0,
+        ResponseTime = 0,
+        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff") // 에러 메시지 발생 시간 기록
+    };
+
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        if (ErrorCommands.Count < 20)
+        {
+            ErrorCommands.Add(errorCommand);
+        }
+    });
+}
+
+private void UpdateProgress()
+{
+    Progress = commandQueue.Count;
+}
+DataGrid 수정 사항
+ListBox 대신 DataGrid로 교체하고 에러 상태와 재시도 횟수, 응답 시간을 컬럼으로 표시하며, 에러인 경우 행의 배경을 노란색으로 설정합니다.
+
+xml
+코드 복사
+<DataGrid Grid.Row="0" Grid.Column="0" ItemsSource="{Binding CommandQueue.RemainingCommands}" AutoGenerateColumns="False" Margin="10">
+    <DataGrid.Columns>
+        <DataGridTextColumn Header="Command" Binding="{Binding CommandText}" Width="200"/>
+        <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100"/>
+        <DataGridTextColumn Header="Retry Count" Binding="{Binding RetryCount}" Width="100"/>
+        <DataGridTextColumn Header="Response Time" Binding="{Binding ResponseTime}" Width="100"/>
+        <DataGridTextColumn Header="Error" Binding="{Binding Result, Converter={StaticResource ErrorConverter}}" Width="100"/>
+        <DataGridTextColumn Header="Time" Binding="{Binding CommandTime}" Width="150"/>
+    </DataGrid.Columns>
+    <DataGrid.RowStyle>
+        <Style TargetType="DataGridRow">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Result}" Value="0">
+                    <Setter Property="Background" Value="Yellow"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </DataGrid.RowStyle>
+</DataGrid>
+이제 DataGrid에 모든 정보를 표시하고, 에러 상태에 따라 배경을 노란색으로 설정할 수 있습니다.
+
+요약
+큐에 10개 이상 작업을 추가하지 않음: _isQueueStopped와 MaximumQueueSize 조건 추가.
+작업이 순차적으로 실행됨: ProcessCommandQueue에서 처리.
+응답 시간 초과 시 모든 작업 중지: StopQueueProcessing 호출.
+재시도 횟수 업데이트: RetryCount를 업데이트하여 리스트에 표시.
+에러가 20개 초과 시 더 이상 에러 추가하지 않음: ShowAlarm과 StopQueueProcessing에서 조건 추가.
+DataGrid에 상태와 에러 표시: DataGrid로 수정 및 에러 표시 시 노
