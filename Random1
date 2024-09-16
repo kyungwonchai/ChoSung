@@ -1,169 +1,264 @@
-합니다. INotifyPropertyChanged 인터페이스를 구현하면, UI 갱신을 수동으로 처리할 필요 없이 속성 값을 업데이트할 때마다 UI가 자동으로 갱신됩니다.
-
-따라서 Dispatcher.Invoke를 계속 사용할 필요 없이, 모델에서 값을 변경하면 UI와 자동으로 연동되도록 할 수 있습니다. 이를 위해서는 모델 속성에 INotifyPropertyChanged를 올바르게 구현하고, 속성 변경 시 자동으로 UI와 값이 동기화되도록 해야 합니다.
-
-수정 방향
-INotifyPropertyChanged 인터페이스를 CommandItem 모델 클래스에서 제대로 활용하여 속성 값이 바뀔 때마다 UI가 자동으로 업데이트되도록 설정.
-PropertyChanged 이벤트를 통해 명령의 Status, ResponseTime, RetryCount 등이 변경되면 자동으로 UI에 반영되도록 처리.
-모델에서 INotifyPropertyChanged 구현
-1. CommandItem 클래스에서 INotifyPropertyChanged 구현
-CommandItem 모델이 속성 변경을 UI에 알리도록 수정합니다.
-
-csharp
-코드 복사
-public class CommandItem : INotifyPropertyChanged
+public class CommandQueueViewModel : INotifyPropertyChanged
 {
-    private string _status;
-    private int _retryCount;
-    private int _responseTime;
+    public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>(); // 남아있는 명령을 저장할 컬렉션
+    public ObservableCollection<CommandItem> ErrorCommands { get; set; } = new ObservableCollection<CommandItem>(); // 에러 발생한 명령을 저장할 컬렉션
+    public event PropertyChangedEventHandler PropertyChanged; // 데이터 바인딩을 위해 속성 변경을 알리는 이벤트
 
-    public string CommandText { get; set; }
+    private Queue<Func<Task<CommandResult>>> commandQueue = new Queue<Func<Task<CommandResult>>>(); // 명령을 비동기로 처리하는 큐
+    private bool _isProcessing; // 현재 작업을 처리 중인지 여부를 확인하는 플래그
+    private bool _isQueueStopped; // 큐가 멈췄는지 여부를 확인하는 플래그
+    private readonly DatabaseHelper _dbHelper; // 데이터베이스 헬퍼 클래스 (DB 로깅용)
 
-    // Status 속성에 변경 알림 추가
-    public string Status
+    public int RetryLimit { get; set; } = 3; // 재시도 횟수 기본값 (3회)
+    public int RetryInterval { get; set; } = 3000; // 재시도 간격 기본값 (3초)
+    public int ResponseTimeout { get; set; } = 5000; // 응답 제한 시간 기본값 (5초)
+    public int MaximumQueueSize { get; set; } = 10; // 큐에 추가될 수 있는 최대 작업 수
+
+    private int _progress; // 프로그레스바 값
+    public int Progress
     {
-        get => _status;
+        get => _progress; // Progress 값을 반환
         set
         {
-            _status = value;
-            OnPropertyChanged(nameof(Status));
+            if (_progress != value) // 값이 변경되었을 때만 업데이트
+            {
+                _progress = value;
+                OnPropertyChanged(nameof(Progress)); // 변경된 값을 UI에 반영
+            }
         }
     }
 
-    // RetryCount 속성에 변경 알림 추가
-    public int RetryCount
+    // 생성자
+    public CommandQueueViewModel()
     {
-        get => _retryCount;
-        set
+        _dbHelper = new DatabaseHelper(); // DatabaseHelper 인스턴스 생성
+        _isProcessing = false; // 처리 중 상태 초기화
+        _isQueueStopped = false; // 큐가 멈춰있는 상태인지 여부 초기화
+        Progress = 0; // 초기 Progress 값 설정
+    }
+
+    // 비동기 작업을 큐에 추가하는 함수
+    public void AddAsyncTaskCommand(Func<Task<string>> asyncTask, string commandText, string sentCommand, Func<string, bool> responseValidator)
+    {
+        // 큐가 멈췄거나, 큐에 저장된 작업이 최대치를 초과했을 때 작업을 추가하지 않음
+        if (_isQueueStopped || commandQueue.Count >= MaximumQueueSize)
         {
-            _retryCount = value;
-            OnPropertyChanged(nameof(RetryCount));
+            ShowAlarm("Queue limit reached or stopped. No further commands can be added."); // 경고 알림
+            return;
         }
+
+        // 큐에 정상적으로 작업 추가
+        EnqueueTask(asyncTask, commandText, sentCommand, responseValidator);
     }
 
-    // ResponseTime 속성에 변경 알림 추가
-    public int ResponseTime
-    {
-        get => _responseTime;
-        set
-        {
-            _responseTime = value;
-            OnPropertyChanged(nameof(ResponseTime));
-        }
-    }
-
-    public string CommandTime { get; set; }
-
-    public event PropertyChangedEventHandler PropertyChanged;
-
-    // 속성 값이 변경되면 PropertyChanged 이벤트를 발생시킴
-    protected void OnPropertyChanged(string propertyName)
-    {
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-    }
-}
-2. CommandQueueViewModel의 EnqueueTask 메서드에서 값 변경
-이제 CommandItem 모델의 속성 값이 변경되면 UI에서 자동으로 갱신됩니다. 따라서 Dispatcher.Invoke()를 사용할 필요 없이, 값을 설정하면 UI가 자동으로 업데이트됩니다.
-
-csharp
-코드 복사
+ 
+// 비동기 작업을 큐에 추가하고 처리하는 메서드
 private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
 {
+    // 새로운 명령 아이템 생성
     var newCommand = new CommandItem 
     { 
-        CommandText = commandText,
-        Status = "Pending",
-        MaxRetryLimit = RetryLimit,
-        RetryCount = 0,
-        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff")
+        CommandText = commandText, // 명령어 텍스트 설정
+        Status = "Pending", // 상태를 "Pending"으로 초기화 (대기 중 상태)
+        MaxRetryLimit = RetryLimit, // 최대 재시도 횟수 설정 (기본 3회)
+        RetryCount = 0, // 재시도 횟수를 0으로 초기화
+        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff") // 명령이 추가된 시간을 기록
     };
 
-    RemainingCommands.Add(newCommand); // RemainingCommands 컬렉션에 추가, UI 자동 갱신됨
+    // UI를 갱신하기 위해 Dispatcher를 사용하여 명령을 RemainingCommands 컬렉션에 추가
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        RemainingCommands.Add(newCommand); // 남아 있는 명령 리스트에 새 명령 추가
+    });
 
+    // 큐에 비동기 작업을 추가, 이 작업은 처리되면 실행됨
     commandQueue.Enqueue(async () =>
     {
-        newCommand.Status = "Processing"; // Status가 변경되면 자동으로 UI에 반영
+        // 명령 처리 중이므로 상태를 "Processing"으로 설정
+        newCommand.Status = "Processing";
 
-        int retryCount = 0;
-        Stopwatch stopwatch = new Stopwatch();
-        _isProcessing = true;
+        // UI에서 상태가 바로 반영되도록 OnPropertyChanged 호출
+        App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 업데이트
 
-        while (retryCount < RetryLimit)
+        int retryCount = 0; // 재시도 횟수를 0으로 초기화
+        Stopwatch stopwatch = new Stopwatch(); // 응답 시간을 측정하기 위한 스톱워치 생성
+        _isProcessing = true; // 현재 작업이 처리 중임을 나타내는 플래그
+
+        // 재시도 횟수가 최대 재시도 횟수보다 적을 때까지 반복
+        while (retryCount < RetryLimit) 
         {
             try
             {
-                stopwatch.Restart();
-                string result = await taskFunc();
+                stopwatch.Restart(); // 스톱워치를 시작해 응답 시간을 측정
+                string result = await taskFunc(); // 실제 비동기 작업 실행 (응답 대기)
+                stopwatch.Stop(); // 응답이 끝나면 스톱워치 종료
 
-                // 0.1초마다 응답 시간 갱신
-                while (stopwatch.ElapsedMilliseconds < ResponseTimeout)
+                int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간(밀리초) 계산
+                newCommand.ResponseTime = responseTime; // 명령 객체에 응답 시간 기록
+                newCommand.RetryCount = retryCount; // 명령 객체에 현재 재시도 횟수 기록
+
+                // 응답 시간이 설정된 제한 시간보다 크면 실패로 처리
+                if (responseTime > ResponseTimeout)
                 {
-                    newCommand.ResponseTime = (int)(stopwatch.ElapsedMilliseconds / 100); // 응답 시간이 변경되면 자동으로 UI에 반영
-                    await Task.Delay(100);
-                }
+                    newCommand.Status = "Timeout"; // 상태를 "Timeout"으로 변경
+                    App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 상태 즉시 업데이트
 
-                stopwatch.Stop();
-                newCommand.ResponseTime = (int)stopwatch.ElapsedMilliseconds;
-
-                if (newCommand.ResponseTime > ResponseTimeout)
-                {
-                    newCommand.Status = "Timeout"; // 상태가 변경되면 자동으로 UI에 반영
-                    newCommand.Result = 0;
-                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, "Timeout", "Failed", newCommand.Result, retryCount, newCommand.ResponseTime, "Timeout occurred");
+                    newCommand.Result = 0; // 실패 결과 설정
+                    // 데이터베이스에 Timeout 상태로 로그 기록
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, "Timeout", "Failed", newCommand.Result, retryCount, responseTime, "Timeout occurred");
+                    
+                    // 큐 처리를 멈춤
                     StopQueueProcessing(newCommand);
+                    // 실패 결과 반환
                     return new CommandResult { Success = false, Message = "Response Timeout" };
                 }
 
+                // 응답이 올바르면 작업 완료로 처리
                 if (responseValidator(result))
                 {
-                    newCommand.Status = "Completed"; // 상태가 변경되면 자동으로 UI에 반영
-                    newCommand.Result = 1;
-                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, newCommand.ResponseTime, result);
-                    UpdateProgress();
-                    _isProcessing = false;
-                    return new CommandResult { Success = true, Message = result };
+                    newCommand.Status = "Completed"; // 상태를 "Completed"로 변경 (성공 상태)
+                    App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 상태 즉시 반영
+
+                    newCommand.Result = 1; // 성공 결과 설정
+                    // 데이터베이스에 성공 상태로 로그 기록
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, result);
+                    
+                    UpdateProgress(); // 작업이 완료되었으므로 프로그레스바 업데이트
+                    _isProcessing = false; // 작업 완료 상태로 처리 중 플래그 해제
+                    return new CommandResult { Success = true, Message = result }; // 성공 결과 반환
                 }
-                else
+                else // 응답이 올바르지 않을 경우
                 {
-                    retryCount++;
-                    newCommand.Status = $"Retrying {retryCount}/{RetryLimit}"; // 재시도 횟수와 상태가 변경되면 자동으로 UI에 반영
+                    retryCount++; // 재시도 횟수 증가
+                    newCommand.Status = $"Retrying {retryCount}/{RetryLimit}"; // 상태를 "Retrying"으로 변경
+                    App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 상태 즉시 반영
+
+                    // 재시도 횟수가 한계에 도달하면 실패로 처리
                     if (retryCount >= RetryLimit)
                     {
-                        newCommand.Status = "Failed";
-                        newCommand.Result = 0;
-                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, newCommand.ResponseTime, "Failed after retries");
-                        StopQueueProcessing(newCommand);
-                        return new CommandResult { Success = false, Message = result };
+                        newCommand.Status = "Failed"; // 상태를 "Failed"로 변경 (재시도 실패)
+                        App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 상태 즉시 반영
+
+                        newCommand.Result = 0; // 실패 결과 설정
+                        // 데이터베이스에 실패 상태로 로그 기록
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, "Failed after retries");
+                        
+                        ShowAlarm("Queue has been stopped over retry count."); // 경고 알림
+                        StopQueueProcessing(newCommand); // 큐 처리 중단
+                        return new CommandResult { Success = false, Message = result }; // 실패 결과 반환
                     }
-                    await Task.Delay(RetryInterval);
+
+                    // 재시도 간격 대기
+                    await Task.Delay(RetryInterval); // 재시도 대기 시간
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) // 예외가 발생할 경우
             {
-                newCommand.Status = "Failed"; // 상태가 변경되면 자동으로 UI에 반영
-                newCommand.Result = 0;
-                stopwatch.Stop();
-                newCommand.ResponseTime = (int)stopwatch.ElapsedMilliseconds;
-                await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, newCommand.ResponseTime, ex.Message);
-                StopQueueProcessing(newCommand);
-                return new CommandResult { Success = false, Message = ex.Message };
+                newCommand.Status = "Failed"; // 상태를 "Failed"로 변경
+                App.Current.Dispatcher.Invoke(() => OnPropertyChanged(nameof(RemainingCommands))); // UI 상태 즉시 반영
+
+                newCommand.Result = 0; // 실패 결과 설정
+                stopwatch.Stop(); // 응답 시간 측정을 멈춤
+                int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간 계산
+
+                newCommand.ResponseTime = responseTime; // 명령 객체에 응답 시간 기록
+                // 예외 발생 시 데이터베이스에 로그 기록
+                await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
+                
+                ShowAlarm("Error occurred. All tasks stopped."); // 경고 알림
+                StopQueueProcessing(newCommand); // 큐 처리 중단
+                return new CommandResult { Success = false, Message = ex.Message }; // 실패 결과 반환
             }
         }
 
-        UpdateProgress();
-        _isProcessing = false;
-        return new CommandResult { Success = false };
+        UpdateProgress(); // 프로그레스바 업데이트
+        _isProcessing = false; // 작업 완료 상태로 처리 중 플래그 해제
+        return new CommandResult { Success = false }; // 실패 결과 반환
     });
 
+    // 현재 다른 작업이 진행 중이지 않으면 큐에서 작업 처리 시작
     if (!_isProcessing)
     {
-        _isProcessing = true;
-        await ProcessCommandQueue();
+        _isProcessing = true; // 처리 중 상태 설정
+        await ProcessCommandQueue(); // 큐에서 작업을 처리
     }
 
-    UpdateProgress();
+    UpdateProgress(); // 프로그레스바 상태 업데이트
 }
-수정된 부분 요약:
-CommandItem 클래스에서 INotifyPropertyChanged 구현: 각 속성 값이 변경될 때 UI가 자동으로 갱신되도록 설정.
-EnqueueTask 메서드에서 값 변경 시 Dispatcher.Invoke 제거: Status, RetryCount, ResponseTime 등의 값이 변경되면 자동으로 UI에 반영되도록 수정.
-이제 MVVM 패턴에 맞게 모델의 값이 변경되면 U
+
+// 큐에서 작업을 순차적으로 처리하는 메서드
+private async Task ProcessCommandQueue()
+{
+    // 큐에 남아있는 작업이 있을 때까지 반복
+    while (commandQueue.Count > 0)
+    {
+        // 만약 큐가 중단된 상태라면 더 이상 작업을 처리하지 않음
+        if (_isQueueStopped)
+        {
+            break; // 루프를 종료하여 큐 처리를 중단
+        }
+
+        var command = commandQueue.Dequeue(); // 큐에서 작업을 꺼냄
+        await command(); // 꺼낸 작업을 실행
+        UpdateProgress(); // 작업이 끝날 때마다 Progress 업데이트
+    }
+
+    _isProcessing = false; // 모든 작업이 끝난 후 처리 중 상태를 해제
+}
+
+// 큐의 처리를 멈추고 추가 작업을 차단하는 메서드
+private void StopQueueProcessing(CommandItem errorCommand)
+{
+    _isQueueStopped = true; // 큐를 멈춘 상태로 설정
+
+    // UI 스레드에서 에러 목록에 추가
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        // 에러 목록이 20개 이하일 때만 추가 (더 이상 에러 목록이 쌓이지 않도록)
+        if (ErrorCommands.Count < 20)
+        {
+            errorCommand.Status = "Failed"; // 상태를 "Failed"로 변경
+            errorCommand.CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff"); // 에러 발생 시간 기록
+            ErrorCommands.Add(errorCommand); // 에러 리스트에 추가
+        }
+    });
+
+    ShowAlarm("Queue has been stopped due to a Timeout or failure."); // 에러 알람 표시
+}
+
+// 알람 메시지를 UI에 추가하는 메서드
+private void ShowAlarm(string message)
+{
+    var errorCommand = new CommandItem
+    {
+        CommandText = message, // 알람 메시지 설정
+        Status = "Error", // 상태를 "Error"로 설정
+        Result = 0, // 실패 상태로 설정
+        RetryCount = 0, // 재시도 횟수 없음
+        ResponseTime = 0, // 응답 시간 없음
+        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff") // 알람 발생 시간 기록
+    };
+
+    // UI 스레드에서 에러 메시지를 에러 리스트박스에 추가
+    App.Current.Dispatcher.Invoke(() =>
+    {
+        if (ErrorCommands.Count < 20) // 에러가 20개 이하일 때만 추가
+        {
+            ErrorCommands.Add(errorCommand); // 에러 리스트박스에 추가
+        }
+    });
+}
+
+// 프로그레스바 상태를 업데이트하는 메서드
+private void UpdateProgress()
+{
+    // 남아 있는 명령의 개수에 따라 Progress 값을 업데이트
+    Progress = commandQueue.Count;
+}
+
+// INotifyPropertyChanged 인터페이스의 OnPropertyChanged 메서드 구현
+protected void OnPropertyChanged(string propertyName)
+{
+    // UI에 데이터가 변경되었음을 알림
+    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+}
