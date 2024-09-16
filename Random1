@@ -1,37 +1,125 @@
-using System.Data.SqlClient;
-using System.Threading.Tasks;
-
-// 명령어 로그를 데이터베이스에 삽입하는 메서드
-public async Task LogCommandToDatabase(string commandText, string sentCommand, string receivedCommand, string status, int result, int retryCount, int responseTime, string output)
+// 큐에 작업을 추가하고 처리하는 메서드
+private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
 {
-    // SQL 쿼리: 명령 로그를 테이블에 삽입
-    string query = @"
-        INSERT INTO CommandLog (CommandText, SentCommand, ReceivedCommand, Status, Result, RetryCount, ResponseTime, Output)
-        VALUES (@commandText, @sentCommand, @receivedCommand, @status, @result, @retryCount, @responseTime, @output)";
+    // 새로운 명령 아이템 생성
+    var newCommand = new CommandItem 
+    { 
+        CommandText = commandText, // 명령 텍스트 설정
+        Status = "Pending", // 상태를 "Pending"으로 초기화
+        MaxRetryLimit = RetryLimit, // 최대 재시도 횟수 설정
+        RetryCount = 0, // 재시도 횟수를 0으로 초기화
+        CommandTime = DateTime.Now.ToString("yyMMdd HH:mm:ss.fff") // 명령이 추가된 시간을 기록
+    };
 
-    // 데이터베이스 연결 문자열 설정 (필요에 따라 수정)
-    string connectionString = "your_connection_string_here"; // 여기에는 실제 연결 문자열을 넣어야 합니다.
-
-    // 비동기 방식으로 데이터베이스에 연결
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    // UI 업데이트: 명령을 RemainingCommands 컬렉션에 추가
+    App.Current.Dispatcher.Invoke(() =>
     {
-        await conn.OpenAsync(); // 데이터베이스 연결 열기
+        RemainingCommands.Add(newCommand); // 남아있는 명령 리스트에 추가
+    });
 
-        // SQL Command 객체 생성
-        using (SqlCommand cmd = new SqlCommand(query, conn))
+    // 큐에 작업을 비동기로 추가
+    commandQueue.Enqueue(async () =>
+    {
+        // 명령을 처리 중일 때 상태를 "Processing"으로 변경
+        newCommand.Status = "Processing";
+        int retryCount = 0; // 재시도 횟수를 0으로 초기화
+        Stopwatch stopwatch = new Stopwatch(); // 응답 시간을 측정하기 위한 스톱워치
+
+        _isProcessing = true; // 작업이 처리 중임을 나타내는 플래그
+
+        // 재시도 횟수가 최대치를 넘지 않는 한 반복 실행
+        while (retryCount < RetryLimit) 
         {
-            // 매개변수 설정
-            cmd.Parameters.AddWithValue("@commandText", commandText);
-            cmd.Parameters.AddWithValue("@sentCommand", sentCommand);
-            cmd.Parameters.AddWithValue("@receivedCommand", receivedCommand);
-            cmd.Parameters.AddWithValue("@status", status);
-            cmd.Parameters.AddWithValue("@result", result);
-            cmd.Parameters.AddWithValue("@retryCount", retryCount);
-            cmd.Parameters.AddWithValue("@responseTime", responseTime);
-            cmd.Parameters.AddWithValue("@output", output); // @output 매개변수 추가
+            try
+            {
+                stopwatch.Restart(); // 응답 시간 측정을 시작
+                string result = await taskFunc(); // 실제 비동기 작업 수행
+                stopwatch.Stop(); // 작업이 끝나면 응답 시간 측정을 종료
 
-            // 명령 실행
-            await cmd.ExecuteNonQueryAsync();
+                int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간을 계산
+                newCommand.ResponseTime = responseTime; // 응답 시간을 저장
+                newCommand.RetryCount = retryCount; // 재시도 횟수를 저장
+
+                // 응답 시간이 초과되었을 때: 즉시 실패로 처리하고 큐를 멈춤
+                if (responseTime > ResponseTimeout)
+                {
+                    newCommand.Status = "Timeout"; // 상태를 "Timeout"으로 변경
+                    ShowAlarm("Timeout occurred. All tasks stopped."); // 경고 메시지 표시
+                    newCommand.Result = 0; // 실패로 처리
+
+                    // **여기에서 output 값 제공: 이 경우엔 "Timeout" 상태**
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, "Timeout", "Failed", newCommand.Result, retryCount, responseTime, "Timeout occurred"); // DB 기록
+                    
+                    StopQueueProcessing(newCommand); // 큐를 중단
+                    return new CommandResult { Success = false, Message = "Response Timeout" }; // 실패 결과 반환
+                }
+
+                // 응답이 정상일 경우
+                if (responseValidator(result))
+                {
+                    newCommand.Status = "Completed"; // 상태를 "Completed"로 변경
+                    newCommand.Result = 1; // 성공 플래그 설정
+
+                    // **정상 응답 시 output 값을 result로 제공**
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, result); // DB 기록
+
+                    UpdateProgress(); // 프로그레스바 업데이트
+                    _isProcessing = false; // 작업이 끝났음을 표시
+                    return new CommandResult { Success = true, Message = result }; // 성공 결과 반환
+                }
+                else
+                {
+                    retryCount++; // 재시도 횟수를 증가
+                    newCommand.Status = $"Retrying {retryCount}/{RetryLimit}"; // 상태를 "Retrying"으로 변경
+                    ShowAlarm($"Retrying {retryCount}/{RetryLimit} due to incorrect response."); // 경고 알림
+
+                    // 재시도 횟수가 한계에 도달했을 경우
+                    if (retryCount >= RetryLimit)
+                    {
+                        newCommand.Status = "Failed"; // 상태를 "Failed"로 변경
+                        newCommand.Result = 0; // 실패 플래그 설정
+
+                        // **재시도 실패 시 output을 "Failed after retries"로 제공**
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, "Failed after retries"); // DB 기록
+                        
+                        ShowAlarm("Queue has been stopped over retry count."); // 경고 알림
+                        StopQueueProcessing(newCommand); // 큐를 멈춤
+                        return new CommandResult { Success = false, Message = result }; // 실패 결과 반환
+                    }
+
+                    // 재시도 간격만큼 대기
+                    await Task.Delay(RetryInterval);
+                }
+            }
+            catch (Exception ex)
+            {
+                newCommand.Status = "Failed"; // 예외 발생 시 "Failed"로 상태 변경
+                newCommand.Result = 0; // 실패 플래그 설정
+                stopwatch.Stop(); // 응답 시간 측정을 멈춤
+                int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간 계산
+
+                newCommand.ResponseTime = responseTime; // 응답 시간 기록
+
+                // **예외 발생 시 output을 예외 메시지로 제공**
+                await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message); // 예외 발생 시 DB 기록
+                
+                ShowAlarm("Error occurred. All tasks stopped."); // 경고 알림
+                StopQueueProcessing(newCommand); // 큐를 중단
+                return new CommandResult { Success = false, Message = ex.Message }; // 실패 결과 반환
+            }
         }
+
+        UpdateProgress(); // 프로그레스바 업데이트
+        _isProcessing = false; // 작업이 끝났음을 표시
+        return new CommandResult { Success = false };
+    });
+
+    // 큐에서 실행 중인 작업이 없으면 처리 시작
+    if (!_isProcessing)
+    {
+        _isProcessing = true;
+        await ProcessCommandQueue(); // 큐에서 작업을 처리
     }
+
+    UpdateProgress(); // 프로그레스바 상태 업데이트
 }
