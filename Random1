@@ -1,17 +1,256 @@
-// 알람을 에러 리스트박스에 추가하는 함수
-private void ShowAlarm(string message)
-{
-    var errorCommand = new CommandItem
-    {
-        CommandText = "Error",
-        Status = "Error",
-        Result = 0, // 에러 상태로 처리
-        RetryCount = 0, // 에러 메시지이므로 재시도 없음
-        ResponseTime = 0 // 응답 시간 없음
-    };
+확한 요구 사항을 이해했습니다. 이번에는 문제를 해결하기 위해 각 규칙을 고려한 Command Queue 시스템을 설계하고 구현해 드리겠습니다.
 
-    App.Current.Dispatcher.Invoke(() =>
+요구 사항을 반영한 설계:
+큐에 10개가 넘으면 작업을 추가하지 않음.
+EnqueueTask: 큐에 들어간 작업을 순차적으로 실행하고, 다음 작업이 먼저 실행되지 않음.
+응답 시간이 5초를 초과하면 모든 작업 중지 및 큐에 더 이상 작업 추가 불가.
+응답이 잘못되었을 경우 3초 후 재시도, 최대 3회 재시도.
+재시도 중임을 명확하게 표시.
+재시도 횟수가 3회를 넘으면 모든 작업 중지 및 큐에 작업 추가 불가.
+큐에 10개가 쌓이면 작업 중단.
+수정된 C# 코드 (CommandQueueViewModel)
+csharp
+코드 복사
+using System;
+using System.Collections.ObjectModel;
+using System.Threading.Tasks;
+using System.ComponentModel;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Windows.Threading;
+
+public class CommandQueueViewModel : INotifyPropertyChanged
+{
+    public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>();
+    public ObservableCollection<CommandItem> ErrorCommands { get; set; } = new ObservableCollection<CommandItem>(); // 에러 리스트박스용 컬렉션
+    public event PropertyChangedEventHandler PropertyChanged;
+
+    private Queue<Func<Task<CommandResult>>> commandQueue = new Queue<Func<Task<CommandResult>>>();
+    private bool _isProcessing;
+    private bool _isQueueStopped; // 큐가 멈춘 상태를 확인하는 플래그
+    private readonly DatabaseHelper _dbHelper;
+
+    public int RetryLimit { get; set; } = 3; // 기본 재시도 횟수 3회
+    public int RetryInterval { get; set; } = 3000; // 기본 재시도 간격 3초
+    public int ResponseTimeout { get; set; } = 5000; // 응답 제한 시간 5초 (5000ms)
+    public int MaximumQueueSize { get; set; } = 10; // 최대 큐 크기 10개
+
+    private int _progress;
+    public int Progress
     {
-        ErrorCommands.Add(errorCommand); // 에러 리스트박스에 추가
-    });
+        get => _progress;
+        set
+        {
+            if (_progress != value)
+            {
+                _progress = value;
+                OnPropertyChanged(nameof(Progress)); // Progress 변경 시 UI 업데이트
+            }
+        }
+    }
+
+    public CommandQueueViewModel()
+    {
+        _dbHelper = new DatabaseHelper();
+        _isProcessing = false; // 처리 중 상태 플래그 초기화
+        _isQueueStopped = false; // 큐 멈춤 상태 초기화
+        Progress = 0; // 초기값 0
+    }
+
+    // 외부 클래스에서 큐에 작업을 추가하려고 할 때 사용하는 함수
+    public void AddAsyncTaskCommand(Func<Task<string>> asyncTask, string commandText, string sentCommand, Func<string, bool> responseValidator)
+    {
+        // 큐가 멈춘 상태이거나 최대 큐 크기를 초과한 경우 작업을 추가하지 않음
+        if (_isQueueStopped || commandQueue.Count >= MaximumQueueSize)
+        {
+            ShowAlarm("Queue limit reached or stopped. No further commands can be added.");
+            return;
+        }
+
+        // 정상적인 경우 작업 추가
+        EnqueueTask(asyncTask, commandText, sentCommand, responseValidator);
+    }
+
+    // 큐에 작업을 추가하고 처리하는 함수
+    private async void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
+    {
+        var newCommand = new CommandItem 
+        { 
+            CommandText = commandText, 
+            Status = "Pending", 
+            MaxRetryLimit = RetryLimit, // 최대 재시도 횟수 설정
+            RetryCount = 0 // 초기 재시도 횟수는 0
+        };
+
+        App.Current.Dispatcher.Invoke(() =>
+        {
+            RemainingCommands.Add(newCommand); // 작업을 리스트박스에 추가
+        });
+
+        // 큐에 작업 추가
+        commandQueue.Enqueue(async () =>
+        {
+            newCommand.Status = "Processing";
+            int retryCount = 0;
+            Stopwatch stopwatch = new Stopwatch(); // 응답 시간 측정용 스톱워치
+
+            _isProcessing = true;
+
+            while (retryCount < RetryLimit) // 재시도 횟수가 최대 재시도 횟수보다 적을 때까지 반복
+            {
+                try
+                {
+                    stopwatch.Restart(); // 응답 시간 측정 시작
+                    string result = await taskFunc(); // 비동기 작업 실행
+                    stopwatch.Stop(); // 응답 시간 측정 완료
+
+                    int responseTime = (int)stopwatch.ElapsedMilliseconds; // 응답 시간 계산
+                    newCommand.ResponseTime = responseTime; // 응답 시간 저장
+                    newCommand.RetryCount = retryCount; // 재시도 횟수 업데이트
+
+                    // 응답 시간이 초과되면 큐 처리를 멈추고 모든 작업을 중단
+                    if (responseTime > ResponseTimeout)
+                    {
+                        newCommand.Status = "Timeout"; // 응답 시간 초과로 실패 처리
+                        ShowAlarm("Timeout occurred. All tasks stopped.");
+                        newCommand.Result = 0;
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, "Timeout", "Failed", newCommand.Result, retryCount, responseTime, "Response Timeout");
+                        StopQueueProcessing(newCommand); // 큐 처리 중단 및 에러 추가, 더 이상 큐에 추가하지 않음
+                        return new CommandResult { Success = false, Message = "Response Timeout" };
+                    }
+
+                    // 정상 응답일 경우 작업 완료 처리
+                    if (responseValidator(result))
+                    {
+                        newCommand.Status = "Completed"; // 성공 처리
+                        newCommand.Result = 1; // 성공 플래그
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, newCommand.Output);
+                        UpdateProgress(); // 작업 완료 시 Progress 업데이트
+                        _isProcessing = false; // 작업 완료 후 처리 중 해제
+                        return new CommandResult { Success = true, Message = result };
+                    }
+                    else
+                    {
+                        retryCount++;
+                        newCommand.Status = "Retrying"; // 재시도 중임을 표시
+                        ShowAlarm($"Retrying {retryCount}/{RetryLimit} due to incorrect response.");
+                        
+                        if (retryCount >= RetryLimit)
+                        {
+                            newCommand.Status = "Failed"; // 실패 처리
+                            newCommand.Result = 0; // 실패 플래그
+                            await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Failed", newCommand.Result, retryCount, responseTime, result);
+                            ShowAlarm("Failed after maximum retries. All tasks stopped.");
+                            StopQueueProcessing(newCommand); // 실패 후 큐 처리 중단 및 추가 작업 차단
+                            return new CommandResult { Success = false, Message = result };
+                        }
+                        await Task.Delay(RetryInterval); // 재시도 간격 대기
+                    }
+                }
+                catch (Exception ex)
+                {
+                    newCommand.Status = "Failed"; // 실패 처리
+                    newCommand.Result = 0; // 실패 플래그
+                    stopwatch.Stop(); // 예외 시에도 응답 시간 측정 종료
+                    int responseTime = (int)stopwatch.ElapsedMilliseconds;
+
+                    newCommand.ResponseTime = responseTime; // 예외 발생 시에도 응답 시간 기록
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
+                    ShowAlarm("Error occurred. All tasks stopped.");
+                    StopQueueProcessing(newCommand); // 예외 발생 시 큐 처리 중단 및 추가 작업 차단
+                    return new CommandResult { Success = false, Message = ex.Message };
+                }
+            }
+
+            UpdateProgress(); // 최종적으로 Progress 업데이트
+            _isProcessing = false; // 모든 작업 종료 후 플래그 해제
+            return new CommandResult { Success = false };
+        });
+
+        // 큐에서 작업이 시작되지 않았으면 처리 시작
+        if (!_isProcessing)
+        {
+            _isProcessing = true;
+            await ProcessCommandQueue(); // 큐에 있는 작업을 처리
+        }
+
+        UpdateProgress(); // 프로그레스바 상태 업데이트
+    }
+
+    // 큐에서 작업을 순차적으로 처리하는 함수
+    private async Task ProcessCommandQueue()
+    {
+        while (commandQueue.Count > 0)
+        {
+            var command = commandQueue.Dequeue(); // 큐에서 작업을 꺼냄
+            await command(); // 큐에 있는 작업 실행
+            UpdateProgress(); // 작업 진행에 따라 ProgressBar 업데이트
+        }
+
+        _isProcessing = false; // 모든 작업 완료 후 처리 중 상태 해제
+    }
+
+    // 큐 처리 중단 및 추가 작업 차단 함수
+    private void StopQueueProcessing(CommandItem errorCommand)
+    {
+        _isQueueStopped = true; // 큐를 멈춤
+        App.Current.Dispatcher.Invoke(() =>
+        {
+            ErrorCommands.Add(errorCommand); // 에러 리스트박스에 추가
+        });
+        ShowAlarm("Queue has been stopped due to a Timeout or failure.");
+    }
+
+    // 알람을 에러 리스트박스에 추가하는 함수
+    private void ShowAlarm(string message)
+    {
+        var errorCommand = new CommandItem
+        {
+            CommandText = message,
+            Status = "Error",
+            Result = 0, // 에러 상태로 처리
+            RetryCount = 0, // 에러 메시지이므로 재시도 없음
+            ResponseTime = 0 // 응답 시간 없음
+        };
+
+        App.Current.Dispatcher.Invoke(() =>
+        {
+            ErrorCommands.Add(errorCommand); // 에러 리스트박스에 추가
+        });
+    }
+
+    // 프로그레스바 상태 업데이트
+    private void UpdateProgress()
+    {
+        Progress = commandQueue.Count; // 남은 명령의 수에 따라 Progress 값 업데이트
+    }
+
+    // INotifyPropertyChanged 인터페이스 구현
+    protected void OnPropertyChanged(string propertyName)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }
+설명:
+큐에 10개 이상 쌓이면 작업 추가 차단:
+
+AddAsyncTaskCommand에서 큐 크기가 MaximumQueueSize를 넘으면 더 이상 작업을 추가하지 않습니다.
+응답 시간이 5초를 초과하면 모든 작업 중단:
+
+응답 시간이 5초를 초과하면 **StopQueueProcessing()**을 호출하여 모든 작업을 중단하고, 추가 작업도 차단합니다.
+응답이 틀릴 경우 3초 후 재시도:
+
+응답이 틀릴 경우 3초 후 재시도하며, 재시도 중임을 **"Retrying"**으로 표시합니다.
+재시도 횟수가 3회를 넘으면 작업 중단:
+
+재시도 횟수가 3회를 넘으면 더 이상 재시도하지 않고 작업을 중단하고, 에러 리스트박스에 추가합니다.
+작업이 실행되는 동안 새로운 작업은 대기:
+
+큐에 추가된 작업은 순차적으로 처리되며, 하나의 작업이 완료되기 전까지 다음 작업이 실행되지 않습니다.
+이 코드는 요구 사항에 맞게 응답 시간 초과 시 작업을 중단하고, 재시도 횟수에 따라 작업을 제어하며, 큐 크기에 따라 작업 추가를 차단합니다.
+
+
+
+
+
+
