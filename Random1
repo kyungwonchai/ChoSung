@@ -1,22 +1,47 @@
-FO(First In, First Out) 방식으로 가장 먼저 들어온 항목을 제거하는 방식으로 사용할 수 있습니다. 파이썬의 pop(0)처럼 리스트의 첫 번째 항목을 제거하려면 **RemoveAt(0)**을 사용하면 됩니다.
-
-이를 이용해서 RemainingCommands 컬렉션의 크기가 5개를 초과할 때 가장 먼저 추가된 항목을 제거하는 방식으로 처리할 수 있습니다.
+만약 작업을 추가할 때 단순 대기 함수를 넣고 싶다면, 비동기 작업을 실행하는 함수(taskFunc)에서 일정 시간 동안 대기하는 함수를 사용할 수 있습니다. C#에서 비동기 대기는 Task.Delay()를 통해 쉽게 구현할 수 있습니다.
 
 해결 방법:
-최대 항목 수를 5개로 제한.
-항목이 5개를 초과할 때, 가장 먼저 들어온 항목을 제거하는 로직을 추가.
-수정된 코드
+대기 작업을 추가하고 싶다면, Task.Delay()를 비동기 함수로 넣으면 됩니다.
+이 작업은 응답 검증 함수(responseValidator)에서 대기 후 성공 또는 실패를 반환하는 방식으로 처리할 수 있습니다.
+예시 코드: 단순 대기 작업 추가
+대기 작업을 정의: Task.Delay()로 일정 시간 동안 대기하는 비동기 함수를 정의합니다.
+
+검증 함수: 단순히 true 또는 false를 반환하여, 대기 작업이 끝난 후 성공 처리하도록 설정합니다.
+
+1. 대기 함수 추가
+csharp
+코드 복사
+private async Task<string> WaitTask()
+{
+    // 5초 동안 대기하는 작업
+    await Task.Delay(5000); 
+    return "Wait Completed"; // 대기 완료 후 메시지 반환
+}
+2. 검증 함수 추가
+csharp
+코드 복사
+private bool ValidateWaitTask(string result)
+{
+    // 대기 작업이 완료되면 무조건 true로 성공 처리
+    return result == "Wait Completed";
+}
+3. 대기 작업을 큐에 추가하는 코드
+csharp
+코드 복사
+public void AddWaitTaskCommand()
+{
+    // 대기 작업과 검증 함수 추가
+    AddAsyncTaskCommand(WaitTask, "Wait 5 Seconds", "Waiting", ValidateWaitTask);
+}
+4. 전체 흐름
 csharp
 코드 복사
 public class CommandQueueViewModel : INotifyPropertyChanged
 {
-    public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>(); // 명령을 저장하는 컬렉션
-    
-    private const int MaxCommandCount = 5; // 최대 5개의 명령만 유지
+    public ObservableCollection<CommandItem> RemainingCommands { get; set; } = new ObservableCollection<CommandItem>();
 
-    // 기타 기존 코드...
-
-    private void EnqueueTask(Func<Task<string>> taskFunc, string commandText, string sentCommand, Func<string, bool> responseValidator)
+    // 명령을 큐에 추가하는 함수
+    public void AddAsyncTaskCommand(Func<Task<string>> asyncTask, string commandText, string sentCommand, Func<string, bool> responseValidator)
     {
         var newCommand = new CommandItem
         {
@@ -29,32 +54,85 @@ public class CommandQueueViewModel : INotifyPropertyChanged
 
         App.Current.Dispatcher.Invoke(() =>
         {
-            // 새로운 명령을 RemainingCommands에 추가
             RemainingCommands.Add(newCommand);
-
-            // 5개를 초과하면 가장 먼저 들어온 항목(첫 번째 항목)을 삭제
-            if (RemainingCommands.Count > MaxCommandCount)
+            
+            if (RemainingCommands.Count > 5)
             {
-                RemainingCommands.RemoveAt(0); // 가장 오래된 항목 제거
+                RemainingCommands.RemoveAt(0); // FIFO 방식으로 가장 오래된 명령 삭제
             }
         });
 
-        // 기존 비동기 작업 처리 코드...
+        commandQueue.Enqueue(async () =>
+        {
+            newCommand.Status = "Processing";
+            int retryCount = 0;
+            Stopwatch stopwatch = new Stopwatch();
+            _isProcessing = true;
+
+            while (retryCount < RetryLimit)
+            {
+                try
+                {
+                    stopwatch.Restart();
+                    string result = await asyncTask(); // 여기서 대기 작업 실행
+                    stopwatch.Stop();
+
+                    int responseTime = (int)stopwatch.ElapsedMilliseconds;
+                    newCommand.ResponseTime = responseTime;
+
+                    if (responseValidator(result))
+                    {
+                        newCommand.Status = "Completed";
+                        newCommand.Result = 1;
+
+                        App.Current.Dispatcher.Invoke(() => RemainingCommands.Remove(newCommand)); // 완료된 명령 제거
+
+                        await _dbHelper.LogCommandToDatabase(commandText, sentCommand, result, "Completed", newCommand.Result, retryCount, responseTime, result);
+                        UpdateProgress();
+                        _isProcessing = false;
+                        return new CommandResult { Success = true, Message = result };
+                    }
+                    else
+                    {
+                        retryCount++;
+                        newCommand.Status = $"Retrying {retryCount}/{RetryLimit}";
+                        await Task.Delay(RetryInterval);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    newCommand.Status = "Failed";
+                    newCommand.Result = 0;
+                    stopwatch.Stop();
+                    int responseTime = (int)stopwatch.ElapsedMilliseconds;
+                    newCommand.ResponseTime = responseTime;
+                    await _dbHelper.LogCommandToDatabase(commandText, sentCommand, ex.Message, "Failed", newCommand.Result, retryCount, responseTime, ex.Message);
+                    StopQueueProcessing(newCommand);
+                    return new CommandResult { Success = false, Message = ex.Message };
+                }
+            }
+
+            UpdateProgress();
+            _isProcessing = false;
+            return new CommandResult { Success = false };
+        });
+
+        if (!_isProcessing)
+        {
+            _isProcessing = true;
+            ProcessCommandQueue(); // 큐 처리 시작
+        }
+
+        UpdateProgress();
     }
-
-    // 기타 기존 코드...
 }
-코드 설명:
-MaxCommandCount 상수:
+전체 흐름 설명:
+WaitTask: 이 함수는 5초 동안 대기하는 비동기 작업을 수행하며, 완료되면 "Wait Completed" 메시지를 반환합니다.
 
-최대 5개의 항목만 **RemainingCommands**에 유지하도록 상수를 정의했습니다.
-항목 추가 및 제거:
+ValidateWaitTask: 응답이 "Wait Completed"이면 성공(true)으로 간주하고, 그렇지 않으면 실패 처리합니다.
 
-새로운 명령이 추가될 때마다, **RemainingCommands**의 항목 수가 5개를 초과하면 가장 먼저 추가된 항목을 **RemoveAt(0)**로 삭제합니다. 이는 파이썬의 pop(0)과 동일한 동작을 합니다.
-컬렉션 관리:
+AddWaitTaskCommand: 큐에 대기 작업을 추가하는 함수입니다. 호출하면 5초 동안 대기하는 작업이 추가됩니다.
 
-이 방식으로 최대 5개의 명령만 RemainingCommands에 유지되며, 가장 오래된 항목부터 삭제됩니다.
-흐름:
-명령이 추가될 때마다, RemainingCommands에 추가됩니다.
-명령이 5개를 초과하면, 가장 먼저 추가된 명령을 자동으로 삭제하여 항상 최신 5개의 명령만 DataGrid에 표시됩니다.
-이 코드를 적용하면 파이썬의 pop(0)과 유사한 방식으로 FIFO 구조를 구현하여, 항상 5개의 항목만 유지하고 나머지는 자동으로 삭제하게 됩니
+FIFO 방식: RemainingCommands의 항목이 5개를 초과하면 가장 먼저 들어온 항목을 자동으로 삭제합니다. DataGrid에는 항상 최대 5개의 미완료된 명령만 표시됩니다.
+
+이 코드를 통해 단순 대기 작업을 명령 큐에 추가할 수 있으며, 작업이 완료되면 성공 처리됩니다
