@@ -1,13 +1,12 @@
-이해했습니다. 파일 경로는 **C:\PROD_FILE_LOG**이고, 로그 파일 규칙은 명확히 알려주셨습니다. 또한, 처음 실행 시 마지막 10개의 파일을 가져와서 화면에 표시하며, 새로 추가된 파일에 대해서는 순차적으로 작업을 처리해야 합니다.
+해했습니다. 요구 사항은 처음 실행할 때는 최근 10개의 파일만 보여주고, 그 이후에 신규로 생성되는 파일만 처리하라는 것입니다. 이를 반영하여 전체 코드를 수정하겠습니다.
 
-요약 수정 사항:
-경로는 **C:\PROD_FILE_LOG**로 고정.
-처음 실행 시 마지막 10개의 파일을 불러와 DataGrid에 추가.
-Dispatcher.Invoke를 사용해 UI 스레드에서 작업을 추가.
-새로 감지된 파일은 임의 함수에 파라미터를 전달하고 처리.
-작업 목록은 MAG_NO, PO_NO, 기타 항목 및 상태 정보를 표시.
-**파일 추가 시 시퀀스 번호(1, 2, 3)**에 따라 처리.
-FileProcessor.cs (파일 처리 및 감시, 초기 10개 처리 포함)
+수정할 주요 내용:
+
+처음 실행 시에는 최근 10개의 파일만 DataGrid에 표시하고 작업은 실행되지 않음.
+신규로 감지된 파일에 대해서만 작업이 처리되도록 구현.
+UI 업데이트를 위한 Dispatcher.Invoke 적용.
+경로는 C:\PROD_FILE_LOG로 고정.
+FileProcessor.cs (파일 처리 및 감시, 초기 10개만 표시, 이후 신규 파일 처리)
 Services/FileProcessor.cs
 
 csharp
@@ -27,8 +26,9 @@ public class FileProcessor
     private DateTime _lastProcessedFileTime;  // 마지막으로 처리한 파일의 시간
     private Timer _fileCheckTimer;
     private Dictionary<string, List<LogEntry>> _poFiles = new Dictionary<string, List<LogEntry>>(); // PO별 파일 관리
+    private bool _isFirstLoadComplete = false;  // 처음 10개 파일 로드가 완료되었는지 여부
 
-    public event Action<LogEntry> NewFileDetected;  // 파일이 감지되면 발생하는 이벤트
+    public event Action<LogEntry, bool> NewFileDetected;  // 파일이 감지되면 발생하는 이벤트, bool은 작업 실행 여부
 
     public FileProcessor(string logFolder, PlcCommunication plcCommunication)
     {
@@ -36,7 +36,7 @@ public class FileProcessor
         _plcCommunication = plcCommunication;
         _lastProcessedFileTime = DateTime.MinValue;  // 기본값으로 설정
 
-        // 처음 실행 시 마지막 10개 파일 가져오기
+        // 처음 실행 시 마지막 10개 파일 가져오기 (표시만)
         LoadInitialFiles();
 
         // 5초마다 파일을 감시하는 타이머 설정
@@ -55,7 +55,7 @@ public class FileProcessor
     }
 
     /// <summary>
-    /// 초기 실행 시, 최근 10개의 파일을 로드합니다.
+    /// 초기 실행 시, 최근 10개의 파일을 로드합니다. (작업 실행 X)
     /// </summary>
     public void LoadInitialFiles()
     {
@@ -72,9 +72,14 @@ public class FileProcessor
             // 시퀀스 플래그 설정: 첫 파일(1), 중간 파일(2), 마지막 파일(3)
             logEntry.SequenceFlag = DetermineSequenceFlag(logEntry);
 
-            // 이벤트 발생 (MainViewModel에서 처리)
-            NewFileDetected?.Invoke(logEntry);
+            // 처음 10개 파일은 작업 실행하지 않고 표시만 함
+            NewFileDetected?.Invoke(logEntry, false);
+
+            // 마지막 처리 시간 업데이트 (다음 파일부터 감지)
+            _lastProcessedFileTime = ExtractDateTimeFromFileName(file);
         }
+
+        _isFirstLoadComplete = true;  // 첫 로드 완료
     }
 
     /// <summary>
@@ -98,11 +103,14 @@ public class FileProcessor
                 // 시퀀스 플래그 설정: 첫 파일(1), 중간 파일(2), 마지막 파일(3)
                 logEntry.SequenceFlag = DetermineSequenceFlag(logEntry);
 
-                // 이벤트 발생 및 PLC 통신 트리거
-                NewFileDetected?.Invoke(logEntry);
+                // 파일 감지 후, 첫 로드 이후에는 작업 실행
+                NewFileDetected?.Invoke(logEntry, _isFirstLoadComplete);
 
-                // PLC 신호 전송
-                _plcCommunication.SendSignalForFile(file);
+                // PLC 신호 전송 (첫 로드 이후에만 실행)
+                if (_isFirstLoadComplete)
+                {
+                    _plcCommunication.SendSignalForFile(file);
+                }
 
                 // 마지막 처리 시간 업데이트
                 _lastProcessedFileTime = fileTime;
@@ -172,7 +180,7 @@ public class FileProcessor
         return 2; // 중간 파일
     }
 }
-MainViewModel.cs (ViewModel 수정, Dispatcher.Invoke 추가)
+MainViewModel.cs (ViewModel 수정, 작업 실행 여부 추가)
 ViewModels/MainViewModel.cs
 
 csharp
@@ -201,7 +209,7 @@ public class MainViewModel : ViewModelBase
         // 파일 처리 클래스 생성 (경로와 PLC 통신 클래스 전달)
         _fileProcessor = new FileProcessor(@"C:\PROD_FILE_LOG", plcCommunication);
 
-        // 파일 감지 이벤트 연결
+        // 파일 감지 이벤트 연결 (작업 실행 여부에 따라 다르게 처리)
         _fileProcessor.NewFileDetected += OnNewFileDetected;
 
         CancelAllCommand = new RelayCommand(CancelAllTasks);
@@ -211,11 +219,11 @@ public class MainViewModel : ViewModelBase
     /// 새로운 파일이 감지되었을 때 호출되는 메서드.
     /// Dispatcher.Invoke를 사용하여 UI 스레드에서 안전하게 작업 추가.
     /// </summary>
-    private void OnNewFileDetected(LogEntry logEntry)
+    private void OnNewFileDetected(LogEntry logEntry, bool executeTask)
     {
         Application.Current.Dispatcher.Invoke(() =>
         {
-            var taskModel = new TaskModel(logEntry, _taskQueue, true);
+            var taskModel = new TaskModel(logEntry, _taskQueue, executeTask);
             TaskList.Add(taskModel);
         });
     }
@@ -232,7 +240,7 @@ public class MainViewModel : ViewModelBase
         }
     }
 }
-MainWindow.xaml (UI 변경, Dispatcher 고려)
+MainWindow.xaml (UI 변경)
 Views/MainWindow.xaml
 
 xml
@@ -294,14 +302,13 @@ xml
 설명:
 FileProcessor:
 
-처음 실행 시 최근 10개의 파일을 가져와서 처리합니다.
-이후 5초마다 폴더를 체크하여 새로운 파일이 추가되면 NewFileDetected 이벤트를 통해 MainViewModel로 전달합니다.
-파일의 시퀀스 번호(첫 번째: 1, 중간: 2, 마지막: 3)를 계산하여 로그 항목에 추가합니다.
+처음 실행 시 최근 10개의 파일만 로드하고 작업을 실행하지 않으며, 그 이후에 새로운 파일이 감지될 때만 작업이 실행되도록 구현되었습니다.
+이벤트 핸들러로 파일 추가 여부와 작업 실행 여부를 구분할 수 있습니다.
 MainViewModel:
 
-Dispatcher를 사용해 UI 스레드에서 안전하게 작업을 추가합니다.
-작업 목록에 MAG_NO, PO_NO, 시퀀스 번호 등 8개의 항목을 표시하고 상태에 따른 배경색을 변경합니다.
+처음 10개 파일에 대해서는 작업이 실행되지 않도록 처리하고, 신규 파일에 대해서는 작업이 실행되도록 수정했습니다.
+Dispatcher.Invoke를 사용해 UI 스레드에서 안전하게 작업을 추가합니다.
 MainWindow.xaml:
 
 DataGrid에서 각 항목을 표시하고, 작업 상태에 따라 배경색이 변경됩니다 (녹색, 스카이블루, 빨강, 회색).
-이제 이 코드는 파일 경로와 파일 규칙을 완전히 반영한 상태로, 처음 10개의 파일을 로드하고, 이후 새로운 파일이 추가되면 UI에서 순차적으로 작업을 처리할 수 있습
+이제 이 코드는 처음 실행 시 최근 10개의 파일만 표시하고, 그 이후 신규 로그 파일이 추가되면 작업이 처리되는 방식으로 동작합니다.
