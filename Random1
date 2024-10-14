@@ -1,150 +1,228 @@
- 관리를 쉽게 하기 위해서는 로그 레벨과 로그 카테고리를 구분하고, LogHelper 클래스에서 이를 처리할 수 있는 구조를 설계하는 것이 좋습니다. 로그 레벨은 일반적으로 Info, Debug, Warning, Error와 같은 수준별로 구분할 수 있고, 카테고리는 로그의 출처나 관심 영역(예: Communication, UI, Database) 등을 구분할 수 있습니다. 또한, 로그를 파일로 남길 때 파일을 나누거나 로그 뷰어를 통해 필터링할 수 있도록 구현할 수 있습니다.
+etermineSequenceFlag 메서드를 추가하여 PO_NO가 이전 파일의 PO_NO와 다를 경우, 시퀀스 플래그를 1로 리턴하도록 설정할 수 있습니다. 이를 위해 FileProcessor 클래스에서 마지막 처리된 PO_NO를 저장하고, 이를 기준으로 현재 파일의 PO_NO와 비교하여 플래그를 결정하게 할 수 있습니다.
 
-1. 로그 레벨 및 카테고리 구분
-먼저, 로그 메시지를 관리할 수 있는 LogLevel과 LogCategory라는 enum을 만들어서 로그의 타입을 구분합니다.
+다음은 이에 대한 구현입니다.
 
+수정된 FileProcessor 코드
 csharp
 코드 복사
-public enum LogLevel
-{
-    Info,
-    Debug,
-    Warning,
-    Error
-}
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Timers;
 
-public enum LogCategory
+public class FileProcessor
 {
-    Communication,
-    UI,
-    Database,
-    TaskQueue
-}
-2. LogHelper 클래스 확장
-LogHelper 클래스에서 로그 레벨과 카테고리를 받아 처리하도록 변경합니다. 또한, 로그 메시지를 필터링하거나 로그 파일을 카테고리별로 나눠 기록할 수 있도록 설계할 수 있습니다.
+    private string _networkPath = @"\\10.44.44.44\file_log";  // 네트워크 경로
+    private string _localPath = @"C:\prod_file_log";          // 로컬 경로
+    private string _backupPath = @"C:\MESPRODFILE_Backup";    // 백업 경로
+    private DateTime _lastProcessedTime = DateTime.MinValue;  // 마지막 처리된 파일 시간 기록
+    private string _lastPONumber = "";                        // 마지막 처리된 PO_NO
+    private Timer _fileCheckTimer;                            // 타이머 객체
 
-csharp
-코드 복사
-public class LogHelper
-{
-    private static readonly object _lock = new object();
-    private static readonly string logFilePath = "log.txt";
-
-    // 로그를 파일에 남기거나 필요한 추가 처리를 위해 메서드를 확장
-    public static void Log(LogLevel level, LogCategory category, string message)
+    public FileProcessor()
     {
-        string logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{level}] [{category}] {message}";
-        
-        // 파일에 로그 기록
-        lock (_lock)
-        {
-            System.IO.File.AppendAllText(logFilePath, logMessage + Environment.NewLine);
-        }
+        // 로컬 및 백업 디렉터리 존재 여부 확인 후 없으면 생성
+        EnsureDirectoryExists(_localPath);
+        EnsureDirectoryExists(_backupPath);
 
-        // 필요하면 로그 레벨에 따라 콘솔 출력 혹은 다른 처리를 추가 가능
-        if (level == LogLevel.Error)
+        // 5초마다 새로 생성된 파일이 있는지 체크하는 타이머 설정
+        _fileCheckTimer = new Timer(5000); // 5초
+        _fileCheckTimer.Elapsed += OnTimedEvent;
+        _fileCheckTimer.AutoReset = true;
+        _fileCheckTimer.Enabled = true;  // 타이머 시작
+    }
+
+    /// <summary>
+    /// 디렉토리의 존재 여부를 확인하고 없으면 생성하는 함수
+    /// </summary>
+    /// <param name="path">생성할 디렉토리 경로</param>
+    private void EnsureDirectoryExists(string path)
+    {
+        if (!Directory.Exists(path))
         {
-            // 콘솔 또는 다른 서비스에 출력
-            Console.WriteLine(logMessage);
+            Directory.CreateDirectory(path);
         }
     }
 
-    // 편의성을 위해 로그 레벨별로 바로 호출할 수 있는 메서드
-    public static void LogInfo(LogCategory category, string message)
+    /// <summary>
+    /// 타이머가 5초마다 호출하는 이벤트 핸들러. 새로 생성된 파일을 체크합니다.
+    /// </summary>
+    private void OnTimedEvent(Object source, ElapsedEventArgs e)
     {
-        Log(LogLevel.Info, category, message);
+        // 새로 생성된 파일이 있는지 확인하고 처리
+        ProcessFilesFromNetwork().Wait(); 
     }
 
-    public static void LogError(LogCategory category, string message)
+    /// <summary>
+    /// 네트워크 경로에서 파일을 로컬 경로로 안전하게 복사한 후 처리 및 삭제
+    /// </summary>
+    public async Task ProcessFilesFromNetwork()
     {
-        Log(LogLevel.Error, category, message);
+        // 네트워크 경로에서 모든 파일을 가져옴
+        var files = Directory.GetFiles(_networkPath);
+
+        // 각 파일을 로컬로 복사한 후 처리
+        foreach (var file in files)
+        {
+            string fileName = Path.GetFileName(file);
+            string localFile = Path.Combine(_localPath, fileName);
+
+            // 파일이 다 쓰여졌는지 확인
+            if (IsFileReady(file))
+            {
+                // 네트워크에서 로컬로 파일 복사
+                File.Copy(file, localFile, true);  // 파일 덮어쓰기 허용
+
+                // 파일을 로컬에서 처리
+                await ProcessFile(localFile);
+
+                // 처리 후 파일을 백업 경로로 이동
+                MoveFileToBackup(localFile);
+
+                // 네트워크 경로의 파일 삭제
+                DeleteNetworkFile(file);
+            }
+        }
     }
 
-    public static void LogWarning(LogCategory category, string message)
-    {
-        Log(LogLevel.Warning, category, message);
-    }
-    
-    public static void LogDebug(LogCategory category, string message)
-    {
-        Log(LogLevel.Debug, category, message);
-    }
-}
-3. ViewModel에서 로그 사용
-이제 ViewModel에서 LogHelper를 사용하여 로그를 남길 때, 카테고리와 레벨을 지정할 수 있습니다.
-
-csharp
-코드 복사
-public class MainViewModel : ViewModelBase
-{
-    public void ExecuteTask()
+    /// <summary>
+    /// 파일이 다 쓰여졌는지 확인하는 함수
+    /// </summary>
+    /// <param name="filePath">확인할 파일 경로</param>
+    /// <returns>파일이 준비되었는지 여부</returns>
+    private bool IsFileReady(string filePath)
     {
         try
         {
-            // 작업 수행 코드
-            LogHelper.LogInfo(LogCategory.TaskQueue, "작업 시작");
-
-            // 작업 수행 성공 시
-            LogHelper.LogInfo(LogCategory.TaskQueue, "작업 성공");
-
+            using (FileStream inputStream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                return inputStream.Length > 0;  // 파일 크기가 0보다 크면 읽기 가능
+            }
         }
-        catch (Exception ex)
+        catch (IOException)
         {
-            // 오류 발생 시 로그 기록
-            LogHelper.LogError(LogCategory.TaskQueue, $"작업 실패: {ex.Message}");
+            // 파일이 잠겨 있거나 접근할 수 없으면 아직 준비되지 않음
+            return false;
         }
     }
 
-    public void CommunicateWithServer()
+    /// <summary>
+    /// 파일을 로컬에서 처리하는 함수
+    /// PO_NO에 따라 시퀀스 플래그를 결정합니다.
+    /// </summary>
+    private async Task ProcessFile(string filePath)
+    {
+        // 파일 처리 로직 (파일 내용 읽기, 분석 등)
+        Console.WriteLine($"Processing file: {filePath}");
+
+        // 파일 내용 읽기 (예시로 파일에서 PO_NO를 추출하는 로직)
+        string[] lines = await File.ReadAllLinesAsync(filePath);
+        string poNo = ExtractPONumber(lines);
+
+        // 시퀀스 플래그 결정
+        int sequenceFlag = DetermineSequenceFlag(poNo);
+        Console.WriteLine($"PO_NO: {poNo}, SequenceFlag: {sequenceFlag}");
+
+        // 마지막 처리된 PO_NO 업데이트
+        _lastPONumber = poNo;
+    }
+
+    /// <summary>
+    /// 파일에서 PO_NO를 추출하는 함수
+    /// (실제 파일 포맷에 맞게 수정 필요)
+    /// </summary>
+    private string ExtractPONumber(string[] lines)
+    {
+        // 파일의 첫 줄이 PO_NO라고 가정
+        return lines.FirstOrDefault()?.Split('=')[1].Trim();
+    }
+
+    /// <summary>
+    /// PO_NO에 따라 시퀀스 플래그를 결정하는 함수
+    /// 1: 새로 시작된 PO_NO
+    /// 2: 기존 PO_NO의 중간 파일
+    /// </summary>
+    private int DetermineSequenceFlag(string poNo)
+    {
+        if (poNo != _lastPONumber)
+        {
+            return 1;  // 새로 시작된 PO_NO일 경우 시퀀스 플래그 1
+        }
+        else
+        {
+            return 2;  // 동일한 PO_NO일 경우 시퀀스 플래그 2
+        }
+    }
+
+    /// <summary>
+    /// 파일을 백업 폴더로 이동하는 함수 (날짜별로 폴더 생성)
+    /// </summary>
+    /// <param name="filePath">백업할 파일 경로</param>
+    private void MoveFileToBackup(string filePath)
+    {
+        // 백업 폴더에 날짜별 폴더 생성
+        string dateFolder = DateTime.Now.ToString("yyyyMMdd");
+        string backupFolder = Path.Combine(_backupPath, dateFolder);
+
+        // 백업 디렉터리 생성 (날짜별로)
+        EnsureDirectoryExists(backupFolder);
+
+        // 원본 파일명 가져오기
+        string fileName = Path.GetFileName(filePath);
+
+        // 백업 경로 설정
+        string backupFilePath = Path.Combine(backupFolder, fileName);
+
+        // 파일 이동 (백업 경로로)
+        File.Move(filePath, backupFilePath);
+    }
+
+    /// <summary>
+    /// 네트워크 경로에서 파일을 삭제하는 함수
+    /// </summary>
+    /// <param name="filePath">삭제할 네트워크 파일 경로</param>
+    private void DeleteNetworkFile(string filePath)
     {
         try
         {
-            LogHelper.LogDebug(LogCategory.Communication, "서버와 통신 시작");
-
-            // 통신 코드
-            LogHelper.LogInfo(LogCategory.Communication, "서버 통신 성공");
+            File.Delete(filePath);  // 네트워크 경로에서 파일 삭제
+            Console.WriteLine($"File deleted from network path: {filePath}");
         }
-        catch (Exception ex)
+        catch (IOException ex)
         {
-            LogHelper.LogError(LogCategory.Communication, $"서버 통신 실패: {ex.Message}");
+            Console.WriteLine($"Error deleting file from network path: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 백업된 파일 중 3개월 이상 된 파일을 삭제하는 함수
+    /// </summary>
+    public void DeleteOldBackupFiles()
+    {
+        // 백업 디렉터리에서 날짜별 폴더 확인
+        var directories = Directory.GetDirectories(_backupPath);
+
+        foreach (var dir in directories)
+        {
+            // 폴더명을 날짜로 변환하여 3개월 이전의 폴더는 삭제
+            string folderName = Path.GetFileName(dir);
+            if (DateTime.TryParseExact(folderName, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out DateTime folderDate))
+            {
+                if (folderDate < DateTime.Now.AddMonths(-3))
+                {
+                    Directory.Delete(dir, true);  // 폴더 및 하위 파일 삭제
+                }
+            }
         }
     }
 }
-4. 로그 파일 관리 및 필터링
-로그 파일이 너무 커지지 않도록 파일을 일정 크기나 날짜별로 분할하거나, 로그 뷰어에서 카테고리별로 필터링할 수 있게 하는 추가 기능을 도입할 수 있습니다.
+주요 변경 사항 설명
+PO_NO 비교:
 
-날짜별 파일 저장: 매일 새로운 로그 파일을 생성할 수 있습니다. 예를 들어, 파일 이름에 날짜를 추가하여 관리합니다.
-csharp
-코드 복사
-private static string GetLogFilePath()
-{
-    string date = DateTime.Now.ToString("yyyy-MM-dd");
-    return $"log_{date}.txt";
-}
-로그 뷰어: 로그를 뷰어에서 카테고리나 레벨로 필터링할 수 있도록 하면 관리가 더욱 편리합니다. WPF에서 간단한 로그 뷰어 UI를 만들어 로그를 출력하거나 검색할 수 있습니다.
-5. LogHelper와 MVVM 패턴 연동
-MVVM 패턴에서는 LogHelper에서 발생하는 로그를 ObservableCollection으로 바인딩해 UI에서 실시간으로 로그를 확인할 수 있게 할 수도 있습니다.
+DetermineSequenceFlag 함수에서 이전에 처리된 PO_NO를 저장한 _lastPONumber와 현재 파일의 PO_NO를 비교하여 새롭게 시작된 PO_NO일 경우 시퀀스 플래그를 1로 반환하도록 수정하였습니다.
+동일한 PO_NO일 경우에는 시퀀스 플래그를 2로 반환합니다.
+_lastPONumber:
 
-csharp
-코드 복사
-public class MainViewModel : ViewModelBase
-{
-    public ObservableCollection<string> LogMessages { get; private set; }
-
-    public MainViewModel()
-    {
-        LogMessages = new ObservableCollection<string>();
-        LogHelper.OnLogReceived += AddLogMessage;
-    }
-
-    private void AddLogMessage(string message)
-    {
-        // UI 바인딩을 위해 로그 메시지 추가
-        App.Current.Dispatcher.Invoke(() => LogMessages.Add(message));
-    }
-}
-이 방식으로 로그를 효율적으로 관리하고, 카테고리별, 레벨별로 쉽게 필터링할 수 있어 디버깅이나 로그 분석이 훨씬 수월해집니다.
-
-
-
-
+이전에 처리한 파일의 PO_NO를 저장하기 위해 _lastPONumber 변수를 사용합니다. 각 파일을 처리할 때마다 _lastPONumber를 갱신하여 다음 파일과 비교할 수 있도록 했습니다.
+파일 처리:
