@@ -1,6 +1,20 @@
-ignalR 통신을 처리하는 클래스를 비동기 방식으로 구현하고, Singleton 패턴을 사용하여 SignalR 클래스를 전역적으로 하나만 사용하도록 전체 구조를 다시 작성하겠습니다. WithUrl 관련 에러가 발생하는 경우, 이를 해결하기 위해서는 Microsoft.AspNetCore.SignalR.Client와 관련된 패키지의 버전이나 설정을 확인하는 것이 좋습니다. 우선 SignalRClient 클래스를 Singleton 패턴으로 재구성하고 비동기 방식으로 다시 작성하겠습니다.
+WithUrl 관련 오류는 Microsoft.AspNetCore.SignalR.Client 패키지에서 제공되는 확장 메서드를 사용하려는 것인데, 패키지가 설치되지 않았거나 잘못된 버전이 설치되어 있을 가능성이 큽니다. 먼저 Microsoft.AspNetCore.SignalR.Client 패키지를 프로젝트에 설치하거나 버전을 확인해야 합니다.
 
-1. SignalRClient 클래스 (Singleton 패턴 및 비동기형 SignalR 처리)
+1. NuGet 패키지 설치
+Visual Studio에서 아래 명령어를 사용하여 패키지를 설치할 수 있습니다:
+
+패키지 관리자 콘솔을 열고 아래 명령을 입력합니다:
+bash
+코드 복사
+Install-Package Microsoft.AspNetCore.SignalR.Client
+패키지가 설치되었는지 확인하세요. 프로젝트의 Dependencies -> NuGet 아래에 Microsoft.AspNetCore.SignalR.Client가 있는지 확인합니다.
+
+만약 여전히 오류가 발생한다면, 타겟 프레임워크와 SignalR 패키지 버전이 호환되는지 확인해야 합니다. netcoreapp3.1, net5.0, 또는 그 이상의 버전이 필요합니다.
+
+2. 전송 후 성공 여부 확인하기
+SignalR 메시지를 전송한 후, 결과를 리턴받아 성공 여부를 확인할 수 있습니다. 이 작업은 SignalR의 메서드 호출에 대해 응답을 받을 수 있도록 서버 쪽에서 관련 로직을 작성한 후, 클라이언트 쪽에서 해당 응답을 처리하도록 구현해야 합니다.
+
+3. SignalRClient 클래스 수정 (결과 리턴받기)
 csharp
 코드 복사
 using System;
@@ -12,6 +26,7 @@ public class SignalRClient
     private static SignalRClient _instance;  // Singleton 인스턴스
     private HubConnection _hubConnection;  // SignalR 연결 객체
     public event EventHandler<string> LogMessageReceived;  // 로그 이벤트
+    public event EventHandler<string> MessageResponseReceived;  // 메시지 응답 이벤트
 
     // Singleton 패턴을 위한 private 생성자
     private SignalRClient() { }
@@ -40,6 +55,11 @@ public class SignalRClient
                     .WithUrl(hubUrl)  // 허브 URL 설정
                     .Build();
 
+                // 서버에서 오는 응답 처리 (서버 쪽에서 response 메시지를 보내줘야 함)
+                _hubConnection.On<string>("ReceiveResponse", (responseMessage) => {
+                    MessageResponseReceived?.Invoke(this, responseMessage);  // 응답 메시지 처리
+                });
+
                 await _hubConnection.StartAsync();  // 비동기로 SignalR 연결 시작
                 Log("SignalR Connection Started");  // 연결 성공 로그
             }
@@ -51,7 +71,7 @@ public class SignalRClient
     }
 
     // 메시지 전송 함수 (비동기)
-    public async Task SendMessageAsync(string message)
+    public async Task<bool> SendMessageAsync(string message)
     {
         try
         {
@@ -59,15 +79,20 @@ public class SignalRClient
             {
                 await _hubConnection.InvokeAsync("SendMessage", message);
                 Log($"Message sent: {message}");  // 성공적으로 전송된 경우 로그
+
+                // 전송 후 서버로부터 응답을 기다리고, 성공 여부 확인
+                return true;
             }
             else
             {
                 LogError("SignalR is not connected.");
+                return false;
             }
         }
         catch (Exception ex)
         {
             LogError(ex.Message);  // 전송 중 오류 발생 시 로그 기록
+            return false;
         }
     }
 
@@ -83,7 +108,7 @@ public class SignalRClient
         Log($"Error: {errorMessage}");  // 에러 로그 기록
     }
 }
-2. MainViewModel 클래스 (SignalRClient의 Singleton 인스턴스를 사용)
+4. MainViewModel에서 성공 여부 및 응답 처리
 csharp
 코드 복사
 using System;
@@ -94,6 +119,7 @@ using System.Threading.Tasks;
 public class MainViewModel : INotifyPropertyChanged
 {
     private string _logMessage;
+    private string _responseMessage;
 
     public event PropertyChangedEventHandler PropertyChanged;
 
@@ -107,10 +133,21 @@ public class MainViewModel : INotifyPropertyChanged
         }
     }
 
+    public string ResponseMessage
+    {
+        get { return _responseMessage; }
+        set
+        {
+            _responseMessage = value;
+            OnPropertyChanged();
+        }
+    }
+
     public MainViewModel()
     {
         InitializeSignalR();  // SignalR 연결 초기화
         SignalRClient.Instance.LogMessageReceived += OnLogMessageReceived;  // 로그 메시지 수신 이벤트 연결
+        SignalRClient.Instance.MessageResponseReceived += OnMessageResponseReceived;  // 응답 메시지 수신 이벤트 연결
         OtherClass.SignalReceived += OnSignalReceived;  // 외부 클래스의 이벤트 수신
     }
 
@@ -123,13 +160,21 @@ public class MainViewModel : INotifyPropertyChanged
     // 외부 클래스에서 이벤트가 발생했을 때 호출되는 함수
     private async void OnSignalReceived(object sender, string message)
     {
-        await SendSignalRMessageAsync(message);
+        bool isSuccess = await SendSignalRMessageAsync(message);
+        if (isSuccess)
+        {
+            LogMessage = "Message sent successfully.";
+        }
+        else
+        {
+            LogMessage = "Message failed to send.";
+        }
     }
 
     // SignalR을 통해 메시지를 보내는 함수
-    private async Task SendSignalRMessageAsync(string message)
+    private async Task<bool> SendSignalRMessageAsync(string message)
     {
-        await SignalRClient.Instance.SendMessageAsync(message);  // Singleton 인스턴스의 SendMessage 호출
+        return await SignalRClient.Instance.SendMessageAsync(message);  // Singleton 인스턴스의 SendMessage 호출
     }
 
     // SignalRClient에서 발생한 로그 메시지를 수신하여 UI에 표시
@@ -138,73 +183,37 @@ public class MainViewModel : INotifyPropertyChanged
         LogMessage = logMessage;  // 로그 메시지 업데이트
     }
 
+    // SignalR 서버로부터 응답을 받았을 때 처리
+    private void OnMessageResponseReceived(object sender, string responseMessage)
+    {
+        ResponseMessage = $"Received response: {responseMessage}";  // 응답 메시지 UI에 표시
+    }
+
     // PropertyChanged 이벤트 발생 함수
     protected void OnPropertyChanged([CallerMemberName] string name = null)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
 }
-3. OtherClass (신호를 발생시키는 클래스)
+5. 서버에서 응답 처리 예시 (SignalR 허브)
+서버에서는 클라이언트의 메시지를 처리한 후 응답을 반환해야 합니다. 아래는 간단한 SignalR 허브 예시입니다.
+
 csharp
 코드 복사
-using System;
+using Microsoft.AspNetCore.SignalR;
+using System.Threading.Tasks;
 
-public class OtherClass
+public class MyHub : Hub
 {
-    // 신호를 외부로 전달하는 이벤트
-    public static event EventHandler<string> SignalReceived;
-
-    // 특정 조건에서 신호를 발생시키는 함수 (예시로 타이머로 신호를 발생시킴)
-    public void TriggerSignal()
+    public async Task SendMessage(string message)
     {
-        string message = "This is a test message";
-
-        // 이벤트 발생, MainViewModel에서 수신하여 SignalR로 전송함
-        SignalReceived?.Invoke(this, message);
+        // 메시지를 처리한 후 응답을 클라이언트로 보냄
+        await Clients.Caller.SendAsync("ReceiveResponse", $"Message '{message}' received and processed.");
     }
 }
-4. XAML (UI 부분)
-xml
-코드 복사
-<Window x:Class="WpfApp.MainWindow"
-        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="MainWindow" Height="350" Width="525">
-    <Grid>
-        <TextBlock Text="{Binding LogMessage}" VerticalAlignment="Center" HorizontalAlignment="Center" />
-    </Grid>
-</Window>
-5. MainWindow.xaml.cs (뷰모델 설정)
-csharp
-코드 복사
-using System.Windows;
+요약
+패키지 문제 해결: WithUrl 관련 에러는 Microsoft.AspNetCore.SignalR.Client 패키지가 설치되지 않았거나 버전 호환 문제가 있을 가능성이 크므로, 패키지를 설치하고 버전을 확인합니다.
 
-public partial class MainWindow : Window
-{
-    public MainWindow()
-    {
-        InitializeComponent();
-        DataContext = new MainViewModel();  // MainViewModel을 DataContext로 설정
-    }
-}
-설명
-SignalRClient (Singleton 패턴):
+응답 처리: 클라이언트에서 SignalR 서버로 메시지를 보낸 후, 서버에서 응답을 받는 구조를 구현하였습니다. 서버는 클라이언트의 메시지를 처리한 후 응답을 반환하고, 클라이언트에서는 이 응답을 UI에 표시할 수 있습니다.
 
-SignalRClient는 Singleton 패턴을 사용하여 애플리케이션 전역에서 하나의 SignalR 연결을 공유합니다. 이를 통해 메모리 사용을 최적화하고, 여러 인스턴스에서 발생할 수 있는 불필요한 연결을 방지합니다.
-InitializeSignalRConnectionAsync: 허브 URL을 받아 SignalR 연결을 초기화하고 비동기로 시작합니다. 만약 연결이 실패하거나 예외가 발생하면 에러 로그를 남깁니다.
-SendMessageAsync: SignalR 서버로 메시지를 비동기로 전송하며, 연결 상태를 확인하고 로그를 남깁니다.
-MainViewModel:
-
-SignalRClient.Instance를 통해 Singleton 인스턴스를 사용하여 메시지를 전송하고, 초기화할 때도 같은 인스턴스를 사용합니다.
-LogMessage는 UI와 바인딩되며, SignalR 로그 메시지가 발생할 때마다 자동으로 UI에 표시됩니다.
-OtherClass:
-
-신호를 발생시키는 클래스입니다. 외부에서 이벤트를 통해 MainViewModel로 신호를 전달하여 SignalR로 값을 보냅니다.
-에러 처리 및 프로그램 안정성
-SignalR 연결 중에 문제가 발생하거나 메시지 전송 중 오류가 발생할 경우, LogError 메서드를 통해 에러 메시지를 로그로 남기고 프로그램은 종료되지 않습니다.
-로그 기록: 에러 메시지 또는 성공 메시지는 LogMessageReceived 이벤트를 통해 외부로 전달되며, UI에서 이를 확인할 수 있습니다.
-이 코드 구조는 Singleton 패턴을 사용하여 SignalR 연결을 한 번만 생성하고 공유하도록 하였으며, 비동기 방식으로 통신을 처리하고 에러 처리 로직도 포함하였습니다.
-
-
-
-
+Singleton 패턴: SignalR 연결을 한 번만 생성하여 사용하는 Singleton 패턴을 적용하였고, 메시지 전송 및 응답 처리를 비동기 방식으로 수행합니다.
