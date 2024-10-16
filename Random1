@@ -1,36 +1,148 @@
-using System.Windows.Threading;
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-// WPF에서 타이머는 DispatcherTimer를 사용합니다
-private DispatcherTimer _connectionCheckTimer;
-
-// 서버와의 연결 상태를 5초마다 체크하는 메서드
-private void StartConnectionCheck()
+public class SocketClientMergeOI
 {
-    if (_connectionCheckTimer == null)
-    {
-        _connectionCheckTimer = new DispatcherTimer();
-        _connectionCheckTimer.Interval = TimeSpan.FromMilliseconds(_checkInterval); // 5초 간격 설정
-        _connectionCheckTimer.Tick += CheckConnectionStatus; // 타이머 틱 이벤트에 핸들러 연결
-        _connectionCheckTimer.Start(); // 타이머 시작
-    }
-}
+    private TcpClient _client; // TCP 클라이언트 객체
+    private NetworkStream _stream; // 네트워크 스트림
+    private readonly string _ipAddress; // 서버의 IP 주소
+    private readonly int _port; // 서버의 포트 번호
+    private bool _isConnected; // 서버와의 연결 여부 플래그
+    private const int _retryInterval = 3000; // 3초 간격으로 연결 시도
+    private const int _checkInterval = 5000; // 5초 간격으로 연결 상태 확인
+    private Timer _connectionCheckTimer; // 연결 상태 확인을 위한 타이머
 
-// 연결 상태 확인을 위한 메서드
-private void CheckConnectionStatus(object sender, EventArgs e)
-{
-    if (_client != null && (!_client.Connected || (_client.Client.Poll(0, SelectMode.SelectRead) && _client.Client.Available == 0)))
+    // 연결 상태가 변경될 때 호출될 이벤트
+    public event Action<bool> ConnectionStatusChanged;
+
+    public SocketClientMergeOI(string ipAddress, int port)
     {
-        // 연결이 끊어졌으면 재연결 시도
+        _ipAddress = ipAddress;
+        _port = port;
+        _client = new TcpClient();
         _isConnected = false;
-        ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
-        StopConnectionCheck(); // 연결 확인 타이머 중지
-        StartConnectionAttemptAsync(); // 재연결 시도
+        StartConnectionCheck(); // 주기적으로 서버 연결 상태 확인
     }
-}
 
-// 연결 상태 확인을 중지하는 메서드
-private void StopConnectionCheck()
-{
-    _connectionCheckTimer?.Stop(); // 타이머 중지
-    _connectionCheckTimer = null; // 타이머 해제
+    // 서버에 연결 시도하는 비동기 함수
+    private async Task AttemptConnectionAsync()
+    {
+        try
+        {
+            // 서버에 연결 시도
+            await _client.ConnectAsync(_ipAddress, _port);
+            _isConnected = true; // 연결 성공
+            _stream = _client.GetStream(); // 스트림 설정
+            ConnectionStatusChanged?.Invoke(true); // 연결 성공 이벤트 호출
+            StartReceiving(); // 서버로부터 데이터 수신 시작
+        }
+        catch (SocketException)
+        {
+            // 연결 실패 시 상태 변경 및 이벤트 호출
+            _isConnected = false;
+            ConnectionStatusChanged?.Invoke(false); // 연결 실패 이벤트 호출
+        }
+    }
+
+    // 서버와의 연결 상태를 5초마다 체크하는 메서드
+    private void StartConnectionCheck()
+    {
+        // 5초마다 연결 상태 확인을 위한 타이머 설정
+        _connectionCheckTimer = new Timer(CheckConnectionStatus, null, 0, _checkInterval);
+    }
+
+    // 연결 상태 확인을 위한 메서드
+    private async void CheckConnectionStatus(object state)
+    {
+        if (_client == null || !_client.Connected || (_client.Client.Poll(0, SelectMode.SelectRead) && _client.Client.Available == 0))
+        {
+            // 연결이 끊어졌거나 문제가 발생한 경우
+            _isConnected = false;
+            ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
+            await AttemptConnectionAsync(); // 재연결 시도
+        }
+    }
+
+    // 서버로부터 메시지를 수신하는 비동기 함수
+    private async void StartReceiving()
+    {
+        byte[] buffer = new byte[1024]; // 수신할 데이터를 담을 버퍼 생성
+
+        while (_isConnected)
+        {
+            try
+            {
+                int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length); // 데이터를 비동기적으로 읽음
+                if (bytesRead > 0)
+                {
+                    string receivedMessage = Encoding.ASCII.GetString(buffer, 0, bytesRead); // 수신된 데이터를 문자열로 변환
+                    Console.WriteLine($"Received: {receivedMessage}");
+                }
+            }
+            catch (Exception)
+            {
+                // 서버와의 연결이 끊긴 경우
+                _isConnected = false; // 연결 플래그를 false로 설정
+                ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
+                await AttemptConnectionAsync(); // 재연결 시도
+            }
+        }
+    }
+
+    // 서버로 메시지를 전송하는 비동기 함수
+    public async Task<string> SendAndReceiveMessageAsync(string message)
+    {
+        if (!_isConnected) // 연결이 되어 있지 않으면
+        {
+            return "Not connected";
+        }
+
+        string fullMessage = $"\x02{message}\x03"; // STX 및 ETX 추가
+        byte[] messageBytes = Encoding.ASCII.GetBytes(fullMessage);
+
+        try
+        {
+            await _stream.WriteAsync(messageBytes, 0, messageBytes.Length); // 메시지 전송
+        }
+        catch (Exception)
+        {
+            _isConnected = false; // 연결 문제 발생 시 플래그 변경
+            ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
+            await AttemptConnectionAsync(); // 재연결 시도
+            return "Send failed. Connection lost.";
+        }
+
+        // 서버로부터 응답 대기
+        try
+        {
+            byte[] buffer = new byte[1024];
+            int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length); // 응답 수신
+            if (bytesRead > 0)
+            {
+                string receivedMessage = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                return receivedMessage;
+            }
+        }
+        catch (Exception)
+        {
+            _isConnected = false; // 서버와의 연결 끊김 감지
+            ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
+            await AttemptConnectionAsync(); // 재연결 시도
+        }
+
+        return "No response.";
+    }
+
+    // 연결을 중지하는 함수
+    public void StopConnection()
+    {
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        ConnectionStatusChanged?.Invoke(false); // 연결 해제 이벤트 호출
+        _connectionCheckTimer?.Dispose(); // 연결 상태 확인 타이머 중지
+    }
 }
