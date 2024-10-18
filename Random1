@@ -1,92 +1,229 @@
-검정 화면이 뜨는 문제는 FindWindow 함수가 올바른 창 핸들을 찾지 못하거나, SetForegroundWindow와 ShowWindow 호출이 잘못되었을 때 발생할 수 있습니다. 이를 해결하기 위해 WPF의 창 핸들을 정확하게 찾아 기존 인스턴스를 활성화하는 방법을 조금 수정하겠습니다.
+먼저 COM 포트를 싱글톤으로 구성하고, 비동기 통신 클래스를 구현하여 연결 상태와 에러 처리를 관리하는 방법을 설명드리겠습니다. WPF MVVM 패턴을 준수하여 MainViewModel에서 UI 업데이트를 반영하도록 하겠습니다.
 
-WPF 애플리케이션에서는 FindWindow로 정확한 핸들을 찾기 어려울 수 있으므로, WPF의 MainWindow를 직접 검색하는 방식으로 수정해보겠습니다.
+1. 싱글톤 COM 포트 클래스 구현
+싱글톤 패턴으로 COM 포트 클래스를 작성하여 프로그램 내에서 COM 포트 객체가 하나만 생성되고 유지되도록 합니다.
 
-수정된 코드: App.xaml.cs
 csharp
 코드 복사
-using System;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Threading;
-using System.Windows;
-
-namespace YourNamespace
+public class ComPortSingleton
 {
-    public partial class App : Application
+    private static readonly Lazy<ComPortSingleton> instance = new Lazy<ComPortSingleton>(() => new ComPortSingleton());
+    public static ComPortSingleton Instance => instance.Value;
+
+    private SerialPort _serialPort;
+    public bool IsConnected => _serialPort?.IsOpen ?? false;
+
+    private ComPortSingleton()
     {
-        private static Mutex _mutex;
-        private const string MutexName = "YourUniqueMutexName"; // 고유한 이름으로 변경하세요
+        _serialPort = new SerialPort("COM1", 9600, Parity.None, 8, StopBits.One);
+        _serialPort.DataReceived += SerialPort_DataReceived;
+    }
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
+    public async Task<bool> ConnectAsync()
+    {
+        if (IsConnected) return true;
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-
-        private const int SW_RESTORE = 9;
-
-        protected override void OnStartup(StartupEventArgs e)
+        try
         {
-            bool isNewInstance;
-            _mutex = new Mutex(true, MutexName, out isNewInstance);
-
-            if (!isNewInstance)
-            {
-                // 이미 실행 중인 프로그램이 있는 경우, 기존 인스턴스를 활성화
-                ActivateExistingInstance();
-                Shutdown(); // 새 인스턴스를 종료
-                return;
-            }
-
-            base.OnStartup(e);
+            _serialPort.Open();
+            return true;
         }
-
-        private void ActivateExistingInstance()
+        catch (Exception)
         {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                // WPF 애플리케이션의 활성 창을 찾기 위해 LINQ와 Win32 API를 결합하여 정확한 핸들을 찾습니다.
-                var existingWindow = Application.Current.Windows.OfType<MainWindow>().FirstOrDefault();
-
-                if (existingWindow != null)
-                {
-                    // WPF 창 핸들을 가져옵니다.
-                    var wih = new System.Windows.Interop.WindowInteropHelper(existingWindow);
-                    IntPtr hWnd = wih.Handle;
-
-                    if (hWnd != IntPtr.Zero)
-                    {
-                        // 트레이에 내려간 상태라면 윈도우를 복원
-                        ShowWindow(hWnd, SW_RESTORE);
-                        // 윈도우를 활성화
-                        SetForegroundWindow(hWnd);
-                    }
-                }
-            });
-        }
-
-        protected override void OnExit(ExitEventArgs e)
-        {
-            _mutex?.ReleaseMutex();
-            _mutex?.Dispose();
-            base.OnExit(e);
+            return false;
         }
     }
+
+    public async Task<bool> ReconnectAsync()
+    {
+        while (!await ConnectAsync())
+        {
+            await Task.Delay(5000); // 5초 간격으로 재시도
+        }
+        return true;
+    }
+
+    private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+    {
+        // 수신된 데이터 처리
+    }
 }
-코드 수정 설명
-WPF 윈도우 직접 검색:
+2. 비동기 통신 클래스
+PLC와 비동기 통신을 처리하는 클래스를 작성합니다. 이 클래스는 싱글톤 COM 포트를 사용하여 데이터를 주고받으며, 에러 발생 시 장치 상태를 주기적으로 체크하여 대기합니다.
 
-Application.Current.Windows.OfType<MainWindow>().FirstOrDefault()를 사용하여 현재 실행 중인 WPF 애플리케이션의 MainWindow를 찾습니다. WPF에서는 창 클래스를 직접 사용하는 것이 FindWindow 함수보다 더 안정적입니다.
-찾은 MainWindow를 WindowInteropHelper를 통해 핸들(hWnd)을 얻어냅니다.
-Dispatcher 사용:
+csharp
+코드 복사
+public class PlcCommunication
+{
+    private readonly ComPortSingleton _comPort;
+    private readonly MainViewModel _viewModel;
 
-Application.Current.Dispatcher.Invoke를 사용하여 UI 스레드에서 안전하게 실행되도록 합니다.
-ShowWindow와 SetForegroundWindow:
+    public PlcCommunication(MainViewModel viewModel)
+    {
+        _comPort = ComPortSingleton.Instance;
+        _viewModel = viewModel;
+    }
 
-ShowWindow는 트레이로 내려간 창을 다시 복원하며, SetForegroundWindow는 창을 최상위로 가져옵니다.
-주의사항
-MainWindow는 WPF 애플리케이션의 기본 창 클래스 이름입니다. 만약 다른 이름을 사용하고 있다면 코드에서 클래스 이름을 수정해야 합니다.
+    public async Task InitializeAsync()
+    {
+        // COM 포트 연결 시도
+        if (!await _comPort.ReconnectAsync())
+        {
+            _viewModel.UpdateStatus("연결 실패", false);
+            return;
+        }
+
+        _viewModel.UpdateStatus("연결 성공", true);
+    }
+
+    public async Task SendCommandAsync(string command)
+    {
+        if (!_comPort.IsConnected)
+        {
+            _viewModel.UpdateStatus("연결되지 않음", false);
+            await _comPort.ReconnectAsync();
+        }
+
+        try
+        {
+            // 명령어 전송
+            _comPort.Write(command);
+        }
+        catch (Exception)
+        {
+            _viewModel.UpdateStatus("명령 전송 실패", false);
+            return;
+        }
+
+        // 응답 대기 및 에러 처리
+        await WaitForDeviceRecoveryAsync();
+    }
+
+    private async Task WaitForDeviceRecoveryAsync()
+    {
+        bool deviceError = true;
+        while (deviceError)
+        {
+            // 2초마다 장치 상태 확인
+            await Task.Delay(2000);
+            deviceError = !CheckDeviceStatus();
+
+            if (deviceError)
+            {
+                _viewModel.UpdateStatus("장치 에러", false);
+            }
+            else
+            {
+                _viewModel.UpdateStatus("정상 동작", true);
+            }
+        }
+    }
+
+    private bool CheckDeviceStatus()
+    {
+        // 장치 상태 확인 로직 구현 (PLC로부터 데이터를 받아 처리)
+        // 정상적으로 응답하면 true, 에러 응답이면 false 반환
+        return true; // 예시로 true 반환
+    }
+}
+3. MainViewModel에서 UI 업데이트
+MainViewModel에서는 통신 클래스에서 발생하는 이벤트와 상태를 받아 UI를 업데이트합니다.
+
+csharp
+코드 복사
+public class MainViewModel : INotifyPropertyChanged
+{
+    private string _buttonText;
+    private Brush _buttonColor;
+    private ObservableCollection<ConnectionStatus> _connectionStatuses;
+
+    public string ButtonText
+    {
+        get => _buttonText;
+        set
+        {
+            _buttonText = value;
+            OnPropertyChanged(nameof(ButtonText));
+        }
+    }
+
+    public Brush ButtonColor
+    {
+        get => _buttonColor;
+        set
+        {
+            _buttonColor = value;
+            OnPropertyChanged(nameof(ButtonColor));
+        }
+    }
+
+    public ObservableCollection<ConnectionStatus> ConnectionStatuses
+    {
+        get => _connectionStatuses;
+        set
+        {
+            _connectionStatuses = value;
+            OnPropertyChanged(nameof(ConnectionStatuses));
+        }
+    }
+
+    public MainViewModel()
+    {
+        _connectionStatuses = new ObservableCollection<ConnectionStatus>();
+        var plcComm = new PlcCommunication(this);
+        plcComm.InitializeAsync();
+    }
+
+    public void UpdateStatus(string status, bool isNormal)
+    {
+        ButtonText = status;
+        ButtonColor = isNormal ? Brushes.Blue : Brushes.Red;
+
+        // 연결 상태를 기록 (최대 10개까지)
+        if (_connectionStatuses.Count >= 10)
+        {
+            _connectionStatuses.RemoveAt(0);
+        }
+
+        _connectionStatuses.Add(new ConnectionStatus
+        {
+            Time = DateTime.Now,
+            Status = status,
+            ComPortNumber = "COM1" // 예시로 COM1 사용
+        });
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+    protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}
+
+public class ConnectionStatus
+{
+    public DateTime Time { get; set; }
+    public string Status { get; set; }
+    public string ComPortNumber { get; set; }
+}
+4. XAML 예시
+버튼과 연결 상태를 표시할 테이블을 정의합니다.
+
+xml
+코드 복사
+<Window x:Class="YourNamespace.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MainWindow" Height="350" Width="525">
+    <Grid>
+        <Button Content="{Binding ButtonText}" Background="{Binding ButtonColor}" Width="200" Height="50"/>
+        <DataGrid ItemsSource="{Binding ConnectionStatuses}" AutoGenerateColumns="False" Width="300" Height="200" Margin="0,60,0,0">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Time" Binding="{Binding Time}" />
+                <DataGridTextColumn Header="Status" Binding="{Binding Status}" />
+                <DataGridTextColumn Header="ComPort" Binding="{Binding ComPortNumber}" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </Grid>
+</Window>
+요약
+싱글톤 COM 포트 클래스: 하나의 인스턴스만 유지하며, 비동기적으로 연결을 체크하고 재시도합니다.
+비동기 통신 클래스: 명령 전송 후 에러가 발생하면 주기적으로 장치 상태를 체크하여 정상화될 때까지 대기합니다.
+MainViewModel: 통신 클래스에서 발생하는 상태를 받아 버튼의 텍스트와 색상, 그리고 연결 상태를 업데이트합니다.
