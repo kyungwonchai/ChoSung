@@ -1,72 +1,177 @@
 using System;
-using System.Net.Sockets;
-using System.Text;
+using System.IO.Ports;
+using System.Threading;
 using System.Threading.Tasks;
 
-public class SocketClientMergeOI
+public class ComPortPLC
 {
-    private TcpClient _client;
-    private NetworkStream _stream;
-    private readonly string _ipAddress;
-    private readonly int _port;
-    private bool _isConnected;
-    private const int _retryInterval = 2000;  // 2초 간격으로 재시도
-    private const int _maxRetryTime = 5 * 60 * 1000;  // 최대 5분 (300초)
+    private static ComPortPLC _instance;
+    private SerialPort _serialPort;
+    private string _currentPort;         // 현재 연결된 포트 이름
+    private bool _isConnected = false;   // 연결 상태 플래그
+    private static readonly object _lock = new object();
+    private static readonly int MaxReconnectAttempts = 10;
+    private static readonly TimeSpan ReconnectInterval = TimeSpan.FromSeconds(30);
 
-    public SocketClientMergeOI(string ipAddress, int port)
+    // 싱글톤 인스턴스 반환
+    public static ComPortPLC Instance => _instance ?? (_instance = new ComPortPLC());
+
+    // 비공개 생성자 (싱글톤 패턴)
+    private ComPortPLC() 
     {
-        _ipAddress = ipAddress;
-        _port = port;
-        _client = new TcpClient();
-        _isConnected = false;
+        // 프로그램 시작 시 연결 시도
+        Task.Run(async () => await TryConnectToComPortAsync());
     }
 
-    // 메시지를 보내고 응답을 받는 비동기 함수
-    public async Task<string> SendAndReceiveMessageAsync(string message)
+    /// <summary>
+    /// 현재 COM 포트가 연결되어 있는지 여부를 반환합니다.
+    /// </summary>
+    public bool IsConnected => _isConnected;
+
+    /// <summary>
+    /// COM 포트 연결을 시도하고, 연결 성공 시 플래그를 설정합니다.
+    /// </summary>
+    private async Task TryConnectToComPortAsync()
     {
-        int elapsedTime = 0;
-
-        // 연결 상태 확인
-        while (!_isConnected && elapsedTime < _maxRetryTime)
+        // 기존 저장된 포트 먼저 시도
+        if (!string.IsNullOrEmpty(_currentPort))
         {
-            await Task.Delay(_retryInterval);
-            elapsedTime += _retryInterval;
+            if (await TryOpenComPortAsync(_currentPort))
+            {
+                return; // 성공 시 종료
+            }
         }
 
-        // 5분 동안 연결이 되지 않으면 "NG" 반환
-        if (!_isConnected)
+        // 포트 순회하며 연결 시도
+        string[] availablePorts = SerialPort.GetPortNames();
+        foreach (var port in availablePorts)
         {
-            return "NG";
+            if (await TryOpenComPortAsync(port))
+            {
+                return; // 성공 시 종료
+            }
         }
 
+        // 포트가 없으면 일정 시간 후 재시도
+        await AttemptReconnect();
+    }
+
+    /// <summary>
+    /// COM 포트를 열고, PLC 신호 테스트를 실행하여 정상 연결 여부를 확인합니다.
+    /// </summary>
+    private async Task<bool> TryOpenComPortAsync(string port)
+    {
         try
         {
-            // STX와 ETX로 메시지 감싸기
-            string framedMessage = "\u0002" + message + "\u0003"; // STX(0x02), ETX(0x03)
-            byte[] dataToSend = Encoding.ASCII.GetBytes(framedMessage);
+            _serialPort = new SerialPort(port, 9600);  // 보통의 PLC 통신 보레이트
+            _serialPort.Open();
 
-            // 메시지 전송
-            await _stream.WriteAsync(dataToSend, 0, dataToSend.Length);
-
-            // 응답 받기
-            byte[] buffer = new byte[256];
-            int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length);
-            string receivedMessage = Encoding.ASCII.GetString(buffer, 0, bytesRead);
-
-            // OK 또는 NG 판단 (단순 예시로 OK인지 아닌지 판단)
-            if (receivedMessage.Contains("OK"))
+            // 연결 성공 시 PLC에 테스트 신호 전송 (예: "$01SRCC00014")
+            if (await TestPLCConnection())
             {
-                return "OK";
+                _currentPort = port;
+                _isConnected = true;
+                Console.WriteLine($"Successfully connected to COM port: {port}");
+                return true;
             }
             else
             {
-                return "NG";
+                _serialPort.Close(); // 신호 실패 시 포트 닫기
             }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            _isConnected = false;  // 연결이 끊어졌을 경우 플래그 변경
-            return "NG";  // 예외 발생 시 "NG" 반환
+            Console.WriteLine($"Failed to connect to COM port: {port}. Error: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// PLC 연결 테스트 신호를 보내고 응답을 확인합니다.
+    /// </summary>
+    private async Task<bool> TestPLCConnection()
+    {
+        try
+        {
+            // 테스트 신호 전송 (이 부분은 PLC 기기와의 통신 규약에 맞게 수정)
+            _serialPort.WriteLine("$01SRCC00014");
+
+            // 테스트 신호 후 일정 시간 대기 (응답 받는 시간을 줍니다)
+            await Task.Delay(500); // 500ms 대기
+
+            // PLC 응답 수신 (예: 응답 내용 확인)
+            string response = _serialPort.ReadLine();
+            if (response.Contains("SUCCESS"))  // 가정된 정상 응답 값
+            {
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during PLC test connection: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 모든 COM 포트를 순회하며 일정 시간 동안 재연결을 시도합니다.
+    /// </summary>
+    private async Task AttemptReconnect()
+    {
+        for (int attempt = 1; attempt <= MaxReconnectAttempts; attempt++)
+        {
+            Console.WriteLine($"Reconnect attempt {attempt}/{MaxReconnectAttempts}...");
+
+            string[] availablePorts = SerialPort.GetPortNames();
+            foreach (var port in availablePorts)
+            {
+                if (await TryOpenComPortAsync(port))
+                {
+                    return; // 연결 성공 시 바로 종료
+                }
+            }
+
+            // 일정 시간 대기 후 재시도
+            await Task.Delay(ReconnectInterval);
+        }
+
+        Console.WriteLine("Failed to reconnect to any COM port.");
+        _isConnected = false;
+    }
+
+    /// <summary>
+    /// 수동으로 COM 포트를 다시 연결하는 메서드
+    /// </summary>
+    public async Task<bool> ManualReconnect()
+    {
+        await TryConnectToComPortAsync();
+        return _isConnected;
+    }
+
+    /// <summary>
+    /// PLC 명령어를 전송하는 메서드 (연결 상태 체크 후 실행)
+    /// </summary>
+    public async Task SendPLCCommand(string command)
+    {
+        if (_isConnected)
+        {
+            try
+            {
+                _serialPort.WriteLine(command);
+                Console.WriteLine($"Command sent: {command}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending command to PLC: {ex.Message}");
+                await AttemptReconnect();  // 명령어 실행 중 실패 시 재연결 시도
+            }
+        }
+        else
+        {
+            Console.WriteLine("Not connected to any COM port.");
+            await AttemptReconnect();
         }
     }
 }
