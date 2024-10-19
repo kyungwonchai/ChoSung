@@ -1,109 +1,94 @@
 using System;
-using System.IO.Ports;
+using System.Net.Sockets;
 using System.Threading.Tasks;
 
-public class CommandQueueViewModel
+public class SocketClientMergeOI
 {
-    private SerialPort _serialPort;
-    private int _retryCount = 0;
-    private const int MaxRetryCount = 10;  // 최대 10회까지 재시도 (10분)
-    private const int RetryInterval = 60000; // 1분 간격으로 재시도 (60000 밀리초 = 1분)
+    private TcpClient _client;  // TCP 클라이언트 객체
+    private NetworkStream _stream;  // 네트워크 스트림
+    private readonly string _ipAddress;  // 서버 IP 주소
+    private readonly int _port;  // 서버 포트
+    private bool _isConnected;  // 연결 상태 플래그
+    private const int _retryInterval = 2000;  // 2초 간격으로 연결 시도
+    private const int _maxRetryTime = 5 * 60 * 1000;  // 최대 5분 (300초)
 
-    public CommandQueueViewModel(string comPort)
+    // 연결 상태가 변경될 때 호출될 이벤트
+    public event Action<bool> ConnectionStatusChanged;
+
+    public SocketClientMergeOI(string ipAddress, int port)
     {
-        InitializeComPort(comPort);
+        _ipAddress = ipAddress;
+        _port = port;
+        _isConnected = false;
+        StartConnectionAttemptAsync();  // 연결 시도
     }
 
-    // COM 포트 초기화
-    private void InitializeComPort(string comPort)
+    // 서버에 연결 시도하는 비동기 함수
+    private async void StartConnectionAttemptAsync()
     {
-        _serialPort = new SerialPort(comPort);
-        _serialPort.BaudRate = 9600;  // 필요한 설정들
-        _serialPort.Parity = Parity.None;
-        _serialPort.StopBits = StopBits.One;
-        _serialPort.DataBits = 8;
-        _serialPort.Handshake = Handshake.None;
-    }
+        int elapsedTime = 0;  // 경과 시간 측정
 
-    // 명령을 순차적으로 실행하는 함수
-    public async Task<CommandResult> ExecuteCommandsAsync(Func<Task<CommandResult>> command)
-    {
-        CommandResult result = null;
-        try
+        while (elapsedTime < _maxRetryTime)
         {
-            if (!_serialPort.IsOpen)
+            if (!_isConnected)
             {
-                _serialPort.Open();  // 포트가 닫혀 있으면 연다
-            }
-
-            // 명령 실행
-            result = await command();
-
-            if (!result.Success)
-            {
-                // 실패 시 처리
-                throw new Exception(result.ErrorMessage);
+                try
+                {
+                    _client = new TcpClient();
+                    await _client.ConnectAsync(_ipAddress, _port);
+                    _isConnected = true;  // 연결 성공
+                    _stream = _client.GetStream();  // 스트림 설정
+                    ConnectionStatusChanged?.Invoke(true);  // 연결 성공 이벤트 호출
+                    StartReceiving();  // 데이터 수신 시작
+                    break;  // 연결이 성공하면 반복문 종료
+                }
+                catch (SocketException)
+                {
+                    // 연결 실패, 2초 대기 후 재시도
+                    await Task.Delay(_retryInterval);
+                    elapsedTime += _retryInterval;
+                }
             }
         }
-        catch (IOException ex) when (ex.Message.Contains("시스템에 부착된 장치가 작동하지 않습니다"))
+
+        // 5분 동안 연결 실패 시, NG 처리
+        if (!_isConnected)
         {
-            // 장치 연결 문제 시
-            await RetryReconnectAsync();
+            ConnectionStatusChanged?.Invoke(false);  // 연결 실패 상태 전송
+            Console.WriteLine("NG: 서버 연결에 실패하였습니다.");
+        }
+    }
+
+    // 서버로부터 데이터를 수신하는 함수 (여기서는 구현 간략화)
+    private async void StartReceiving()
+    {
+        byte[] buffer = new byte[1024];
+        try
+        {
+            while (_isConnected)
+            {
+                int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length);
+                if (bytesRead == 0)
+                {
+                    // 서버와의 연결 끊김
+                    _isConnected = false;
+                    ConnectionStatusChanged?.Invoke(false);  // 연결 해제 알림
+                    StartConnectionAttemptAsync();  // 재연결 시도
+                }
+                else
+                {
+                    // 데이터 처리 (필요에 따라 구현)
+                    string receivedData = System.Text.Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                    Console.WriteLine($"수신된 데이터: {receivedData}");
+                }
+            }
         }
         catch (Exception ex)
         {
-            // 그 외 일반 예외 처리
-            return new CommandResult
-            {
-                Success = false,
-                ErrorMessage = ex.Message
-            };
+            Console.WriteLine($"데이터 수신 중 오류 발생: {ex.Message}");
+            _isConnected = false;
+            ConnectionStatusChanged?.Invoke(false);  // 연결 해제 알림
+            StartConnectionAttemptAsync();  // 재연결 시도
         }
-
-        return result;
     }
-
-    // 장치 재연결을 시도하는 함수
-    private async Task RetryReconnectAsync()
-    {
-        while (_retryCount < MaxRetryCount)
-        {
-            try
-            {
-                // 연결 상태 체크
-                if (_serialPort.IsOpen)
-                {
-                    _serialPort.Close();  // 연결이 안 되어 있다면 우선 닫고
-                }
-
-                // 다시 연결 시도
-                _serialPort.Open();
-
-                if (_serialPort.IsOpen)  // 성공적으로 열렸다면
-                {
-                    _retryCount = 0; // 재시도 카운트 리셋
-                    Console.WriteLine("COM 포트 재연결 성공!");
-                    return;  // 연결 성공 시 정상 종료
-                }
-            }
-            catch (Exception)
-            {
-                _retryCount++;
-                Console.WriteLine($"재연결 시도 {_retryCount}회 실패. 1분 후 다시 시도합니다.");
-
-                // 1분 대기 후 재시도
-                await Task.Delay(RetryInterval);
-            }
-        }
-
-        // 10분간 시도 후에도 실패 시 에러 리턴
-        throw new IOException("장치 연결 실패: 시스템에 부착된 장치가 작동하지 않습니다.");
-    }
-}
-
-// 명령 실행 결과를 리턴하는 클래스
-public class CommandResult
-{
-    public bool Success { get; set; }
-    public string ErrorMessage { get; set; }
 }
