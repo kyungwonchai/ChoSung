@@ -1,110 +1,247 @@
-습니다. commandqueue 로그를 메인으로 유지하면서, 나머지 파일들은 시간과 로그 값을 SentValue 컬럼에 통합하여 하나로 묶는 방식으로 수정하겠습니다. 또한, A 열에는 파일명을 넣어 로그가 어떤 파일에서 왔는지 알 수 있도록 하겠습니다.
+니다. 사용자가 진동과 소리를 충분히 인지할 수 있도록 진동과 사운드를 길게 유지하고, 팝업 창을 띄워 사용자가 터치하면 꺼지도록 구현하겠습니다. 이 기능은 AlertDialog를 사용하여 팝업 창을 띄우고, 사용자가 창을 닫을 때 소리와 진동을 멈추도록 할 수 있습니다.
 
-아래는 수정된 코드입니다:
+구현 개요
+진동 및 사운드 재생: Vibrator와 MediaPlayer를 사용하여 진동과 사운드를 동시에 시작합니다.
+팝업 창 띄우기: 사용자가 팝업 창을 터치하면 진동과 사운드가 멈추도록 합니다.
+사용자 권한 처리: Android 12(API 31) 이상에서 진동 권한을 요청해야 하므로 권한 요청을 포함합니다.
+코드 구현
+아래는 이 기능을 구현한 전체 코드입니다.
 
-python
+kotlin
 코드 복사
-import os
-import csv
-from datetime import datetime
+package com.dxmxsmd.routeracralarm
 
-# Log file directory
-log_directory = "c:/test"
+import android.Manifest
+import android.app.AlertDialog
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.media.RingtoneManager
+import android.net.Uri
+import android.os.*
+import android.util.Log
+import android.widget.Button
+import android.widget.CheckBox
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.lifecycle.lifecycleScope
+import com.microsoft.signalr.HubConnection
+import com.microsoft.signalr.HubConnectionBuilder
+import kotlinx.coroutines.launch
 
-# Dictionary to store unique SentValue prefixes for commandqueue logs
-unique_prefixes = {}
+class MainActivity : ComponentActivity() {
 
-# List to store the parsed log data for both commandqueue and other logs
-log_data = []
+    private lateinit var hubConnection: HubConnection
+    private lateinit var notificationManager: NotificationManager
+    private lateinit var vibrationCheckBox: CheckBox
+    private lateinit var viewMessagesButton: Button
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var mediaPlayer: MediaPlayer? = null
+    private var vibrator: Vibrator? = null
 
-# Process commandqueue files
-for filename in os.listdir(log_directory):
-    if filename.endswith(".txt") and "commandqueue" in filename.lower():
-        file_path = os.path.join(log_directory, filename)
-        
-        # Open and read the file once
-        with open(file_path, 'r', encoding='utf-8') as file:
-            lines = file.readlines()
-            for line in lines:
-                # Split the line by '|'
-                parts = line.strip().split('|')
-                if len(parts) == 7:  # Only process if all required fields are present
-                    # Extract the first 14 characters of SentValue as a prefix
-                    prefix = parts[1][:14]
-                    unique_prefixes[prefix] = None  # Store as a key for uniqueness
-                    
-                    # Extract response value based on conditions
-                    response_value = parts[2]
-                    if "WDD" in prefix:
-                        sent_value = parts[1]
-                        extracted_value = sent_value[19:] if len(sent_value) >= 20 else ""
-                    else:
-                        extracted_value = response_value[-7:] if len(response_value) >= 7 else response_value
-                    
-                    # Remove the last 2 characters from the extracted value
-                    extracted_value = extracted_value[:-2] if len(extracted_value) > 2 else ""
-                    
-                    # Add the row to the log data list
-                    log_data.append([filename, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], prefix, extracted_value])
+    // 런타임 권한 요청을 위한 launcher 정의
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        if (isGranted) {
+            Log.d("Permission", "Notification permission granted")
+        } else {
+            Log.d("Permission", "Notification permission denied")
+        }
+    }
 
-# Process other .txt files (non-commandqueue files)
-for filename in os.listdir(log_directory):
-    if filename.endswith(".txt") and "commandqueue" not in filename.lower():
-        file_path = os.path.join(log_directory, filename)
-        
-        # Open and read the file once, process all lines at once
-        with open(file_path, 'r', encoding='utf-8') as file:
-            lines = file.readlines()
-            for line in lines:
-                # Extract time value enclosed in [] and the remaining part as SentValue
-                if '[' in line and ']' in line:
-                    start_idx = line.index('[')
-                    end_idx = line.index(']', start_idx) + 1
-                    time_value = line[start_idx:end_idx]  # Extract the time value with brackets
-                    remaining_value = line[end_idx:].strip()  # Remaining part of the line as SentValue
-                    
-                    # Add a row for non-commandqueue logs, filling other columns as empty
-                    log_data.append([filename, time_value, remaining_value, "", "", "", "", "", "", ""])
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-# Sort the log data by the time value
-log_data.sort(key=lambda x: x[1])
+        // 진동 체크박스 초기화
+        vibrationCheckBox = findViewById(R.id.vibrationCheckBox)
 
-# Convert unique prefixes from commandqueue into a sorted list
-sorted_prefixes = sorted(unique_prefixes.keys())
+        // 최근 메시지 보기 버튼 초기화 및 클릭 리스너 설정
+        viewMessagesButton = findViewById(R.id.viewMessagesButton)
+        viewMessagesButton.setOnClickListener {
+            openOrReplaceDataActivity() // DataActivity 열기 또는 교체
+        }
 
-# Prepare the output directory
-output_directory = "c:/test/csv2"
-os.makedirs(output_directory, exist_ok=True)
+        // 알림 채널 생성
+        createNotificationChannel()
 
-# Create the output file name with the current timestamp
-timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-output_file = os.path.join(output_directory, f"{timestamp}_merged_log_output.csv")
+        // Android 13 이상에서 알림 권한 요청
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestNotificationPermission()
+        }
 
-# Save the sorted data to a CSV file with dynamic columns based on SentValue prefixes
-with open(output_file, 'w', newline='', encoding='utf-8-sig') as csvfile:
-    csvwriter = csv.writer(csvfile)
-    
-    # Write column headers
-    headers = ["FileName", "Time", "SentValue", "ResponseValue", "Result", "Result2", "Retry", "Speed"] + sorted_prefixes + ["ExtractedValue"]
-    csvwriter.writerow(headers)
-    
-    # Write all the data at once, ensuring that commandqueue logs and others are handled properly
-    for row in log_data:
-        if "commandqueue" in row[0].lower():
-            # For commandqueue, maintain the structure and fill in the appropriate columns
-            data_row = row[:8]  # Base columns
-            prefix_values = [''] * len(sorted_prefixes)
-            prefix = row[8]
-            if prefix in sorted_prefixes:
-                prefix_index = sorted_prefixes.index(prefix)
-                prefix_values[prefix_index] = f"'{row[9]}"  # Add extracted value as text
-            csvwriter.writerow(data_row + prefix_values + [row[9]])
-        else:
-            # For non-commandqueue, leave commandqueue-specific columns empty and use only filename, time, and combined value
-            data_row = row[:3] + [""] * 5  # Fill only FileName, Time, and SentValue, others empty
-            prefix_values = [''] * len(sorted_prefixes)
-            csvwriter.writerow(data_row + prefix_values + [""])
+        // Android 12 이상에서 진동 권한 요청
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestVibrationPermission()
+        }
 
-print(f"CSV file has been saved as '{output_file}'.")
-코드 설명
-commandqueue 로그 처리:
+        // Wake Lock 설정
+        acquireWakeLock()
+
+        // SignalR 서버 연결 설정
+        hubConnection = HubConnectionBuilder.create("https://your-signalr-server-address")
+            .build()
+
+        // SignalR 메시지 수신 대기
+        hubConnection.on("ReceiveMessage", { message: String ->
+            showNotification(message) // 메시지 수신 시 알림
+            openOrReplaceDataActivity() // DataActivity 열기 또는 기존 액티비티 교체
+
+            // 메시지에 "err1"이 포함되어 있으면 사운드와 진동 재생 후 팝업 창 띄우기
+            if (message.contains("err1", ignoreCase = true)) {
+                playAlarmAndVibration()
+                showAlertDialog()
+            }
+        }, String::class.java)
+
+        lifecycleScope.launch {
+            try {
+                hubConnection.start().blockingAwait()
+                Log.d("SignalR", "Connected to SignalR server.")
+            } catch (e: Exception) {
+                Log.e("SignalR", "SignalR connection failed", e)
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        releaseWakeLock() // 액티비티가 파괴될 때 Wake Lock 해제
+        stopAlarmAndVibration() // 미디어 플레이어와 진동 해제
+    }
+
+    private fun acquireWakeLock() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "RouterACRAlarm::WakeLock"
+        )
+        wakeLock?.acquire()
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+    }
+
+    private fun playAlarmAndVibration() {
+        // 사운드 재생 설정
+        try {
+            val alarmSound: Uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
+            mediaPlayer = MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .build()
+                )
+                setDataSource(this@MainActivity, alarmSound)
+                isLooping = true // 사운드를 반복 재생
+                prepare()
+                start()
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to play alarm sound", e)
+        }
+
+        // 진동 설정
+        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (vibrationCheckBox.isChecked) {
+            val pattern = longArrayOf(0, 1000, 1000) // 진동 패턴 (1초 진동, 1초 멈춤)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(
+                    VibrationEffect.createWaveform(pattern, 0) // 0: 반복 진동
+                )
+            } else {
+                vibrator?.vibrate(pattern, 0) // 0: 반복 진동
+            }
+        }
+    }
+
+    private fun stopAlarmAndVibration() {
+        mediaPlayer?.let {
+            if (it.isPlaying) {
+                it.stop()
+                it.release()
+            }
+        }
+        vibrator?.cancel()
+    }
+
+    private fun showAlertDialog() {
+        // 팝업 창 설정
+        val builder = AlertDialog.Builder(this)
+        builder.setTitle("알림")
+            .setMessage("문제를 확인하고 창을 터치하여 경고음을 종료하세요.")
+            .setPositiveButton("확인") { dialog, _ ->
+                stopAlarmAndVibration() // 사운드와 진동 멈춤
+                dialog.dismiss()
+            }
+            .setCancelable(false) // 사용자가 창을 닫기 전까지 팝업이 꺼지지 않음
+        builder.create().show()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "SignalR Channel"
+            val descriptionText = "Channel for SignalR notifications"
+            val importance = NotificationManager.IMPORTANCE_HIGH
+            val channel = NotificationChannel("SIGNALR_CHANNEL", name, importance).apply {
+                description = descriptionText
+            }
+            notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        } else {
+            notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        when {
+            ActivityCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED -> {
+                Log.d("Permission", "Notification permission already granted")
+            }
+            else -> {
+                requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
+    private fun requestVibrationPermission() {
+        if (ActivityCompat.checkSelfPermission(
+                this, Manifest.permission.VIBRATE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.VIBRATE), 0
+            )
+        }
+    }
+
+    private fun openOrReplaceDataActivity() {
+        val intent = Intent(this, DataActivity::class.java)
+        intent.flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        startActivity(intent)
+    }
+}
+설명
+사운드와 진동 재생:
+
+playAlarmAndVibration 함수는 사운드와 진동을 동시에 시작합니다. 진동은 VibrationEffect를 사용하여 패턴을 설정하고 반복합니다.
+mediaPlayer를 사용하여 알람 소리를 반복 재생합니다.
+팝업 창 띄우기:
