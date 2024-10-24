@@ -1,6 +1,114 @@
-SSQL에서 현재 시간과 time1 컬럼의 차이를 초 단위로 계산하여 elapsed라는 새로운 컬럼에 업데이트하는 쿼리는 다음과 같습니다. 이 쿼리는 DATEDIFF 함수를 사용하여 시간 차이를 초 단위로 계산합니다.
+업을 수행하는 상황에서, 이중 리턴 문제는 비동기 작업의 처리 순서와 리턴 값이 제대로 연결되지 않기 때문에 발생할 수 있습니다. 구조를 효율적으로 수정하면서 최소한의 수정으로 문제를 해결하는 방법을 단계별로 설명하겠습니다.
 
-sql
+1. 현재 구조 이해
+먼저, 현재 구조를 간단하게 요약해 보겠습니다:
+
+TaskModel은 파일을 파싱하고 함수 목록(funclist)을 구성한 후, 이 목록을 AddTaskSequenceToCQ를 통해 큐에 추가합니다.
+AddTaskSequenceToCQ 함수는 funclist를 반복하면서 taskmodelqueue2에 넣고 검증함수 A를 함께 전달합니다.
+EnqueueTask는 CommandQueue에 funcStatus.Task를 넣어서 실행하고, Task<string>을 리턴합니다.
+이때 함수는 다른 큐 (cmd2queue)에서 비동기 작업을 또다시 수행합니다.
+여기서 문제가 되는 것은 이중 리턴으로, 각 큐에서 리턴되는 값이 정확하게 이어지지 않는 점입니다.
+2. 수정 방향
+이중 리턴 문제를 해결하려면, 각 큐가 수행하는 작업과 리턴 값이 연결되어야 하며, 비동기 함수 호출이 정확한 순서와 값을 유지해야 합니다.
+
+수정 가이드:
+각 EnqueueTask와 EnqueueTask2 함수가 비동기적으로 작업을 수행하고 그 결과를 명확하게 리턴하도록 수정합니다.
+TaskCompletionSource를 사용하여 큐의 작업이 완료될 때까지 기다리게 하고, 작업이 완료된 후 명확한 결과를 리턴하도록 합니다.
+3. 상세 수정 가이드
+A. EnqueueTask 수정
+EnqueueTask 함수에서는 TaskCompletionSource를 활용해 비동기 작업이 완료될 때까지 대기하게 하고, 완료되면 결과를 리턴하도록 수정합니다.
+
+csharp
 코드 복사
-UPDATE YourTableName
-SET elapsed = DATEDIFF(SECOND, time1, GETDATE());
+public async Task<string> EnqueueTask(Func<Task<string>> taskFunc)
+{
+    var tcs = new TaskCompletionSource<string>();
+
+    CommandQueue.Enqueue(async () =>
+    {
+        try
+        {
+            var result = await taskFunc();
+            tcs.SetResult(result); // 작업 성공 시 결과 설정
+        }
+        catch (Exception ex)
+        {
+            tcs.SetException(ex); // 예외 발생 시 설정
+        }
+    });
+
+    return await tcs.Task; // 작업이 완료될 때까지 대기하고 결과를 리턴
+}
+설명:
+
+TaskCompletionSource는 비동기 작업이 완료될 때까지 대기하게 하며, 완료 후 결과를 반환합니다.
+Enqueue 내부에서 비동기 작업이 실행된 후 SetResult를 통해 값을 설정하거나, 오류가 발생하면 SetException을 통해 예외를 설정합니다.
+B. EnqueueTask2 수정
+EnqueueTask2에서도 마찬가지로 TaskCompletionSource를 사용해, func<task<string>>이 작업을 수행한 후 결과를 명확히 리턴하도록 합니다.
+
+csharp
+코드 복사
+public async Task<CmdResult> EnqueueTask2(Func<Task<string>> taskFunc)
+{
+    var tcs = new TaskCompletionSource<CmdResult>();
+
+    cmd7queue.Enqueue(async () =>
+    {
+        try
+        {
+            var result = await taskFunc();
+
+            // 검증 작업 (조건에 따라 정상 또는 NG)
+            var cmdResult = new CmdResult();
+            if (result == "Success")
+            {
+                cmdResult.IsSuccess = true;
+                cmdResult.Message = "Task succeeded.";
+            }
+            else
+            {
+                cmdResult.IsSuccess = false;
+                cmdResult.Message = "Task failed.";
+            }
+
+            tcs.SetResult(cmdResult); // 결과 설정
+        }
+        catch (Exception ex)
+        {
+            tcs.SetException(ex); // 예외 발생 시 설정
+        }
+    });
+
+    return await tcs.Task; // 작업이 완료될 때까지 대기하고 결과를 리턴
+}
+설명:
+
+마찬가지로 TaskCompletionSource를 사용하여 작업이 완료될 때까지 대기하고, 결과를 명확히 설정합니다.
+검증 함수의 결과에 따라 CmdResult 객체를 반환합니다.
+C. AddAsyncTaskCommand2 수정
+AddAsyncTaskCommand2 함수에서 EnqueueTask2 호출 후 그 결과를 반환하도록 수정합니다.
+
+csharp
+코드 복사
+public async Task<CmdResult> AddAsyncTaskCommand2(Func<Task<string>> taskFunc, Func<string, bool> validationFunc)
+{
+    var cmdResult = await EnqueueTask2(taskFunc);
+
+    // 검증 함수 실행
+    if (!validationFunc(cmdResult.Message))
+    {
+        cmdResult.IsSuccess = false;
+        cmdResult.Message = "Validation failed.";
+    }
+
+    return cmdResult;
+}
+설명:
+
+EnqueueTask2의 결과를 기다린 후 검증 함수를 실행하여 결과를 업데이트합니다.
+4. 동작 방식
+파일이 감지되면: 파일 파싱 후 TaskModel에서 함수 목록(funclist)을 구성하여 AddTaskSequenceToCQ를 통해 추가합니다.
+EnqueueTask: 큐에 작업이 추가되면 TaskCompletionSource를 사용해 비동기 작업이 완료될 때까지 기다립니다.
+EnqueueTask2: 또 다른 큐에서도 TaskCompletionSource를 활용해, 결과를 명확히 리턴합니다.
+결과 처리: 각 큐에서 처리된 결과는 CmdResult 형식으로 리턴되어 다음 작업에 활용됩니다.
+결론
