@@ -106,3 +106,147 @@ COM 포트 재설정 메서드: CloseAndReopenComPortAsync 메서드는 COM 포�
 SendCommandWithRetryAndReconnectAsync 메서드에서는 명령 전송 후 재시도 횟수를 넘겨도 응답을 받지 못하면 CloseAndReopenComPortAsync 메서드를 호출하여 포트를 재설정합니다.
 만약 재설정에 성공하면 명령을 다시 시도하고, 실패하면 최종적으로 에러를 반환하도록 합니다.
 로깅: 각 단계에서 포트의 상태와 명령 전송, 재시도 상태를 모두 로깅하여 통신 흐름을 추적하고, 문제 발생 시 진단에 활용할 수 있습니다.
+
+이 코드로 COM 포트가 안정적으로 닫히고 다시 열리며, 여전히 응답이 없을 경우 최종적으로 에러 상태를 반환하여 문제를 파악할 수 있습니다.
+
+
+
+
+
+
+나의 말:
+아니 컴포트 열고닫는태스크도 시간제한을둬서 똑디안되면에러치게
+ChatGPT의 말:
+ChatGPT
+COM 포트를 열고 닫는 작업에도 시간 제한을 두어, 특정 시간 내에 포트를 제대로 닫고 열지 못하면 에러를 반환하도록 구현할 수 있습니다. 이렇게 하면 포트를 안정적으로 관리할 수 있고, 문제가 발생했을 때 즉각적으로 에러를 인식할 수 있습니다.
+
+아래 코드는 포트를 닫고 여는 작업 각각에 대해 시간 제한을 두고, 실패 시 에러 로그를 기록하는 방식으로 구현한 예시입니다.
+
+코드 구현
+csharp
+코드 복사
+private const int TimeoutDuration = 1000; // 명령 타임아웃 시간 1초
+private const int RetryCount = 3; // 명령 재시도 횟수
+private const int ComPortOperationTimeout = 2000; // COM 포트 열기/닫기 타임아웃 시간 2초
+
+public async Task<string> SendCommandWithRetryAndReconnectAsync(string command)
+{
+    int attempt = 0;
+    string response = string.Empty;
+
+    while (attempt < RetryCount)
+    {
+        attempt++;
+
+        // 응답 수신 시도
+        var responseTask = SendCommandAsync(command);
+        if (await Task.WhenAny(responseTask, Task.Delay(TimeoutDuration)) == responseTask)
+        {
+            response = responseTask.Result;
+            if (!string.IsNullOrEmpty(response))
+            {
+                LogT5($"응답 수신 성공: {response} (시도 횟수: {attempt})");
+                return response;
+            }
+        }
+
+        // 응답 미수신 시 재시도
+        LogT5($"응답 미수신, 재시도 중... (시도 횟수: {attempt})");
+        await Task.Delay(500); // 재시도 전 짧은 대기 시간 추가
+    }
+
+    // 재시도 실패 시 COM 포트 재설정 시도
+    LogT5($"응답 수신 실패: {command}, 최종 시도 횟수: {RetryCount}. COM 포트 재설정 시도 중...");
+    bool reconnectSuccess = await CloseAndReopenComPortWithTimeoutAsync();
+    if (!reconnectSuccess)
+    {
+        LogT5("COM 포트 재설정 실패. 오류 발생.");
+        return "COM 포트 재설정 실패";
+    }
+
+    // 재연결 후 명령 재시도
+    LogT5("COM 포트 재설정 성공. 명령 재시도 중...");
+    return await SendCommandWithRetryAndReconnectAsync(command);
+}
+
+private async Task<bool> CloseAndReopenComPortWithTimeoutAsync()
+{
+    // 포트 닫기 시도
+    bool closeSuccess = await PerformOperationWithTimeoutAsync(() =>
+    {
+        LogT5("COM 포트 닫는 중...");
+        comPort.Close();
+        LogT5("COM 포트 닫힘 성공.");
+    }, "COM 포트 닫기 실패");
+
+    if (!closeSuccess) return false;
+
+    // 포트 열기 시도
+    bool openSuccess = await PerformOperationWithTimeoutAsync(() =>
+    {
+        LogT5("COM 포트 여는 중...");
+        comPort.Open();
+        LogT5("COM 포트 열림 성공.");
+    }, "COM 포트 열기 실패");
+
+    return openSuccess;
+}
+
+private async Task<bool> PerformOperationWithTimeoutAsync(Action operation, string errorMessage)
+{
+    try
+    {
+        var task = Task.Run(operation);
+        if (await Task.WhenAny(task, Task.Delay(ComPortOperationTimeout)) == task)
+        {
+            // 작업이 성공적으로 완료된 경우
+            return true;
+        }
+        else
+        {
+            // 작업이 타임아웃된 경우
+            LogT5($"{errorMessage} (타임아웃 {ComPortOperationTimeout}ms 초과)");
+            return false;
+        }
+    }
+    catch (Exception ex)
+    {
+        LogT5($"{errorMessage}: {ex.Message}");
+        return false;
+    }
+}
+
+private async Task<string> SendCommandAsync(string command)
+{
+    try
+    {
+        LogT5($"명령 전송: {command}");
+        await networkStream.WriteAsync(Encoding.ASCII.GetBytes(command)); // 명령 전송
+
+        byte[] buffer = new byte[1024];
+        int bytesRead = await networkStream.ReadAsync(buffer, 0, buffer.Length); // 응답 수신
+        string response = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+
+        LogT5($"응답 수신: {response}");
+        return response;
+    }
+    catch (Exception ex)
+    {
+        LogT5($"통신 오류: {ex.Message}");
+        return string.Empty;
+    }
+}
+
+private void LogT5(string message)
+{
+    msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+}
+설명
+PerformOperationWithTimeoutAsync 메서드: 이 메서드는 COM 포트를 여는/닫는 작업에 대해 타임아웃을 적용합니다.
+
+operation 인자로 작업(예: comPort.Close() 또는 comPort.Open())을 받고, Task.WhenAny를 사용해 작업이 설정된 ComPortOperationTimeout 시간 내에 완료되었는지 확인합니다.
+작업이 타임아웃되면 LogT5로 타임아웃 에러를 기록하고 false를 반환합니다. 작업이 성공하면 true를 반환합니다.
+포트 닫기 및 열기 시도:
+
+CloseAndReopenComPortWithTimeoutAsync 메서드는 포트를 닫고 여는 작업을 순서대로 수행합니다. 닫기와 열기 각각에 대해 PerformOperationWithTimeoutAsync를 호출하여 타임아웃을 적용하며, 닫기 또는 열기 중 하나라도 실패하면 최종적으로 false를 반환합니다.
+로깅: 각 작업의 성공, 실패, 타임아웃 정보를 기록하여 정확한 상태를 추적할 수 있습니다. 타임아웃이 발생할 경우 해당 메시지가 로그에 기록됩니다.
