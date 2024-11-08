@@ -1,58 +1,12 @@
- 세마포어는 항상 설정된 최대 카운트를 초과하지 않도록 Release()를 호출해야 합니다. 세마포어의 현재 카운트가 이미 최대 카운트에 도달해 있는 상태에서 추가로 Release()를 호출하면, 세마포어의 최대 허용 카운트를 초과하게 되어 SemaphoreFullException 예외가 발생합니다.
+시도 중에는 SemaphoreSlim을 사용하여 함수 추가를 대기하도록 코드에서 제어할 수 있습니다. 현재 코드에서 AddAsyncTaskCommand가 SemaphoreSlim의 대기를 무시하고 넘어가는 문제를 해결하기 위해, 재시도 중일 때는 확실하게 세마포어를 통해 대기하고, 재연결이 완료되면 대기 중인 작업을 진행하도록 해야 합니다.
 
-세마포어의 최대 카운트 초과 시 예외 발생
-세마포어는 생성 시 지정한 최대 카운트를 초과할 수 없으므로, 현재 카운트가 최대치에 도달한 상태에서 추가로 Release()를 호출하면 SemaphoreFullException 예외가 발생합니다.
-따라서 Release() 호출 시에는 현재 카운트를 확인하여 최대 카운트에 도달하지 않았는지 확인하는 것이 안전합니다.
-예외를 방지하는 방법
-세마포어의 최대 카운트 초과로 인한 예외를 방지하기 위해 다음과 같은 방법을 사용할 수 있습니다.
-
-CurrentCount 확인 후 Release() 호출:
-
-SemaphoreSlim.CurrentCount 속성을 사용하여 현재 카운트가 최대치에 도달했는지 확인합니다.
-최대 카운트에 도달하지 않은 경우에만 Release()를 호출하여 초과 예외를 방지합니다.
-코드 예제
-
-csharp
-코드 복사
-private readonly SemaphoreSlim semaphore = new SemaphoreSlim(0, 1); // 초기 카운트 0, 최대 카운트 1
-
-public void Process()
-{
-    // 작업 수행 전 세마포어 대기
-    semaphore.Wait();
-
-    try
-    {
-        // 작업 수행
-        Console.WriteLine("작업 수행 중...");
-    }
-    finally
-    {
-        // 현재 카운트가 최대 카운트에 도달하지 않았을 때만 Release 호출
-        if (semaphore.CurrentCount < 1) // 최대 카운트 확인
-        {
-            semaphore.Release(); // 최대 카운트 초과하지 않도록 Release
-        }
-    }
-}
-정리
-세마포어의 최대 카운트를 초과하여 Release()를 호출하면 SemaphoreFullException이 발생하므로, 항상 현재 카운트를 확인하여 최대 카운트에 도달하지 않았을 때만 Release()를 호출해야 합니다.
-이렇게 하면 세마포어의 현재 카운트를 안전하게 유지하며, 예외를 방지할 수 있습니다.
-
-
-
-
-
-나의 말:
-아니 아까이벤트 주면 바로 릴리즈했잔 ㅏ이거수정좀해바라
-ChatGPT의 말:
-ChatGPT
-아래는 ReconnectCompleted 이벤트가 발생할 때 즉시 Release()를 호출하지 않도록 변경한 코드입니다. COM 포트가 재연결 완료 시 이벤트를 발생시키되, 세마포어의 CurrentCount를 확인한 후 필요할 때만 Release()를 호출하여 최대 카운트를 초과하지 않도록 했습니다.
-
+해결 방안
+Wait() 사용 위치 확인: AddAsyncTaskCommand에서 COM 포트가 재시도 상태인지 체크한 후, **확실하게 세마포어 대기(Wait())**를 거치도록 합니다.
+IsRetrying과 세마포어 동기화: IsRetrying 플래그가 true일 때는 세마포어에서 대기하도록 하고, 재연결 완료 시 IsRetrying을 false로 변경한 후 Release()를 호출해 대기를 해제합니다.
 수정된 코드
-CommandQueueManager에서 이벤트 발생 시 현재 세마포어 상태를 확인하고 필요할 때만 Release()를 호출하도록 수정했습니다.
+아래 수정된 코드에서는 AddAsyncTaskCommand가 COM 포트가 재시도 상태일 때 SemaphoreSlim.Wait()를 통해 대기하고, COM 포트 재연결이 완료되면 SemaphoreSlim.Release()를 호출하여 대기 중인 작업을 해제하도록 구현했습니다.
 
-ComPortManager 클래스 (COM 포트 관리)
+ComPortManager 클래스 (재연결 완료 시 IsRetrying과 세마포어 동기화)
 csharp
 코드 복사
 public class ComPortManager
@@ -74,7 +28,7 @@ public class ComPortManager
         {
             LogT5($"COM 포트 닫기 실패: {ex.Message}");
             IsRetrying = false;
-            ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+            ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제 요청
             return false;
         }
 
@@ -108,15 +62,13 @@ public class ComPortManager
         msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
     }
 }
-CommandQueueManager 클래스 (이벤트 발생 시 세마포어 상태 확인 후 Release)
-이제 이벤트 발생 시 바로 Release()를 호출하는 대신, 세마포어의 CurrentCount를 확인한 후에만 Release()를 호출하여 최대 카운트를 초과하지 않도록 합니다.
-
+CommandQueueManager 클래스 (재시도 중인 경우 세마포어를 통한 확실한 대기)
 csharp
 코드 복사
 public class CommandQueueManager
 {
     private readonly ComPortManager comPortManager; // COM 포트 관리자 클래스 인스턴스
-    private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(1, 1); // 대기 제어용 세마포어
+    private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(0, 1); // 초기 카운트 0, 최대 카운트 1
 
     public CommandQueueManager(ComPortManager comPortManager)
     {
@@ -139,7 +91,7 @@ public class CommandQueueManager
     // 비동기 메서드가 아닌, 동기적으로 실행되는 명령 추가 메서드
     public void AddAsyncTaskCommand(Action command)
     {
-        // COM 포트가 재시도 중이라면 동기적으로 대기
+        // COM 포트가 재시도 중이라면 확실하게 대기
         if (comPortManager.IsRetrying)
         {
             LogT5("COM 포트 재시도 중, AddAsyncTaskCommand 대기 중...");
@@ -156,9 +108,11 @@ public class CommandQueueManager
         msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
     }
 }
-설명
-이벤트 발생 시 세마포어 상태 확인:
+수정 사항 요약
+세마포어 초기화 변경:
 
-OnReconnectCompleted 메서드는 ReconnectCompleted 이벤트가 발생할 때 호출됩니다.
-이 메서드에서 세마포어의 CurrentCount를 확인한 후, 현재 카운트가 최대치에 도달하지 않았을 때만 Release()를 호출하여 최대 카운트 초과 예외를 방지합니다.
-Release() 호출 제어:
+SemaphoreSlim을 new SemaphoreSlim(0, 1)로 설정하여 COM 포트가 처음 재시도 상태일 때는 접근이 불가능하게 설정합니다. 이렇게 하면 COM 포트가 재시도 중일 때 항상 대기 상태가 되며, 재연결이 완료되면 Release()로 접근을 허용하게 됩니다.
+재시도 상태에 따른 대기 강제:
+
+AddAsyncTaskCommand에서 IsRetrying이 true인 경우, Wait()를 통해 세마포어에서 대기합니다. 이로써 COM 포트가 정상 상태로 돌아올 때까지 명령이 추가되지 않도록 보장합니다.
+재연결 완료 시 대기 해제:
