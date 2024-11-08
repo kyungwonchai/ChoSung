@@ -1,4 +1,4 @@
-도록 Release()를 호출해야 합니다. 세마포어의 현재 카운트가 이미 최대 카운트에 도달해 있는 상태에서 추가로 Release()를 호출하면, 세마포어의 최대 허용 카운트를 초과하게 되어 SemaphoreFullException 예외가 발생합니다.
+ 세마포어는 항상 설정된 최대 카운트를 초과하지 않도록 Release()를 호출해야 합니다. 세마포어의 현재 카운트가 이미 최대 카운트에 도달해 있는 상태에서 추가로 Release()를 호출하면, 세마포어의 최대 허용 카운트를 초과하게 되어 SemaphoreFullException 예외가 발생합니다.
 
 세마포어의 최대 카운트 초과 시 예외 발생
 세마포어는 생성 시 지정한 최대 카운트를 초과할 수 없으므로, 현재 카운트가 최대치에 도달한 상태에서 추가로 Release()를 호출하면 SemaphoreFullException 예외가 발생합니다.
@@ -36,3 +36,129 @@ public void Process()
     }
 }
 정리
+세마포어의 최대 카운트를 초과하여 Release()를 호출하면 SemaphoreFullException이 발생하므로, 항상 현재 카운트를 확인하여 최대 카운트에 도달하지 않았을 때만 Release()를 호출해야 합니다.
+이렇게 하면 세마포어의 현재 카운트를 안전하게 유지하며, 예외를 방지할 수 있습니다.
+
+
+
+
+
+나의 말:
+아니 아까이벤트 주면 바로 릴리즈했잔 ㅏ이거수정좀해바라
+ChatGPT의 말:
+ChatGPT
+아래는 ReconnectCompleted 이벤트가 발생할 때 즉시 Release()를 호출하지 않도록 변경한 코드입니다. COM 포트가 재연결 완료 시 이벤트를 발생시키되, 세마포어의 CurrentCount를 확인한 후 필요할 때만 Release()를 호출하여 최대 카운트를 초과하지 않도록 했습니다.
+
+수정된 코드
+CommandQueueManager에서 이벤트 발생 시 현재 세마포어 상태를 확인하고 필요할 때만 Release()를 호출하도록 수정했습니다.
+
+ComPortManager 클래스 (COM 포트 관리)
+csharp
+코드 복사
+public class ComPortManager
+{
+    public bool IsRetrying { get; private set; } = false; // COM 포트 재시도 상태
+    public event Action ReconnectCompleted; // 재연결 완료 시 이벤트 발생
+
+    public bool CloseAndReopenComPortWithRetry()
+    {
+        IsRetrying = true; // 재시도 상태 설정
+
+        try
+        {
+            LogT5("COM 포트 닫는 중...");
+            comPort.Close();
+            LogT5("COM 포트 닫힘 성공.");
+        }
+        catch (Exception ex)
+        {
+            LogT5($"COM 포트 닫기 실패: {ex.Message}");
+            IsRetrying = false;
+            ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+            return false;
+        }
+
+        for (int i = 0; i < 500000; i++)
+        {
+            try
+            {
+                LogT5($"COM 포트 열기 시도 중... (시도 횟수: {i + 1})");
+                comPort.Open();
+                LogT5("COM 포트 열림 성공.");
+
+                IsRetrying = false; // 재시도 상태 해제
+                ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제 요청
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogT5($"COM 포트 열기 실패: {ex.Message} (시도 횟수: {i + 1})");
+                System.Threading.Thread.Sleep(5); // 짧은 대기 후 다시 시도
+            }
+        }
+
+        IsRetrying = false;
+        ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제 요청
+        LogT5("COM 포트 열기 시도 500,000번 초과, 포트 열기 실패.");
+        return false;
+    }
+
+    private void LogT5(string message)
+    {
+        msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+    }
+}
+CommandQueueManager 클래스 (이벤트 발생 시 세마포어 상태 확인 후 Release)
+이제 이벤트 발생 시 바로 Release()를 호출하는 대신, 세마포어의 CurrentCount를 확인한 후에만 Release()를 호출하여 최대 카운트를 초과하지 않도록 합니다.
+
+csharp
+코드 복사
+public class CommandQueueManager
+{
+    private readonly ComPortManager comPortManager; // COM 포트 관리자 클래스 인스턴스
+    private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(1, 1); // 대기 제어용 세마포어
+
+    public CommandQueueManager(ComPortManager comPortManager)
+    {
+        this.comPortManager = comPortManager;
+
+        // 재연결 완료 시 대기 해제 이벤트 연결
+        this.comPortManager.ReconnectCompleted += OnReconnectCompleted;
+    }
+
+    // 재연결 완료 시 호출되는 메서드
+    private void OnReconnectCompleted()
+    {
+        // 세마포어의 현재 카운트가 최대 카운트에 도달하지 않았을 때만 Release 호출
+        if (comPortSemaphore.CurrentCount < 1) // 최대 카운트 확인
+        {
+            comPortSemaphore.Release(); // 최대 카운트 초과하지 않도록 Release
+        }
+    }
+
+    // 비동기 메서드가 아닌, 동기적으로 실행되는 명령 추가 메서드
+    public void AddAsyncTaskCommand(Action command)
+    {
+        // COM 포트가 재시도 중이라면 동기적으로 대기
+        if (comPortManager.IsRetrying)
+        {
+            LogT5("COM 포트 재시도 중, AddAsyncTaskCommand 대기 중...");
+            comPortSemaphore.Wait(); // 재시도 끝날 때까지 대기 (동기 방식)
+        }
+
+        // 대기 후 큐에 작업 추가
+        LogT5("AddAsyncTaskCommand: 명령 추가 중...");
+        TaskQueue.Enqueue(command); // 큐에 명령 추가
+    }
+
+    private void LogT5(string message)
+    {
+        msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+    }
+}
+설명
+이벤트 발생 시 세마포어 상태 확인:
+
+OnReconnectCompleted 메서드는 ReconnectCompleted 이벤트가 발생할 때 호출됩니다.
+이 메서드에서 세마포어의 CurrentCount를 확인한 후, 현재 카운트가 최대치에 도달하지 않았을 때만 Release()를 호출하여 최대 카운트 초과 예외를 방지합니다.
+Release() 호출 제어:
