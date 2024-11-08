@@ -1,74 +1,126 @@
- 있을 때 추가 작업이 대기하도록 구현하려면, COM 포트의 상태를 확인하고 재시도 중일 경우 대기하도록 설정해야 합니다. 이를 위해 COM 포트 상태를 나타내는 플래그와 Task를 사용하여 비동기로 대기하도록 구성할 수 있습니다.
+른 클래스에 COM 포트 명령이 있는 경우, 상태 확인 및 대기를 위해서 COM 포트 상태를 공유하는 방식으로 구현할 수 있습니다. 이를 위해 COM 포트 상태를 관리하는 속성을 COM 관리 클래스에 두고, AddAsyncTaskCommand 메서드를 호출하는 클래스에서 이 속성을 확인하도록 설계하면 됩니다.
 
-코드 구현
-아래는 COM 포트가 재시도 상태일 때 AddAsyncTaskCommand가 대기하도록 설정한 예시입니다.
+COM 관리 클래스: COM 포트 상태를 관리하며, 포트가 재시도 중인지 여부를 다른 클래스에서 확인할 수 있도록 IsRetrying 속성을 추가합니다. 또한, 재시도 완료 시 대기 중인 작업을 해제할 수 있도록 이벤트도 추가합니다.
 
+명령 추가 클래스: AddAsyncTaskCommand를 호출할 때 COM 관리 클래스의 IsRetrying 상태를 확인하고, 재시도 중이면 대기하도록 합니다.
+
+예제 코드
+1. COM 관리 클래스 (예: ComPortManager)
 csharp
 코드 복사
-private bool isComPortRetrying = false; // COM 포트 재시도 상태 플래그
-private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(1, 1); // 대기 제어용 세마포어
-
-public async Task AddAsyncTaskCommand(Func<Task> command)
+public class ComPortManager
 {
-    // COM 포트가 재시도 중이라면 대기
-    if (isComPortRetrying)
-    {
-        LogT5("COM 포트 재시도 중, AddAsyncTaskCommand 대기 중...");
-        await comPortSemaphore.WaitAsync(); // 재시도 끝날 때까지 대기
-    }
+    public bool IsRetrying { get; private set; } = false; // COM 포트 재시도 상태
+    public event Action ReconnectCompleted; // 재연결 완료 시 이벤트 발생
 
-    // 대기 후 큐에 작업 추가
-    LogT5("AddAsyncTaskCommand: 명령 추가 중...");
-    await TaskQueue.Enqueue(command);
-}
-
-private async Task<bool> CloseAndReopenComPortWithRetryAsync()
-{
-    isComPortRetrying = true; // 재시도 상태 설정
-    bool closeSuccess = await PerformOperationWithTimeoutAsync(() =>
+    public async Task<bool> CloseAndReopenComPortWithRetryAsync()
     {
-        LogT5("COM 포트 닫는 중...");
-        comPort.Close();
-        LogT5("COM 포트 닫힘 성공.");
-    }, "COM 포트 닫기 실패");
+        IsRetrying = true; // 재시도 상태 설정
+        bool closeSuccess = await PerformOperationWithTimeoutAsync(() =>
+        {
+            LogT5("COM 포트 닫는 중...");
+            comPort.Close();
+            LogT5("COM 포트 닫힘 성공.");
+        }, "COM 포트 닫기 실패");
 
-    if (!closeSuccess)
-    {
-        isComPortRetrying = false;
-        comPortSemaphore.Release(); // 재시도 종료, 대기 해제
+        if (!closeSuccess)
+        {
+            IsRetrying = false;
+            ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+            return false;
+        }
+
+        for (int i = 0; i < MaxOpenAttempts; i++)
+        {
+            try
+            {
+                LogT5($"COM 포트 열기 시도 중... (시도 횟수: {i + 1})");
+                comPort.Open();
+                LogT5("COM 포트 열림 성공.");
+                IsRetrying = false; // 재시도 상태 해제
+                ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogT5($"COM 포트 열기 실패: {ex.Message} (시도 횟수: {i + 1})");
+                await Task.Delay(OpenAttemptDelay); // 재시도 대기
+            }
+        }
+
+        IsRetrying = false;
+        ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+        LogT5("COM 포트 열기 시도 500,000번 초과, 포트 열기 실패.");
         return false;
     }
 
-    for (int i = 0; i < MaxOpenAttempts; i++)
+    private async Task<bool> PerformOperationWithTimeoutAsync(Action operation, string errorMessage)
     {
         try
         {
-            LogT5($"COM 포트 열기 시도 중... (시도 횟수: {i + 1})");
-            comPort.Open();
-            LogT5("COM 포트 열림 성공.");
-            isComPortRetrying = false; // 재시도 상태 해제
-            comPortSemaphore.Release(); // 대기 중인 작업 해제
-            return true;
+            var task = Task.Run(operation);
+            if (await Task.WhenAny(task, Task.Delay(ComPortOperationTimeout)) == task)
+            {
+                return true;
+            }
+            else
+            {
+                LogT5($"{errorMessage} (타임아웃 {ComPortOperationTimeout}ms 초과)");
+                return false;
+            }
         }
         catch (Exception ex)
         {
-            LogT5($"COM 포트 열기 실패: {ex.Message} (시도 횟수: {i + 1})");
-            await Task.Delay(OpenAttemptDelay); // 재시도 대기
+            LogT5($"{errorMessage}: {ex.Message}");
+            return false;
         }
     }
 
-    isComPortRetrying = false;
-    comPortSemaphore.Release(); // 재시도 종료, 대기 해제
-    LogT5("COM 포트 열기 시도 500,000번 초과, 포트 열기 실패.");
-    return false;
+    private void LogT5(string message)
+    {
+        msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+    }
+}
+2. 명령 추가 클래스에서 대기 처리 (예: CommandQueueManager)
+csharp
+코드 복사
+public class CommandQueueManager
+{
+    private readonly ComPortManager comPortManager;
+    private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(1, 1); // 대기 제어용 세마포어
+
+    public CommandQueueManager(ComPortManager comPortManager)
+    {
+        this.comPortManager = comPortManager;
+
+        // 재연결 완료 시 대기 해제 이벤트 연결
+        this.comPortManager.ReconnectCompleted += () => comPortSemaphore.Release();
+    }
+
+    public async Task AddAsyncTaskCommand(Func<Task> command)
+    {
+        // COM 포트가 재시도 중이라면 대기
+        if (comPortManager.IsRetrying)
+        {
+            LogT5("COM 포트 재시도 중, AddAsyncTaskCommand 대기 중...");
+            await comPortSemaphore.WaitAsync(); // 재시도 끝날 때까지 대기
+        }
+
+        // 대기 후 큐에 작업 추가
+        LogT5("AddAsyncTaskCommand: 명령 추가 중...");
+        await TaskQueue.Enqueue(command);
+    }
+
+    private void LogT5(string message)
+    {
+        msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+    }
 }
 설명
-플래그 설정 및 대기 제어:
+ComPortManager 클래스:
 
-isComPortRetrying 플래그를 사용하여 COM 포트가 재시도 중인지 상태를 확인합니다.
-comPortSemaphore를 사용하여 COM 포트가 닫혀서 재시도 중일 때 AddAsyncTaskCommand에서 대기하도록 합니다.
-AddAsyncTaskCommand에서 대기:
+IsRetrying 속성을 통해 COM 포트가 재시도 중인지 여부를 확인할 수 있습니다.
+ReconnectCompleted 이벤트는 포트가 정상적으로 열리거나 재시도가 종료될 때 호출되어 CommandQueueManager에서 대기를 해제하도록 합니다.
+CommandQueueManager 클래스:
 
-AddAsyncTaskCommand가 호출될 때 isComPortRetrying 플래그가 true인 경우 WaitAsync로 재시도가 완료될 때까지 대기합니다.
-COM 포트가 열리면 Semaphore.Release()를 호출하여 대기 중인 작업을 해제합니다.
-재시도 상태 관리:
+AddAsyncTaskCommand가 호출될 때 comPortManager.IsRetrying을 확인하고, 재시도 중이라면 comPortSemaphore.WaitAsync()로 대기합니다.
