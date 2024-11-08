@@ -1,31 +1,34 @@
- 정확히 이해하신 대로 세마포어는 자원에 대한 접근을 제한하여 특정 시점에서만 작업이 큐에 추가될 수 있도록 합니다. 여기서 세마포어의 핵심 개념은 "동시에 접근 가능한 자원의 개수를 제한하여 대기 중인 작업을 조절" 하는 것입니다.
+COM 포트 재연결 상태에서 CommandQueue에 명령을 추가하는 작업을 안전하게 관리하기 위해 세마포어(Semaphore)를 사용해야 합니다. 세마포어는 COM 포트가 재연결 중일 때 AddAsyncTaskCommand가 기다리도록 만들며, 재연결이 완료되면 대기 중인 작업이 명령 큐에 추가되도록 해줍니다.
 
-이 개념을 CommandQueue와 AddAsyncTaskCommand 함수에 적용할 때의 상세한 흐름을 설명드리겠습니다.
+이 예제에서는 세마포어를 특정 위치에 생성하고 사용하여 COM 포트가 재연결 중일 때도 안정적으로 동작하도록 하는 방식을 설명하겠습니다.
 
-시나리오: CommandQueue와 COM 포트 상태를 관리하는 예제
-예를 들어, CommandQueue에 명령을 추가하는 AddAsyncTaskCommand 함수가 있다고 가정해보겠습니다. CommandQueue는 기본적으로 FIFO(First-In-First-Out) 방식으로 큐에 쌓인 작업을 순서대로 처리합니다. 그러나, COM 포트가 재시도 상태일 때는 새로운 명령을 큐에 넣으면 안 되는 상황이 발생할 수 있습니다. 이때, 세마포어를 사용하여 COM 포트가 재시도를 완료한 후에만 새로운 명령을 큐에 추가할 수 있게 조절하는 것이 가능합니다.
+예제 코드 흐름
+SemaphoreSlim 생성: COM 포트가 재연결 중일 때 CommandQueue에 새로운 명령을 추가하지 못하도록 제어하기 위해 SemaphoreSlim을 생성합니다. 이 세마포어는 재연결 중인 경우에만 대기하도록 설정합니다.
 
-세마포어 사용 이유
-동시 접근 제한: COM 포트가 재시도 중일 때는 CommandQueue에 명령을 추가하지 못하도록 제어해야 합니다.
-대기 상태 관리: 세마포어를 사용하면 AddAsyncTaskCommand 함수가 COM 포트가 열릴 때까지 기다렸다가 큐에 추가할 수 있도록 대기 상태를 유지할 수 있습니다.
-순서 보장: CommandQueue 자체는 FIFO이기 때문에 명령 실행의 순서가 자동으로 보장되지만, 세마포어는 AddAsyncTaskCommand가 새로운 명령을 큐에 넣을 수 있는 시점을 조절하는 역할을 합니다.
-세마포어 적용 방식
-세마포어를 적용하기 위해서는 다음 단계로 진행합니다.
+COM 포트 상태 관리: IsRetrying이라는 플래그로 COM 포트가 현재 재연결 중인 상태인지 관리합니다. 이 값이 true일 때, AddAsyncTaskCommand는 세마포어를 통해 COM 포트가 사용 가능해질 때까지 대기하게 됩니다.
 
-세마포어 생성: COM 포트가 재시도 중인 상태에서는 AddAsyncTaskCommand에서 대기하도록 SemaphoreSlim을 생성합니다.
-COM 포트 상태 관리: COM 포트의 재시도 상태를 관리하는 플래그(IsRetrying 등)를 통해 COM 포트가 사용 가능한 상태인지 확인합니다.
-대기 및 해제: WaitAsync() 메서드를 통해 명령을 큐에 넣기 전 COM 포트가 정상 상태인지 확인하고, Release()를 통해 COM 포트가 정상 상태로 돌아왔을 때 대기를 해제하여 명령을 큐에 추가할 수 있도록 합니다.
-세마포어를 적용한 코드 예제
+대기 및 해제: COM 포트가 재연결 상태일 때 WaitAsync() 메서드를 사용하여 명령 추가 작업을 대기시킵니다. 이후 COM 포트가 다시 열리면 ReconnectCompleted 이벤트를 발생시켜 Release()를 호출하여 대기 중인 작업을 해제합니다.
+
+예제 코드 및 주석 설명
+1. COM 포트 관리 클래스 (ComPortManager)
+이 클래스는 COM 포트를 관리하고, 재연결 상태일 때 재연결 완료 이벤트를 발생시켜 대기 중인 작업을 해제하는 역할을 합니다.
+
 csharp
 코드 복사
 public class ComPortManager
 {
-    public bool IsRetrying { get; private set; } = false; // COM 포트 재시도 상태
-    public event Action ReconnectCompleted; // 재연결 완료 시 이벤트 발생
+    // COM 포트 재시도 상태를 나타내는 플래그
+    public bool IsRetrying { get; private set; } = false;
 
+    // 재연결 완료 시, 대기 중인 작업을 해제하기 위해 사용할 이벤트
+    public event Action ReconnectCompleted;
+
+    // COM 포트를 닫고 다시 열기 위한 비동기 메서드
     public async Task<bool> CloseAndReopenComPortWithRetryAsync()
     {
-        IsRetrying = true; // 재시도 상태 설정
+        IsRetrying = true; // COM 포트가 재시도 중임을 표시
+
+        // COM 포트 닫기 시도
         bool closeSuccess = await PerformOperationWithTimeoutAsync(() =>
         {
             LogT5("COM 포트 닫는 중...");
@@ -35,11 +38,13 @@ public class ComPortManager
 
         if (!closeSuccess)
         {
+            // 포트 닫기 실패 시 재시도 상태 해제 및 대기 해제
             IsRetrying = false;
-            ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+            ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제
             return false;
         }
 
+        // 포트를 여러 번 열기 시도
         for (int i = 0; i < MaxOpenAttempts; i++)
         {
             try
@@ -47,6 +52,7 @@ public class ComPortManager
                 LogT5($"COM 포트 열기 시도 중... (시도 횟수: {i + 1})");
                 comPort.Open();
                 LogT5("COM 포트 열림 성공.");
+                
                 IsRetrying = false; // 재시도 상태 해제
                 ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제
                 return true;
@@ -58,31 +64,33 @@ public class ComPortManager
             }
         }
 
+        // 최대 재시도 횟수를 초과한 경우, 재시도 상태 해제 및 대기 중 작업 해제
         IsRetrying = false;
-        ReconnectCompleted?.Invoke(); // 재시도 종료, 대기 해제
+        ReconnectCompleted?.Invoke(); // 대기 중인 작업 해제
         LogT5("COM 포트 열기 시도 500,000번 초과, 포트 열기 실패.");
         return false;
     }
 
+    // COM 포트를 여닫는 작업에 시간 제한을 걸어 수행하는 메서드
     private async Task<bool> PerformOperationWithTimeoutAsync(Action operation, string errorMessage)
     {
         try
         {
-            var task = Task.Run(operation);
+            var task = Task.Run(operation); // 작업을 별도 스레드에서 수행
             if (await Task.WhenAny(task, Task.Delay(ComPortOperationTimeout)) == task)
             {
-                return true;
+                return true; // 작업 성공 시 true 반환
             }
             else
             {
                 LogT5($"{errorMessage} (타임아웃 {ComPortOperationTimeout}ms 초과)");
-                return false;
+                return false; // 작업 타임아웃 시 false 반환
             }
         }
         catch (Exception ex)
         {
             LogT5($"{errorMessage}: {ex.Message}");
-            return false;
+            return false; // 작업 중 예외 발생 시 false 반환
         }
     }
 
@@ -91,6 +99,57 @@ public class ComPortManager
         msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
     }
 }
+2. CommandQueueManager 클래스
+이 클래스는 AddAsyncTaskCommand에서 명령을 추가할 때 COM 포트가 재시도 상태이면 대기하도록 세마포어를 사용합니다.
 
+csharp
+코드 복사
+public class CommandQueueManager
+{
+    private readonly ComPortManager comPortManager; // COM 포트 관리자 클래스 인스턴스
+    private readonly SemaphoreSlim comPortSemaphore = new SemaphoreSlim(1, 1); // 대기 제어용 세마포어
 
+    public CommandQueueManager(ComPortManager comPortManager)
+    {
+        this.comPortManager = comPortManager;
 
+        // 재연결 완료 시 대기 해제 이벤트 연결
+        this.comPortManager.ReconnectCompleted += () => comPortSemaphore.Release();
+    }
+
+    // 명령을 큐에 추가하는 메서드
+    public async Task AddAsyncTaskCommand(Func<Task> command)
+    {
+        // COM 포트가 재시도 중이라면 대기
+        if (comPortManager.IsRetrying)
+        {
+            LogT5("COM 포트 재시도 중, AddAsyncTaskCommand 대기 중...");
+            await comPortSemaphore.WaitAsync(); // 재시도 끝날 때까지 대기
+        }
+
+        // 대기 후 큐에 작업 추가
+        LogT5("AddAsyncTaskCommand: 명령 추가 중...");
+        await TaskQueue.Enqueue(command); // 큐에 명령 추가
+    }
+
+    private void LogT5(string message)
+    {
+        msgvs.Instance.LogT5($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+    }
+}
+코드 흐름과 상세 설명
+세마포어 생성:
+
+CommandQueueManager 클래스 내부에 SemaphoreSlim 인스턴스를 생성합니다. SemaphoreSlim은 재시도 중일 때 COM 포트가 사용 가능해질 때까지 대기 상태를 유지할 수 있게 해 줍니다.
+SemaphoreSlim은 동시 접근을 제한하는 용도로 사용되며, 여기서는 단일 진입만을 허용하기 위해 1로 초기화합니다.
+재시도 상태 관리:
+
+ComPortManager 클래스는 IsRetrying 플래그와 ReconnectCompleted 이벤트를 통해 COM 포트가 재연결 중인지 그리고 재연결이 완료되었는지를 다른 클래스에서 확인할 수 있도록 합니다.
+ReconnectCompleted 이벤트는 재연결이 완료되었을 때 CommandQueueManager에서 대기 중인 SemaphoreSlim을 해제할 수 있도록 합니다.
+대기와 해제 처리:
+
+AddAsyncTaskCommand 메서드에서 명령을 큐에 추가할 때, IsRetrying 플래그가 true인 경우 세마포어의 WaitAsync()를 호출하여 대기합니다. 이 대기는 ReconnectCompleted 이벤트가 발생할 때까지 유지됩니다.
+ReconnectCompleted 이벤트가 발생하면 comPortSemaphore.Release()가 호출되어 대기 중인 작업이 해제되며, 큐에 명령을 추가할 수 있게 됩니다.
+실제 예제 적용:
+
+SemaphoreSlim을 CommandQueueManager 클래스에서 생성하여 특정 자원(COM 포트 상태)에 접근할 수 있을 때만 명령이 큐에 추가되도록 하는 것이 핵심입니다.
