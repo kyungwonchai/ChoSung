@@ -1,18 +1,17 @@
-여전히 갱신되지 않는다면 아래 문제와 해결 방법을 확인해야 합니다. 제대로 동작하도록 구체적으로 수정한 코드를 다시 제공합니다.
+ 문제가 발생하는 이유는 대부분 ObservableCollection과 UI 바인딩이 제대로 동작하지 않거나, UI 스레드에서 컬렉션 갱신이 이루어지지 않아서입니다. 문제가 무엇인지 명확히 해결하기 위해 다음과 같은 단계로 문제를 분석하고 코드를 수정했습니다.
 
-문제 원인
-ObservableCollection과 UI 스레드 문제
-ObservableCollection은 UI 스레드에서 변경이 발생해야 UI에 반영됩니다. 이벤트나 비동기 작업에서 UI 스레드를 사용하지 않을 경우 반영되지 않습니다.
+문제 분석
+이벤트가 호출되었음에도 UI에 반영되지 않는 이유:
 
-뷰모델과 XAML 바인딩 확인
-DataGrid가 LogEntries 컬렉션과 제대로 바인딩되지 않았거나, DataContext 설정이 잘못되었을 가능성이 있습니다.
+ObservableCollection은 내부적으로 컬렉션 변경 알림을 UI에 전달하지만, UI 스레드에서 변경하지 않으면 UI가 업데이트되지 않습니다.
+DataGrid가 ObservableCollection을 제대로 참조하지 않거나, 뷰모델과의 데이터 바인딩이 깨졌을 가능성도 있습니다.
+추가된 데이터가 보이지 않는 증상:
 
-컬렉션 변경 이벤트가 UI에 전달되지 않음
-ObservableCollection이 아닌 다른 방식으로 데이터가 수정되었다면, 변경 알림이 전달되지 않았을 수 있습니다.
-
-수정 코드
-1. MergeOIErrLogManager 클래스
-ObservableCollection은 UI 스레드에서만 수정되도록 Dispatcher.Invoke를 통해 안전하게 갱신합니다.
+LogEntries 컬렉션에 데이터가 추가되었지만 UI가 이를 감지하지 못하고 갱신되지 않는 경우 발생합니다.
+특히, 이벤트 기반 데이터 갱신 시 UI와 ObservableCollection이 동기화되지 않으면 문제가 생깁니다.
+최종 해결 코드
+1. MergeOIErrLogManager
+이벤트를 통해 전달된 데이터를 UI 스레드에서 확실히 추가하도록 수정합니다.
 
 csharp
 코드 복사
@@ -35,7 +34,7 @@ public class MergeOIErrLogManager
         var newEntry = ParseLogLine(logLine);
         if (newEntry != null)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() => // 반드시 UI 스레드에서 실행
             {
                 lock (_lock)
                 {
@@ -92,8 +91,8 @@ public class MergeOIErrLogEntry
     public string Message { get; set; } // 메시지
     public string Details { get; set; } // 세부 내용
 }
-2. SocketClientMergeOI 클래스
-OnLogReceived 이벤트를 통해 로그 메시지를 전달합니다.
+2. SocketClientMergeOI
+이벤트로 로그 데이터를 MergeOIErrLogManager로 전달합니다.
 
 csharp
 코드 복사
@@ -118,7 +117,7 @@ public class SocketClientMergeOI
     }
 }
 3. MainViewModel
-MergeOIErrLogManager와 SocketClientMergeOI를 연결하여 로그를 처리합니다.
+뷰모델에서 MergeOIErrLogManager와 SocketClientMergeOI를 연결하고, LogEntries를 바인딩합니다.
 
 csharp
 코드 복사
@@ -137,12 +136,25 @@ public class MainViewModel : BaseViewModel
         // 이벤트 구독
         _socketClient.OnLogReceived += _logManager.HandleLogEvent;
 
-        // 초기화
-        Task.Run(async () => await _logManager.InitializeAsync());
+        // 테스트: 소켓 메시지 시뮬레이션
+        Task.Run(() => SimulateSocketMessages());
+    }
+
+    /// <summary>
+    /// 테스트용: 소켓 메시지 시뮬레이션
+    /// </summary>
+    private async Task SimulateSocketMessages()
+    {
+        await Task.Delay(1000);
+        _socketClient.ProcessSocketMessage("ERROR: Connection lost");
+        await Task.Delay(1000);
+        _socketClient.ProcessSocketMessage("INFO: Reconnected");
+        await Task.Delay(1000);
+        _socketClient.ProcessSocketMessage("ERROR: Timeout");
     }
 }
 4. XAML
-LogEntries를 DataGrid에 바인딩합니다.
+UI에서 LogEntries를 DataGrid에 바인딩합니다.
 
 xml
 코드 복사
@@ -156,42 +168,24 @@ xml
     <Grid>
         <DataGrid ItemsSource="{Binding LogEntries}" AutoGenerateColumns="False" IsReadOnly="True" Margin="10">
             <DataGrid.Columns>
+                <!-- 시간 컬럼 -->
                 <DataGridTextColumn Header="시간" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm:ss.fff}" Width="*"/>
+                <!-- 메시지 컬럼 -->
                 <DataGridTextColumn Header="메시지" Binding="{Binding Message}" Width="2*"/>
+                <!-- 세부 내용 컬럼 -->
                 <DataGridTextColumn Header="세부 내용" Binding="{Binding Details}" Width="2*"/>
             </DataGrid.Columns>
         </DataGrid>
     </Grid>
 </Window>
-테스트용 코드
-아래 코드는 테스트용으로 SocketClientMergeOI가 이벤트를 발생시켜 로그를 추가합니다.
+최종 점검 사항
+UI 스레드에서 LogEntries 수정 확인
 
-csharp
-코드 복사
-public class AppTest
-{
-    public void Test()
-    {
-        var socketClient = new SocketClientMergeOI();
-        var logManager = new MergeOIErrLogManager();
+Application.Current.Dispatcher.Invoke를 통해 UI 스레드에서 컬렉션을 수정하도록 보장했습니다.
+뷰모델과 XAML 바인딩 점검
 
-        // 이벤트 연결
-        socketClient.OnLogReceived += logManager.HandleLogEvent;
+DataGrid의 ItemsSource는 LogEntries와 정확히 바인딩되었습니다.
+MainViewModel이 DataContext로 설정되어 있습니다.
+테스트 코드
 
-        // 테스트 메시지 처리
-        socketClient.ProcessSocketMessage("ERROR: Connection lost");
-        socketClient.ProcessSocketMessage("ERROR: Timeout occurred");
-    }
-}
-주요 점검 사항
-XAML 바인딩 확인
-
-DataGrid의 ItemsSource가 LogEntries로 바인딩되어 있는지 확인합니다.
-UI 스레드에서 데이터 수정
-
-모든 ObservableCollection 수정 작업이 Dispatcher.Invoke 안에서 이루어지는지 확인합니다.
-테스트 시뮬레이션
-
-테스트 코드로 SocketClientMergeOI에서 이벤트를 발생시켜 로그가 추가되는지 확인합니다.
-결과
-SocketClientMergeOI에서 로그 메시지가 발생하면 MergeOIErrLogManager로 전달됩니다.
+SimulateSocketMessages로 소켓 메시지 발생 시 로그가 정상적으로 추가되는지 확인합니다.
