@@ -1,194 +1,220 @@
-시리얼 포트를 사용하는 스캐너와 다른 프로그램 간의 충돌 없이 데이터를 처리하고 포트를 반환하는 문제를 해결하려면 아래와 같은 구조를 추천합니다:
+아래는 시리얼 포트 스캐너 데이터를 읽어 데이터베이스에 저장하는 Windows 서비스 프로그램 코드입니다. 서비스가 실행 중일 때는 데이터를 읽고, 서비스를 중단하면 포트를 해제하여 다른 프로그램에서 사용할 수 있습니다.
 
-서비스 설계: 시리얼 포트를 독점하지 않고 필요할 때 포트를 반환하도록 설계.
-포트 사용 관리: Mutex나 상태 플래그를 사용해 포트 사용 여부를 관리.
-백그라운드 작업: 데이터 읽기를 비동기로 처리하고 데이터가 있을 경우 DB에 전송.
-포트 반환 요청 처리: 외부 프로그램에서 포트 반환 요청을 할 수 있도록 IPC(예: 파일, TCP/UDP, 네임드 파이프 등)를 구현.
-아래는 C#으로 구현한 샘플 코드입니다.
+이 코드는 C# Windows Service Application을 기반으로 작성되었습니다.
 
-전체 코드 구조
+1. Windows Service 프로젝트 생성
+Visual Studio에서 Windows Service (.NET Framework) 템플릿을 사용해 프로젝트를 생성합니다.
+서비스 이름을 SerialScannerService로 설정합니다.
+2. 서비스 코드
+Program.cs
+csharp
+코드 복사
+using System.ServiceProcess;
+
+namespace SerialScannerService
+{
+    static class Program
+    {
+        static void Main()
+        {
+            ServiceBase[] ServicesToRun;
+            ServicesToRun = new ServiceBase[]
+            {
+                new ScannerService()
+            };
+            ServiceBase.Run(ServicesToRun);
+        }
+    }
+}
+ScannerService.cs
 csharp
 코드 복사
 using System;
 using System.IO.Ports;
+using System.ServiceProcess;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Data.SqlClient;
 
-class ScannerService
+namespace SerialScannerService
 {
-    private SerialPort _serialPort;
-    private bool _isRunning = true;
-    private bool _isPortInUse = false;
-    private readonly Mutex _portMutex = new Mutex();
-
-    public ScannerService(string portName, int baudRate)
+    public partial class ScannerService : ServiceBase
     {
-        _serialPort = new SerialPort(portName, baudRate)
+        private SerialPort _serialPort; // 시리얼 포트 객체
+        private Thread _workerThread; // 데이터를 읽는 작업을 실행할 스레드
+        private bool _isRunning; // 서비스 실행 상태 플래그
+
+        public ScannerService()
         {
-            ReadTimeout = 1000, // 1초 읽기 타임아웃
-            WriteTimeout = 1000
-        };
-    }
-
-    public void Start()
-    {
-        Task.Run(() => ListenForData());
-        Console.WriteLine("Scanner service started. Listening for data...");
-    }
-
-    public void Stop()
-    {
-        _isRunning = false;
-        if (_serialPort.IsOpen)
-        {
-            _serialPort.Close();
+            InitializeComponent();
         }
-        Console.WriteLine("Scanner service stopped.");
-    }
 
-    private void ListenForData()
-    {
-        try
+        protected override void OnStart(string[] args)
         {
-            _serialPort.Open();
-            while (_isRunning)
+            try
             {
-                if (_isPortInUse)
+                // 서비스 시작 시 로직
+                _isRunning = true;
+
+                // 시리얼 포트 초기화
+                _serialPort = new SerialPort("COM3", 9600)
                 {
-                    Thread.Sleep(500); // 포트가 사용 중이면 대기
-                    continue;
+                    ReadTimeout = 1000, // 읽기 타임아웃 1초
+                    WriteTimeout = 1000
+                };
+
+                // 포트 열기
+                _serialPort.Open();
+
+                // 데이터 읽기 작업 실행
+                _workerThread = new Thread(ReadSerialData)
+                {
+                    IsBackground = true // 백그라운드 스레드로 설정
+                };
+                _workerThread.Start();
+
+                LogMessage("Service started and serial port opened.");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error during service start: {ex.Message}");
+                Stop();
+            }
+        }
+
+        protected override void OnStop()
+        {
+            try
+            {
+                // 서비스 중지 시 로직
+                _isRunning = false;
+
+                // 스레드 종료
+                _workerThread?.Join();
+
+                // 시리얼 포트 닫기
+                if (_serialPort?.IsOpen == true)
+                {
+                    _serialPort.Close();
                 }
 
+                LogMessage("Service stopped and serial port closed.");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error during service stop: {ex.Message}");
+            }
+        }
+
+        private void ReadSerialData()
+        {
+            while (_isRunning)
+            {
                 try
                 {
-                    _portMutex.WaitOne(); // 포트 독점
-
-                    if (!_serialPort.IsOpen) continue;
-
-                    string data = _serialPort.ReadLine(); // 데이터 읽기
+                    // 데이터 읽기
+                    string data = _serialPort.ReadLine();
                     if (!string.IsNullOrWhiteSpace(data))
                     {
-                        Console.WriteLine($"Data received: {data}");
+                        LogMessage($"Data received: {data}");
+
+                        // 데이터베이스로 전송
                         SendToDatabase(data);
                     }
                 }
                 catch (TimeoutException)
                 {
-                    // 읽기 시간 초과 시 무시
+                    // 읽기 시간 초과 무시
                 }
-                finally
+                catch (Exception ex)
                 {
-                    _portMutex.ReleaseMutex();
+                    LogMessage($"Error reading data: {ex.Message}");
                 }
             }
         }
-        catch (Exception ex)
+
+        private void SendToDatabase(string data)
         {
-            Console.WriteLine($"Error in ListenForData: {ex.Message}");
-        }
-        finally
-        {
-            if (_serialPort.IsOpen)
+            string connectionString = "YourDatabaseConnectionStringHere";
+            string query = "INSERT INTO ScannerData (ScannedValue, Timestamp) VALUES (@Value, @Timestamp)";
+
+            try
             {
-                _serialPort.Close();
+                using (var connection = new SqlConnection(connectionString))
+                {
+                    using (var command = new SqlCommand(query, connection))
+                    {
+                        // 데이터 매개변수 추가
+                        command.Parameters.AddWithValue("@Value", data);
+                        command.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+
+                        connection.Open();
+                        command.ExecuteNonQuery();
+                    }
+                }
+
+                LogMessage($"Data sent to database: {data}");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Database error: {ex.Message}");
             }
         }
-    }
 
-    private void SendToDatabase(string data)
-    {
-        string connectionString = "YourDatabaseConnectionStringHere";
-        string query = "INSERT INTO ScannerData (ScannedValue, Timestamp) VALUES (@Value, @Timestamp)";
-
-        using (var connection = new SqlConnection(connectionString))
+        private void LogMessage(string message)
         {
-            using (var command = new SqlCommand(query, connection))
-            {
-                command.Parameters.AddWithValue("@Value", data);
-                command.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+            string logPath = AppDomain.CurrentDomain.BaseDirectory + "\\ScannerServiceLog.txt";
+            string logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}";
 
-                connection.Open();
-                command.ExecuteNonQuery();
+            try
+            {
+                System.IO.File.AppendAllText(logPath, logMessage + Environment.NewLine);
+            }
+            catch
+            {
+                // 로그 기록 실패 시 무시
             }
         }
-
-        Console.WriteLine($"Data sent to database: {data}");
-    }
-
-    public void ReleasePort()
-    {
-        _isPortInUse = true;
-        if (_serialPort.IsOpen)
-        {
-            _serialPort.Close();
-        }
-        Console.WriteLine("Serial port released for external use.");
-    }
-
-    public void ReclaimPort()
-    {
-        _isPortInUse = false;
-        if (!_serialPort.IsOpen)
-        {
-            _serialPort.Open();
-        }
-        Console.WriteLine("Serial port reclaimed by service.");
     }
 }
-
-class Program
+Service1.Designer.cs
+csharp
+코드 복사
+namespace SerialScannerService
 {
-    static void Main(string[] args)
+    partial class ScannerService
     {
-        ScannerService service = new ScannerService("COM3", 9600);
-
-        Console.CancelKeyPress += (sender, e) =>
+        private void InitializeComponent()
         {
-            service.Stop();
-        };
-
-        service.Start();
-
-        while (true)
-        {
-            Console.WriteLine("Enter command (release/reclaim/exit):");
-            string command = Console.ReadLine();
-
-            if (command == "release")
-            {
-                service.ReleasePort();
-            }
-            else if (command == "reclaim")
-            {
-                service.ReclaimPort();
-            }
-            else if (command == "exit")
-            {
-                service.Stop();
-                break;
-            }
+            this.ServiceName = "SerialScannerService";
         }
     }
 }
-코드 설명
-ListenForData 메서드:
+3. 서비스 설치
+Windows 서비스는 설치가 필요합니다.
 
-데이터를 읽는 작업은 백그라운드에서 비동기로 실행.
-읽은 데이터를 데이터베이스에 저장.
-포트 반환:
+InstallUtil을 사용한 설치
+프로젝트 빌드 후 bin/Debug 또는 bin/Release 폴더에서 .exe 파일을 찾습니다.
+관리자 권한으로 명령 프롬프트를 열고 다음 명령어를 실행합니다:
+bash
+코드 복사
+InstallUtil SerialScannerService.exe
+서비스 시작
+Windows 서비스 관리 도구 (services.msc)를 엽니다.
+SerialScannerService를 찾아 시작 버튼을 클릭합니다.
+4. 코드 설명
+서비스 시작/중지:
 
-ReleasePort 메서드를 호출하면 포트를 반환.
-포트 반환 중에는 데이터 읽기를 멈추고 외부 프로그램에서 포트를 사용할 수 있도록 준비.
-포트 재요청:
+OnStart: 시리얼 포트를 열고 데이터를 읽기 시작.
+OnStop: 포트를 닫고 스레드를 종료.
+시리얼 데이터 처리:
 
-ReclaimPort 메서드를 호출하면 서비스가 다시 포트를 사용.
-포트 상태 관리:
+ReadSerialData: 포트 데이터를 읽고, 읽은 데이터를 DB에 저장.
+로그 기록:
 
-Mutex와 bool _isPortInUse 변수를 활용해 포트 사용 상태를 관리.
-IPC(외부 프로그램과 통신)
-외부 프로그램에서 포트 반환을 요청하려면 네임드 파이프나 TCP 서버를 추가로 구현할 수 있습니다. 예를 들어, 네임드 파이프를 사용하면 외부 프로그램에서 간단히 명령을 보낼 수 있습니다.
+LogMessage: 서비스 상태 및 오류를 로그 파일에 기록.
+데이터베이스 전송:
 
-장점
-안정성: 포트 독점을 관리하여 충돌 방지.
-유연성: 포트 반환 및 재요청 가능.
+SendToDatabase: 읽은 데이터를 데이터베이스로 전송.
+추가 고려 사항
+포트 및 속도 설정: SerialPort 객체 생성 시 COM 포트와 속도를 환경 설정 파일에서 읽도록 수정 가능.
+오류 복구: 포트 연결 오류 발생 시 일정 시간 후 다시 연결 시도.
