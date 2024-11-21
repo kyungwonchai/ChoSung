@@ -1,13 +1,194 @@
-using DevExpress.XtraRichEdit.API.Native;
+시리얼 포트를 사용하는 스캐너와 다른 프로그램 간의 충돌 없이 데이터를 처리하고 포트를 반환하는 문제를 해결하려면 아래와 같은 구조를 추천합니다:
 
-// 리치 텍스트 컨트롤 초기화 후 스타일 설정
-richEditControl.Loaded += (s, e) =>
+서비스 설계: 시리얼 포트를 독점하지 않고 필요할 때 포트를 반환하도록 설계.
+포트 사용 관리: Mutex나 상태 플래그를 사용해 포트 사용 여부를 관리.
+백그라운드 작업: 데이터 읽기를 비동기로 처리하고 데이터가 있을 경우 DB에 전송.
+포트 반환 요청 처리: 외부 프로그램에서 포트 반환 요청을 할 수 있도록 IPC(예: 파일, TCP/UDP, 네임드 파이프 등)를 구현.
+아래는 C#으로 구현한 샘플 코드입니다.
+
+전체 코드 구조
+csharp
+코드 복사
+using System;
+using System.IO.Ports;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Data.SqlClient;
+
+class ScannerService
 {
-    var document = richEditControl.Document;
+    private SerialPort _serialPort;
+    private bool _isRunning = true;
+    private bool _isPortInUse = false;
+    private readonly Mutex _portMutex = new Mutex();
 
-    // 기본 문서 서식 설정
-    document.BeginUpdate();
-    document.DefaultCharacterProperties.ForeColor = System.Windows.Media.Colors.White; // 글자색 흰색
-    document.DefaultParagraphProperties.BackColor = System.Windows.Media.Colors.Black; // 배경 검정색
-    document.EndUpdate();
-};
+    public ScannerService(string portName, int baudRate)
+    {
+        _serialPort = new SerialPort(portName, baudRate)
+        {
+            ReadTimeout = 1000, // 1초 읽기 타임아웃
+            WriteTimeout = 1000
+        };
+    }
+
+    public void Start()
+    {
+        Task.Run(() => ListenForData());
+        Console.WriteLine("Scanner service started. Listening for data...");
+    }
+
+    public void Stop()
+    {
+        _isRunning = false;
+        if (_serialPort.IsOpen)
+        {
+            _serialPort.Close();
+        }
+        Console.WriteLine("Scanner service stopped.");
+    }
+
+    private void ListenForData()
+    {
+        try
+        {
+            _serialPort.Open();
+            while (_isRunning)
+            {
+                if (_isPortInUse)
+                {
+                    Thread.Sleep(500); // 포트가 사용 중이면 대기
+                    continue;
+                }
+
+                try
+                {
+                    _portMutex.WaitOne(); // 포트 독점
+
+                    if (!_serialPort.IsOpen) continue;
+
+                    string data = _serialPort.ReadLine(); // 데이터 읽기
+                    if (!string.IsNullOrWhiteSpace(data))
+                    {
+                        Console.WriteLine($"Data received: {data}");
+                        SendToDatabase(data);
+                    }
+                }
+                catch (TimeoutException)
+                {
+                    // 읽기 시간 초과 시 무시
+                }
+                finally
+                {
+                    _portMutex.ReleaseMutex();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error in ListenForData: {ex.Message}");
+        }
+        finally
+        {
+            if (_serialPort.IsOpen)
+            {
+                _serialPort.Close();
+            }
+        }
+    }
+
+    private void SendToDatabase(string data)
+    {
+        string connectionString = "YourDatabaseConnectionStringHere";
+        string query = "INSERT INTO ScannerData (ScannedValue, Timestamp) VALUES (@Value, @Timestamp)";
+
+        using (var connection = new SqlConnection(connectionString))
+        {
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@Value", data);
+                command.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+
+                connection.Open();
+                command.ExecuteNonQuery();
+            }
+        }
+
+        Console.WriteLine($"Data sent to database: {data}");
+    }
+
+    public void ReleasePort()
+    {
+        _isPortInUse = true;
+        if (_serialPort.IsOpen)
+        {
+            _serialPort.Close();
+        }
+        Console.WriteLine("Serial port released for external use.");
+    }
+
+    public void ReclaimPort()
+    {
+        _isPortInUse = false;
+        if (!_serialPort.IsOpen)
+        {
+            _serialPort.Open();
+        }
+        Console.WriteLine("Serial port reclaimed by service.");
+    }
+}
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        ScannerService service = new ScannerService("COM3", 9600);
+
+        Console.CancelKeyPress += (sender, e) =>
+        {
+            service.Stop();
+        };
+
+        service.Start();
+
+        while (true)
+        {
+            Console.WriteLine("Enter command (release/reclaim/exit):");
+            string command = Console.ReadLine();
+
+            if (command == "release")
+            {
+                service.ReleasePort();
+            }
+            else if (command == "reclaim")
+            {
+                service.ReclaimPort();
+            }
+            else if (command == "exit")
+            {
+                service.Stop();
+                break;
+            }
+        }
+    }
+}
+코드 설명
+ListenForData 메서드:
+
+데이터를 읽는 작업은 백그라운드에서 비동기로 실행.
+읽은 데이터를 데이터베이스에 저장.
+포트 반환:
+
+ReleasePort 메서드를 호출하면 포트를 반환.
+포트 반환 중에는 데이터 읽기를 멈추고 외부 프로그램에서 포트를 사용할 수 있도록 준비.
+포트 재요청:
+
+ReclaimPort 메서드를 호출하면 서비스가 다시 포트를 사용.
+포트 상태 관리:
+
+Mutex와 bool _isPortInUse 변수를 활용해 포트 사용 상태를 관리.
+IPC(외부 프로그램과 통신)
+외부 프로그램에서 포트 반환을 요청하려면 네임드 파이프나 TCP 서버를 추가로 구현할 수 있습니다. 예를 들어, 네임드 파이프를 사용하면 외부 프로그램에서 간단히 명령을 보낼 수 있습니다.
+
+장점
+안정성: 포트 독점을 관리하여 충돌 방지.
+유연성: 포트 반환 및 재요청 가능.
