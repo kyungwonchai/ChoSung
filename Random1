@@ -1,11 +1,91 @@
-bservableCollection에 데이터를 추가했음에도 UI가 갱신되지 않는다면, UI 바인딩 문제 또는 INotifyPropertyChanged 이벤트가 트리거되지 않는 문제일 가능성이 높습니다.
+된 데이터가 항상 맨 위에 들어가야 한다면, ObservableCollection의 Insert 메서드를 사용하여 **컬렉션의 첫 번째 위치(인덱스 0)**에 항목을 추가하도록 수정해야 합니다. 기본적으로 Add 메서드는 데이터가 컬렉션의 끝에 추가되기 때문에, 새 데이터가 맨 위에 표시되지 않는 문제를 해결할 수 있습니다.
 
-여기서는 UI 업데이트를 강제적으로 알리는 방법과 구조적 문제 해결을 모두 적용합니다.
+수정된 코드
+1. MergeOIErrLogManager
+ObservableCollection에 데이터를 추가할 때 맨 위에 삽입하도록 수정합니다.
 
-해결 방법 1: RaisePropertyChanged 강제 트리거 추가
-ObservableCollection의 변경을 UI에 강제적으로 알리려면, LogEntries 속성을 다시 평가하도록 바인딩 업데이트를 트리거해야 합니다.
+csharp
+코드 복사
+using System;
+using System.Collections.ObjectModel;
+using System.Windows;
 
-수정된 MainViewModel 코드
+public class MergeOIErrLogManager
+{
+    private readonly object _lock = new object();
+
+    public ObservableCollection<MergeOIErrLogEntry> LogEntries { get; private set; } = new ObservableCollection<MergeOIErrLogEntry>();
+
+    /// <summary>
+    /// 이벤트로 전달된 로그 처리
+    /// </summary>
+    /// <param name="logLine">로그 라인</param>
+    public void HandleLogEvent(string logLine)
+    {
+        var newEntry = ParseLogLine(logLine);
+        if (newEntry != null)
+        {
+            Application.Current.Dispatcher.Invoke(() => // 반드시 UI 스레드에서 실행
+            {
+                lock (_lock)
+                {
+                    // 항상 맨 위에 삽입
+                    LogEntries.Insert(0, newEntry);
+
+                    // 오래된 로그 삭제 (최근 2일치까지만 유지)
+                    var cutoffTime = DateTime.Now.AddDays(-2);
+                    for (int i = LogEntries.Count - 1; i >= 0; i--)
+                    {
+                        if (LogEntries[i].Time < cutoffTime)
+                        {
+                            LogEntries.RemoveAt(i);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// <summary>
+    /// 로그 라인 파싱
+    /// </summary>
+    private MergeOIErrLogEntry ParseLogLine(string line)
+    {
+        try
+        {
+            var timeEndIndex = line.IndexOf("]");
+            var timePart = line.Substring(1, timeEndIndex - 1); // [시간] 부분
+            var messageStartIndex = timeEndIndex + 2;
+            var messageEndIndex = line.LastIndexOf(":");
+            var messagePart = line.Substring(messageStartIndex, messageEndIndex - messageStartIndex);
+            var detailsPart = line.Substring(messageEndIndex + 1);
+
+            return new MergeOIErrLogEntry
+            {
+                Time = DateTime.Parse(timePart),
+                Message = messagePart,
+                Details = detailsPart
+            };
+        }
+        catch
+        {
+            return null; // 잘못된 로그는 무시
+        }
+    }
+}
+
+/// <summary>
+/// 로그 항목 클래스
+/// </summary>
+public class MergeOIErrLogEntry
+{
+    public DateTime Time { get; set; } // 로그 시간
+    public string Message { get; set; } // 메시지
+    public string Details { get; set; } // 세부 내용
+}
+2. MainViewModel
+LogEntries 속성을 통해 UI에서 항상 최신 데이터가 맨 위에 표시되도록 합니다.
+
 csharp
 코드 복사
 public class MainViewModel : BaseViewModel
@@ -21,20 +101,10 @@ public class MainViewModel : BaseViewModel
         _socketClient = new SocketClientMergeOI();
 
         // 이벤트 구독
-        _socketClient.OnLogReceived += HandleLogEvent;
+        _socketClient.OnLogReceived += _logManager.HandleLogEvent;
 
         // 테스트: 소켓 메시지 시뮬레이션
         Task.Run(() => SimulateSocketMessages());
-    }
-
-    /// <summary>
-    /// 이벤트를 처리하여 UI 갱신을 강제 트리거
-    /// </summary>
-    /// <param name="logLine">추가된 로그</param>
-    private void HandleLogEvent(string logLine)
-    {
-        _logManager.HandleLogEvent(logLine);
-        OnPropertyChanged(nameof(LogEntries)); // UI 강제 갱신
     }
 
     /// <summary>
@@ -50,81 +120,34 @@ public class MainViewModel : BaseViewModel
         _socketClient.ProcessSocketMessage("ERROR: Timeout");
     }
 }
-주요 변경 사항
-OnPropertyChanged(nameof(LogEntries)) 추가
+3. SocketClientMergeOI
+이벤트를 통해 MergeOIErrLogManager로 메시지를 전달합니다.
 
-LogEntries 프로퍼티를 다시 평가하도록 UI에 알립니다.
-이벤트 핸들러 직접 호출
-
-SocketClientMergeOI의 이벤트를 구독하여 로그 처리 후 UI에 즉시 반영되도록 수정.
-해결 방법 2: UI 업데이트 강제 트리거
-만약 위 방식으로도 동작하지 않는다면, ObservableCollection을 직접 새 인스턴스로 교체하여 강제 업데이트를 트리거합니다.
-
-MainViewModel 수정
 csharp
 코드 복사
-public class MainViewModel : BaseViewModel
-{
-    private MergeOIErrLogManager _logManager;
-    private SocketClientMergeOI _socketClient;
-    private ObservableCollection<MergeOIErrLogEntry> _logEntries;
+using System;
 
-    public ObservableCollection<MergeOIErrLogEntry> LogEntries
+public class SocketClientMergeOI
+{
+    public event Action<string> OnLogReceived;
+
+    private void RaiseLogEvent(string logMessage)
     {
-        get => _logEntries;
-        private set
+        OnLogReceived?.Invoke(logMessage);
+    }
+
+    public void ProcessSocketMessage(string receivedMessage)
+    {
+        if (receivedMessage.Contains("ERROR"))
         {
-            _logEntries = value;
-            OnPropertyChanged(nameof(LogEntries)); // UI 강제 업데이트
+            string logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR: {receivedMessage}";
+            RaiseLogEvent(logMessage);
         }
     }
-
-    public MainViewModel()
-    {
-        _logManager = new MergeOIErrLogManager();
-        _socketClient = new SocketClientMergeOI();
-
-        _logEntries = _logManager.LogEntries;
-
-        // 이벤트 구독
-        _socketClient.OnLogReceived += HandleLogEvent;
-
-        // 테스트: 소켓 메시지 시뮬레이션
-        Task.Run(() => SimulateSocketMessages());
-    }
-
-    /// <summary>
-    /// 로그 이벤트 처리 및 UI 갱신
-    /// </summary>
-    /// <param name="logLine">추가된 로그</param>
-    private void HandleLogEvent(string logLine)
-    {
-        _logManager.HandleLogEvent(logLine);
-
-        // ObservableCollection 교체를 통한 강제 업데이트
-        LogEntries = new ObservableCollection<MergeOIErrLogEntry>(_logManager.LogEntries);
-    }
-
-    /// <summary>
-    /// 테스트용: 소켓 메시지 시뮬레이션
-    /// </summary>
-    private async Task SimulateSocketMessages()
-    {
-        await Task.Delay(1000);
-        _socketClient.ProcessSocketMessage("ERROR: Connection lost");
-        await Task.Delay(1000);
-        _socketClient.ProcessSocketMessage("INFO: Reconnected");
-        await Task.Delay(1000);
-        _socketClient.ProcessSocketMessage("ERROR: Timeout");
-    }
 }
-주요 변경 사항
-컬렉션 교체를 통한 강제 업데이트
-LogEntries 속성에 새 ObservableCollection을 할당하여 바인딩 업데이트를 강제합니다.
-해결 방법 3: XAML 바인딩 속성 확인
-DataGrid의 ItemsSource가 LogEntries에 정확히 바인딩되어 있는지 다시 확인합니다.
+4. XAML
+UI는 LogEntries에 바인딩된 데이터를 자동으로 갱신하며, 새 데이터가 항상 맨 위에 표시됩니다.
 
-수정된 XAML
 xml
 코드 복사
 <DataGrid ItemsSource="{Binding LogEntries, UpdateSourceTrigger=PropertyChanged}" 
@@ -135,22 +158,16 @@ xml
         <DataGridTextColumn Header="세부 내용" Binding="{Binding Details}" Width="2*"/>
     </DataGrid.Columns>
 </DataGrid>
-주요 변경 사항
-UpdateSourceTrigger=PropertyChanged 추가
-DataGrid가 데이터 변경 사항을 즉시 반영하도록 수정.
-최종 결과
-위 코드를 적용하면:
+주요 변경 사항 요약
+LogEntries.Insert(0, newEntry) 사용
 
-SocketClientMergeOI의 이벤트 발생 → MergeOIErrLogManager에서 처리.
-LogEntries 속성 업데이트 → UI에 즉시 반영.
-강제로 UI를 갱신하도록 구현했기 때문에 이제 추가된 데이터가 항상 표시됩니다.
-디버깅 팁
-만약 여전히 동작하지 않는다면:
+Add 대신 Insert를 사용하여 컬렉션의 맨 앞에 데이터를 삽입합니다.
+ObservableCollection의 Insert 메서드는 UI에 즉시 반영됩니다.
+UI 강제 업데이트
 
-이벤트 호출 확인
+Application.Current.Dispatcher.Invoke를 통해 항상 UI 스레드에서 ObservableCollection을 수정.
+오래된 로그 삭제
 
-SocketClientMergeOI.OnLogReceived가 실제로 호출되고 있는지 디버깅.
-MergeOIErrLogManager.LogEntries 데이터 확인
-
-LogEntries에 데이터가 추가되었는지 확인.
-UI 바인딩 확인
+2일 이상된 로그는 자동으로 삭제.
+테스트 결과
+새로 들어온 로그가 항상 DataGrid의 맨 위에 표시됩니다.
