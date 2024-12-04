@@ -1,122 +1,104 @@
-통신 시 문제가 발생하는 원인을 특정하기 위해 로깅을 강화하고, 전송 과정 및 응답 과정을 철저히 검증하는 코드 구조를 다음과 같이 개선할 수 있습니다:
+이 문제는 readUnitEndAsync 함수에서 비동기적으로 시리얼 포트에서 데이터를 읽는 과정에서 발생하는 OperationCanceledException (또는 비슷한 IOException)과 관련된 것으로 보입니다. 예를 들어, 프로그램이 종료되거나 스레드가 중단될 때 이러한 예외가 발생할 수 있습니다. 이 상황에서 적절한 로그를 남기고, 코드의 안정성을 높이기 위해 try-catch 블록을 확장하는 방식으로 문제를 해결할 수 있습니다. 아래 코드에서는 예외 처리를 강화하고, 발생한 예외의 로그를 남기는 방식으로 개선된 코드입니다.
 
-1. 전송 데이터 로깅 추가
-전송한 데이터가 제대로 변환되었는지 확인하기 위해 commandBytes의 내용을 로깅합니다. 전송 전에 명령 자체와 변환된 바이트 데이터를 모두 기록합니다.
+우선 예외가 발생하는 이유를 몇 가지 추정해 보겠습니다.
 
-2. 응답 데이터 로깅 추가
-PLC로부터 받은 응답 데이터를 그대로 로깅하여 문제를 추적합니다.
+프로그램 종료 또는 스레드 중단: 응용 프로그램이나 스레드가 종료되면서 현재 진행 중인 IO 작업이 취소되는 상황에서 예외가 발생할 수 있습니다.
+포트 연결 문제: 시리얼 포트 연결이 끊기거나 다른 이유로 작업이 중단되는 경우.
+코드 결함: 코드가 특정 상황을 적절히 처리하지 못해 중단되는 경우.
+아래에 개선된 예외 처리와 로그 남기기 방식을 추가한 readUnitEndAsync 함수를 작성해 드리겠습니다:
 
-3. 예외 세분화
-IO 예외와 기타 예외를 분리하여 처리합니다. IO 관련 문제가 발생했는지, 아니면 다른 로직에서 문제가 생겼는지 구분할 수 있도록 예외를 나눕니다.
-
-4. 전송 및 응답 시간 측정
-타이밍 문제를 확인하기 위해 전송 시작 및 완료 시점을 기록합니다.
-
-개선된 코드 예시
 csharp
 코드 복사
-private async Task SendCommandAsync(string command)
+using System;
+using System.IO.Ports;
+using System.Threading.Tasks;
+
+public class PlcCommunication
 {
-    try
+    private SerialPort _serialPort;
+
+    public PlcCommunication(SerialPort serialPort)
     {
-        if (_serialPort.IsOpen)
-        {
-            // 전송 데이터 로깅
-            byte[] commandBytes = Encoding.ASCII.GetBytes(command);
-            await LogHelper.Instance.WriteLogAsync($"[SEND] Command: {command}, Bytes: {BitConverter.ToString(commandBytes)}");
-
-            // 전송 시간 기록
-            DateTime sendStartTime = DateTime.Now;
-            await _serialPort.BaseStream.WriteAsync(commandBytes, 0, commandBytes.Length);
-            await _serialPort.BaseStream.FlushAsync();
-            DateTime sendEndTime = DateTime.Now;
-
-            // 전송 완료 로깅
-            await LogHelper.Instance.WriteLogAsync($"[SEND] Data sent successfully. Time: {sendEndTime - sendStartTime}");
-
-            // 응답 처리
-            await ReceiveResponseAsync();
-        }
-        else
-        {
-            await LogHelper.Instance.WriteLogAsync("[ERROR] Serial port is not open.");
-        }
+        _serialPort = serialPort;
     }
-    catch (IOException ioEx)
-    {
-        // IO 예외 처리
-        await LogHelper.Instance.WriteLogAsync($"[ERROR] IO Exception: {ioEx.Message}");
-    }
-    catch (Exception ex)
-    {
-        // 일반 예외 처리
-        await LogHelper.Instance.WriteLogAsync($"[ERROR] Exception: {ex.Message}");
-    }
-}
 
-private async Task ReceiveResponseAsync()
-{
-    try
+    public async Task<string> ReadUnitEndAsync()
     {
-        if (_serialPort.IsOpen)
+        var buffer = new byte[256];
+        try
         {
-            // 응답 읽기
-            byte[] buffer = new byte[1024];
-            int bytesRead = await _serialPort.BaseStream.ReadAsync(buffer, 0, buffer.Length);
-
-            // 응답 데이터 로깅
-            string response = Encoding.ASCII.GetString(buffer, 0, bytesRead);
-            await LogHelper.Instance.WriteLogAsync($"[RECEIVE] Response: {response}, Bytes: {BitConverter.ToString(buffer, 0, bytesRead)}");
-
-            // 응답 검증 (예: OK 확인)
-            if (response.Contains("OK"))
+            while (true)
             {
-                await LogHelper.Instance.WriteLogAsync("[RECEIVE] Valid response received: OK");
-            }
-            else
-            {
-                await LogHelper.Instance.WriteLogAsync("[RECEIVE] Invalid response or error.");
+                int bytesRead = await _serialPort.BaseStream.ReadAsync(buffer, 0, buffer.Length);
+                
+                // 데이터를 성공적으로 읽었을 때 처리 로직 추가
+                if (bytesRead > 0)
+                {
+                    string receivedData = System.Text.Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                    Log("Data received: " + receivedData);
+                    return receivedData;
+                }
             }
         }
-        else
+        catch (OperationCanceledException ex)
         {
-            await LogHelper.Instance.WriteLogAsync("[ERROR] Serial port is not open during response.");
+            LogError("Read operation canceled: " + ex.Message);
+            // 필요한 정리 작업 (리소스 해제, 상태 초기화 등)
+            return "Operation canceled";
+        }
+        catch (IOException ex)
+        {
+            LogError("I/O error during reading: " + ex.Message);
+            // 포트가 끊어졌을 가능성이 높으므로 재연결 또는 오류 상태 처리
+            ReconnectPort();
+            return "I/O error";
+        }
+        catch (Exception ex)
+        {
+            LogError("Unexpected error: " + ex.Message);
+            return "Unexpected error";
         }
     }
-    catch (IOException ioEx)
+
+    private void Log(string message)
     {
-        await LogHelper.Instance.WriteLogAsync($"[ERROR] IO Exception during response: {ioEx.Message}");
+        msgvs.Instance.LogT5($"INFO: {message}");
     }
-    catch (Exception ex)
+
+    private void LogError(string message)
     {
-        await LogHelper.Instance.WriteLogAsync($"[ERROR] Exception during response: {ex.Message}");
+        msgvs.Instance.LogT5($"ERROR: {message}");
+    }
+
+    private void ReconnectPort()
+    {
+        try
+        {
+            if (_serialPort.IsOpen)
+            {
+                _serialPort.Close();
+            }
+            _serialPort.Open();
+            Log("Port reconnected successfully.");
+        }
+        catch (Exception ex)
+        {
+            LogError("Failed to reconnect port: " + ex.Message);
+        }
     }
 }
-주요 개선 사항 설명
-전송/응답 데이터 로깅:
+개선사항 요약
+try-catch 블록 강화:
 
-전송 명령과 변환된 바이트 데이터를 기록하여 명령이 올바른지 확인합니다.
-응답 데이터를 기록하여 PLC의 응답 상태를 분석합니다.
-시간 측정:
+OperationCanceledException: 스레드 중단이나 프로그램 종료로 인해 발생할 수 있는 상황을 포착하여 해당 로그를 남기고 이후의 정리 작업을 처리할 수 있도록 했습니다.
+IOException: 시리얼 포트 연결 문제로 인한 오류를 포착하여 로그를 남기고 포트를 재연결하는 기능 (ReconnectPort)을 추가했습니다.
+그 외 예외 처리: 알 수 없는 예외가 발생했을 경우에도 로그를 남겨 문제를 쉽게 파악할 수 있도록 했습니다.
+로그 남기기 (Log 메서드):
 
-전송 소요 시간과 응답 시간을 측정하여 네트워크 지연 또는 타이밍 문제를 확인합니다.
-예외 처리 강화:
+예외 발생 시 정확한 로그 메시지를 남겨 문제 발생 시점과 원인을 추적하기 쉽게 했습니다.
+msgvs.Instance.LogT5(string) 메서드를 사용해 INFO와 ERROR로 구분하여 로그를 기록하도록 했습니다.
+재연결 로직 (ReconnectPort 메서드):
 
-IO 예외와 일반 예외를 분리하여 원인 분석을 용이하게 합니다.
-로깅 형식 통일:
-
-[SEND], [RECEIVE], [ERROR]와 같은 태그를 붙여 로그를 구분하고, 데이터 내용을 직관적으로 파악할 수 있도록 합니다.
-이 코드로 로깅을 강화하면, PLC 또는 선로 문제를 명확히 구분하고, 통신 과정을 상세히 추적할 수 있습니다.
-
-
-
-
-
-
-
-
-
-
-
-
-ChatGPT는 실수를 할 수 있습니다. 중요한 정보를 확인하세요.
+만약 포트 연결이 끊어지거나 문제가 발생했을 때, 시리얼 포트를 재연결하는 기능을 추가하여 통신의 안정성을 높였습니다.
+문제 발생 이유 및 해결 방법
+프로그램 종료나 스레드 종료로 인한 문제: 스레드가 강제로 종료되거나 프로그램이 종료될 때 await 상태에 있는 IO 작업이 취소되며 발생할 수 있습니다. 이 경우 OperationCanceledException을 포착하고 로그를 남겨 이후 처리를 할 수 있게 했습니다.
