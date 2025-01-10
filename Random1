@@ -1,102 +1,105 @@
-SQL Server에서 자동으로 실행되는 작업 중 가장 부하가 큰 작업을 찾고, 그 안에서 평균 실행 시간과 문제를 일으키는 쿼리를 파악하려면, SQL Agent 작업, Stored Procedure, 트리거 또는 다른 주기적 작업에서 실행된 쿼리를 모니터링해야 합니다. 아래는 이를 확인하는 방법입니다.
+sys_policy_purge_history는 SQL Server에서 **Policy-Based Management(정책 기반 관리)**와 관련된 시스템 프로시저입니다. 이 프로시저는 Policy-Based Management에서 생성된 기록을 정리(purge)하는 데 사용됩니다. 기본적으로 SQL Server 에이전트 작업(Scheduled Job)으로 주기적으로 실행되며, 오래된 정책 평가 기록을 삭제하여 msdb 데이터베이스의 크기를 관리합니다.
 
-1. 최근 실행된 작업(Job) 분석
-SQL Agent 작업(Job) 중 가장 오래 실행되거나 부하가 큰 작업을 확인하려면 아래 쿼리를 실행합니다.
+1. sys_policy_purge_history란?
+역할: Policy-Based Management에서 생성된 오래된 기록을 정리하여 msdb 데이터베이스의 크기를 제어.
+관련 테이블:
+msdb.dbo.syspolicy_policy_execution_history
+msdb.dbo.syspolicy_policy_execution_history_details
+실행 주기: 기본적으로 SQL Server 설치 시, SQL Agent Job으로 생성되어 정기적으로 실행됩니다.
+2. 왜 부하를 유발하나?
+sys_policy_purge_history가 부하를 유발하는 주요 원인은 다음과 같습니다:
 
+기록 데이터 과다:
+정책 실행 기록이 많을 경우 삭제 작업에 과도한 리소스가 소모됩니다.
+특히 msdb 데이터베이스의 크기가 클 경우 더 많은 IO가 발생.
+잘못된 설정:
+기본적으로 정책 기록은 오래된 데이터만 삭제해야 하지만, 설정이 잘못된 경우 모든 데이터를 삭제하려 시도할 수 있습니다.
+병목 현상:
+Purge 작업이 다른 작업과 겹쳐 리소스 경쟁이 발생.
+3. sys_policy_purge_history를 확인하고 수정하는 방법
+3.1 SQL Agent 작업 확인
+SQL Server 설치 시 기본적으로 생성되는 Policy History Cleanup 작업이 sys_policy_purge_history를 실행합니다. 해당 작업을 확인하고 설정을 조정할 수 있습니다.
+
+SQL 에이전트 작업 확인
 sql
 코드 복사
--- SQL Agent 작업 실행 기록 분석
+-- SQL Agent 작업 확인
 SELECT 
-    j.name AS JobName, -- 작업 이름
-    h.run_date AS RunDate, -- 실행 날짜
-    h.run_time AS RunTime, -- 실행 시작 시간
-    msdb.dbo.agent_datetime(h.run_date, h.run_time) AS StartDateTime, -- 실행 시작 시각
-    h.run_duration AS RunDuration, -- 실행 소요 시간 (HHMMSS 형식)
-    CASE h.run_status
-        WHEN 0 THEN 'Failed'
-        WHEN 1 THEN 'Succeeded'
-        WHEN 2 THEN 'Retry'
-        WHEN 3 THEN 'Canceled'
-        ELSE 'Unknown'
-    END AS RunStatus, -- 작업 상태
-    s.step_name AS StepName, -- 작업 단계 이름
-    s.command AS CommandText -- 실행된 T-SQL 또는 명령어
+    j.name AS JobName,
+    s.step_name AS StepName,
+    s.command AS CommandText
 FROM msdb.dbo.sysjobs j
-JOIN msdb.dbo.sysjobhistory h
-    ON j.job_id = h.job_id
 JOIN msdb.dbo.sysjobsteps s
     ON j.job_id = s.job_id
-WHERE h.run_date = CONVERT(VARCHAR(8), GETDATE(), 112) -- 오늘 실행된 작업
-ORDER BY h.run_duration DESC; -- 실행 시간 기준 정렬
-쿼리 설명
-JobName: 작업 이름.
-RunDuration: 실행된 작업의 소요 시간(HHMMSS).
-CommandText: 작업 단계에서 실행된 실제 T-SQL 쿼리 또는 명령.
-2. 가장 부하가 큰 쿼리 찾기
-자동 실행되는 작업(Job) 또는 주기적으로 실행되는 쿼리 중 평균 실행 시간이 높은 쿼리를 찾으려면 다음 쿼리를 실행합니다.
+WHERE s.command LIKE '%sys_policy_purge_history%';
+출력 결과에서 JobName을 확인한 후 SQL Server Management Studio(SSMS)에서 해당 작업을 열어 주기(스케줄)와 실행 내용을 확인합니다.
+
+3.2 수동으로 실행 여부 확인
+SQL Agent를 통해 실행되지 않고 수동으로 실행되었는지 확인하려면 다음 쿼리를 사용하세요.
 
 sql
 코드 복사
--- 평균 실행 시간 기준으로 상위 10개 쿼리 찾기
-WITH QueryStats AS (
-    SELECT 
-        qs.sql_handle,
-        qs.plan_handle,
-        qs.creation_time,
-        qs.last_execution_time,
-        qs.execution_count, -- 실행 횟수
-        qs.total_worker_time / 1000 AS TotalCPUTime_ms, -- 총 CPU 시간 (ms)
-        qs.total_elapsed_time / 1000 AS TotalElapsedTime_ms, -- 총 실행 시간 (ms)
-        qs.total_elapsed_time / NULLIF(qs.execution_count, 0) / 1000 AS AvgElapsedTime_ms, -- 평균 실행 시간 (ms)
-        qs.total_logical_reads AS TotalLogicalReads, -- 논리적 읽기 수
-        qs.total_logical_reads / NULLIF(qs.execution_count, 0) AS AvgLogicalReads, -- 평균 논리적 읽기
-        qs.total_physical_reads AS TotalPhysicalReads, -- 물리적 읽기 수
-        qs.total_logical_writes AS TotalLogicalWrites -- 논리적 쓰기 수
-    FROM sys.dm_exec_query_stats qs
-    WHERE qs.execution_count > 0 -- 실행된 적이 있는 쿼리만 포함
-)
+-- sys_policy_purge_history의 최근 실행 기록 확인
 SELECT TOP 10
-    DB_NAME(DB_ID()) AS DatabaseName, -- 데이터베이스 이름
-    qs.execution_count AS ExecutionCount, -- 실행 횟수
-    qs.AvgElapsedTime_ms AS AvgExecutionTime_ms, -- 평균 실행 시간 (ms)
-    qs.TotalCPUTime_ms AS TotalCPUTime_ms, -- 총 CPU 시간 (ms)
-    qs.AvgLogicalReads AS AvgLogicalReads, -- 평균 논리적 읽기
-    qs.TotalLogicalWrites AS TotalLogicalWrites, -- 총 논리적 쓰기
-    SUBSTRING(st.text, (qs.statement_start_offset / 2) + 1, 
-              ((CASE qs.statement_end_offset 
-                  WHEN -1 THEN DATALENGTH(st.text)
-                  ELSE qs.statement_end_offset
-              END - qs.statement_start_offset) / 2) + 1) AS QueryText -- 실행된 쿼리
-FROM QueryStats qs
-CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-ORDER BY qs.AvgElapsedTime_ms DESC; -- 평균 실행 시간 기준 정렬
-쿼리 설명
-AvgElapsedTime_ms: 쿼리의 평균 실행 시간(밀리초).
-ExecutionCount: 쿼리 실행 횟수.
-QueryText: 실제로 실행된 쿼리 텍스트.
-TotalCPUTime_ms: 쿼리가 사용한 총 CPU 시간.
-AvgLogicalReads: 쿼리 실행당 평균 논리적 읽기.
-3. 문제가 되는 쿼리의 실행 계획 확인
-위에서 확인된 문제가 되는 쿼리를 실행 계획으로 분석하여 최적화합니다.
+    p.name AS ProcedureName,
+    l.start_time,
+    l.end_time,
+    l.status,
+    l.error_message
+FROM msdb.dbo.sysjobhistory l
+JOIN msdb.dbo.sysjobs j ON l.job_id = j.job_id
+WHERE j.name LIKE '%Policy History Cleanup%'
+ORDER BY l.start_time DESC;
+3.3 기본 작업 수정
+Policy History Cleanup 작업을 수정하거나 비활성화할 수 있습니다.
 
-실행 계획 확인
+작업 스케줄 수정
+SSMS에서 SQL Server Agent → Jobs → Policy History Cleanup을 엽니다.
+스케줄 탭에서 실행 주기를 조정합니다.
+매일 실행 → 주간 실행으로 변경.
+부하가 적은 시간대로 스케줄링.
+작업 비활성화
+만약 필요하지 않다면 작업을 비활성화할 수 있습니다.
+
 sql
 코드 복사
--- 실행 계획 확인
-SET SHOWPLAN_XML ON; -- 실행 계획을 XML 형식으로 출력
--- 문제가 되는 쿼리 실행
-<여기에 문제 쿼리를 입력하세요>
-SET SHOWPLAN_XML OFF;
-4. 쿼리 최적화
-문제가 되는 쿼리를 확인한 후 아래 방법으로 최적화합니다:
+-- 작업 비활성화
+EXEC msdb.dbo.sp_update_job @job_name = 'Policy History Cleanup', @enabled = 0;
+4. msdb 데이터베이스 최적화
+sys_policy_purge_history가 실행되더라도 부하를 줄이기 위해 msdb 데이터베이스를 최적화합니다.
 
-인덱스 추가:
-쿼리에서 자주 검색되는 열에 적절한 인덱스를 추가.
-실행 계획 분석:
-실행 계획에서 테이블 스캔(Table Scan)이나 인덱스 스캔(Index Scan)을 줄이고 인덱스 탐색(Index Seek)을 유도.
-쿼리 리팩토링:
-불필요한 JOIN 제거, 서브쿼리 최적화 등.
-요약
-위의 두 가지 쿼리로 다음을 확인할 수 있습니다:
+오래된 기록 수동 정리
+오래된 정책 실행 기록을 수동으로 삭제합니다.
+sql
+코드 복사
+-- 오래된 정책 실행 기록 삭제
+DELETE FROM msdb.dbo.syspolicy_policy_execution_history
+WHERE end_date < DATEADD(MONTH, -3, GETDATE());
+관련 세부 기록 삭제:
+sql
+코드 복사
+DELETE FROM msdb.dbo.syspolicy_policy_execution_history_details
+WHERE policy_execution_history_id NOT IN (
+    SELECT policy_execution_history_id FROM msdb.dbo.syspolicy_policy_execution_history
+);
+msdb 인덱스 재구성
+msdb 데이터베이스의 성능을 최적화하기 위해 인덱스를 재구성합니다.
 
-SQL Agent 작업 중 실행 시간이 긴 작업 (RunDuration 기준).
+sql
+코드 복사
+-- msdb 데이터베이스 인덱스 재구성
+USE msdb;
+EXEC sp_MSforeachtable @command1='ALTER INDEX ALL ON ? REBUILD';
+5. 결론 및 조치
+sys_policy_purge_history는 SQL Server가 msdb 데이터베이스의 기록을 관리하기 위한 시스템 프로시저입니다.
+부하를 줄이는 방법:
+Policy History Cleanup 작업의 주기를 조정하거나 부하가 적은 시간대로 옮김.
+오래된 정책 기록을 수동으로 삭제.
+msdb 데이터베이스 최적화(인덱스 재구성 등).
+필요 시 작업을 비활성화하거나, 정책 기반 관리 기능이 필요 없다면 전체 Policy-Based Management를 비활성화할 수도 있습니다.
+sql
+코드 복사
+-- Policy-Based Management 비활성화
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure 'Policy-Based Management Enabled', 0;
