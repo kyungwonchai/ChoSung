@@ -1,31 +1,77 @@
-s.dm_io_virtual_file_stats에서 num_of_reads 또는 num_of_writes가 0일 때 발생합니다. 이를 방지하기 위해 NULLIF 함수를 사용하여 나누는 값이 0일 경우 NULL로 처리합니다. 아래는 수정된 코드입니다.
+정 인스턴스에서 최근 10분간 CPU 부하를 초래한 가장 큰 이유(쿼리)를 찾으려면, **sys.dm_exec_requests, sys.dm_exec_sessions, sys.dm_exec_query_stats, sys.dm_exec_sql_text**와 같은 동적 관리 뷰(DMV)를 활용해야 합니다. 아래는 상세한 쿼리입니다.
 
+최근 10분간 CPU 부하 원인 찾는 쿼리
 sql
 코드 복사
--- IO 부하 확인 (0으로 나누기 방지)
+-- 최근 10분간 CPU 부하를 초래한 쿼리 찾기
+WITH RecentCPUUsage AS (
+    SELECT 
+        qs.sql_handle,
+        qs.plan_handle,
+        qs.creation_time,
+        qs.last_execution_time,
+        qs.total_worker_time / 1000 AS TotalCPUTime_ms, -- CPU 시간(ms 단위)
+        qs.execution_count,
+        qs.total_worker_time / NULLIF(qs.execution_count, 0) / 1000 AS AvgCPUTimePerExec_ms, -- 실행당 평균 CPU 시간
+        qs.total_elapsed_time / 1000 AS TotalElapsedTime_ms, -- 총 실행 시간
+        qs.total_elapsed_time / NULLIF(qs.execution_count, 0) / 1000 AS AvgElapsedTimePerExec_ms, -- 실행당 평균 지연 시간
+        qs.total_logical_reads AS TotalLogicalReads, -- 논리적 읽기 수
+        qs.total_physical_reads AS TotalPhysicalReads, -- 물리적 읽기 수
+        qs.total_logical_writes AS TotalLogicalWrites -- 논리적 쓰기 수
+    FROM sys.dm_exec_query_stats qs
+    WHERE qs.last_execution_time > DATEADD(MINUTE, -10, GETDATE()) -- 최근 10분 동안 실행된 쿼리
+)
 SELECT 
-    DB_NAME(fs.database_id) AS DatabaseName,
-    CASE 
-        WHEN fs.num_of_reads = 0 THEN NULL
-        ELSE fs.io_stall_read_ms / NULLIF(fs.num_of_reads, 0)
-    END AS AvgReadLatency_ms,
-    CASE 
-        WHEN fs.num_of_writes = 0 THEN NULL
-        ELSE fs.io_stall_write_ms / NULLIF(fs.num_of_writes, 0)
-    END AS AvgWriteLatency_ms,
-    fs.io_stall_read_ms AS TotalReadStall_ms,
-    fs.io_stall_write_ms AS TotalWriteStall_ms
-FROM sys.dm_io_virtual_file_stats(NULL, NULL) fs
-ORDER BY AvgReadLatency_ms DESC;
-수정된 코드 설명
-NULLIF(fs.num_of_reads, 0) 사용
+    TOP 10
+    DB_NAME(es.database_id) AS DatabaseName, -- 데이터베이스 이름
+    es.host_name AS HostName, -- 클라이언트 호스트 이름
+    es.login_name AS LoginName, -- 로그인 사용자
+    es.program_name AS ProgramName, -- 실행 프로그램 이름
+    rc.TotalCPUTime_ms, -- 총 CPU 사용량
+    rc.AvgCPUTimePerExec_ms, -- 실행당 평균 CPU 사용량
+    rc.execution_count AS ExecutionCount, -- 실행 횟수
+    rc.TotalElapsedTime_ms, -- 총 실행 시간
+    rc.AvgElapsedTimePerExec_ms, -- 실행당 평균 지연 시간
+    rc.TotalLogicalReads, -- 논리적 읽기
+    rc.TotalPhysicalReads, -- 물리적 읽기
+    rc.TotalLogicalWrites, -- 논리적 쓰기
+    SUBSTRING(sqltext.text, (req.statement_start_offset / 2) + 1, 
+              ((CASE req.statement_end_offset 
+                   WHEN -1 THEN DATALENGTH(sqltext.text) 
+                   ELSE req.statement_end_offset 
+               END - req.statement_start_offset) / 2) + 1) AS QueryText -- 쿼리 텍스트
+FROM RecentCPUUsage rc
+INNER JOIN sys.dm_exec_requests req ON rc.plan_handle = req.plan_handle
+INNER JOIN sys.dm_exec_sessions es ON req.session_id = es.session_id
+CROSS APPLY sys.dm_exec_sql_text(rc.sql_handle) AS sqltext
+WHERE es.is_user_process = 1 -- 사용자 세션만 포함
+ORDER BY rc.TotalCPUTime_ms DESC; -- 총 CPU 사용량 기준 정렬
+쿼리 설명
+sys.dm_exec_query_stats:
 
-fs.num_of_reads가 0이면 NULL을 반환하여 나누기 연산을 방지합니다.
-CASE 문
+CPU 사용량(total_worker_time), 실행 횟수(execution_count), 논리적/물리적 읽기(total_logical_reads, total_physical_reads), 지연 시간(total_elapsed_time) 등의 데이터를 제공합니다.
+sys.dm_exec_requests 및 sys.dm_exec_sessions:
 
-fs.num_of_reads 또는 fs.num_of_writes가 0인 경우 NULL로 표시하여 평균 지연 시간이 계산되지 않도록 합니다.
-정렬 기준
+현재 실행 중인 요청과 세션 정보를 제공합니다.
+세션의 사용자 이름(login_name), 클라이언트 호스트 이름(host_name), 프로그램 이름(program_name)을 확인합니다.
+sys.dm_exec_sql_text:
 
-AvgReadLatency_ms 값이 계산된 경우에만 정렬되도록 합니다.
-출력 결과
-AvgReadLatency_ms와 AvgWriteLatency_ms는 값이 계산되지 않는 경우 NULL로 표시됩니다.
+쿼리 텍스트를 추출하여 실행 중인 SQL을 확인합니다.
+DATEADD(MINUTE, -10, GETDATE()):
+
+최근 10분 동안 실행된 쿼리를 필터링합니다.
+CPU 사용량 기준 정렬:
+
+총 CPU 사용량(TotalCPUTime_ms)이 높은 순으로 정렬합니다.
+주요 결과
+DatabaseName: 부하를 발생시킨 쿼리가 실행된 데이터베이스 이름.
+HostName: 쿼리를 실행한 클라이언트 호스트.
+LoginName: 쿼리를 실행한 사용자.
+ProgramName: 실행 프로그램(예: SSMS, 애플리케이션).
+QueryText: 부하를 발생시킨 실제 SQL 쿼리.
+TotalCPUTime_ms: 쿼리가 사용한 총 CPU 시간.
+AvgCPUTimePerExec_ms: 쿼리 실행당 평균 CPU 시간.
+추가 조치
+문제가 되는 쿼리 최적화:
+CPU 부하가 큰 쿼리를 분석하여 인덱스 추가, 쿼리 리팩토링 또는 실행 계획을 검토.
+리소스 관리:
