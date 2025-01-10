@@ -1,17 +1,185 @@
-￦￦10.22.22.22\Result에는
-폴더들이있다 
-작업을 하나해야하고 이 작업은 작업종료후 1분쉬고
-다시 해야해
+어진 요구사항을 기준으로 C# 비동기 패턴을 사용하여 MSSQL 데이터베이스에 데이터를 업로드하는 서비스를 작성하는 방법을 아래에 상세히 설명하겠습니다.
 
-작업이 뭐냐면
-내가 기억하는 가장 마지막에 수정된 파일의 수정시간(최초는 1년전시간) 보다 큰 모든 .csv파일을 공유모드로 열어 DB로넘겨야해
+1. 작업 프로세스 요약
+가장 마지막 수정된 시간 기억: 초기값은 1년 전으로 설정.
+폴더 및 파일 검색: \\10.22.22.22\Result 하위 모든 폴더에서 .csv 파일 검색.
+수정 시간 비교: 마지막 기억된 수정 시간 이후의 파일만 읽기.
+CSV 데이터 읽기: 공유 모드로 파일을 열고 데이터를 읽음.
+DB 저장:
+컬럼 매핑:
+InspectionTime → datetime
+ModelName, AlignResult 등 문자열 값.
+MPxDATA (x=1~4) → float.
+AlignResult가 N/A인 경우 업로드하지 않음.
+1분 대기 후 재작업 반복.
+2. 코드 구성
+2.1 주요 클래스
+FileProcessor: 파일 처리 클래스.
+DatabaseUploader: MSSQL 업로드 처리 클래스.
+ServiceRunner: 서비스 실행 및 반복 관리 클래스.
+2.2 C# 코드
+csharp
+코드 복사
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 
-경로형식은 그 Result안에  폴더A\yyyyMMdd 안에 어떤 폴더 안에,  파일들이있는데
-이때  csv탐색은 그 Result하위 모든 파일대상으로 해주면되고
-속도최적을 위해 항상 ,, 기존에 기억된 값이후의 시간부터 내가 읽어야할 대상파일을 찾으면될거야
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var service = new ServiceRunner();
+        await service.StartAsync();
+    }
+}
 
-그리고 이제 저장을 해야하는데
-컬럼 A~K를 DB에 넣으면되 
-순서대￦￦로
-InspectionTime,  ModelName, AlignResult, MP1DATA,MP1RESULT,MP2DATA,MP2RESULT,MP3DATA,MP3RESULT,MP4DATA,MP4RESULT 이때 뒤에 DATA거 븉운ㅁ=콜롬았자 그건 float 속성이고
-앞에 첫열은 datatime
+public class ServiceRunner
+{
+    private DateTime _lastProcessedTime = DateTime.Now.AddYears(-1); // 최초 1년 전 시간
+
+    public async Task StartAsync()
+    {
+        while (true)
+        {
+            try
+            {
+                Console.WriteLine($"작업 시작: {DateTime.Now}");
+                var processor = new FileProcessor(_lastProcessedTime);
+                var newFiles = processor.GetNewFiles(@"\\10.22.22.22\Result");
+
+                if (newFiles.Any())
+                {
+                    foreach (var file in newFiles)
+                    {
+                        Console.WriteLine($"파일 처리 중: {file}");
+                        var rows = processor.ReadCsv(file);
+                        var uploader = new DatabaseUploader();
+                        await uploader.UploadToDatabaseAsync(rows);
+                    }
+
+                    // 마지막 수정 시간 업데이트
+                    _lastProcessedTime = newFiles.Max(f => File.GetLastWriteTime(f));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"에러 발생: {ex.Message}");
+            }
+
+            // 1분 대기
+            Console.WriteLine("1분 대기 중...");
+            await Task.Delay(TimeSpan.FromMinutes(1));
+        }
+    }
+}
+
+public class FileProcessor
+{
+    private readonly DateTime _lastProcessedTime;
+
+    public FileProcessor(DateTime lastProcessedTime)
+    {
+        _lastProcessedTime = lastProcessedTime;
+    }
+
+    public List<string> GetNewFiles(string rootPath)
+    {
+        // Result 하위 모든 폴더에서 새로운 파일 탐색
+        return Directory.GetFiles(rootPath, "*.csv", SearchOption.AllDirectories)
+                        .Where(file => File.GetLastWriteTime(file) > _lastProcessedTime)
+                        .ToList();
+    }
+
+    public List<Dictionary<string, object>> ReadCsv(string filePath)
+    {
+        var rows = new List<Dictionary<string, object>>();
+
+        using (var reader = new StreamReader(new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
+        {
+            var headers = reader.ReadLine()?.Split(','); // 첫 번째 줄은 헤더
+            if (headers == null) throw new InvalidOperationException("CSV 파일이 비어있습니다.");
+
+            while (!reader.EndOfStream)
+            {
+                var values = reader.ReadLine()?.Split(',');
+                if (values == null || values.Length < headers.Length) continue;
+
+                var row = new Dictionary<string, object>();
+                for (int i = 0; i < headers.Length; i++)
+                {
+                    row[headers[i]] = values[i];
+                }
+
+                // AlignResult가 N/A인 경우 제외
+                if (row.TryGetValue("AlignResult", out var alignResult) && alignResult.ToString() == "N/A")
+                {
+                    continue;
+                }
+
+                rows.Add(row);
+            }
+        }
+
+        return rows;
+    }
+}
+
+public class DatabaseUploader
+{
+    private const string ConnectionString = "Server=YOUR_SERVER;Database=YOUR_DATABASE;User Id=YOUR_USER;Password=YOUR_PASSWORD;";
+
+    public async Task UploadToDatabaseAsync(List<Dictionary<string, object>> rows)
+    {
+        using (var connection = new SqlConnection(ConnectionString))
+        {
+            await connection.OpenAsync();
+
+            foreach (var row in rows)
+            {
+                using (var command = new SqlCommand(
+                    @"INSERT INTO YourTable (InspectionTime, ModelName, AlignResult, MP1DATA, MP1RESULT, MP2DATA, MP2RESULT, MP3DATA, MP3RESULT, MP4DATA, MP4RESULT)
+                      VALUES (@InspectionTime, @ModelName, @AlignResult, @MP1DATA, @MP1RESULT, @MP2DATA, @MP2RESULT, @MP3DATA, @MP3RESULT, @MP4DATA, @MP4RESULT)", connection))
+                {
+                    // 매핑
+                    command.Parameters.AddWithValue("@InspectionTime", DateTime.Parse(row["InspectionTime"].ToString()));
+                    command.Parameters.AddWithValue("@ModelName", row["ModelName"].ToString());
+                    command.Parameters.AddWithValue("@AlignResult", row["AlignResult"].ToString());
+                    command.Parameters.AddWithValue("@MP1DATA", float.Parse(row["MP1DATA"].ToString()));
+                    command.Parameters.AddWithValue("@MP1RESULT", row["MP1RESULT"].ToString());
+                    command.Parameters.AddWithValue("@MP2DATA", float.Parse(row["MP2DATA"].ToString()));
+                    command.Parameters.AddWithValue("@MP2RESULT", row["MP2RESULT"].ToString());
+                    command.Parameters.AddWithValue("@MP3DATA", float.Parse(row["MP3DATA"].ToString()));
+                    command.Parameters.AddWithValue("@MP3RESULT", row["MP3RESULT"].ToString());
+                    command.Parameters.AddWithValue("@MP4DATA", float.Parse(row["MP4DATA"].ToString()));
+                    command.Parameters.AddWithValue("@MP4RESULT", row["MP4RESULT"].ToString());
+
+                    await command.ExecuteNonQueryAsync();
+                }
+            }
+        }
+    }
+}
+3. MSSQL 테이블 생성
+sql
+코드 복사
+CREATE TABLE YourTable (
+    InspectionTime DATETIME NOT NULL,
+    ModelName NVARCHAR(100),
+    AlignResult NVARCHAR(100),
+    MP1DATA FLOAT,
+    MP1RESULT NVARCHAR(100),
+    MP2DATA FLOAT,
+    MP2RESULT NVARCHAR(100),
+    MP3DATA FLOAT,
+    MP3RESULT NVARCHAR(100),
+    MP4DATA FLOAT,
+    MP4RESULT NVARCHAR(100)
+);
+4. 주요 포인트
+CSV 공유 모드로 열기: FileStream으로 FileShare.ReadWrite 옵션 설정.
+비동기 처리: 파일 읽기와 데이터베이스 업로드 모두 비동기로 처리하여 성능 최적화.
+예외 처리: 각 단계에서 예외 발생 시 로그 출력.
+최적화: 마지막 처리된 수정 시간 이후의 파일만 탐색.
