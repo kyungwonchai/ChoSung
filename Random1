@@ -1,95 +1,102 @@
-PU 사용량이 90%까지 치솟는 상황에서 어떤 쿼리가 문제인지 정확히 모르는 경우, 현재 실행 중인 쿼리를 실시간으로 모니터링하여 CPU 사용량이 높은 쿼리를 직접 확인해야 합니다. 아래는 이를 확인하고 분석할 수 있는 방법과 SQL 쿼리입니다.
+SQL Server에서 자동으로 실행되는 작업 중 가장 부하가 큰 작업을 찾고, 그 안에서 평균 실행 시간과 문제를 일으키는 쿼리를 파악하려면, SQL Agent 작업, Stored Procedure, 트리거 또는 다른 주기적 작업에서 실행된 쿼리를 모니터링해야 합니다. 아래는 이를 확인하는 방법입니다.
 
-1. 현재 실행 중인 쿼리 모니터링
-아래 쿼리를 사용하면 현재 CPU 사용량이 높은 쿼리를 실시간으로 확인할 수 있습니다.
+1. 최근 실행된 작업(Job) 분석
+SQL Agent 작업(Job) 중 가장 오래 실행되거나 부하가 큰 작업을 확인하려면 아래 쿼리를 실행합니다.
 
 sql
 코드 복사
--- 현재 실행 중인 CPU 사용량이 높은 쿼리 찾기
+-- SQL Agent 작업 실행 기록 분석
 SELECT 
-    r.session_id,
-    r.status,
-    r.cpu_time / 1000 AS CPUTime_ms, -- 현재 쿼리의 CPU 시간(ms 단위)
-    r.total_elapsed_time / 1000 AS ElapsedTime_ms, -- 총 실행 시간(ms 단위)
-    r.logical_reads, -- 논리적 읽기 수
-    r.reads, -- 물리적 읽기 수
-    r.writes, -- 쓰기 작업 수
-    r.wait_type, -- 대기 유형
-    s.login_name,
-    s.host_name,
-    s.program_name,
-    DB_NAME(r.database_id) AS DatabaseName,
-    SUBSTRING(qt.text, (r.statement_start_offset / 2) + 1, 
-              ((CASE r.statement_end_offset 
-                   WHEN -1 THEN DATALENGTH(qt.text)
-                   ELSE r.statement_end_offset 
-               END - r.statement_start_offset) / 2) + 1) AS QueryText, -- 현재 실행 중인 쿼리 텍스트
-    qp.query_plan AS QueryPlan -- 실행 계획
-FROM sys.dm_exec_requests r
-JOIN sys.dm_exec_sessions s
-    ON r.session_id = s.session_id
-CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS qt
-OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp
-WHERE r.cpu_time > 0 -- CPU를 사용하는 쿼리만 선택
-ORDER BY r.cpu_time DESC; -- CPU 사용량 기준 정렬
-2. 쿼리 설명
-r.cpu_time: 현재 실행 중인 쿼리가 사용한 CPU 시간(ms).
-r.logical_reads, r.reads, r.writes:
-쿼리가 수행한 I/O 작업의 양.
-논리적 읽기와 물리적 읽기가 많은 경우 인덱스가 없거나 비효율적인 쿼리일 가능성이 높습니다.
-r.wait_type:
-대기 유형을 통해 리소스 병목 현상을 확인합니다.
-QueryText:
-실행 중인 SQL 쿼리 텍스트.
-QueryPlan:
-쿼리의 실행 계획을 확인하여 비효율적인 부분을 파악합니다.
-3. 쿼리 분석 후 조치
-3.1 문제가 되는 쿼리 확인
-위 쿼리의 결과에서 CPU 사용량이 가장 높은 쿼리를 확인합니다.
-
-실행 중인 쿼리(QueryText)를 복사하여 직접 실행 계획(Execution Plan)을 확인합니다.
-3.2 쿼리 최적화
-아래와 같은 방식으로 쿼리를 최적화할 수 있습니다.
-
-인덱스 추가: 테이블에 적절한 인덱스를 추가하여 검색 속도를 높입니다.
-쿼리 리팩토링: SELECT * 대신 필요한 열만 조회.
-I/O 병목 해결: 인덱스 제안을 활용하여 논리적/물리적 읽기 횟수를 줄입니다.
-3.3 강제로 세션 종료 (응급 조치)
-문제가 되는 세션을 확인한 후 강제로 종료할 수 있습니다.
+    j.name AS JobName, -- 작업 이름
+    h.run_date AS RunDate, -- 실행 날짜
+    h.run_time AS RunTime, -- 실행 시작 시간
+    msdb.dbo.agent_datetime(h.run_date, h.run_time) AS StartDateTime, -- 실행 시작 시각
+    h.run_duration AS RunDuration, -- 실행 소요 시간 (HHMMSS 형식)
+    CASE h.run_status
+        WHEN 0 THEN 'Failed'
+        WHEN 1 THEN 'Succeeded'
+        WHEN 2 THEN 'Retry'
+        WHEN 3 THEN 'Canceled'
+        ELSE 'Unknown'
+    END AS RunStatus, -- 작업 상태
+    s.step_name AS StepName, -- 작업 단계 이름
+    s.command AS CommandText -- 실행된 T-SQL 또는 명령어
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobhistory h
+    ON j.job_id = h.job_id
+JOIN msdb.dbo.sysjobsteps s
+    ON j.job_id = s.job_id
+WHERE h.run_date = CONVERT(VARCHAR(8), GETDATE(), 112) -- 오늘 실행된 작업
+ORDER BY h.run_duration DESC; -- 실행 시간 기준 정렬
+쿼리 설명
+JobName: 작업 이름.
+RunDuration: 실행된 작업의 소요 시간(HHMMSS).
+CommandText: 작업 단계에서 실행된 실제 T-SQL 쿼리 또는 명령.
+2. 가장 부하가 큰 쿼리 찾기
+자동 실행되는 작업(Job) 또는 주기적으로 실행되는 쿼리 중 평균 실행 시간이 높은 쿼리를 찾으려면 다음 쿼리를 실행합니다.
 
 sql
 코드 복사
--- 문제 쿼리를 종료
-KILL <Session_ID>;
-Session_ID는 위 쿼리 결과에서 가장 높은 CPU 사용량을 가진 세션의 ID를 사용합니다.
-
-4. 장기적인 해결책: Query Store 활용
-SQL Server 2014 SP2 이상에서는 Query Store를 활성화하여 과거 실행 기록 및 CPU 사용량 통계를 확인할 수 있습니다.
-
-Query Store 활성화:
-sql
-코드 복사
-ALTER DATABASE [YourDatabaseName] SET QUERY_STORE = ON;
-ALTER DATABASE [YourDatabaseName] SET QUERY_STORE (OPERATION_MODE = READ_WRITE);
-CPU 사용량이 높은 쿼리 확인:
-sql
-코드 복사
--- Query Store에서 CPU 사용량이 높은 쿼리 확인
+-- 평균 실행 시간 기준으로 상위 10개 쿼리 찾기
+WITH QueryStats AS (
+    SELECT 
+        qs.sql_handle,
+        qs.plan_handle,
+        qs.creation_time,
+        qs.last_execution_time,
+        qs.execution_count, -- 실행 횟수
+        qs.total_worker_time / 1000 AS TotalCPUTime_ms, -- 총 CPU 시간 (ms)
+        qs.total_elapsed_time / 1000 AS TotalElapsedTime_ms, -- 총 실행 시간 (ms)
+        qs.total_elapsed_time / NULLIF(qs.execution_count, 0) / 1000 AS AvgElapsedTime_ms, -- 평균 실행 시간 (ms)
+        qs.total_logical_reads AS TotalLogicalReads, -- 논리적 읽기 수
+        qs.total_logical_reads / NULLIF(qs.execution_count, 0) AS AvgLogicalReads, -- 평균 논리적 읽기
+        qs.total_physical_reads AS TotalPhysicalReads, -- 물리적 읽기 수
+        qs.total_logical_writes AS TotalLogicalWrites -- 논리적 쓰기 수
+    FROM sys.dm_exec_query_stats qs
+    WHERE qs.execution_count > 0 -- 실행된 적이 있는 쿼리만 포함
+)
 SELECT TOP 10
-    qs.query_id,
-    qs.plan_id,
-    qs.avg_cpu_time / 1000 AS AvgCPUTime_ms, -- 평균 CPU 시간(ms 단위)
-    qs.avg_duration / 1000 AS AvgDuration_ms, -- 평균 실행 시간(ms 단위)
-    qs.execution_count,
-    qs.last_execution_time,
-    qt.query_sql_text,
-    qp.query_plan
-FROM sys.query_store_runtime_stats qs
-JOIN sys.query_store_query_text qt
-    ON qs.query_id = qt.query_id
-JOIN sys.query_store_plan qp
-    ON qs.plan_id = qp.plan_id
-ORDER BY qs.avg_cpu_time DESC;
-5. 결론
-실시간 확인: 현재 CPU 사용량이 높은 쿼리를 위 쿼리로 즉시 확인.
-응급 조치: 필요 시 해당 세션 종료.
+    DB_NAME(DB_ID()) AS DatabaseName, -- 데이터베이스 이름
+    qs.execution_count AS ExecutionCount, -- 실행 횟수
+    qs.AvgElapsedTime_ms AS AvgExecutionTime_ms, -- 평균 실행 시간 (ms)
+    qs.TotalCPUTime_ms AS TotalCPUTime_ms, -- 총 CPU 시간 (ms)
+    qs.AvgLogicalReads AS AvgLogicalReads, -- 평균 논리적 읽기
+    qs.TotalLogicalWrites AS TotalLogicalWrites, -- 총 논리적 쓰기
+    SUBSTRING(st.text, (qs.statement_start_offset / 2) + 1, 
+              ((CASE qs.statement_end_offset 
+                  WHEN -1 THEN DATALENGTH(st.text)
+                  ELSE qs.statement_end_offset
+              END - qs.statement_start_offset) / 2) + 1) AS QueryText -- 실행된 쿼리
+FROM QueryStats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+ORDER BY qs.AvgElapsedTime_ms DESC; -- 평균 실행 시간 기준 정렬
+쿼리 설명
+AvgElapsedTime_ms: 쿼리의 평균 실행 시간(밀리초).
+ExecutionCount: 쿼리 실행 횟수.
+QueryText: 실제로 실행된 쿼리 텍스트.
+TotalCPUTime_ms: 쿼리가 사용한 총 CPU 시간.
+AvgLogicalReads: 쿼리 실행당 평균 논리적 읽기.
+3. 문제가 되는 쿼리의 실행 계획 확인
+위에서 확인된 문제가 되는 쿼리를 실행 계획으로 분석하여 최적화합니다.
+
+실행 계획 확인
+sql
+코드 복사
+-- 실행 계획 확인
+SET SHOWPLAN_XML ON; -- 실행 계획을 XML 형식으로 출력
+-- 문제가 되는 쿼리 실행
+<여기에 문제 쿼리를 입력하세요>
+SET SHOWPLAN_XML OFF;
+4. 쿼리 최적화
+문제가 되는 쿼리를 확인한 후 아래 방법으로 최적화합니다:
+
+인덱스 추가:
+쿼리에서 자주 검색되는 열에 적절한 인덱스를 추가.
+실행 계획 분석:
+실행 계획에서 테이블 스캔(Table Scan)이나 인덱스 스캔(Index Scan)을 줄이고 인덱스 탐색(Index Seek)을 유도.
+쿼리 리팩토링:
+불필요한 JOIN 제거, 서브쿼리 최적화 등.
+요약
+위의 두 가지 쿼리로 다음을 확인할 수 있습니다:
+
+SQL Agent 작업 중 실행 시간이 긴 작업 (RunDuration 기준).
