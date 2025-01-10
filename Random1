@@ -1,23 +1,6 @@
-어진 요구사항을 기준으로 C# 비동기 패턴을 사용하여 MSSQL 데이터베이스에 데이터를 업로드하는 서비스를 작성하는 방법을 아래에 상세히 설명하겠습니다.
+아래는 요청한 기능을 반영한 수정된 C# 전체 솔루션 코드입니다. InspectionTime과 ModelName을 고유 키로 사용하며, 중복 데이터를 방지하고, IP 정보를 ipname 컬럼에 추가하도록 구현하였습니다. 또한 프로그램 중단 상황을 대비하여 데이터베이스에서 마지막 업로드된 정보를 확인하고 작업을 이어갈 수 있도록 수정했습니다.
 
-1. 작업 프로세스 요약
-가장 마지막 수정된 시간 기억: 초기값은 1년 전으로 설정.
-폴더 및 파일 검색: \\10.22.22.22\Result 하위 모든 폴더에서 .csv 파일 검색.
-수정 시간 비교: 마지막 기억된 수정 시간 이후의 파일만 읽기.
-CSV 데이터 읽기: 공유 모드로 파일을 열고 데이터를 읽음.
-DB 저장:
-컬럼 매핑:
-InspectionTime → datetime
-ModelName, AlignResult 등 문자열 값.
-MPxDATA (x=1~4) → float.
-AlignResult가 N/A인 경우 업로드하지 않음.
-1분 대기 후 재작업 반복.
-2. 코드 구성
-2.1 주요 클래스
-FileProcessor: 파일 처리 클래스.
-DatabaseUploader: MSSQL 업로드 처리 클래스.
-ServiceRunner: 서비스 실행 및 반복 관리 클래스.
-2.2 C# 코드
+전체 코드
 csharp
 코드 복사
 using System;
@@ -31,6 +14,7 @@ class Program
 {
     static async Task Main(string[] args)
     {
+        // 서비스 실행 시작
         var service = new ServiceRunner();
         await service.StartAsync();
     }
@@ -38,7 +22,29 @@ class Program
 
 public class ServiceRunner
 {
-    private DateTime _lastProcessedTime = DateTime.Now.AddYears(-1); // 최초 1년 전 시간
+    private DateTime _lastInspectionTime;
+
+    public ServiceRunner()
+    {
+        // DB에서 마지막 InspectionTime 가져오기
+        _lastInspectionTime = GetLastInspectionTimeFromDatabase();
+    }
+
+    // DB에서 마지막 InspectionTime을 가져오는 함수
+    private DateTime GetLastInspectionTimeFromDatabase()
+    {
+        const string query = "SELECT MAX(InspectionTime) FROM YourTable";
+
+        using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(query, connection))
+            {
+                var result = command.ExecuteScalar();
+                return result == DBNull.Value ? DateTime.Now.AddYears(-1) : Convert.ToDateTime(result);
+            }
+        }
+    }
 
     public async Task StartAsync()
     {
@@ -47,7 +53,9 @@ public class ServiceRunner
             try
             {
                 Console.WriteLine($"작업 시작: {DateTime.Now}");
-                var processor = new FileProcessor(_lastProcessedTime);
+                
+                // 파일 처리 클래스 초기화
+                var processor = new FileProcessor(_lastInspectionTime);
                 var newFiles = processor.GetNewFiles(@"\\10.22.22.22\Result");
 
                 if (newFiles.Any())
@@ -55,13 +63,17 @@ public class ServiceRunner
                     foreach (var file in newFiles)
                     {
                         Console.WriteLine($"파일 처리 중: {file}");
+                        
+                        // 파일 내용 읽기
                         var rows = processor.ReadCsv(file);
+
+                        // 데이터 업로드
                         var uploader = new DatabaseUploader();
                         await uploader.UploadToDatabaseAsync(rows);
                     }
 
-                    // 마지막 수정 시간 업데이트
-                    _lastProcessedTime = newFiles.Max(f => File.GetLastWriteTime(f));
+                    // 마지막 처리된 파일의 InspectionTime 업데이트
+                    _lastInspectionTime = GetLastInspectionTimeFromDatabase();
                 }
             }
             catch (Exception ex)
@@ -78,18 +90,18 @@ public class ServiceRunner
 
 public class FileProcessor
 {
-    private readonly DateTime _lastProcessedTime;
+    private readonly DateTime _lastInspectionTime;
 
-    public FileProcessor(DateTime lastProcessedTime)
+    public FileProcessor(DateTime lastInspectionTime)
     {
-        _lastProcessedTime = lastProcessedTime;
+        _lastInspectionTime = lastInspectionTime;
     }
 
     public List<string> GetNewFiles(string rootPath)
     {
-        // Result 하위 모든 폴더에서 새로운 파일 탐색
+        // Result 하위 모든 폴더에서 수정 시간 기준 새로운 파일 검색
         return Directory.GetFiles(rootPath, "*.csv", SearchOption.AllDirectories)
-                        .Where(file => File.GetLastWriteTime(file) > _lastProcessedTime)
+                        .Where(file => File.GetLastWriteTime(file) > _lastInspectionTime)
                         .ToList();
     }
 
@@ -119,6 +131,9 @@ public class FileProcessor
                     continue;
                 }
 
+                // IP 정보 추가
+                row["ipname"] = "10.22.22.22"; // 하드코딩된 IP
+
                 rows.Add(row);
             }
         }
@@ -129,7 +144,8 @@ public class FileProcessor
 
 public class DatabaseUploader
 {
-    private const string ConnectionString = "Server=YOUR_SERVER;Database=YOUR_DATABASE;User Id=YOUR_USER;Password=YOUR_PASSWORD;";
+    // DB 연결 문자열
+    public const string ConnectionString = "Server=YOUR_SERVER;Database=YOUR_DATABASE;User Id=YOUR_USER;Password=YOUR_PASSWORD;";
 
     public async Task UploadToDatabaseAsync(List<Dictionary<string, object>> rows)
     {
@@ -140,8 +156,9 @@ public class DatabaseUploader
             foreach (var row in rows)
             {
                 using (var command = new SqlCommand(
-                    @"INSERT INTO YourTable (InspectionTime, ModelName, AlignResult, MP1DATA, MP1RESULT, MP2DATA, MP2RESULT, MP3DATA, MP3RESULT, MP4DATA, MP4RESULT)
-                      VALUES (@InspectionTime, @ModelName, @AlignResult, @MP1DATA, @MP1RESULT, @MP2DATA, @MP2RESULT, @MP3DATA, @MP3RESULT, @MP4DATA, @MP4RESULT)", connection))
+                    @"IF NOT EXISTS (SELECT 1 FROM YourTable WHERE InspectionTime = @InspectionTime AND ModelName = @ModelName)
+                      INSERT INTO YourTable (InspectionTime, ModelName, AlignResult, MP1DATA, MP1RESULT, MP2DATA, MP2RESULT, MP3DATA, MP3RESULT, MP4DATA, MP4RESULT, ipname)
+                      VALUES (@InspectionTime, @ModelName, @AlignResult, @MP1DATA, @MP1RESULT, @MP2DATA, @MP2RESULT, @MP3DATA, @MP3RESULT, @MP4DATA, @MP4RESULT, @ipname)", connection))
                 {
                     // 매핑
                     command.Parameters.AddWithValue("@InspectionTime", DateTime.Parse(row["InspectionTime"].ToString()));
@@ -155,6 +172,7 @@ public class DatabaseUploader
                     command.Parameters.AddWithValue("@MP3RESULT", row["MP3RESULT"].ToString());
                     command.Parameters.AddWithValue("@MP4DATA", float.Parse(row["MP4DATA"].ToString()));
                     command.Parameters.AddWithValue("@MP4RESULT", row["MP4RESULT"].ToString());
+                    command.Parameters.AddWithValue("@ipname", row["ipname"].ToString());
 
                     await command.ExecuteNonQueryAsync();
                 }
@@ -162,12 +180,12 @@ public class DatabaseUploader
         }
     }
 }
-3. MSSQL 테이블 생성
+MSSQL 테이블 생성
 sql
 코드 복사
 CREATE TABLE YourTable (
     InspectionTime DATETIME NOT NULL,
-    ModelName NVARCHAR(100),
+    ModelName NVARCHAR(100) NOT NULL,
     AlignResult NVARCHAR(100),
     MP1DATA FLOAT,
     MP1RESULT NVARCHAR(100),
@@ -176,10 +194,11 @@ CREATE TABLE YourTable (
     MP3DATA FLOAT,
     MP3RESULT NVARCHAR(100),
     MP4DATA FLOAT,
-    MP4RESULT NVARCHAR(100)
+    MP4RESULT NVARCHAR(100),
+    ipname NVARCHAR(50) NOT NULL,
+    PRIMARY KEY (InspectionTime, ModelName) -- 고유 키 설정
 );
-4. 주요 포인트
-CSV 공유 모드로 열기: FileStream으로 FileShare.ReadWrite 옵션 설정.
-비동기 처리: 파일 읽기와 데이터베이스 업로드 모두 비동기로 처리하여 성능 최적화.
-예외 처리: 각 단계에서 예외 발생 시 로그 출력.
-최적화: 마지막 처리된 수정 시간 이후의 파일만 탐색.
+코드 주요 변경점
+고유 키 처리: InspectionTime과 ModelName을 기본 키로 설정.
+중복 방지: IF NOT EXISTS를 사용하여 기존 데이터가 존재하면 삽입하지 않음.
+IP 정보 저장: ipname 필드에 IP 정보를 추가.
