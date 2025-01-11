@@ -1,169 +1,105 @@
-는 주어진 MainWindow.xaml.cs 코드를 수정하여 버튼 클릭 없이 프로그램 시작 시 자동 실행되며, 1분 간격으로 작업을 반복하도록 변경한 최종 코드입니다. 타이머를 추가해 작업 완료 후 1분 대기 후 반복 실행되도록 설정했습니다.
+아래는 IP별로 마지막 업로드 시간을 관리하도록 필요한 함수를 수정한 코드입니다.
 
-수정된 MainWindow.xaml.cs
+수정 방향
+_lastUploadedTime를 Dictionary로 변경:
+
+IP별로 마지막 InspectionTime을 관리합니다.
+키는 IP 주소, 값은 마지막 업로드 시간(DateTime).
+DB에서 IP별로 마지막 InspectionTime 가져오기:
+
+각 IP별로 가장 최신 InspectionTime을 조회하여 _lastUploadedTimes에 저장.
+업로드 완료 후 해당 IP의 마지막 시간 갱신:
+
+업로드가 완료되면 해당 IP의 마지막 InspectionTime을 _lastUploadedTimes에 반영합니다.
+수정된 함수
+1. _lastUploadedTimes 초기화 (IP별로 관리)
 csharp
 코드 복사
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using System.Windows;
+private readonly Dictionary<string, DateTime> _lastUploadedTimes = new Dictionary<string, DateTime>();
 
-namespace RouterVisionInspGather
+/// <summary>
+/// DB에서 IP별로 마지막 업로드된 InspectionTime 가져오기
+/// </summary>
+private void InitializeLastUploadedTimes()
 {
-    public partial class MainWindow : Window
+    const string query = "SELECT IPAddress, MAX(InspectionTime) AS LastInspectionTime FROM YourTable GROUP BY IPAddress";
+
+    using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
     {
-        private readonly List<string> _ipAddresses; // DB에서 가져온 IP 리스트
-        private DateTime _lastUploadedTime; // 마지막 업로드된 InspectionTime
-        private bool _isRunning = false; // 현재 작업 실행 상태 플래그
-
-        public MainWindow()
+        connection.Open();
+        using (var command = new SqlCommand(query, connection))
+        using (var reader = command.ExecuteReader())
         {
-            InitializeComponent();
-
-            // DB에서 IP 리스트 가져오기
-            _ipAddresses = GetIpAddressesFromDatabase();
-            StatusListBox.Items.Add($"가져온 IP 목록: {string.Join(", ", _ipAddresses)}");
-
-            // 마지막 업로드된 InspectionTime 가져오기
-            _lastUploadedTime = GetLastUploadedTimeFromDatabase();
-            StatusListBox.Items.Add($"마지막 업로드된 시간: {_lastUploadedTime}");
-
-            // 프로그램 시작 시 작업 반복 실행
-            _ = StartProcessingLoopAsync();
-        }
-
-        /// <summary>
-        /// 작업을 1분 간격으로 반복 실행
-        /// </summary>
-        private async Task StartProcessingLoopAsync()
-        {
-            while (true) // 무한 반복
+            while (reader.Read())
             {
-                if (!_isRunning)
-                {
-                    _isRunning = true;
-
-                    try
-                    {
-                        await StartProcessingAsync(); // 작업 실행
-                    }
-                    catch (Exception ex)
-                    {
-                        StatusListBox.Items.Add($"에러 발생: {ex.Message}");
-                    }
-                    finally
-                    {
-                        _isRunning = false;
-                    }
-                }
-
-                // 1분 대기
-                await Task.Delay(60000);
+                var ipAddress = reader.GetString(0);
+                var lastTime = reader.IsDBNull(1) ? DateTime.Now.AddYears(-1) : reader.GetDateTime(1);
+                _lastUploadedTimes[ipAddress] = lastTime;
             }
         }
+    }
 
-        /// <summary>
-        /// 모든 IP에 대해 파일 처리 작업 시작
-        /// </summary>
-        private async Task StartProcessingAsync()
+    // 없는 IP는 기본값으로 1년 전 시간 추가
+    foreach (var ip in _ipAddresses)
+    {
+        if (!_lastUploadedTimes.ContainsKey(ip))
         {
-            foreach (var ip in _ipAddresses)
-            {
-                StatusListBox.Items.Add($"IP {ip} 처리 중...");
-
-                // 해당 IP에 대한 파일 처리
-                var processor = new FileProcessor(_lastUploadedTime, ip);
-                var newRows = processor.GetNewRows($@"\\{ip}\Result");
-
-                if (newRows.Any())
-                {
-                    var uploader = new DatabaseUploader();
-                    await uploader.UploadToDatabaseAsync(newRows);
-
-                    StatusListBox.Items.Add($"IP {ip}에서 {newRows.Count}개의 데이터 업로드 완료.");
-                }
-                else
-                {
-                    StatusListBox.Items.Add($"IP {ip}: 새로운 데이터 없음.");
-                }
-            }
-
-            // 마지막 업로드된 시간 갱신
-            _lastUploadedTime = GetLastUploadedTimeFromDatabase();
+            _lastUploadedTimes[ip] = DateTime.Now.AddYears(-1);
         }
+    }
+}
+2. IP별로 작업 실행 (StartProcessingAsync)
+csharp
+코드 복사
+private async Task StartProcessingAsync()
+{
+    foreach (var ip in _ipAddresses)
+    {
+        StatusListBox.Items.Add($"IP {ip} 처리 중...");
 
-        /// <summary>
-        /// DB에서 IP 리스트를 가져오는 함수
-        /// </summary>
-        private List<string> GetIpAddressesFromDatabase()
+        // 해당 IP에 대한 마지막 업로드 시간 가져오기
+        var lastUploadedTime = _lastUploadedTimes[ip];
+
+        // 파일 처리
+        var processor = new FileProcessor(lastUploadedTime, ip);
+        var newRows = processor.GetNewRows($@"\\{ip}\Result");
+
+        if (newRows.Any())
         {
-            const string query = "SELECT DISTINCT IPAddress FROM IpTable"; // IP 저장 테이블
-            var ipList = new List<string>();
+            var uploader = new DatabaseUploader();
+            await uploader.UploadToDatabaseAsync(newRows);
 
-            using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
-            {
-                connection.Open();
-                using (var command = new SqlCommand(query, connection))
-                using (var reader = command.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        ipList.Add(reader.GetString(0)); // 첫 번째 열에서 IP 주소 가져오기
-                    }
-                }
-            }
+            StatusListBox.Items.Add($"IP {ip}에서 {newRows.Count}개의 데이터 업로드 완료.");
 
-            return ipList;
+            // 마지막 업로드 시간 갱신
+            _lastUploadedTimes[ip] = newRows.Max(row => (DateTime)row["InspectionTime"]);
         }
-
-        /// <summary>
-        /// 데이터베이스에서 마지막 업로드된 InspectionTime 가져오기
-        /// </summary>
-        private DateTime GetLastUploadedTimeFromDatabase()
+        else
         {
-            const string query = "SELECT MAX(InspectionTime) FROM YourTable";
-
-            using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
-            {
-                connection.Open();
-                using (var command = new SqlCommand(query, connection))
-                {
-                    var result = command.ExecuteScalar();
-                    // 결과값이 없을 경우 1년 전 시간 반환
-                    return result == DBNull.Value ? DateTime.Now.AddYears(-1) : Convert.ToDateTime(result);
-                }
-            }
+            StatusListBox.Items.Add($"IP {ip}: 새로운 데이터 없음.");
         }
     }
 }
 변경된 주요 내용
-반복 실행 로직 추가 (StartProcessingLoopAsync):
+_lastUploadedTimes 관리:
 
-프로그램 시작 시 무한 루프를 통해 작업이 반복 실행되도록 변경.
-await Task.Delay(60000)를 사용하여 작업 완료 후 1분 대기.
-플래그로 중복 실행 방지:
+_lastUploadedTimes는 IP별로 마지막 업로드된 시간을 관리하는 Dictionary<string, DateTime>.
+초기화 (InitializeLastUploadedTimes):
 
-_isRunning 플래그를 사용하여 작업 중복 실행 방지.
-버튼 클릭 코드 제거:
+DB에서 각 IP별로 가장 최신 InspectionTime을 조회하여 _lastUploadedTimes에 저장.
+DB에 없는 IP는 기본값(1년 전 시간)으로 초기화.
+IP별 작업 처리 (StartProcessingAsync):
 
-StartButton_Click 이벤트 제거 (자동 실행으로 대체).
-작업 실행:
-
-기존의 StartProcessingAsync를 통해 작업 실행.
-리스트박스 로그 관리:
-
-작업 상태를 StatusListBox에 표시.
+각 IP의 마지막 업로드 시간을 기반으로 파일을 처리.
+업로드 완료 후 해당 IP의 마지막 시간을 갱신.
 결과
 리스트박스 출력 예시
 yaml
 코드 복사
-2025-01-10 10:00:00 - 가져온 IP 목록: 192.168.0.1, 192.168.0.2
-2025-01-10 10:00:01 - 마지막 업로드된 시간: 2025-01-09 18:00:00
-2025-01-10 10:00:02 - IP 192.168.0.1 처리 중...
+2025-01-10 10:00:00 - IP 192.168.0.1 처리 중...
 2025-01-10 10:00:05 - IP 192.168.0.1에서 5개의 데이터 업로드 완료.
 2025-01-10 10:00:06 - IP 192.168.0.2 처리 중...
 2025-01-10 10:00:10 - IP 192.168.0.2에서 3개의 데이터 업로드 완료.
-2025-01-10 10:00:11 - 1분 대기 시작
+2025-01-10 10:01:00 - IP 192.168.0.1 처리 중...
+2025-01-10 10:01:05 - IP 192.168.0.1: 새로운 데이터 없음.
+2025-01-10 10:01:06 - IP 192.168.0.2 처리 중...
