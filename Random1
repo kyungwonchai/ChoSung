@@ -1,343 +1,146 @@
-래는 ModelName이 동적으로 추가될 수 있는 상황을 감안하여 최종적으로 수정된 전체 솔루션 코드입니다. IP-Result 내의 동적인 ModelName 관리를 중심으로 구현했습니다.
+는 WPF DevExpress 22.2를 사용하여, ipname별 최근 100개의 데이터를 가져와 표준편차를 계산하고, 막대 그래프로 나타내는 전체 코드입니다. 이 코드는 데이터를 MSSQL에서 가져오고, 차트 컨트롤에 표준편차를 표시합니다.
 
-MainWindow.xaml.cs
+1. MSSQL 테이블 예시
+SQL 데이터베이스에서 데이터를 가져오는 쿼리는 다음과 같습니다:
+
+sql
+코드 복사
+SELECT TOP 100 ipname, InspectionTime, MP1DATA, MP2DATA, MP3DATA, MP4DATA, MP5DATA
+FROM YourTable
+WHERE ipname = @ipname
+ORDER BY InspectionTime DESC;
+2. XAML (DevExpress ChartControl)
+XAML 파일에서 차트를 추가합니다.
+
+xml
+코드 복사
+<Window x:Class="YourNamespace.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:dxc="http://schemas.devexpress.com/winfx/2008/xaml/charts"
+        Title="Standard Deviation Chart" Height="600" Width="800">
+    <Grid>
+        <dxc:ChartControl x:Name="chartControl" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+            <dxc:XYDiagram2D>
+                <dxc:XYDiagram2D.AxisX>
+                    <dxc:AxisX2D Title="IP Name" VisibleInPanes="true" />
+                </dxc:XYDiagram2D.AxisX>
+                <dxc:XYDiagram2D.AxisY>
+                    <dxc:AxisY2D Title="Standard Deviation" VisibleInPanes="true" />
+                </dxc:XYDiagram2D.AxisY>
+                <dxc:BarSideBySideSeries2D DisplayName="Standard Deviation"
+                                           DataSource="{Binding Data}"
+                                           ArgumentDataMember="IpName"
+                                           ValueDataMember="StdDev">
+                </dxc:BarSideBySideSeries2D>
+            </dxc:XYDiagram2D>
+        </dxc:ChartControl>
+    </Grid>
+</Window>
+3. MainWindow.xaml.cs
+아래는 SqlConnection을 사용하여 데이터를 가져오고 표준편차를 계산하여 그래프에 바인딩하는 코드입니다.
+
 csharp
 코드 복사
 using System;
-using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Data;
 using System.Data.SqlClient;
-using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 
-namespace RouterVisionInspGather
+namespace YourNamespace
 {
     public partial class MainWindow : Window
     {
-        private readonly List<string> _ipAddresses; // DB에서 가져온 IP 리스트
-        private readonly Dictionary<string, Dictionary<string, DateTime>> _lastUploadedTimes = new Dictionary<string, Dictionary<string, DateTime>>(); // IP별 ModelName별 마지막 업로드 시간
-        private bool _isRunning = false; // 현재 작업 실행 상태 플래그
+        public ObservableCollection<ChartData> Data { get; set; } = new ObservableCollection<ChartData>();
 
         public MainWindow()
         {
             InitializeComponent();
-
-            // DB에서 IP 리스트와 마지막 업로드 시간 초기화
-            _ipAddresses = GetIpAddressesFromDatabase();
-            AddLog($"가져온 IP 목록: {string.Join(", ", _ipAddresses)}");
-
-            InitializeLastUploadedTimes();
-            AddLog("IP 및 ModelName별 마지막 업로드 시간 초기화 완료.");
-
-            // 프로그램 시작 시 작업 반복 실행
-            _ = StartProcessingLoopAsync();
+            DataContext = this;
+            LoadChartData();
         }
 
-        /// <summary>
-        /// 작업을 1분 간격으로 반복 실행
-        /// </summary>
-        private async Task StartProcessingLoopAsync()
-        {
-            while (true) // 무한 반복
-            {
-                if (!_isRunning)
-                {
-                    _isRunning = true;
-
-                    try
-                    {
-                        await StartProcessingAsync(); // 작업 실행
-                    }
-                    catch (Exception ex)
-                    {
-                        AddLog($"작업 중 에러 발생: {ex.Message}");
-                    }
-                    finally
-                    {
-                        _isRunning = false;
-                    }
-                }
-
-                // 1분 대기
-                await Task.Delay(60000);
-            }
-        }
-
-        /// <summary>
-        /// 모든 IP에 대해 파일 처리 작업 시작
-        /// </summary>
-        private async Task StartProcessingAsync()
-        {
-            foreach (var ip in _ipAddresses)
-            {
-                AddLog($"IP {ip} 처리 중...");
-
-                try
-                {
-                    // 해당 IP의 Result 폴더에서 ModelName 목록 가져오기
-                    var modelNames = GetModelNames($@"\\{ip}\Result");
-
-                    foreach (var modelName in modelNames)
-                    {
-                        // 새로운 ModelName 발견 시 기본값 추가
-                        if (!_lastUploadedTimes[ip].ContainsKey(modelName))
-                        {
-                            _lastUploadedTimes[ip][modelName] = DateTime.Now.AddYears(-1); // 1년 전 기본값
-                            AddLog($"IP {ip}에 새로운 ModelName 발견: {modelName}, 기본값 설정 완료.");
-                        }
-
-                        // ModelName별 마지막 업로드 시간 가져오기
-                        var lastUploadedTime = _lastUploadedTimes[ip][modelName];
-
-                        // 파일 처리
-                        var processor = new FileProcessor(lastUploadedTime, ip, modelName);
-                        var newRows = processor.GetNewRows($@"\\{ip}\Result\{modelName}");
-
-                        if (newRows.Any())
-                        {
-                            var uploader = new DatabaseUploader();
-                            await uploader.UploadToDatabaseAsync(newRows);
-
-                            AddLog($"IP {ip}, ModelName {modelName}에서 {newRows.Count}개의 데이터 업로드 완료.");
-
-                            // 마지막 업로드 시간 갱신
-                            _lastUploadedTimes[ip][modelName] = newRows.Max(row => (DateTime)row["InspectionTime"]);
-                        }
-                        else
-                        {
-                            AddLog($"IP {ip}, ModelName {modelName}: 새로운 데이터 없음.");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AddLog($"IP {ip} 처리 중 에러 발생: {ex.Message}");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Result 폴더 내의 ModelName 목록 가져오기
-        /// </summary>
-        private List<string> GetModelNames(string resultPath)
+        private async void LoadChartData()
         {
             try
             {
-                if (!Directory.Exists(resultPath)) return new List<string>();
+                var connectionString = "YourConnectionString"; // 데이터베이스 연결 문자열
+                var ipNames = new[] { "IP1", "IP2", "IP3" }; // IP 목록 (필요 시 동적으로 변경)
 
-                return Directory.GetDirectories(resultPath)
-                    .Select(Path.GetFileName)
-                    .ToList();
+                foreach (var ipName in ipNames)
+                {
+                    var dataPoints = await GetDataAsync(connectionString, ipName);
+                    if (dataPoints.Any())
+                    {
+                        var stdDev = CalculateStandardDeviation(dataPoints);
+                        Data.Add(new ChartData { IpName = ipName, StdDev = stdDev });
+                    }
+                }
             }
             catch (Exception ex)
             {
-                AddLog($"Result 폴더에서 ModelName 목록을 가져오는 중 에러 발생: {ex.Message}");
-                return new List<string>();
+                MessageBox.Show($"Error: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// DB에서 IP 리스트를 가져오는 함수
-        /// </summary>
-        private List<string> GetIpAddressesFromDatabase()
+        private async Task<double[]> GetDataAsync(string connectionString, string ipName)
         {
-            const string query = "SELECT DISTINCT IPAddress FROM IpTable"; // IP 저장 테이블
-            var ipList = new List<string>();
+            var values = new ObservableCollection<double>();
 
-            using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
-            {
-                connection.Open();
-                using (var command = new SqlCommand(query, connection))
-                using (var reader = command.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        ipList.Add(reader.GetString(0)); // 첫 번째 열에서 IP 주소 가져오기
-                    }
-                }
-            }
-
-            return ipList;
-        }
-
-        /// <summary>
-        /// DB에서 IP 및 ModelName별로 마지막 업로드된 InspectionTime 초기화
-        /// </summary>
-        private void InitializeLastUploadedTimes()
-        {
-            const string query = "SELECT IPAddress, ModelName, MAX(InspectionTime) AS LastInspectionTime FROM YourTable GROUP BY IPAddress, ModelName";
-
-            using (var connection = new SqlConnection(DatabaseUploader.ConnectionString))
-            {
-                connection.Open();
-                using (var command = new SqlCommand(query, connection))
-                using (var reader = command.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var ipAddress = reader.GetString(0);
-                        var modelName = reader.GetString(1);
-                        var lastTime = reader.IsDBNull(2) ? DateTime.Now.AddYears(-1) : reader.GetDateTime(2);
-
-                        if (!_lastUploadedTimes.ContainsKey(ipAddress))
-                        {
-                            _lastUploadedTimes[ipAddress] = new Dictionary<string, DateTime>();
-                        }
-
-                        _lastUploadedTimes[ipAddress][modelName] = lastTime;
-                    }
-                }
-            }
-
-            // 없는 IP 및 ModelName에 기본값 설정
-            foreach (var ip in _ipAddresses)
-            {
-                if (!_lastUploadedTimes.ContainsKey(ip))
-                {
-                    _lastUploadedTimes[ip] = new Dictionary<string, DateTime>();
-                }
-
-                var modelNames = GetModelNames($@"\\{ip}\Result");
-                foreach (var modelName in modelNames)
-                {
-                    if (!_lastUploadedTimes[ip].ContainsKey(modelName))
-                    {
-                        _lastUploadedTimes[ip][modelName] = DateTime.Now.AddYears(-1);
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// 리스트박스에 로그를 추가하고, 50개까지만 유지합니다.
-        /// </summary>
-        private void AddLog(string message)
-        {
-            string log = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}";
-
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                // 리스트박스에 로그 추가
-                StatusListBox.Items.Add(log);
-
-                // 리스트박스 항목이 50개를 초과하면 오래된 항목 삭제
-                while (StatusListBox.Items.Count > 50)
-                {
-                    StatusListBox.Items.RemoveAt(0); // 가장 오래된 항목 삭제
-                }
-            });
-
-            // 디버그 출력
-            Debug.WriteLine(log);
-        }
-    }
-
-    /// <summary>
-    /// 파일 처리 클래스
-    /// </summary>
-    public class FileProcessor
-    {
-        private readonly DateTime _lastUploadedTime;
-        private readonly string _ipAddress;
-        private readonly string _modelName;
-
-        public FileProcessor(DateTime lastUploadedTime, string ipAddress, string modelName)
-        {
-            _lastUploadedTime = lastUploadedTime;
-            _ipAddress = ipAddress;
-            _modelName = modelName;
-        }
-
-        /// <summary>
-        /// 새로운 데이터 행 가져오기
-        /// </summary>
-        public List<Dictionary<string, object>> GetNewRows(string rootPath)
-        {
-            var newRows = new List<Dictionary<string, object>>();
-            var csvFiles = Directory.GetFiles(rootPath, "*.csv", SearchOption.AllDirectories);
-
-            foreach (var file in csvFiles)
-            {
-                using (var reader = new StreamReader(new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
-                {
-                    reader.ReadLine(); // 첫 번째 행(헤더) 무시
-                    while (!reader.EndOfStream)
-                    {
-                        var values = reader.ReadLine()?.Split(',');
-                        if (values == null || values.Length < 4) continue;
-
-                        // 4열이 숫자(정수 또는 실수)가 아니면 제외
-                        if (!decimal.TryParse(values[3], out _)) continue;
-
-                        var row = new Dictionary<string, object>
-                        {
-                            ["InspectionTime"] = DateTime.Parse(values[0]),
-                            ["ModelName"] = _modelName,
-                            ["AlignResult"] = values[2],
-                            ["MP1DATA"] = float.Parse(values[3]),
-                            ["MP1RESULT"] = values[4],
-                            ["ipname"] = _ipAddress // 현재 IP 추가
-                        };
-
-                        // InspectionTime 조건 검사
-                        if ((DateTime)row["InspectionTime"] > _lastUploadedTime)
-                        {
-                            newRows.Add(row);
-                        }
-                    }
-                }
-            }
-
-            return newRows;
-        }
-    }
-
-    /// <summary>
-    /// 데이터베이스 업로드 클래스
-    /// </summary>
-    public class DatabaseUploader
-    {
-        public const string ConnectionString = "Server=YOUR_SERVER;Database=YOUR_DATABASE;User Id=YOUR_USER;Password=YOUR_PASSWORD;";
-
-        /// <summary>
-        /// 데이터베이스로 업로드
-        /// </summary>
-        public async Task UploadToDatabaseAsync(List<Dictionary<string, object>> rows)
-        {
-            using (var connection = new SqlConnection(ConnectionString))
+            using (var connection = new SqlConnection(connectionString))
             {
                 await connection.OpenAsync();
 
-                foreach (var row in rows)
+                using (var command = new SqlCommand(
+                    @"SELECT TOP 100 MP1DATA, MP2DATA, MP3DATA, MP4DATA, MP5DATA
+                      FROM YourTable
+                      WHERE ipname = @ipname
+                      ORDER BY InspectionTime DESC", connection))
                 {
-                    using (var command = new SqlCommand(
-                        @"IF NOT EXISTS (SELECT 1 FROM YourTable WHERE InspectionTime = @InspectionTime AND ModelName = @ModelName)
-                          INSERT INTO YourTable (InspectionTime, ModelName, AlignResult, MP1DATA, MP1RESULT, ipname)
-                          VALUES (@InspectionTime, @ModelName, @AlignResult, @MP1DATA, @MP1RESULT, @ipname)", connection))
-                    {
-                        command.Parameters.AddWithValue("@InspectionTime", row["InspectionTime"]);
-                        command.Parameters.AddWithValue("@ModelName", row["ModelName"]);
-                        command.Parameters.AddWithValue("@AlignResult", row["AlignResult"]);
-                        command.Parameters.AddWithValue("@MP1DATA", row["MP1DATA"]);
-                        command.Parameters.AddWithValue("@MP1RESULT", row["MP1RESULT"]);
-                        command.Parameters.AddWithValue("@ipname", row["ipname"]);
+                    command.Parameters.AddWithValue("@ipname", ipName);
 
-                        await command.ExecuteNonQueryAsync();
+                    using (var reader = await command.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            // 각 MP 데이터의 평균 계산
+                            var mpData = new[]
+                            {
+                                reader.GetDouble(0),
+                                reader.GetDouble(1),
+                                reader.GetDouble(2),
+                                reader.GetDouble(3),
+                                reader.GetDouble(4)
+                            };
+                            values.Add(mpData.Average());
+                        }
                     }
                 }
             }
+
+            return values.ToArray();
+        }
+
+        private double CalculateStandardDeviation(double[] values)
+        {
+            if (values.Length == 0) return 0;
+
+            var mean = values.Average();
+            var variance = values.Select(v => Math.Pow(v - mean, 2)).Average();
+            return Math.Sqrt(variance);
         }
     }
+
+    public class ChartData
+    {
+        public string IpName { get; set; }
+        public double StdDev { get; set; }
+    }
 }
-변경된 주요 내용
-ModelName 관리 강화:
-
-IP-ModelName 구조를 관리하며, 동적으로 추가된 ModelName을 처리.
-초기화 시 기본값 설정:
-
-새로운 ModelName을 발견하면 기본값(1년 전)으로 추가.
-모든 작업에서 ModelName 기반 처리:
-
-각 ModelName의 마지막 업로드 시간을 관리하고 갱신.
-로그와 에러 처리:
+4. 주요 설명
+표준편차 계산: 각 MP1DATA ~ MP5DATA의 평균값을 계산한 후 표준편차를 구합니다.
+DevExpress 차트 컨트롤: ChartControl에서 데이터 소스는 ObservableCollection으로 설정되어 실시간 바인딩이 가능합니다.
+비동기 데이터 로드: GetDataAsync는 SQL 데이터를 비동기로 가져와 성능을 최적화합니다.
