@@ -1,21 +1,32 @@
-오면 행이 1개이고, 3~5번 컬럼(특징 값)을 입력 데이터로 사용하여 **2번 컬럼(목표 값)**을 예측하고, 이를 실제값과 비교합니다.
+아래는 요청하신 대로 1열(날짜/시간)은 제외, 2열은 타겟(y), **3~5열은 입력값(features)**으로 사용하는 모델 훈련 코드입니다. 이 코드는 최적의 모델을 선택하고, 필요시 튜닝 과정을 병행합니다.
 
-수정된 코드
+1. 모델 훈련 및 최적 모델 저장
+주요 내용:
+DB에서 PandB 데이터 가져오기: MSSQL 저장 프로시저 사용.
+모델 학습: XGBoost, RandomForest, LinearRegression 사용.
+최적 모델 선택: K-Fold 교차 검증으로 MSE 기준 최적 모델 선택.
+모델 저장: 최적 모델을 저장하여 이후 예측 단계에서 사용.
 python
 코드 복사
-# 필요한 라이브러리 임포트
-import joblib
-import pymssql
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+# 필요한 라이브러리 설치 및 임포트
+!pip install pandas scikit-learn xgboost pymssql matplotlib joblib --quiet
 
-# 데이터베이스에서 PRealAandB 데이터를 불러오는 함수
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
+import pymssql
+import joblib
+
+# 데이터베이스에서 PandB 데이터를 불러오는 함수
 def fetch_data_from_db(proc_name):
     """
-    MSSQL 저장 프로시저를 호출하여 데이터를 가져옵니다.
+    MSSQL 저장 프로시저를 호출하여 PandB 데이터를 가져옵니다.
     :param proc_name: 저장 프로시저 이름
-    :return: 데이터 (numpy 배열)
+    :return: 데이터 (DataFrame)
     """
     server = "localhost"  # DB 서버 주소
     user = "your_username"  # 사용자 이름
@@ -26,100 +37,81 @@ def fetch_data_from_db(proc_name):
         conn = pymssql.connect(server=server, user=user, password=password, database=database)
         query = f"EXEC {proc_name}"  # 저장 프로시저 실행
         df = pd.read_sql(query, conn)  # 데이터프레임으로 변환
-        return df.values  # numpy 배열로 반환
+        return df
     except Exception as e:
         print(f"Error fetching data: {e}")
-        return np.array([])
+        return pd.DataFrame()
 
-# 저장된 모델 로드
-try:
-    model = joblib.load("best_model.pkl")
-    print("Best model loaded successfully.")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    exit()
-
-# PRealAandB 데이터 불러오기 (행이 1개인 데이터)
-data = fetch_data_from_db("PRealAandB")  # PRealAandB 저장 프로시저 호출
-if data.size == 0:
-    print("Error: No data fetched from PRealAandB.")
+# PandB 데이터 가져오기
+data = fetch_data_from_db("GetPandB")  # PandB 데이터 저장 프로시저 호출
+if data.empty:
+    print("No data fetched. Please check your stored procedure.")
     exit()
 
 # 데이터 준비
-# 첫 번째 컬럼(날짜/시간)을 버리고, 3~5번 컬럼은 입력값으로 사용
-features = data[:, 2:5]  # 3~5번 컬럼 (입력값)
-actual_value = data[0, 1]  # 2번 컬럼 (실제값)
+X = data.iloc[:, 2:5].values  # 3~5열 (특징값)
+y = data.iloc[:, 1].values    # 2열 (타겟값)
 
-# 예측 수행
-predicted_value = model.predict(features)[0]
-print(f"Predicted value for column 2: {predicted_value}")
-print(f"Actual value for column 2: {actual_value}")
+# 사용할 모델 정의
+models = {
+    "XGBoost": XGBRegressor(random_state=42, n_estimators=100, max_depth=5),
+    "RandomForest": RandomForestRegressor(random_state=42, n_estimators=100),
+    "LinearRegression": LinearRegression()
+}
 
-# 시각화: 예측값 vs 실제값
-plt.figure(figsize=(8, 6))
+# K-Fold 교차 검증
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+best_model_name = None
+best_model = None
+lowest_mse = float("inf")
 
-# 예측값과 실제값 시각화
-plt.bar(["Predicted", "Actual"], [predicted_value, actual_value], color=['blue', 'red'], alpha=0.7)
-plt.title("Predicted vs Actual Value for Column 2")
-plt.ylabel("Value")
-plt.grid(axis='y')
+print("Training models with K-Fold cross-validation...")
+for model_name, model in models.items():
+    mse_scores = []
 
-# 오차 표시
-error = np.abs(predicted_value - actual_value)
-plt.text(0, predicted_value, f"Pred: {predicted_value:.2f}", ha='center', va='bottom')
-plt.text(1, actual_value, f"Actual: {actual_value:.2f}", ha='center', va='bottom')
-plt.text(0.5, max(predicted_value, actual_value) + 0.1, f"Error: {error:.2f}", ha='center', color='black')
+    for train_idx, val_idx in kf.split(X):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
 
-plt.show()
+        # 모델 학습
+        model.fit(X_train, y_train)
+        
+        # 검증
+        predictions = model.predict(X_val)
+        mse = mean_squared_error(y_val, predictions)
+        mse_scores.append(mse)
 
-# 정확도 계산
-max_possible_value = max(predicted_value, actual_value)
-error_score = 100 - (error / max_possible_value * 100)
-print(f"Accuracy Score: {error_score:.2f}/100")
+    # 평균 MSE 계산
+    avg_mse = np.mean(mse_scores)
+    print(f"{model_name}: Average MSE = {avg_mse:.4f}")
+
+    # 최적 모델 선택
+    if avg_mse < lowest_mse:
+        lowest_mse = avg_mse
+        best_model_name = model_name
+        best_model = model
+
+# 최적 모델 출력 및 저장
+print(f"Best model: {best_model_name} with MSE = {lowest_mse:.4f}")
+joblib.dump(best_model, "best_model.pkl")
+print("Best model saved as 'best_model.pkl'")
 코드 설명
-DB에서 PRealAandB 데이터 불러오기:
+DB에서 데이터 가져오기:
 
-PRealAandB 저장 프로시저를 호출하여 데이터를 가져옵니다.
-첫 컬럼(날짜/시간)은 제외.
-3~5번 컬럼을 입력값(features), 2번 컬럼을 **실제값(actual_value)**으로 사용.
-모델 로드 및 예측:
+MSSQL 저장 프로시저 GetPandB를 호출하여 PandB 데이터를 가져옵니다.
+데이터는 다음과 같은 구조를 가정합니다:
+1열: 날짜/시간 (사용하지 않음).
+2열: 타겟 값 (y).
+3~5열: 입력값(features).
+모델 학습:
 
-저장된 모델(best_model.pkl)을 로드합니다.
-3~5번 컬럼 데이터를 모델에 입력하여 2번 컬럼 값을 예측합니다.
-시각화:
+세 가지 모델(XGBoost, RandomForest, LinearRegression)을 사용.
+각 모델에 대해 5-Fold 교차 검증을 수행.
+최적 모델 선택:
 
-예측값과 실제값을 막대 그래프로 비교합니다.
-막대 위에 값과 오차를 표시합니다.
-정확도 계산:
+평균 MSE가 가장 낮은 모델을 선택.
+최적 모델을 best_model.pkl로 저장.
+출력:
 
-최대값을 기준으로 100점 만점의 정확도를 계산합니다:
-정확도
-=
-100
-−
-오차
-최대값
-×
-100
-정확도=100− 
-최대값
-오차
-​
- ×100
-결과
-막대 그래프:
-
-파란색: 모델이 예측한 2번 컬럼 값.
-빨간색: 실제 2번 컬럼 값.
-막대 위에 예측값, 실제값, 오차 표시.
-정확도 출력:
-
-예측값과 실제값의 오차를 기반으로 100점 만점의 정확도를 출력.
-필요 사항
-MSSQL 저장 프로시저:
-
-PRealAandB 저장 프로시저는 한 행의 데이터를 반환해야 하며, 형식은 다음과 같습니다:
-1번 컬럼: 날짜/시간.
-2번 컬럼: 실제 목표 값.
-3~5번 컬럼: 입력 특징 값.
-모델 파일:
+각 모델의 평균 MSE와 최적 모델 이름 및 성능 출력.
+결과물
