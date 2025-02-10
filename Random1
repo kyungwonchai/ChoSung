@@ -1,150 +1,23 @@
-import os
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score
-from collections import Counter
-import numpy as np
-import re
-
-# 하이퍼파라미터 설정
-MAX_VOCAB_SIZE = 10000  # 최대 단어 집합 크기
-EMBEDDING_DIM = 100     # 임베딩 차원
-HIDDEN_DIM = 128        # LSTM의 은닉 상태 차원
-NUM_EPOCHS = 10         # 학습 에포크 수
-BATCH_SIZE = 32         # 배치 크기
-LEARNING_RATE = 0.001   # 학습률
-
-# 데이터셋 클래스 정의
-class TextDataset(Dataset):
-    def __init__(self, file_paths, labels, vocab=None):
-        self.file_paths = file_paths
-        self.labels = labels
-        self.vocab = vocab if vocab else self.build_vocab()
-        self.label_encoder = LabelEncoder()
-        self.encoded_labels = self.label_encoder.fit_transform(labels)
-
-    def build_vocab(self):
-        counter = Counter()
-        for file_path in self.file_paths:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-                tokens = self.tokenize(text)
-                counter.update(tokens)
-        vocab = {word: idx + 1 for idx, (word, _) in enumerate(counter.most_common(MAX_VOCAB_SIZE))}
-        vocab['<PAD>'] = 0
-        return vocab
-
-    def tokenize(self, text):
-        text = re.sub(r'\W+', ' ', text)
-        return text.lower().split()
-
-    def encode_text(self, text):
-        tokens = self.tokenize(text)
-        return [self.vocab.get(token, 0) for token in tokens]
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    def __getitem__(self, idx):
-        file_path = self.file_paths[idx]
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        encoded_text = self.encode_text(text)
-        label = self.encoded_labels[idx]
-        return torch.tensor(encoded_text, dtype=torch.long), torch.tensor(label, dtype=torch.long)
-
-# 패딩을 위한 collate_fn 정의
-def collate_fn(batch):
-    texts, labels = zip(*batch)
-    lengths = [len(text) for text in texts]
-    max_length = max(lengths)
-    padded_texts = [torch.cat([text, torch.zeros(max_length - len(text), dtype=torch.long)]) for text in texts]
-    return torch.stack(padded_texts), torch.tensor(labels), torch.tensor(lengths)
-
-# LSTM 모델 정의
-class TextClassifier(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim):
-        super(TextClassifier, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, text, lengths):
-        embedded = self.embedding(text)
-        packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths, batch_first=True, enforce_sorted=False)
-        _, (hidden, _) = self.lstm(packed)
-        output = self.fc(hidden[-1])
-        return output
-
-# 데이터 로드 및 전처리
-def load_data(data_dir):
-    file_paths = []
-    labels = []
-    for root, _, files in os.walk(data_dir):
-        for file in files:
-            if file.endswith('.txt'):
-                file_paths.append(os.path.join(root, file))
-                labels.append(os.path.splitext(file)[0])
-    return file_paths, labels
-
-# 모델 학습 함수
-def train_model(model, train_loader, criterion, optimizer, device):
-    model.train()
-    for texts, labels, lengths in train_loader:
-        texts, labels, lengths = texts.to(device), labels.to(device), lengths.to(device)
-        optimizer.zero_grad()
-        outputs = model(texts, lengths)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-# 모델 평가 함수
-def evaluate_model(model, val_loader, device):
     model.eval()
-    all_preds = []
-    all_labels = []
+    predictions = []
     with torch.no_grad():
-        for texts, labels, lengths in val_loader:
-            texts, labels, lengths = texts.to(device), labels.to(device), lengths.to(device)
+        for texts, _, lengths in test_loader:
+            texts, lengths = texts.to(device), lengths.to(device)
             outputs = model(texts, lengths)
             _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    return accuracy_score(all_labels, all_preds)
+            predictions.extend(preds.cpu().numpy())
 
-# 메인 실행 함수
-def main(data_dir):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 예측 결과 저장
+    decoded_predictions = train_dataset.label_encoder.inverse_transform(predictions)
+    results_file = os.path.join(data_dir, "prediction_results.txt")
 
-    # 데이터 로드
-    file_paths, labels = load_data(data_dir)
+    with open(results_file, 'w', encoding='utf-8') as f:
+        for file_path, pred_label in zip(test_file_paths, decoded_predictions):
+            actual_label = os.path.splitext(os.path.basename(file_path))[0]  # 실제 파일명
+            f.write(f"{actual_label} -> {pred_label}\n")
 
-    # 데이터셋 및 데이터로더 생성
-    train_paths, val_paths, train_labels, val_labels = train_test_split(file_paths, labels, test_size=0.2, random_state=42)
-    train_dataset = TextDataset(train_paths, train_labels)
-    val_dataset = TextDataset(val_paths, val_labels, vocab=train_dataset.vocab)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-    # 모델 초기화
-    model = TextClassifier(vocab_size=len(train_dataset.vocab), embedding_dim=EMBEDDING_DIM, hidden_dim=HIDDEN_DIM, output_dim=len(set(labels)))
-    model.to(device)
-
-    # 손실 함수 및 옵티마이저 설정
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-    # 모델 학습
-    for epoch in range(NUM_EPOCHS):
-        train_model(model, train_loader, criterion, optimizer, device)
-        val_accuracy = evaluate_model(model, val_loader, device)
-        print(f'Epoch {epoch + 1}/{NUM_EPOCHS}, Validation Accuracy: {val_accuracy:.4f}')
-
-    # 테스트 데이터에 대한 예측
-    test_file_paths, test_labels = load_data(os.path.join(data_dir, 'test'))
-    test_dataset = TextDataset(test_file_paths, test_labels, vocab=train_dataset
-::contentReference[oaicite:0]{index=0}
- 
+    print(f"? 예측 결과 저장 완료: {results_file}")
+    
+if __name__ == "__main__":
+    data_directory = "./data"  # 데이터셋 폴더 경로 (텍스트 파일이 위치한 디렉토리)
+    main(data_directory)
