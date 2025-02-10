@@ -1,36 +1,203 @@
+
+?? 1. 학습 코드 (train.py)
+python
+복사
+편집
 import os
-import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+import re
 
-# 데이터 폴더 생성
-data_dir = "data"
-train_dir = os.path.join(data_dir, "train")
-test_dir = os.path.join(data_dir, "test")
+# 하이퍼파라미터 설정
+MAX_VOCAB_SIZE = 10000
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 128
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+EARLY_STOPPING_ROUNDS = 5
+TARGET_ACCURACY = 0.90
+MODEL_PATH = "model.pth"  # 모델 저장 경로
 
-os.makedirs(train_dir, exist_ok=True)
-os.makedirs(test_dir, exist_ok=True)
+# 텍스트 데이터셋 클래스 정의
+class TextDataset(Dataset):
+    def __init__(self, file_paths, labels, vocab=None):
+        self.file_paths = file_paths
+        self.labels = labels
+        self.vocab = vocab if vocab else self.build_vocab()
+        self.label_encoder = LabelEncoder()
+        self.encoded_labels = self.label_encoder.fit_transform(labels)
 
-# 랜덤한 문장 생성 함수
-def generate_text(number):
-    templates = [
-        f"이 파일의 값은 {number} 입니다.",
-        f"{number} 번 데이터에 해당하는 내용입니다.",
-        f"여기에 적힌 숫자는 {number} 입니다.",
-        f"이 문서는 {number} 값을 포함하고 있습니다."
-    ]
-    return random.choice(templates)
+    def build_vocab(self):
+        words = set()
+        for file_path in self.file_paths:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                words.update(self.tokenize(f.read()))
+        vocab = {word: idx + 1 for idx, word in enumerate(words)}
+        vocab['<PAD>'] = 0
+        return vocab
 
-# 훈련 데이터 생성 (1~500 사이의 랜덤 숫자 400개)
-train_numbers = random.sample(range(1, 501), 400)
-for num in train_numbers:
-    file_path = os.path.join(train_dir, f"{num}.txt")
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(generate_text(num))
+    def tokenize(self, text):
+        text = re.sub(r'\W+', ' ', text).lower()
+        return text.split()
 
-# 테스트 데이터 생성 (나머지 100개 숫자)
-test_numbers = list(set(range(1, 501)) - set(train_numbers))
-for num in test_numbers:
-    file_path = os.path.join(test_dir, f"{num}.txt")
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(generate_text(num))
+    def encode_text(self, text):
+        tokens = self.tokenize(text)
+        return [self.vocab.get(token, 0) for token in tokens]
 
-print(f"? 데이터 생성 완료: {len(train_numbers)}개의 훈련 데이터, {len(test_numbers)}개의 테스트 데이터")
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        file_path = self.file_paths[idx]
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        encoded_text = self.encode_text(text)
+        label = self.encoded_labels[idx]
+        return torch.tensor(encoded_text, dtype=torch.long), torch.tensor(label, dtype=torch.long)
+
+# 패딩을 위한 collate 함수
+def collate_fn(batch):
+    texts, labels = zip(*batch)
+    max_length = max(len(text) for text in texts)
+    padded_texts = [torch.cat([text, torch.zeros(max_length - len(text), dtype=torch.long)]) for text in texts]
+    return torch.stack(padded_texts), torch.tensor(labels)
+
+# LSTM 모델 정의
+class TextClassifier(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim):
+        super(TextClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.3)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, text):
+        embedded = self.embedding(text)
+        _, (hidden, _) = self.lstm(embedded)
+        output = self.fc(hidden[-1])
+        return output
+
+# 데이터 로드 함수
+def load_data(data_dir):
+    file_paths, labels = [], []
+    for file in os.listdir(data_dir):
+        if file.endswith(".txt"):
+            file_paths.append(os.path.join(data_dir, file))
+            labels.append(os.path.splitext(file)[0])  # 파일명(숫자)을 정답으로 사용
+    return file_paths, labels
+
+# 모델 학습 함수
+def train_model(model, train_loader, val_loader, optimizer, criterion, device):
+    model.to(device)
+    best_acc = 0
+    no_improve_count = 0
+
+    for epoch in range(50):
+        model.train()
+        for texts, labels in train_loader:
+            texts, labels = texts.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(texts)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        val_acc = evaluate_model(model, val_loader, device)
+        print(f"Epoch {epoch + 1}: Validation Accuracy = {val_acc:.4f}")
+
+        # Auto Boosting 및 조기 종료
+        if val_acc > best_acc:
+            best_acc = val_acc
+            no_improve_count = 0
+            torch.save(model.state_dict(), MODEL_PATH)  # 모델 저장
+            print(f"? 모델 저장됨: {MODEL_PATH}")
+        else:
+            no_improve_count += 1
+
+        if best_acc >= TARGET_ACCURACY or no_improve_count >= EARLY_STOPPING_ROUNDS:
+            print("? 학습 종료 (조기 종료 or 목표 정확도 도달)")
+            break
+
+# 모델 평가 함수
+def evaluate_model(model, val_loader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for texts, labels in val_loader:
+            texts, labels = texts.to(device), labels.to(device)
+            outputs = model(texts)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    return accuracy_score(all_labels, all_preds)
+
+# 실행 코드
+if __name__ == "__main__":
+    train_dir = "data/train"
+    val_dir = "data/val"
+
+    # 데이터 로드
+    train_paths, labels = load_data(train_dir)
+    train_paths, val_paths, train_labels, val_labels = train_test_split(train_paths, labels, test_size=0.2, random_state=42)
+
+    train_dataset = TextDataset(train_paths, train_labels)
+    val_dataset = TextDataset(val_paths, val_labels, vocab=train_dataset.vocab)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    # 모델 초기화 및 학습
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TextClassifier(len(train_dataset.vocab), EMBEDDING_DIM, HIDDEN_DIM, len(set(labels)))
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.CrossEntropyLoss()
+
+    train_model(model, train_loader, val_loader, optimizer, criterion, device)
+?? 2. 예측 코드 (predict.py)
+python
+복사
+편집
+import os
+import torch
+from train import TextClassifier, TextDataset, load_data, MODEL_PATH
+
+# 모델 불러오기 및 예측 함수
+def predict_from_folder(folder, dataset, device):
+    model = TextClassifier(len(dataset.vocab), 100, 128, len(set(dataset.labels)))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.to(device)
+    model.eval()
+
+    file_paths, _ = load_data(folder)
+    predictions = []
+
+    with torch.no_grad():
+        for file_path in file_paths:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = dataset.encode_text(f.read())
+            input_tensor = torch.tensor([text], dtype=torch.long).to(device)
+            output = model(input_tensor)
+            pred_label = dataset.label_encoder.inverse_transform([torch.argmax(output, dim=1).item()])[0]
+            predictions.append(f"{os.path.basename(file_path)} -> {pred_label}")
+
+    results_file = os.path.join(folder, "prediction_results.txt")
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write("\n".join(predictions))
+
+    print(f"? 예측 완료: 결과 저장 → {results_file}")
+
+if __name__ == "__main__":
+    test_folder = "custom_test"
+    dataset = TextDataset(*load_data("data/train"))
+    predict_from_folder(test_folder, dataset, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+? 이제 train.py로 학습한 후, predict.py로 저장된 모델(model.pth)을 불러와 예측할 수 있습니다! ????
+
+
+
+
+
+
+
