@@ -1,71 +1,127 @@
-SSQL 2014에서 특정 값을 LIKE 조건으로 검색하여 문자열 하나를 반환하는 함수 및 프로시저
-1️⃣ UDF(User Defined Function) - 특정 값 LIKE 검색 후 문자열 반환
-sql
-Copy code
-CREATE FUNCTION dbo.GetMatchingValue (@searchValue NVARCHAR(100))
-RETURNS NVARCHAR(100)
-AS
-BEGIN
-    DECLARE @result NVARCHAR(100)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pymssql
+import numpy as np
+import os
+import json
+from collections import defaultdict
 
-    SELECT TOP 1 @result = ColumnName
-    FROM YourTable
-    WHERE ColumnName LIKE '%' + @searchValue + '%'
-    ORDER BY ColumnName -- 정렬 기준 필요 시 설정
+# DB 연결 설정
+DB_CONFIG = {
+    "server": "YOUR_SERVER",
+    "user": "YOUR_USER",
+    "password": "YOUR_PASSWORD",
+    "database": "YOUR_DATABASE"
+}
 
-    RETURN @result
-END
-✔ 설명
+MODEL_PATH = "qr_model.pth"
+TOKENIZER_PATH = "tokenizer.json"
 
-@searchValue 값을 LIKE 검색으로 포함하는 ColumnName을 조회.
-첫 번째 결과(TOP 1)를 반환.
-ORDER BY ColumnName 추가하여 특정 정렬 기준 설정 가능.
-2️⃣ 프로시저 - LIKE 검색 후 값 반환
-sql
-Copy code
-CREATE PROCEDURE dbo.SearchValueProc
-    @searchValue NVARCHAR(100),
-    @result NVARCHAR(100) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON;
+# QR 데이터셋 정의
+class QRDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.tokenizer = tokenizer
 
-    SELECT TOP 1 @result = ColumnName
-    FROM YourTable
-    WHERE ColumnName LIKE '%' + @searchValue + '%'
-    ORDER BY ColumnName -- 정렬 기준 필요 시 설정
-END
-✔ 설명
+    def __len__(self):
+        return len(self.data)
 
-@result을 OUTPUT 변수로 받아 프로시저 호출 시 값을 저장 가능.
-3️⃣ 프로시저에서 함수 사용 (함수를 프로시저 안에서 사용하기)
-sql
-Copy code
-CREATE PROCEDURE dbo.UseFunctionInProcedure
-    @searchValue NVARCHAR(100),
-    @outputValue NVARCHAR(100) OUTPUT
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET @outputValue = dbo.GetMatchingValue(@searchValue)
-END
-✔ 설명
+    def __getitem__(self, idx):
+        qr_code, label = self.data[idx]
+        qr_encoded = self.tokenizer(qr_code)
+        return torch.tensor(qr_encoded, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
 
-dbo.GetMatchingValue 함수를 프로시저 내에서 호출하여 결과를 반환.
-4️⃣ 실행 예제
-sql
-Copy code
--- 1️⃣ 함수 실행
-SELECT dbo.GetMatchingValue('Test')
+# 간단한 LSTM 모델 정의
+class QRModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(QRModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n.squeeze(0))
 
--- 2️⃣ 프로시저 실행
-DECLARE @output NVARCHAR(100)
-EXEC dbo.SearchValueProc 'Test', @output OUTPUT
-PRINT @output
+# 데이터베이스에서 데이터 가져오기
+def fetch_data():
+    conn = pymssql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("EXEC your_stored_procedure")
+    data = cursor.fetchall()
+    conn.close()
+    return data
 
--- 3️⃣ 프로시저에서 함수 호출 실행
-DECLARE @finalOutput NVARCHAR(100)
-EXEC dbo.UseFunctionInProcedure 'Test', @finalOutput OUTPUT
-PRINT @finalOutput
-✅ 요약
-함수 (dbo.GetMatchingValue): 단일 값 반환 가능.
+# QR 코드 토큰화 함수
+def create_tokenizer(data):
+    unique_chars = sorted(set("".join(qr for _, qr in data)))
+    char_to_idx = {char: idx for idx, char in enumerate(unique_chars, start=1)}
+    char_to_idx["<PAD>"] = 0
+    
+    def tokenizer(qr_code):
+        return [char_to_idx.get(char, 0) for char in qr_code]
+    
+    return tokenizer, char_to_idx
+
+# 모델 저장 및 불러오기
+def save_model(model, tokenizer):
+    torch.save(model.state_dict(), MODEL_PATH)
+    with open(TOKENIZER_PATH, "w") as f:
+        json.dump(tokenizer, f)
+
+def load_model(input_dim, hidden_dim, output_dim):
+    model = QRModel(input_dim, hidden_dim, output_dim)
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH))
+    return model
+
+def load_tokenizer():
+    with open(TOKENIZER_PATH, "r") as f:
+        char_to_idx = json.load(f)
+    def tokenizer(qr_code):
+        return [char_to_idx.get(char, 0) for char in qr_code]
+    return tokenizer
+
+# 학습 루프
+def train_model(model, dataset, epochs=10, batch_size=32, lr=0.001):
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, labels in dataloader:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss:.4f}")
+    
+    save_model(model, dataset.tokenizer)
+
+# 데이터 불러오기 및 학습
+if __name__ == "__main__":
+    raw_data = fetch_data()
+    filtered_data = [(model if model else None, qr) for model, qr in raw_data]
+    model_map = defaultdict(list)
+    for model, qr in filtered_data:
+        model_map[qr].append(model)
+    
+    # 모델명이 없는 경우, 동일한 QR의 과거 기록 활용
+    processed_data = [(model_map[qr][0] if model_map[qr] else "UNKNOWN", qr) for _, qr in filtered_data]
+    
+    tokenizer, char_to_idx = create_tokenizer(processed_data)
+    model_list = list(set(model for model, _ in processed_data))
+    model_to_idx = {model: idx for idx, model in enumerate(model_list)}
+    idx_to_model = {idx: model for model, idx in model_to_idx.items()}
+    
+    dataset = QRDataset([(qr, model_to_idx[model]) for model, qr in processed_data], tokenizer)
+    input_dim = max(len(qr) for _, qr in processed_data)
+    hidden_dim = 128
+    output_dim = len(model_list)
+    
+    model = load_model(input_dim, hidden_dim, output_dim)
+    train_model(model, dataset)
