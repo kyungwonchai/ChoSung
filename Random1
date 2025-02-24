@@ -1,32 +1,87 @@
+다. QR 값으로 모델명을 예측하는 코드를 다시 깔끔하게 정리해서 최종 코드를 준다.
 
-해결 방법
-학습 당시의 최대 QR 길이를 저장
-모델 저장 시, 학습 데이터의 최대 QR 길이를 함께 저장합니다.
-예측 시 동일한 크기로 패딩(padding) 적용
-입력된 QR 값이 학습된 QR 길이보다 짧으면 패딩(0으로 채움)
-입력된 QR 값이 학습된 QR 길이보다 길면 잘라서 사용
-코드 수정 (오류 해결)
-1. 학습 시 최대 QR 길이 저장
+📌 해결 목표
+입력 데이터: runwait.txt (모델명과 QR 값 2개만 사용)
+모델 학습: QR 값을 입력하여 모델명을 예측하도록 학습
+예측 동작: 사용자가 QR을 입력하면 모델명을 출력 (확률도 함께 제공)
+모델 저장/불러오기: 학습한 모델을 .pth 파일로 저장하고, 다시 로드할 수 있도록 구성
+버그 해결:
+입력 길이 불일치 문제 해결 (QR을 벡터화할 때 최대 길이 유지)
+모듈 네임스페이스 충돌 제거
+QR 길이가 짧을 경우 0으로 패딩 추가
+📌 최종 코드
 python
 Copy code
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data_utils
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+
+# 🚀 GPU 사용 가능하면 GPU, 아니면 CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 📌 TXT 파일에서 데이터 불러오기 (모델명 + QR 값)
+def load_data_from_txt(file_path):
+    data = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                model_name, qr_value = parts[:2]  # 첫 번째는 모델명, 두 번째는 QR 값
+                data.append((model_name, qr_value))
+    return pd.DataFrame(data, columns=["Model", "QR"])
+
+# 📌 QR 값을 벡터로 변환하는 함수 (고정된 길이로 패딩 포함)
+def vectorize_qr(qr_values, max_length):
+    vectorized = np.zeros((len(qr_values), max_length), dtype=np.float32)
+    for i, qr in enumerate(qr_values):
+        for j, char in enumerate(qr[:max_length]):  # max_length 초과 시 자름
+            vectorized[i, j] = ord(char)  # 문자 → 아스키 코드 변환
+    return vectorized
+
+# 📌 신경망 모델 정의
+class QRModel(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(QRModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, num_classes)  # 모델 개수만큼 출력 노드 생성
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        x = self.fc4(x)  # 소프트맥스 전 단계
+        return x
+
+# 📌 모델 저장 함수
+MODEL_PATH = "model.pth"
 def save_model(model, encoder, scaler, max_qr_length):
     torch.save({
         "model_state_dict": model.state_dict(),
         "encoder_classes": encoder.classes_,
         "scaler_mean": scaler.mean_,
         "scaler_var": scaler.var_,
-        "max_qr_length": max_qr_length  # 최대 QR 길이 저장
+        "max_qr_length": max_qr_length  # QR 최대 길이 저장
     }, MODEL_PATH)
-2. 모델 불러오기 시 최대 QR 길이 가져오기
-python
-Copy code
+
+# 📌 모델 불러오기 함수
 def load_model():
     if os.path.exists(MODEL_PATH):
         checkpoint = torch.load(MODEL_PATH, map_location=device)
         num_classes = len(checkpoint["encoder_classes"])
         input_size = len(checkpoint["scaler_mean"])
+        
         model = QRModel(input_size, num_classes).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
 
         encoder = LabelEncoder()
         encoder.classes_ = checkpoint["encoder_classes"]
@@ -35,33 +90,69 @@ def load_model():
         scaler.mean_ = checkpoint["scaler_mean"]
         scaler.var_ = checkpoint["scaler_var"]
 
-        max_qr_length = checkpoint["max_qr_length"]  # 저장된 QR 길이 로드
+        max_qr_length = checkpoint["max_qr_length"]
 
         return model, encoder, scaler, max_qr_length
     return None, None, None, None
-3. 예측 시 QR 벡터화에서 패딩 추가
-python
-Copy code
-def vectorize_qr(qr_values, max_length):
-    vectorized = np.zeros((len(qr_values), max_length), dtype=np.float32)  # max_length만큼 0으로 패딩
-    for i, qr in enumerate(qr_values):
-        for j, char in enumerate(qr[:max_length]):  # max_length 초과 시 자름
-            vectorized[i, j] = ord(char)  # 아스키 코드 변환
-    return vectorized
-4. 예측 함수 수정 (QR 길이 문제 해결)
-python
-Copy code
+
+# 📌 모델 학습 함수
+def train_model(df_data, epochs=10, batch_size=64):
+    qr_values = df_data["QR"].values
+    model_names = df_data["Model"].values
+
+    encoder = LabelEncoder()
+    y_encoded = encoder.fit_transform(model_names)
+
+    # QR 값을 벡터화 후 스케일링 적용
+    max_qr_length = max(len(qr) for qr in qr_values)  # QR 최대 길이 계산
+    X_vectorized = vectorize_qr(qr_values, max_qr_length)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_vectorized)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
+
+    # PyTorch 데이터셋 & 데이터로더 생성
+    train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                             torch.tensor(y_train, dtype=torch.long))
+    train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # 모델 초기화
+    num_classes = len(encoder.classes_)
+    model = QRModel(X_train.shape[1], num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # 학습 루프
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.4f}")
+
+    save_model(model, encoder, scaler, max_qr_length)
+    print("🎉 학습 완료! 모델 저장됨.")
+
+# 📌 예측 함수
 def predict_qr(qr_value):
     model, encoder, scaler, max_qr_length = load_model()
     if model is None:
-        print("학습된 모델이 없습니다. 먼저 모델을 학습하세요.")
+        print("❌ 학습된 모델이 없습니다. 먼저 모델을 학습하세요.")
         return
     
-    model.eval()
-    X_vectorized = vectorize_qr([qr_value], max_qr_length)  # 학습된 QR 길이에 맞춤
+    # QR 값 벡터화 (길이 맞추기)
+    X_vectorized = vectorize_qr([qr_value], max_qr_length)
     X_scaled = scaler.transform(X_vectorized)
     X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
 
+    # 예측 수행
     with torch.no_grad():
         outputs = model(X_tensor)
         probabilities = torch.softmax(outputs, dim=1).cpu().numpy().squeeze()
@@ -70,13 +161,21 @@ def predict_qr(qr_value):
     predicted_model = encoder.inverse_transform([predicted_label])[0]
     confidence = probabilities[predicted_label] * 100
 
-    print(f"예측된 모델: {predicted_model}, 신뢰도: {confidence:.2f}%")
-오류 해결 요약
-✅ 모델 학습 시 최대 QR 길이를 저장
-✅ 모델 불러올 때 최대 QR 길이를 함께 불러옴
-✅ 예측 시 입력된 QR 값이 학습된 QR 길이와 동일하도록 패딩 적용
+    print(f"✅ 예측된 모델: {predicted_model}, 신뢰도: {confidence:.2f}%")
 
-예측 실행 예제
-python
-Copy code
-test_qr = "123ABC456"  # 입력 QR
+# 📌 실행 예제
+if __name__ == "__main__":
+    # TXT 파일 데이터 로드 후 학습
+    df_data = load_data_from_txt("runwait.txt")
+    train_model(df_data, epochs=20, batch_size=128)
+
+    # 예측 테스트
+    test_qr = "123ABC456"  # 예측할 QR 값
+    predict_qr(test_qr)
+📌 최종 정리
+TXT 파일에서 데이터 로드 (load_data_from_txt)
+QR 값을 벡터화 (vectorize_qr)
+모델 학습 후 저장 (train_model)
+QR 값 입력 시 모델명 예측 (predict_qr)
+학습된 모델을 자동으로 불러옴 (load_model)
+입력 QR이 학습된 QR과 길이가 다르면 패딩으로 보정
