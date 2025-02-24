@@ -1,2 +1,127 @@
-qr_code = "12345XYZ"
-predicted_model, confidence = predict_qr(qr_code)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pymssql
+import numpy as np
+import os
+import json
+from collections import defaultdict
+
+# DB 연결 설정
+DB_CONFIG = {
+    "server": "YOUR_SERVER",
+    "user": "YOUR_USER",
+    "password": "YOUR_PASSWORD",
+    "database": "YOUR_DATABASE"
+}
+
+MODEL_PATH = "qr_model.pth"
+TOKENIZER_PATH = "tokenizer.json"
+
+# QR 데이터셋 정의
+class QRDataset(Dataset):
+    def __init__(self, data, tokenizer):
+        self.data = data
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        qr_code, label = self.data[idx]
+        qr_encoded = self.tokenizer(qr_code)
+        return torch.tensor(qr_encoded, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+# 간단한 LSTM 모델 정의
+class QRModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(QRModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n.squeeze(0))
+
+# 데이터베이스에서 데이터 가져오기
+def fetch_data():
+    conn = pymssql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("EXEC your_stored_procedure")
+    data = cursor.fetchall()
+    conn.close()
+    return data
+
+# QR 코드 토큰화 함수
+def create_tokenizer(data):
+    unique_chars = sorted(set("".join(qr for _, qr in data)))
+    char_to_idx = {char: idx for idx, char in enumerate(unique_chars, start=1)}
+    char_to_idx["<PAD>"] = 0
+    
+    def tokenizer(qr_code):
+        return [char_to_idx.get(char, 0) for char in qr_code]
+    
+    return tokenizer, char_to_idx
+
+# 모델 저장 및 불러오기
+def save_model(model, tokenizer):
+    torch.save(model.state_dict(), MODEL_PATH)
+    with open(TOKENIZER_PATH, "w") as f:
+        json.dump(tokenizer, f)
+
+def load_model(input_dim, hidden_dim, output_dim):
+    model = QRModel(input_dim, hidden_dim, output_dim)
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH))
+    return model
+
+def load_tokenizer():
+    with open(TOKENIZER_PATH, "r") as f:
+        char_to_idx = json.load(f)
+    def tokenizer(qr_code):
+        return [char_to_idx.get(char, 0) for char in qr_code]
+    return tokenizer
+
+# 학습 루프
+def train_model(model, dataset, epochs=10, batch_size=32, lr=0.001):
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, labels in dataloader:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss:.4f}")
+    
+    save_model(model, dataset.tokenizer)
+
+# 데이터 불러오기 및 학습
+if __name__ == "__main__":
+    raw_data = fetch_data()
+    filtered_data = [(model if model else None, qr) for model, qr in raw_data]
+    model_map = defaultdict(list)
+    for model, qr in filtered_data:
+        model_map[qr].append(model)
+    
+    # 모델명이 없는 경우, 동일한 QR의 과거 기록 활용
+    processed_data = [(model_map[qr][0] if model_map[qr] else "UNKNOWN", qr) for _, qr in filtered_data]
+    
+    tokenizer, char_to_idx = create_tokenizer(processed_data)
+    model_list = list(set(model for model, _ in processed_data))
+    model_to_idx = {model: idx for idx, model in enumerate(model_list)}
+    idx_to_model = {idx: model for model, idx in model_to_idx.items()}
+    
+    dataset = QRDataset([(qr, model_to_idx[model]) for model, qr in processed_data], tokenizer)
+    input_dim = max(len(qr) for _, qr in processed_data)
+    hidden_dim = 128
+    output_dim = len(model_list)
+    
+    model = load_model(input_dim, hidden_dim, output_dim)
+    train_model(model, dataset)
