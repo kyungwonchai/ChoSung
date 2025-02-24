@@ -1,22 +1,65 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data_utils
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
 
-📌 해결 방법
-저장할 때 .scale_ 대신 .var_ 사용하도록 변경합니다.
+# 🚀 GPU 설정
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-📌 수정할 코드
-✅ 모델 저장 시 scale_ 대신 var_ 사용
-python
-Copy code
+# 📌 TXT 파일에서 데이터 로드 (모델명 + QR 값)
+def load_data_from_txt(file_path):
+    data = []
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                model_name, qr_value = parts[:2]
+                data.append((model_name, qr_value))
+    return pd.DataFrame(data, columns=["Model", "QR"])
+
+# 📌 QR 값을 벡터로 변환 (고정된 길이로 패딩)
+def vectorize_qr(qr_values, max_length):
+    vectorized = np.zeros((len(qr_values), max_length), dtype=np.float32)
+    for i, qr in enumerate(qr_values):
+        for j, char in enumerate(qr[:max_length]):
+            vectorized[i, j] = ord(char)
+    return vectorized
+
+# 📌 신경망 모델 정의
+class QRModel(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super(QRModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, num_classes)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
+# 📌 모델 저장 함수
+MODEL_PATH = "model.pth"
 def save_model(model, encoder, scaler, max_qr_length):
+    scale_value = scaler.scale_ if hasattr(scaler, "scale_") else np.sqrt(scaler.var_)  # 🔥 scale_ 없으면 var_로 변환
     torch.save({
         "model_state_dict": model.state_dict(),
         "encoder_classes": encoder.classes_,
         "scaler_mean": scaler.mean_,
-        "scaler_var": scaler.var_,  # ✅ scale_ 대신 var_ 저장
+        "scaler_scale": scale_value,  # ✅ 오류 방지: scale_을 항상 저장
         "max_qr_length": max_qr_length
     }, MODEL_PATH)
-✅ 모델 불러올 때도 var_로 변경
-python
-Copy code
+
+# 📌 모델 불러오기 함수
 def load_model():
     if os.path.exists(MODEL_PATH):
         checkpoint = torch.load(MODEL_PATH, map_location=device)
@@ -32,13 +75,80 @@ def load_model():
 
         scaler = StandardScaler()
         scaler.mean_ = checkpoint["scaler_mean"]
-        scaler.var_ = checkpoint["scaler_var"]  # ✅ scale_ 대신 var_ 사용
+        scaler.scale_ = checkpoint["scaler_scale"]  # ✅ scale_ 저장한 값 사용
 
         max_qr_length = checkpoint["max_qr_length"]
 
         return model, encoder, scaler, max_qr_length
     return None, None, None, None
-📌 최종 정리
-원인: StandardScaler의 .scale_ 속성이 없기 때문
-해결: .scale_을 .var_로 변경하면 해결됨
-수정한 부분:
+
+# 📌 모델 학습 함수
+def train_model(df_data, epochs=10, batch_size=64):
+    qr_values = df_data["QR"].values
+    model_names = df_data["Model"].values
+
+    encoder = LabelEncoder()
+    y_encoded = encoder.fit_transform(model_names)
+
+    max_qr_length = max(len(qr) for qr in qr_values)  # QR 최대 길이 계산
+    X_vectorized = vectorize_qr(qr_values, max_qr_length)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_vectorized)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
+
+    # PyTorch 데이터셋 & 데이터로더 생성
+    train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                             torch.tensor(y_train, dtype=torch.long))
+    train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # 모델 초기화
+    num_classes = len(encoder.classes_)
+    model = QRModel(X_train.shape[1], num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # 학습 루프
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.4f}")
+
+    save_model(model, encoder, scaler, max_qr_length)
+    print("🎉 학습 완료! 모델 저장됨.")
+
+# 📌 예측 함수
+def predict_qr(qr_value):
+    model, encoder, scaler, max_qr_length = load_model()
+    if model is None:
+        print("❌ 학습된 모델이 없습니다. 먼저 모델을 학습하세요.")
+        return
+    
+    X_vectorized = vectorize_qr([qr_value], max_qr_length)
+    X_scaled = scaler.transform(X_vectorized)
+    X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        outputs = model(X_tensor)
+        probabilities = torch.softmax(outputs, dim=1).cpu().numpy().squeeze()
+
+    predicted_label = np.argmax(probabilities)
+    predicted_model = encoder.inverse_transform([predicted_label])[0]
+    confidence = probabilities[predicted_label] * 100
+
+    print(f"✅ 예측된 모델: {predicted_model}, 신뢰도: {confidence:.2f}%")
+
+# 📌 실행 예제
+if __name__ == "__main__":
+    df_data = load_data_from_txt("runwait.txt")  # TXT 파일 로드
+    train_model(df_data, epochs=20, batch_size=128)  # 모델 학습
+    test_qr = "123ABC456"  # 예측할 QR 값
