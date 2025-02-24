@@ -5,22 +5,30 @@ import torch.utils.data as data_utils
 import pandas as pd
 import numpy as np
 import os
+import datetime
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 
 # 🚀 GPU 설정
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 📌 TXT 파일에서 데이터 로드 (모델명 + QR 값)
+# 📌 TXT 파일에서 데이터 로드 (모델명 + QR 값 + 날짜 포함)
 def load_data_from_txt(file_path):
     data = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split()
-            if len(parts) >= 2:
-                model_name, qr_value = parts[:2]
-                data.append((model_name, qr_value))
-    return pd.DataFrame(data, columns=["Model", "QR"])
+            if len(parts) >= 3:
+                model_name, qr_value, date_str = parts[:3]  # 모델명, QR, 날짜
+                data.append((model_name, qr_value, date_str))
+    df = pd.DataFrame(data, columns=["Model", "QR", "Date"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")  # 날짜 변환
+    return df
+
+# 📌 3개월 지난 데이터 제거 함수
+def filter_recent_data(df):
+    cutoff_date = datetime.datetime.now() - datetime.timedelta(days=90)  # 3개월 전 기준
+    return df[df["Date"] >= cutoff_date]
 
 # 📌 QR 값을 벡터로 변환 (고정된 길이로 패딩)
 def vectorize_qr(qr_values, max_length):
@@ -50,12 +58,12 @@ class QRModel(nn.Module):
 # 📌 모델 저장 함수
 MODEL_PATH = "model.pth"
 def save_model(model, encoder, scaler, max_qr_length):
-    scale_value = scaler.scale_ if hasattr(scaler, "scale_") else np.sqrt(scaler.var_)  # 🔥 scale_ 없으면 var_로 변환
+    scale_value = scaler.scale_ if hasattr(scaler, "scale_") else np.sqrt(scaler.var_)
     torch.save({
         "model_state_dict": model.state_dict(),
         "encoder_classes": encoder.classes_,
         "scaler_mean": scaler.mean_,
-        "scaler_scale": scale_value,  # ✅ 오류 방지: scale_을 항상 저장
+        "scaler_scale": scale_value,
         "max_qr_length": max_qr_length
     }, MODEL_PATH)
 
@@ -75,40 +83,55 @@ def load_model():
 
         scaler = StandardScaler()
         scaler.mean_ = checkpoint["scaler_mean"]
-        scaler.scale_ = checkpoint["scaler_scale"]  # ✅ scale_ 저장한 값 사용
+        scaler.scale_ = checkpoint["scaler_scale"]
 
         max_qr_length = checkpoint["max_qr_length"]
 
         return model, encoder, scaler, max_qr_length
     return None, None, None, None
 
-# 📌 모델 학습 함수
-def train_model(df_data, epochs=10, batch_size=64):
-    qr_values = df_data["QR"].values
-    model_names = df_data["Model"].values
+# 📌 모델 학습 함수 (기존 데이터 + 새로운 데이터 합쳐서 학습)
+def train_model(new_df_data, epochs=10, batch_size=64):
+    new_df_data = filter_recent_data(new_df_data)  # 🔥 3개월 지난 데이터 제외
+
+    # 기존 모델 로드
+    model, encoder, scaler, max_qr_length = load_model()
+
+    # 기존 모델이 없으면 새로운 모델 학습
+    if model is None:
+        print("🔴 기존 모델 없음. 새로 학습 시작.")
+        full_df_data = new_df_data
+    else:
+        print("🟢 기존 모델 로드됨. 추가 학습 진행.")
+        old_df_data = pd.read_csv("trained_data.csv")  # 이전 학습 데이터 불러오기
+        old_df_data = filter_recent_data(old_df_data)  # 🔥 기존 데이터도 3개월 지난 거 제외
+        full_df_data = pd.concat([old_df_data, new_df_data]).drop_duplicates().reset_index(drop=True)  # 데이터 합치기
+
+    full_df_data.to_csv("trained_data.csv", index=False)  # 학습 데이터 저장
+
+    # QR 값, 모델명 추출
+    qr_values = full_df_data["QR"].values
+    model_names = full_df_data["Model"].values
 
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(model_names)
 
-    max_qr_length = max(len(qr) for qr in qr_values)  # QR 최대 길이 계산
+    max_qr_length = max(len(qr) for qr in qr_values)
     X_vectorized = vectorize_qr(qr_values, max_qr_length)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_vectorized)
 
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
 
-    # PyTorch 데이터셋 & 데이터로더 생성
     train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                              torch.tensor(y_train, dtype=torch.long))
     train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    # 모델 초기화
     num_classes = len(encoder.classes_)
     model = QRModel(X_train.shape[1], num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    # 학습 루프
     model.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -149,6 +172,6 @@ def predict_qr(qr_value):
 
 # 📌 실행 예제
 if __name__ == "__main__":
-    df_data = load_data_from_txt("runwait.txt")  # TXT 파일 로드
-    train_model(df_data, epochs=20, batch_size=128)  # 모델 학습
+    new_df_data = load_data_from_txt("runwait.txt")  # TXT 파일 로드
+    train_model(new_df_data, epochs=20, batch_size=128)  # 모델 학습
     test_qr = "123ABC456"  # 예측할 QR 값
