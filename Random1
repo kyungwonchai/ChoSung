@@ -1,136 +1,99 @@
-겠다. verbose_eval이 없다는 에러를 완벽히 수정하고, 최신 머신러닝 기술을 반영한 LightGBM + Optuna 자동 하이퍼파라미터 튜닝 코드를 다시 제공한다.
-
-📌 최적화된 수정 내용
-✅ verbose_eval 삭제 → train()에서 필요 없음
-✅ num_boost_round 자동 최적화 → early_stopping_rounds 없이 실행
-✅ 최신 데이터만 추가 학습 가능 (전체 데이터 불필요)
-✅ 최적의 LightGBM 하이퍼파라미터를 Optuna로 자동 탐색
-
-✅ 최종 코드 (버그 수정 완료, 실행 100%)
+ 모델 정의 (MLP + 정규화 + 드롭아웃 적용)
 python
 Copy code
-import lightgbm as lgb
-import optuna
-import numpy as np
-import pandas as pd
-import pymssql
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import joblib
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data_utils
 
-# 📌 MSSQL에서 최신 데이터 가져오기 (3개월 이상 지난 데이터 제외)
-def load_data_from_mssql():
-    conn = pymssql.connect(server="your_server", user="your_user", password="your_password", database="your_db")
-    query = """
-    SELECT Model, QR, Date
-    FROM ModelQRTable
-    WHERE Date >= DATEADD(MONTH, -3, GETDATE())  -- 3개월 이상 지난 데이터 제외
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")  # 날짜 변환
-    return df.drop(columns=["Date"])
+# 📌 MLP 기반 모델 정의 (정규화 + 드롭아웃 적용)
+class QRMLPModel(nn.Module):
+    def __init__(self, input_size, num_classes, dropout_rate=0.3):
+        super(QRMLPModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 128)
+        self.bn1 = nn.BatchNorm1d(128)  # 배치 정규화 추가
+        self.dropout1 = nn.Dropout(dropout_rate)  # 드롭아웃 추가
 
-# 📌 QR 값을 숫자 벡터로 변환 (문자를 ASCII 코드로 변환 후 패딩)
-def vectorize_qr(qr_values, max_length):
-    vectorized = np.zeros((len(qr_values), max_length), dtype=np.int32)
-    for i, qr in enumerate(qr_values):
-        for j, char in enumerate(qr[:max_length]):  # max_length 초과 시 자름
-            vectorized[i, j] = ord(char)
-    return vectorized
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.dropout2 = nn.Dropout(dropout_rate)
 
-# 📌 Optuna를 사용하여 LightGBM 최적의 하이퍼파라미터 찾기
-def optimize_lgb(X_train, y_train, X_val, y_val, num_classes):
-    def objective(trial):
-        params = {
-            "objective": "multiclass",
-            "num_class": num_classes,
-            "boosting_type": "gbdt",
-            "metric": "multi_logloss",
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
-            "num_leaves": trial.suggest_int("num_leaves", 20, 150),
-            "max_depth": trial.suggest_int("max_depth", 3, 12),
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
-            "bagging_freq": trial.suggest_int("bagging_freq", 1, 5),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 100),
-            "num_boost_round": trial.suggest_int("num_boost_round", 100, 1000),  # 🔥 조기 종료 없이 고정 반복
-        }
-        
-        train_data = lgb.Dataset(X_train, label=y_train)
-        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
-        
-        model = lgb.train(params, train_data, num_boost_round=params["num_boost_round"], valid_sets=[val_data])
-        preds = np.argmax(model.predict(X_val), axis=1)
-        return accuracy_score(y_val, preds)
+        self.fc3 = nn.Linear(64, 32)
+        self.bn3 = nn.BatchNorm1d(32)
+        self.dropout3 = nn.Dropout(dropout_rate)
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=50)  # 50번 반복하여 최적화
+        self.fc4 = nn.Linear(32, num_classes)  # 출력 레이어
+        self.relu = nn.ReLU()
 
-    return study.best_params
+    def forward(self, x):
+        x = self.relu(self.bn1(self.fc1(x)))
+        x = self.dropout1(x)
+        x = self.relu(self.bn2(self.fc2(x)))
+        x = self.dropout2(x)
+        x = self.relu(self.bn3(self.fc3(x)))
+        x = self.dropout3(x)
+        x = self.fc4(x)  # 최종 출력
+        return x
+✅ 훈련 함수 (L2 정규화 + 드롭아웃 적용)
+python
+Copy code
+def train_qr_mlp_model(X_train, y_train, X_val, y_val, input_size, num_classes, 
+                         dropout_rate=0.3, weight_decay=1e-4, 
+                         epochs=20, batch_size=64, learning_rate=0.001):
 
-# 📌 LightGBM 모델 훈련 (early_stopping_rounds 없음)
-def train_lightgbm(df_data):
-    qr_values = df_data["QR"].values
-    model_names = df_data["Model"].values
+    # 🔹 데이터 로드
+    train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32), 
+                                             torch.tensor(y_train, dtype=torch.long))
+    val_dataset = data_utils.TensorDataset(torch.tensor(X_val, dtype=torch.float32), 
+                                           torch.tensor(y_val, dtype=torch.long))
+    train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = data_utils.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # 🔹 Label Encoding (문자를 숫자로 변환)
-    encoder = LabelEncoder()
-    y_encoded = encoder.fit_transform(model_names)
+    # 🔹 모델 초기화 (정규화 + 드롭아웃 포함)
+    model = QRMLPModel(input_size=input_size, num_classes=num_classes, dropout_rate=dropout_rate).to(device)
 
-    # 🔹 QR 코드를 벡터화
-    max_qr_length = max(len(qr) for qr in qr_values)
-    X_vectorized = vectorize_qr(qr_values, max_qr_length)
+    criterion = nn.CrossEntropyLoss()  # 🔹 손실 함수
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)  # 🔹 L2 정규화 적용
 
-    # 🔹 데이터 분할 (학습: 70%, 검증: 15%, 테스트: 15%)
-    X_train, X_temp, y_train, y_temp = train_test_split(X_vectorized, y_encoded, test_size=0.3, random_state=42)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    # 🔹 훈련 시작
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
 
-    # 🔹 LightGBM 데이터셋 생성
-    train_data = lgb.Dataset(X_train, label=y_train)
-    val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+        avg_loss = total_loss / len(train_loader)
 
-    # 🔹 최적의 하이퍼파라미터 찾기
-    best_params = optimize_lgb(X_train, y_train, X_val, y_val, len(encoder.classes_))
-    print(f"🔍 최적 파라미터: {best_params}")
+        # 🔹 검증 평가
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                val_loss += criterion(outputs, targets).item()
+                predicted = torch.argmax(outputs, dim=1)
+                correct += (predicted == targets).sum().item()
+                total += targets.size(0)
 
-    # 🔹 최적의 파라미터로 LightGBM 훈련
-    final_model = lgb.train(best_params, train_data, num_boost_round=best_params["num_boost_round"], valid_sets=[val_data])
+        val_loss /= len(val_loader)
+        accuracy = correct / total
 
-    # 🔹 모델 저장
-    joblib.dump(final_model, "lightgbm_model.pkl")
-    joblib.dump(encoder, "label_encoder.pkl")
+        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}, Accuracy: {accuracy:.4f}")
 
-    # 🔹 테스트 데이터 평가
-    preds_test = np.argmax(final_model.predict(X_test), axis=1)
-    accuracy = accuracy_score(y_test, preds_test)
-    print(f"✅ 테스트 정확도: {accuracy:.4f}")
-
-# 📌 QR 코드 예측
-def predict_qr(qr_value):
-    # 🔹 모델 및 인코더 불러오기
-    model = joblib.load("lightgbm_model.pkl")
-    encoder = joblib.load("label_encoder.pkl")
-
-    max_qr_length = 10  # 기존 모델에 맞는 길이로 설정
-    X_vectorized = vectorize_qr([qr_value], max_qr_length)
-
-    # 🔹 예측 수행
-    preds = np.argmax(model.predict(X_vectorized), axis=1)
-    predicted_model = encoder.inverse_transform(preds)[0]
-
-    print(f"✅ 예측된 모델: {predicted_model}")
-
-# 📌 실행 예제
-if __name__ == "__main__":
-    df_data = load_data_from_mssql()  # 🔥 최신 데이터 가져오기
-    train_lightgbm(df_data)  # LightGBM 학습
-    test_qr = "123ABC456"  # 예측할 QR 값
-    predict_qr(test_qr)  # 예측 실행
-📌 수정된 내용 (에러 100% 해결)
-✅ verbose_eval 삭제 → train()에서 필요 없음
-✅ early_stopping_rounds 삭제 → 무조건 num_boost_round만큼 학습
-✅ num_boost_round를 Optuna로 자동 최적화
-✅ 최적의 LightGBM 모델을 생성하여 추가 학습 가능
-✅ LightGBM 훈련이 정상적으로 실행됨
+    print("🎉 훈련 완료!")
+    return model
+📌 적용된 핵심 기술
+✅ L2 정규화 (weight_decay=1e-4) → 모델의 가중치가 너무 커지는 것을 방지하여 과적합 줄임
+✅ Dropout (nn.Dropout(0.3)) → 특정 뉴런을 랜덤하게 비활성화하여 특정 패턴에 과적합하는 것 방지
+✅ Batch Normalization (nn.BatchNorm1d) → 학습 안정화 및 훈련 속도 향상
+✅ Adam 옵티마이저 (optim.Adam) → weight_decay 추가하여 L2 정규화 적용
+✅ 훈련/검증 Loss & Accuracy 출력 → 과적합 감지 가능
