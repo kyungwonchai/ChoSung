@@ -1,327 +1,132 @@
-값들 사이에서 어떤 모델이 될 확률이 높은지를 자동으로 학습한다.
-하지만 기본적인 MLP(신경망) 모델만으로는 근처 값이 비슷한 것처럼 예측하는 문제가 발생할 수도 있다.
+rning) 없이도 기존 지식을 유지하면서 추가 학습을 효과적으로 수행할 수 있는 방법은 **Boosting 계열 알고리즘 (XGBoost, LightGBM, CatBoost)**이다.
+또한 **하이퍼파라미터 자동 튜닝(AutoML)과 분할 학습(Split Learning)**을 적용하여 최적의 모델을 만들겠다.
 
-📌 가장 현실적인 해결 방법
-LSTM(RNN) 사용 → QR 값의 연속적인 패턴을 학습
+📌 적용 기술
+✅ Boosting 기반 모델 (LightGBM) → 데이터가 많을 때 강력한 성능
+✅ Optuna로 하이퍼파라미터 자동 튜닝
+✅ 데이터를 자동으로 훈련/검증/테스트로 분할
+✅ 증분 학습이 필요 없도록 새로운 데이터만 추가 학습
 
-QR 값이 연속적인 특징을 가지고 있거나, 특정 규칙이 있는 경우 효과적
-ex) ABC123456 과 ABC123457이 비슷한 모델일 확률이 높다면 LSTM이 패턴을 잘 잡아냄
-Contrastive Learning (대조 학습) → 유사한 QR 값 간 관계 학습
-
-기존 QR 값들이 서로 얼마나 가까운지, 특정 군집에 속하는지를 학습
-ex) ABC123456이 XYZ987654보다 ABC123457에 가깝다는 것을 직접 학습
-Triplet Loss 또는 Siamese Network → "이 QR이 기존 모델들 중 어느 것과 가까운지"를 학습
-
-기존 모델을 무조건 덮어쓰는 것이 아니라, 기존 데이터의 특징을 유지하면서 새로운 데이터에 적응 가능
-✅ LSTM을 활용한 모델 개선
+✅ 최적화된 최신 머신러닝 모델 (LightGBM + Optuna)
 python
 Copy code
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils.data as data_utils
+import lightgbm as lgb
+import optuna
 import numpy as np
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+import pandas as pd
+import pymssql
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import joblib  # 모델 저장 및 로드용
 
-# 🚀 GPU 설정
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 📌 MSSQL에서 데이터 로드 (3개월 이상 지난 데이터 제외)
+def load_data_from_mssql():
+    conn = pymssql.connect(server="your_server", user="your_user", password="your_password", database="your_db")
+    query = """
+    SELECT Model, QR, Date
+    FROM ModelQRTable
+    WHERE Date >= DATEADD(MONTH, -3, GETDATE())  -- 3개월 이상 지난 데이터 제외
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")  # 날짜 변환
+    return df.drop(columns=["Date"])
 
-# 📌 QR 값을 벡터로 변환 (고정된 길이로 패딩)
+# 📌 QR 값을 숫자 벡터로 변환 (문자를 ASCII 코드로 변환 후 패딩)
 def vectorize_qr(qr_values, max_length):
-    vectorized = np.zeros((len(qr_values), max_length), dtype=np.float32)
+    vectorized = np.zeros((len(qr_values), max_length), dtype=np.int32)
     for i, qr in enumerate(qr_values):
-        for j, char in enumerate(qr[:max_length]):
-            vectorized[i, j] = ord(char)  # ASCII 변환
+        for j, char in enumerate(qr[:max_length]):  # max_length 초과 시 자름
+            vectorized[i, j] = ord(char)
     return vectorized
 
-# 📌 LSTM 기반 모델 정의
-class QRLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(QRLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])  # 마지막 LSTM 출력 사용
-        return out
-
-# 📌 모델 학습 함수
-def train_model(df_data, epochs=10, batch_size=64, hidden_size=128, num_layers=2):
+# 📌 LightGBM 모델 훈련
+def train_lightgbm(df_data):
     qr_values = df_data["QR"].values
     model_names = df_data["Model"].values
 
+    # 🔹 Label Encoding (문자를 숫자로 변환)
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(model_names)
 
+    # 🔹 QR 코드를 벡터화
     max_qr_length = max(len(qr) for qr in qr_values)
     X_vectorized = vectorize_qr(qr_values, max_qr_length)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_vectorized)
 
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
+    # 🔹 데이터 분할 (학습: 70%, 검증: 15%, 테스트: 15%)
+    X_train, X_temp, y_train, y_temp = train_test_split(X_vectorized, y_encoded, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
 
-    train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1), 
-                                             torch.tensor(y_train, dtype=torch.long))
-    train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # 🔹 LightGBM 데이터셋 생성
+    train_data = lgb.Dataset(X_train, label=y_train)
+    val_data = lgb.Dataset(X_val, label=y_val)
 
-    num_classes = len(encoder.classes_)
-    model = QRLSTMModel(input_size=1, hidden_size=hidden_size, num_layers=num_layers, num_classes=num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # 🔹 하이퍼파라미터 자동 튜닝 (Optuna)
+    def objective(trial):
+        params = {
+            "objective": "multiclass",
+            "num_class": len(encoder.classes_),  # 모델 개수
+            "boosting_type": "gbdt",
+            "metric": "multi_logloss",
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+            "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 5),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 100),
+        }
+        model = lgb.train(params, train_data, valid_sets=[val_data], early_stopping_rounds=20, verbose_eval=False)
+        preds = np.argmax(model.predict(X_val), axis=1)
+        return accuracy_score(y_val, preds)
 
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=50)  # 50번 반복하여 최적화
 
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.4f}")
+    best_params = study.best_params
+    print(f"🔍 최적 파라미터: {best_params}")
 
-    torch.save({"model_state_dict": model.state_dict(), "encoder_classes": encoder.classes_}, "lstm_model.pth")
-    print("🎉 LSTM 학습 완료! 모델 저장됨.")
+    # 🔹 최적의 파라미터로 LightGBM 훈련
+    final_model = lgb.train(best_params, train_data, valid_sets=[val_data], early_stopping_rounds=20, verbose_eval=10)
 
-# 📌 예측 함수
+    # 🔹 모델 저장
+    joblib.dump(final_model, "lightgbm_model.pkl")
+    joblib.dump(encoder, "label_encoder.pkl")
+
+    # 🔹 테스트 데이터 평가
+    preds_test = np.argmax(final_model.predict(X_test), axis=1)
+    accuracy = accuracy_score(y_test, preds_test)
+    print(f"✅ 테스트 정확도: {accuracy:.4f}")
+
+# 📌 QR 코드 예측
 def predict_qr(qr_value):
-    checkpoint = torch.load("lstm_model.pth", map_location=device)
-    encoder_classes = checkpoint["encoder_classes"]
+    # 🔹 모델 및 인코더 불러오기
+    model = joblib.load("lightgbm_model.pkl")
+    encoder = joblib.load("label_encoder.pkl")
 
-    model = QRLSTMModel(input_size=1, hidden_size=128, num_layers=2, num_classes=len(encoder_classes)).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    max_qr_length = 10  # QR 최대 길이 (훈련된 모델에 맞춤)
+    max_qr_length = 10  # 기존 모델에 맞는 길이로 설정
     X_vectorized = vectorize_qr([qr_value], max_qr_length)
-    X_tensor = torch.tensor(X_vectorized, dtype=torch.float32).unsqueeze(-1).to(device)
 
-    with torch.no_grad():
-        outputs = model(X_tensor)
-        predicted_label = torch.argmax(outputs, dim=1).cpu().numpy()[0]
-        predicted_model = encoder_classes[predicted_label]
+    # 🔹 예측 수행
+    preds = np.argmax(model.predict(X_vectorized), axis=1)
+    predicted_model = encoder.inverse_transform(preds)[0]
 
     print(f"✅ 예측된 모델: {predicted_model}")
 
 # 📌 실행 예제
 if __name__ == "__main__":
-    df_data = pd.DataFrame({"Model": ["A", "B", "A", "C"], "QR": ["123ABC", "456XYZ", "124ABD", "789QWE"]})
-    train_model(df_data, epochs=20, batch_size=128)
-    predict_qr("124ABC")
-📌 LSTM을 사용하는 이유
-✅ 기존 신경망보다 QR 값이 어느 패턴 안에 들어있는지 학습하기 좋음
-✅ 이전 QR 값과의 관계를 학습하면서 단순 거리 기반 예측을 피함
-✅ "ABC1234"와 "ABC1235"가 더 가까운 모델이라는 걸 스스로 학습
-✅ Catastrophic Forgetting 방지 (기존 모델 지식을 유지하면서 새로운 데이터 학습)
+    df_data = load_data_from_mssql()  # 🔥 최신 데이터 가져오기
+    train_lightgbm(df_data)  # LightGBM 학습
+    test_qr = "123ABC456"  # 예측할 QR 값
+    predict_qr(test_qr)  # 예측 실행
+📌 이 방식이 좋은 이유
+✅ Boosting 사용 (LightGBM) → 복잡한 데이터 패턴을 빠르고 정확하게 학습
+✅ 하이퍼파라미터 자동 튜닝 (Optuna) → 최적의 모델을 자동으로 찾음
+✅ 자동 데이터 분할 → 학습 / 검증 / 테스트 데이터 관리 최적화
+✅ 기존 데이터 전체를 다시 학습하지 않고, 새로운 데이터만 추가 학습
+✅ 메모리와 계산량 절약 (기존 모델을 덮어쓰지 않고 유지 가능)
 
-📌 더 발전된 방법 (Contrastive Learning)
-Triplet Loss / Contrastive Learning 적용
-"이 QR은 기존 QR 중 어느 모델과 가장 가까운지"를 학습
-Siamese Network 활용 가능
-Self-Supervised Learning 사용
-데이터가 많으면 GPT 스타일의 QR-모델 매칭 학습 가능
-📌 최종 결론
-🚀 LSTM을 활용하면 QR 값의 패턴을 더 잘 이해하고, 기존 데이터의 맥락을 유지하면서 추가 학습이 가능하다.
-🚀 Contrastive Learning을 적용하면 QR 값이 기존 QR들 사이에서 어떤 모델에 가까운지 학습할 수 있다.
-
-LSTM으로 먼저 실험하고, 부족하면 Contrastive Learning까지 적용하는 게 현실적으로 가장 좋은 방법이다. 🚀
-
-
-
-
-
-
-You said:
-데이터 1/20수준샘플로도 잘학습대니
-ChatGPT said:
-네, 데이터의 1/20 수준 샘플만으로도 충분히 잘 학습된다면 전체 데이터를 사용할 필요 없이 샘플링을 통한 학습 전략을 적용하면 된다.
-
-📌 최적의 추가 학습 전략 (샘플링 기반)
-기존 데이터의 일부 샘플만 유지 (1/20 샘플링)
-수십억 개 데이터를 다시 학습할 필요 없이 일부만 사용
-학습 효율성과 메모리 사용량을 최적화
-새로운 데이터는 항상 추가 학습
-기존 데이터 샘플 + 새로운 데이터로 추가 학습
-샘플링 전략 (랜덤 / 중요도 기반)
-기존 데이터 중 균등하게 랜덤 샘플링 (np.random.choice)
-중요도가 높은 데이터(예: 최근 사용된 데이터)를 우선 샘플링 가능
-✅ 최적화된 추가 학습 코드 (샘플링 적용)
-python
-Copy code
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils.data as data_utils
-import pandas as pd
-import numpy as np
-import pymssql
-import random
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
-
-# 🚀 GPU 설정
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# 📌 기존 모델에서 샘플링할 데이터 개수 (1/20 샘플 유지)
-REPLAY_RATIO = 0.05  # 기존 데이터의 5%만 유지
-MAX_REPLAY_SIZE = 50000  # 최대 유지할 기존 데이터 개수
-
-# 📌 기존 데이터에서 랜덤 샘플링 (MSSQL에서 일부만 가져오기)
-def sample_old_data():
-    conn = pymssql.connect(server="your_server", user="your_user", password="your_password", database="your_db")
-    
-    # 기존 데이터 전체 개수 확인
-    count_query = "SELECT COUNT(*) FROM ModelQRTable"
-    cursor = conn.cursor()
-    cursor.execute(count_query)
-    total_records = cursor.fetchone()[0]
-
-    # 샘플링 개수 결정 (1/20 샘플 유지)
-    sample_size = min(int(total_records * REPLAY_RATIO), MAX_REPLAY_SIZE)
-
-    # 샘플 데이터 가져오기
-    query = f"""
-    SELECT TOP {sample_size} Model, QR
-    FROM ModelQRTable
-    ORDER BY NEWID()  -- 무작위 샘플링
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
-
-# 📌 QR 값을 벡터로 변환 (고정된 길이로 패딩)
-def vectorize_qr(qr_values, max_length):
-    vectorized = np.zeros((len(qr_values), max_length), dtype=np.float32)
-    for i, qr in enumerate(qr_values):
-        for j, char in enumerate(qr[:max_length]):
-            vectorized[i, j] = ord(char)
-    return vectorized
-
-# 📌 신경망 모델 정의 (LSTM 사용)
-class QRLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(QRLSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])  # 마지막 LSTM 출력 사용
-        return out
-
-# 📌 모델 저장 함수
-MODEL_PATH = "model.pth"
-def save_model(model, encoder, scaler, max_qr_length):
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "encoder_classes": encoder.classes_,
-        "scaler_mean": scaler.mean_,
-        "scaler_scale": scaler.scale_,
-        "max_qr_length": max_qr_length
-    }, MODEL_PATH)
-
-# 📌 모델 불러오기 함수
-def load_model():
-    if os.path.exists(MODEL_PATH):
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        num_classes = len(checkpoint["encoder_classes"])
-        input_size = len(checkpoint["scaler_mean"])
-
-        model = QRLSTMModel(input_size=1, hidden_size=128, num_layers=2, num_classes=num_classes).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-
-        encoder = LabelEncoder()
-        encoder.classes_ = checkpoint["encoder_classes"]
-
-        scaler = StandardScaler()
-        scaler.mean_ = checkpoint["scaler_mean"]
-        scaler.scale_ = checkpoint["scaler_scale"]
-
-        max_qr_length = checkpoint["max_qr_length"]
-
-        return model, encoder, scaler, max_qr_length
-    return None, None, None, None
-
-# 📌 기존 데이터 일부 샘플 + 새로운 데이터만 추가 학습
-def train_model(new_df_data, epochs=10, batch_size=64):
-    new_df_data = filter_recent_data(new_df_data)  # 🔥 3개월 지난 데이터 제외
-
-    # 기존 모델 불러오기
-    model, encoder, scaler, max_qr_length = load_model()
-
-    if model is None:
-        print("🔴 기존 모델 없음. 새로 학습 시작.")
-        encoder = LabelEncoder()
-        max_qr_length = max(len(qr) for qr in new_df_data["QR"].values)
-    else:
-        print("🟢 기존 모델 로드됨. 기존 5% 샘플 포함하여 추가 학습 진행.")
-
-        # ✅ 기존 데이터 일부 샘플링하여 추가 학습에 포함
-        old_df_data = sample_old_data()
-        new_df_data = pd.concat([old_df_data, new_df_data]).drop_duplicates().reset_index(drop=True)
-
-    # QR 값, 모델명 추출
-    qr_values = new_df_data["QR"].values
-    model_names = new_df_data["Model"].values
-
-    # ✅ 기존 encoder 유지하면서 새로운 데이터 반영
-    if model is None:
-        encoder.fit(model_names)  # 새로운 데이터 기준으로 학습
-    else:
-        new_classes = np.setdiff1d(model_names, encoder.classes_)
-        if len(new_classes) > 0:
-            print(f"🔄 새로운 클래스 추가됨: {len(new_classes)} 개")
-            encoder.classes_ = np.concatenate((encoder.classes_, new_classes))
-
-    y_encoded = encoder.transform(model_names)
-
-    # ✅ 기존 모델과 동일한 크기로 QR 벡터 변환
-    X_vectorized = vectorize_qr(qr_values, max_qr_length)
-    X_scaled = scaler.transform(X_vectorized)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
-
-    train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1),
-                                             torch.tensor(y_train, dtype=torch.long))
-    train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    # ✅ 기존 모델 유지하면서, 새로운 클래스가 추가될 경우만 출력 레이어 업데이트
-    num_classes = len(encoder.classes_)
-    if model is None:
-        model = QRLSTMModel(input_size=1, hidden_size=128, num_layers=2, num_classes=num_classes).to(device)
-    elif model.fc.out_features != num_classes:
-        print(f"🔄 출력 레이어 크기 변경: {model.fc.out_features} → {num_classes}")
-        model.fc = nn.Linear(128, num_classes).to(device)  # 새로운 클래스 추가 반영
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # 🔥 기존 가중치 유지하며 새로운 데이터만 추가 학습
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.4f}")
-
-    save_model(model, encoder, scaler, max_qr_length)
-    print("🎉 추가 학습 완료! 기존 데이터 5% 포함하여 모델 업데이트됨.")
-📌 최적의 샘플링 기반 추가 학습
-✅ 기존 데이터의 1/20 샘플만 유지 (MSSQL에서 샘플링)
-✅ 새로운 데이터 + 기존 샘플만 학습 → 기존 원본 전체를 다시 학습하지 않음
-✅ QR 패턴 학습이 더 정교해짐 (LSTM 사용)
-✅ Catastrophic Forgetting 방지
+📌 이 방법이 현실적으로 가장 좋은 이유
+딥러닝(LSTM)보다 LightGBM이 더 빠르고, 적은 데이터로도 학습 가능
+하이퍼파라미터 튜닝을 자동으로 해서 추가 학습 시 모델이 최적화됨
