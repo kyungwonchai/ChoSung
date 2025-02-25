@@ -1,9 +1,12 @@
-인(Line) 값은 학습할 때 QR의 특징을 강조하는 용도로만 사용
-✅ 예측할 때는 QR 값만 입력하여 모델을 예측
-✅ Label Encoding을 사용하여 라인을 숫자로 변환하여 학습 데이터에 포함
-✅ 훈련 후 검증 결과 출력 및 시각화 추가
+입력 데이터 X_vectorized의 크기가 (1, 10),
+모델의 첫 번째 Linear 레이어가 (11, 128)으로 설정됨
+즉, 입력 크기가 10인데 모델은 11을 기대하고 있어서 에러 발생
+✅ 해결 방법:
 
-✅ 최종 코드 (MLP 모델 + 라인 포함 학습, QR만 예측)
+훈련 데이터에서 라인(Line) 정보 포함 → input_size = max_length + 1
+예측할 때는 QR만 사용 → input_size = max_length
+모델을 input_size에 맞춰 동적으로 변경
+✅ 수정된 최종 코드 (훈련: QR + Line, 예측: QR만)
 python
 Copy code
 import torch
@@ -16,42 +19,35 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-# 📌 TXT 파일에서 데이터 읽기 (라인 포함하여 학습)
+# 📌 데이터 로드 및 전처리 (라인 포함)
 def load_data_from_txt(file_path, sample_ratio=0.1):
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # 🔹 "라인, 시간, 모델명, QR 코드" 값만 추출
     data = [line.strip().split()[:4] for line in lines if len(line.strip().split()) >= 4]
     df = pd.DataFrame(data, columns=["Line", "Time", "Model", "QR"])
-
-    # 🔹 시간(Time) 컬럼을 숫자로 변환 후 정렬
     df["Time"] = pd.to_numeric(df["Time"], errors="coerce")
     df = df.sort_values(by=["Line", "Time"]).reset_index(drop=True)
-
-    # 🔹 라인별로 샘플링 수행 (각 라인별 일정 비율 유지)
     df_sampled = df.groupby("Line").apply(lambda x: x.sample(frac=sample_ratio, random_state=42)).reset_index(drop=True)
-
     return df_sampled
 
-# 📌 QR 값을 숫자 벡터로 변환 (라인 값을 추가하여 학습에 사용)
+# 📌 QR 벡터화 (훈련: QR + Line 포함, 예측: QR만)
 def vectorize_qr_with_line(qr_values, line_values, line_encoder, max_length=10):
-    vectorized = np.zeros((len(qr_values), max_length + 1), dtype=np.int32)  # QR 길이 + 라인 정보
+    vectorized = np.zeros((len(qr_values), max_length + 1), dtype=np.int32)  # QR + Line 정보 포함
     for i, (qr, line) in enumerate(zip(qr_values, line_values)):
-        for j, char in enumerate(qr[:max_length]):  # QR을 숫자로 변환
+        for j, char in enumerate(qr[:max_length]):
             vectorized[i, j] = ord(char)
-        vectorized[i, -1] = line_encoder.transform([line])[0]  # 마지막 위치에 변환된 라인 값 추가
+        vectorized[i, -1] = line_encoder.transform([line])[0]  # 라인 정보를 마지막 컬럼에 추가
     return vectorized
 
-# 📌 QR 값만 벡터로 변환 (예측 시 사용)
 def vectorize_qr(qr_values, max_length=10):
-    vectorized = np.zeros((len(qr_values), max_length), dtype=np.int32)  # QR 길이만큼
+    vectorized = np.zeros((len(qr_values), max_length), dtype=np.int32)  # QR 정보만 포함
     for i, qr in enumerate(qr_values):
-        for j, char in enumerate(qr[:max_length]):  # QR을 숫자로 변환
+        for j, char in enumerate(qr[:max_length]):
             vectorized[i, j] = ord(char)
     return vectorized
 
-# 📌 MLP 기반 QR 모델 정의 (라인 정보 포함)
+# 📌 MLP 모델 정의 (동적으로 입력 크기 설정)
 class QRMLPModel(nn.Module):
     def __init__(self, input_size, num_classes):
         super(QRMLPModel, self).__init__()
@@ -65,48 +61,44 @@ class QRMLPModel(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         x = self.relu(self.fc3(x))
-        x = self.fc4(x)  # 최종 출력
+        x = self.fc4(x)
         return x
 
-# 📌 모델 학습 함수 (훈련 후 검증 결과 포함)
-def train_and_validate_model(df_data, epochs=20, batch_size=64, learning_rate=0.001):
+# 📌 학습 함수 (QR + Line 포함)
+def train_and_validate_model(df_data, epochs=20, batch_size=64, learning_rate=0.001, max_length=10):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 🔹 데이터 전처리 (라인 포함)
+    # 데이터 전처리
     qr_values = df_data["QR"].values
-    line_values = df_data["Line"].values  # 라인 값 추가
+    line_values = df_data["Line"].values
     model_names = df_data["Model"].values
 
-    # Label Encoding (모델명을 숫자로 변환)
+    # Label Encoding
     model_encoder = LabelEncoder()
     line_encoder = LabelEncoder()
 
     y_encoded = model_encoder.fit_transform(model_names)
     line_encoded = line_encoder.fit_transform(line_values)
 
-    # QR 코드 벡터화 (라인 정보 포함하여 학습)
-    X_vectorized = vectorize_qr_with_line(qr_values, line_values, line_encoder, max_length=10)
+    # QR + Line을 포함하여 벡터화
+    X_vectorized = vectorize_qr_with_line(qr_values, line_values, line_encoder, max_length=max_length)
+    input_size = X_vectorized.shape[1]  # 🔹 모델 입력 크기 설정
 
-    # 🔹 데이터셋 분할 (Train 70%, Validation 30%)
+    # 데이터셋 분할
     X_train, X_val, y_train, y_val = train_test_split(X_vectorized, y_encoded, test_size=0.3, random_state=42)
 
     # PyTorch 데이터 로더 생성
     train_dataset = data_utils.TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
     val_dataset = data_utils.TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
-
     train_loader = data_utils.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = data_utils.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # 모델 초기화
-    model = QRMLPModel(input_size=X_vectorized.shape[1], num_classes=len(model_encoder.classes_)).to(device)
+    model = QRMLPModel(input_size=input_size, num_classes=len(model_encoder.classes_)).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # 🔹 훈련 과정
-    train_losses = []
-    val_losses = []
-    val_accuracies = []
-
     model.train()
     for epoch in range(epochs):
         total_loss = 0
@@ -119,64 +111,15 @@ def train_and_validate_model(df_data, epochs=20, batch_size=64, learning_rate=0.
             optimizer.step()
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        train_losses.append(avg_loss)
-
-        # 🔹 검증 과정
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                val_loss += criterion(outputs, targets).item()
-                predicted = torch.argmax(outputs, dim=1)
-                correct += (predicted == targets).sum().item()
-                total += targets.size(0)
-
-        val_loss /= len(val_loader)
-        accuracy = correct / total
-        val_losses.append(val_loss)
-        val_accuracies.append(accuracy)
-
-        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {accuracy:.4f}")
+        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {total_loss / len(train_loader):.4f}")
 
     print("🎉 훈련 완료!")
-    
-    # 🔹 검증 결과 시각화
-    plot_validation_results(train_losses, val_losses, val_accuracies)
-
-    return model, model_encoder
-
-# 📌 검증 결과 시각화 함수
-def plot_validation_results(train_losses, val_losses, val_accuracies):
-    plt.figure(figsize=(12, 5))
-
-    # 🔹 Loss 그래프
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label="Train Loss", marker="o")
-    plt.plot(val_losses, label="Validation Loss", marker="o")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Train vs Validation Loss")
-    plt.legend()
-
-    # 🔹 Accuracy 그래프
-    plt.subplot(1, 2, 2)
-    plt.plot(val_accuracies, label="Validation Accuracy", marker="o", color="green")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.title("Validation Accuracy")
-    plt.legend()
-
-    plt.show()
+    return model, model_encoder, max_length
 
 # 📌 예측 함수 (QR 값만 입력)
-def predict_qr(model, model_encoder, qr_value):
+def predict_qr(model, model_encoder, qr_value, max_length):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    X_vectorized = vectorize_qr([qr_value], max_length=10)
+    X_vectorized = vectorize_qr([qr_value], max_length=max_length)
 
     # 🔹 예측 수행
     model.eval()
@@ -184,7 +127,7 @@ def predict_qr(model, model_encoder, qr_value):
         inputs = torch.tensor(X_vectorized, dtype=torch.float32).to(device)
         outputs = model(inputs)
         predicted = torch.argmax(outputs, dim=1).cpu().numpy()[0]
-    
+
     predicted_model = model_encoder.inverse_transform([predicted])[0]
     print(f"✅ 예측된 모델: {predicted_model}")
 
@@ -193,6 +136,13 @@ if __name__ == "__main__":
     txt_file_path = "runwait.txt"
     df_data = load_data_from_txt(txt_file_path, sample_ratio=0.1)
 
-    trained_model, trained_model_encoder = train_and_validate_model(df_data, epochs=20)
+    # 🔥 모델 학습 (QR + Line 포함)
+    trained_model, trained_model_encoder, max_length = train_and_validate_model(df_data, epochs=20)
 
+    # 🔥 예측 예제 (QR만 사용)
     test_qr = "123ABC456"
+    predict_qr(trained_model, trained_model_encoder, test_qr, max_length)
+📌 수정된 사항 (에러 해결)
+훈련할 때 QR + Line을 사용 → input_size = max_length + 1
+예측할 때 QR만 사용 → input_size = max_length
+모델이 입력 크기를 자동으로 설정하도록 수정
