@@ -1,121 +1,86 @@
-너는 C# 프로그램에서 2400 포트로 소켓 서버에 비동기적으로 신호를 보낼 수 있음
+아요. 지금 상황을 기준으로 아주 정확하게 정리해서 설명드릴게요.
 
-그런데 반대로, 상대방(게)이 너에게 먼저 신호를 보내는 상황도 있음
+현재 너의 구조: 요청-응답 기반
+현재는 다음과 같은 구조야:
 
-따라서 수신 대기 상태를 항상 유지하면서, 상대가 보낸 데이터를 비동기적으로 캐치해야 함
+너가 명령을 보냄 (SendAsync)
 
-이론 설명
-소켓 통신에서 상대방이 먼저 데이터를 보낼 수 있는 구조를 처리하려면, 항상 Receive 혹은 ReceiveAsync를 대기 상태로 유지해야 합니다.
+그에 대한 응답을 기다림 (await ReadAsync)
 
-C#에서 Socket 클래스 또는 TcpClient를 사용할 수 있고, 일반적으로 NetworkStream.BeginRead 혹은 Socket.BeginReceive, async/await 기반 Stream.ReadAsync() 등을 사용하여 비동기 수신 루프를 만듭니다.
+응답이 오면 "정상적으로 수신"이라고 판단함
 
-핵심 개념은 다음과 같습니다:
+즉, **"내가 보낼 때만 응답을 기다리는 구조"**이기 때문에,
+상대방이 선제적으로 신호를 줄 경우는 못 받는 구조야.
 
-서버와 연결을 맺고 나면, 데이터를 보내는 것 외에 항상 수신 대기를 돌려야 함
+원하는 구조: 수신 루프를 항상 돌리는 구조
+상대방이 언제든지 신호를 줄 수 있다면,
+별도의 수신 루프(ReceiveLoop)를 항상 돌려야 해.
 
-상대가 데이터를 보내면, 수신 핸들러에서 그걸 파싱하고 처리
+핵심 개념:
+보내기용 SendAsync는 기존처럼 둬도 됨
 
-이때도 UI가 멈추지 않도록 비동기로 구성해야 함
+ReceiveLoop를 병렬로 계속 돌리기만 하면,
+너가 보내든 안 보내든 상대방의 모든 신호를 비동기적으로 받을 수 있어!
 
-연결이 끊기거나 에러 시 다시 연결 로직도 필요
-
-예시 코드 (비동기 수신 포함된 구조, TcpClient 기반)
+요약 구조도:
+scss
+코드 복사
+┌──────────────┐           ┌──────────────┐
+│ 너의 프로그램│           │ 상대방 시스템│
+└────┬─────────┘           └────┬─────────┘
+     │                            │
+     │────── SendAsync() ────────▶│  (명령 보냄)
+     │                            │
+     │◀──── ReceiveAsync() ───────│  (응답 수신)
+     │                            │
+     │                            │
+     │◀───── ReceiveLoop() ◀───── │  (상대가 먼저 보낸 신호 캐치!)
+핵심 코드 구조 요약:
 csharp
 코드 복사
-using System;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-
-public class SocketClientReceiver
+public async Task StartAsync()
 {
-    private TcpClient client;
-    private NetworkStream stream;
+    await client.ConnectAsync(ip, port);
+    stream = client.GetStream();
 
-    public async Task StartAsync(string ip, int port)
+    // ★ 항상 수신 대기를 돌리는 루프 시작
+    _ = Task.Run(() => ReceiveLoop());
+}
+
+private async Task ReceiveLoop()
+{
+    while (true)
     {
-        client = new TcpClient();
-        await client.ConnectAsync(ip, port);
-        Console.WriteLine("Connected to server.");
-
-        stream = client.GetStream();
-
-        // 수신 루프 시작
-        _ = Task.Run(() => ReceiveLoop());
-    }
-
-    private async Task ReceiveLoop()
-    {
-        byte[] buffer = new byte[1024];
-
-        while (true)
+        try
         {
-            try
-            {
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                if (bytesRead == 0)
-                {
-                    Console.WriteLine("Server closed connection.");
-                    break;
-                }
+            int bytes = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (bytes == 0) break;
 
-                string received = Encoding.ASCII.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"[RECV] {received}");
+            string msg = Encoding.ASCII.GetString(buffer, 0, bytes);
+            Console.WriteLine("[RECV] " + msg);
 
-                // 여기서 받은 데이터를 처리
-                ProcessReceivedData(received);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Receive error: {ex.Message}");
-                break;
-            }
+            // 받은 데이터를 파싱하고 처리
         }
-    }
-
-    private void ProcessReceivedData(string data)
-    {
-        // 예: STX ~ ETX 포함되었는지 확인 후 처리
-        if (data.Contains("\u0002") && data.Contains("\u0003"))
+        catch (Exception ex)
         {
-            string message = data.Trim('\u0002', '\u0003');
-            Console.WriteLine($"Parsed message: {message}");
+            Console.WriteLine("수신 에러: " + ex.Message);
         }
-        else
-        {
-            Console.WriteLine("Invalid message format.");
-        }
-    }
-
-    public async Task SendAsync(string message)
-    {
-        if (stream == null) return;
-
-        byte[] data = Encoding.ASCII.GetBytes("\u0002" + message + "\u0003");
-        await stream.WriteAsync(data, 0, data.Length);
-        Console.WriteLine($"[SEND] {message}");
     }
 }
-사용 예시
-csharp
-코드 복사
-class Program
+
+public async Task SendAsync(string msg)
 {
-    static async Task Main()
-    {
-        var client = new SocketClientReceiver();
-        await client.StartAsync("10.22.22.22", 2400);
-
-        // 예: 너가 먼저 보낼 경우
-        await client.SendAsync("HELLO");
-
-        // 프로그램이 종료되지 않도록 대기
-        Console.ReadLine();
-    }
+    byte[] data = Encoding.ASCII.GetBytes(msg);
+    await stream.WriteAsync(data, 0, data.Length);
 }
-요약
-ReceiveLoop()를 항상 돌려야 상대방의 선제 신호를 잡을 수 있음
+정리하면
+기능	현재 방식	개선 방식
+명령 전송	SendAsync()	그대로 유지
+응답 수신	명령 이후만 수신	항상 수신 루프 유지 (ReceiveLoop)
+상대방 선제 신호 수신	없음	수신 루프에서 자동 처리
+프로그램 흐름	요청-응답	요청-응답 + 이벤트 수신 병행
+한 줄 핵심 요약
+"명령 보낼 때만 수신 기다리지 말고, 항상 돌아가는 ReceiveLoop를 돌리면 상대방이 먼저 보내는 신호도 받을 수 있다."
 
-async/await로 UI/메인 스레드를 막지 않음
-
-신호 형식(STX/ETX 포함)은 데이터 가공 처리 부분에서 처리
+필요하다면, 이 구조를 MVVM 패턴으로 리팩토링,
+응답 타입 분류, 로그 남기기, UI 반영 방식까지 다 알려줄 수 있어.
