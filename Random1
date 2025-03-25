@@ -1,86 +1,178 @@
-아요. 지금 상황을 기준으로 아주 정확하게 정리해서 설명드릴게요.
+아요. 그럼 너가 기존에 가지고 있는 구조(SendAsync()로 명령을 보내고 ReadAsync()로 응답을 받는 구조)에 **항상 수신을 대기하는 수신 루프(ReceiveLoop)**를 추가한 전문가 수준의 구조로 바꿔줄게.
 
-현재 너의 구조: 요청-응답 기반
-현재는 다음과 같은 구조야:
+목표 요약
+기존 요청-응답 구조 유지
 
-너가 명령을 보냄 (SendAsync)
+추가로, 상대방이 먼저 보내는 신호도 수신할 수 있는 루프 추가
 
-그에 대한 응답을 기다림 (await ReadAsync)
+전체를 주석 포함한 전문가용 구조로 리팩토링
 
-응답이 오면 "정상적으로 수신"이라고 판단함
-
-즉, **"내가 보낼 때만 응답을 기다리는 구조"**이기 때문에,
-상대방이 선제적으로 신호를 줄 경우는 못 받는 구조야.
-
-원하는 구조: 수신 루프를 항상 돌리는 구조
-상대방이 언제든지 신호를 줄 수 있다면,
-별도의 수신 루프(ReceiveLoop)를 항상 돌려야 해.
-
-핵심 개념:
-보내기용 SendAsync는 기존처럼 둬도 됨
-
-ReceiveLoop를 병렬로 계속 돌리기만 하면,
-너가 보내든 안 보내든 상대방의 모든 신호를 비동기적으로 받을 수 있어!
-
-요약 구조도:
-scss
-코드 복사
-┌──────────────┐           ┌──────────────┐
-│ 너의 프로그램│           │ 상대방 시스템│
-└────┬─────────┘           └────┬─────────┘
-     │                            │
-     │────── SendAsync() ────────▶│  (명령 보냄)
-     │                            │
-     │◀──── ReceiveAsync() ───────│  (응답 수신)
-     │                            │
-     │                            │
-     │◀───── ReceiveLoop() ◀───── │  (상대가 먼저 보낸 신호 캐치!)
-핵심 코드 구조 요약:
+전문가 코드 예시 (주석 포함)
 csharp
 코드 복사
-public async Task StartAsync()
-{
-    await client.ConnectAsync(ip, port);
-    stream = client.GetStream();
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
 
-    // ★ 항상 수신 대기를 돌리는 루프 시작
-    _ = Task.Run(() => ReceiveLoop());
-}
-
-private async Task ReceiveLoop()
+public class ExpertSocketClient
 {
-    while (true)
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private byte[] _buffer = new byte[1024];  // 수신 버퍼
+    private bool _isConnected = false;
+
+    /// <summary>
+    /// 서버에 연결을 시도하고 수신 루프를 시작한다.
+    /// </summary>
+    public async Task ConnectAsync(string ip, int port)
     {
         try
         {
-            int bytes = await stream.ReadAsync(buffer, 0, buffer.Length);
-            if (bytes == 0) break;
+            _client = new TcpClient();
+            await _client.ConnectAsync(ip, port);
+            _stream = _client.GetStream();
+            _isConnected = true;
 
-            string msg = Encoding.ASCII.GetString(buffer, 0, bytes);
-            Console.WriteLine("[RECV] " + msg);
+            Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
-            // 받은 데이터를 파싱하고 처리
+            // 항상 수신 루프를 백그라운드로 실행
+            _ = Task.Run(ReceiveLoopAsync);
         }
         catch (Exception ex)
         {
-            Console.WriteLine("수신 에러: " + ex.Message);
+            Console.WriteLine($"[ERROR] Connection failed: {ex.Message}");
         }
     }
-}
 
-public async Task SendAsync(string msg)
+    /// <summary>
+    /// 명령을 서버로 비동기 전송하고, 응답을 수신한다 (요청-응답 기반).
+    /// </summary>
+    public async Task<string> SendAndReceiveAsync(string message)
+    {
+        if (!_isConnected || _stream == null)
+        {
+            return "[ERROR] Not connected.";
+        }
+
+        try
+        {
+            // STX(\x02), ETX(\x03) 감싸기
+            string wrappedMessage = '\x02' + message + '\x03';
+            byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
+
+            // 명령 전송
+            await _stream.WriteAsync(data, 0, data.Length);
+            Console.WriteLine($"[SEND] {message}");
+
+            // 응답 수신 (명령에 대한 응답만 처리)
+            int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+            string response = Encoding.ASCII.GetString(_buffer, 0, bytesRead);
+
+            Console.WriteLine($"[RESP] {response.Trim('\x02', '\x03')}");
+            return response.Trim('\x02', '\x03');
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] Send/Receive failed: {ex.Message}");
+            return "[ERROR] Communication failed.";
+        }
+    }
+
+    /// <summary>
+    /// 항상 백그라운드에서 서버로부터 수신되는 데이터를 대기하고 처리하는 루프.
+    /// 상대방이 먼저 보내는 신호를 잡을 수 있다.
+    /// </summary>
+    private async Task ReceiveLoopAsync()
+    {
+        while (_isConnected)
+        {
+            try
+            {
+                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("[INFO] Server disconnected.");
+                    _isConnected = false;
+                    break;
+                }
+
+                string receivedData = Encoding.ASCII.GetString(_buffer, 0, bytesRead);
+                string cleanMessage = receivedData.Trim('\x02', '\x03');
+
+                // SendAndReceive에서 받은 응답이라면 무시할 수도 있음 (구분 로직 필요시 추가)
+                Console.WriteLine($"[RECV] (Passive) {cleanMessage}");
+
+                // 여기에 이벤트 발생 처리, 파싱, UI 업데이트 등 구현 가능
+                ProcessIncomingMessage(cleanMessage);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] ReceiveLoop failed: {ex.Message}");
+                _isConnected = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 수신된 메시지를 처리하는 부분 (상대방이 먼저 보낸 신호 등)
+    /// </summary>
+    private void ProcessIncomingMessage(string message)
+    {
+        // 예: "ALARM_ON", "READY", "DONE" 등의 상태 분기
+        switch (message)
+        {
+            case "ALARM_ON":
+                Console.WriteLine("[EVENT] Alarm Activated!");
+                break;
+            case "READY":
+                Console.WriteLine("[EVENT] System Ready.");
+                break;
+            default:
+                Console.WriteLine($"[EVENT] Unknown message: {message}");
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 연결 해제
+    /// </summary>
+    public void Disconnect()
+    {
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        Console.WriteLine("[INFO] Disconnected.");
+    }
+}
+사용 예시
+csharp
+코드 복사
+class Program
 {
-    byte[] data = Encoding.ASCII.GetBytes(msg);
-    await stream.WriteAsync(data, 0, data.Length);
-}
-정리하면
-기능	현재 방식	개선 방식
-명령 전송	SendAsync()	그대로 유지
-응답 수신	명령 이후만 수신	항상 수신 루프 유지 (ReceiveLoop)
-상대방 선제 신호 수신	없음	수신 루프에서 자동 처리
-프로그램 흐름	요청-응답	요청-응답 + 이벤트 수신 병행
-한 줄 핵심 요약
-"명령 보낼 때만 수신 기다리지 말고, 항상 돌아가는 ReceiveLoop를 돌리면 상대방이 먼저 보내는 신호도 받을 수 있다."
+    static async Task Main(string[] args)
+    {
+        var client = new ExpertSocketClient();
 
-필요하다면, 이 구조를 MVVM 패턴으로 리팩토링,
-응답 타입 분류, 로그 남기기, UI 반영 방식까지 다 알려줄 수 있어.
+        // 서버 연결
+        await client.ConnectAsync("10.22.22.22", 2400);
+
+        // 명령 전송 및 응답 수신 (기존 로직 그대로)
+        string response = await client.SendAndReceiveAsync("STATUS_CHECK");
+
+        Console.WriteLine(">>> Response from server: " + response);
+
+        // 계속 수신 루프는 백그라운드에서 돌아감
+        Console.ReadLine(); // 프로그램 종료 방지
+        client.Disconnect();
+    }
+}
+실무적 요약
+기능	설명
+SendAndReceiveAsync	기존 방식처럼 명령 보내고 응답 받기
+ReceiveLoopAsync	상대가 먼저 보내는 메시지 수신 처리 (항상 작동)
+ProcessIncomingMessage	수신 메시지에 따라 분기처리 (이벤트 알람 등)
+Disconnect	수동 연결 해제 처리
+이제 너는 "내가 보낼 때" + "상대가 먼저 보낼 때" 모두 수신할 수 있는 구조를 갖춘 거야.
+이제 이걸 MVVM 구조에 녹이거나 로그 저장/에러 복구까지 확장도 가능해.
