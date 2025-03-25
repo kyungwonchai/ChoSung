@@ -1,22 +1,21 @@
 
-Q. 상대방이 먼저 보낸 신호인지, 아니면 내가 보낸 명령에 대한 응답인지 어떻게 구분하냐?
-A. 응답을 구분하는 3가지 방법
-메시지 내용으로 구분
-예) 내가 "STATUS_CHECK" 보냈는데 "STATUS:OK"가 오면 응답임
+조건 요약
+상대방이 보내는 선제 신호는 하나뿐: OP_CLEAR (STX/ETX로 감싸짐)
 
-메시지에 고유 ID 또는 명령명 포함
-예) "ID123:STATUS_CHECK" 보냈고, "ID123:STATUS_OK" 오면 응답임
+그 외 모든 수신은 내가 보낸 명령에 대한 응답
 
-응답 수신 대기 Task와 수신 루프를 분리해서
-응답 대기 Task는 내가 기다리는 응답만 받아서 처리하고
-수신 루프는 나머지 수신을 처리함 (이 방법을 지금 구현할 거야)
+그러면 OP_CLEAR만 별도로 처리하고, 나머지는 응답 처리하면 돼!
 
-전문가 방식: 응답 Task와 항상 수신 루프를 분리
-SendAndWaitResponseAsync() → 보낸 명령에 대한 응답을 기다림
+전략 (간단하고 명확하게)
+수신 메시지를 STX/ETX로 클린하게 정리
 
-ReceiveLoopAsync() → 모든 메시지를 받고, 응답이면 응답 처리, 아니면 이벤트로 분기
+메시지가 "OP_CLEAR"이면 → 선제 이벤트로 처리
 
-전문가 예시코드 (ID로 구분 + 주석 매우 상세)
+나머지는 모두 → 응답용으로 처리
+
+전문가 코드 (주석 포함)
+(딱 너 상황 맞게 OP_CLEAR 구분만 추가한 구조야)
+
 csharp
 코드 복사
 using System;
@@ -32,7 +31,7 @@ public class ExpertSocketClient
     private byte[] _buffer = new byte[1024];
     private bool _isConnected = false;
 
-    // 요청 ID와 응답 TaskCompletionSource를 매칭하는 딕셔너리
+    // 응답 대기 중인 요청 ID 맵
     private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseWaiters
         = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
 
@@ -48,40 +47,33 @@ public class ExpertSocketClient
 
         Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
-        // 백그라운드에서 수신 루프 시작
         _ = Task.Run(ReceiveLoopAsync);
     }
 
     /// <summary>
-    /// 명령을 보내고 그에 대한 응답을 기다린다 (ID 포함 방식)
+    /// 명령 전송 후 응답 대기 (ID 사용)
     /// </summary>
     public async Task<string> SendAndWaitResponseAsync(string command)
     {
         if (!_isConnected) return "[ERROR] Not connected.";
 
-        // 고유 ID 생성 (Guid or Timestamp)
-        string id = Guid.NewGuid().ToString("N").Substring(0, 8); // 예: "a1b2c3d4"
-
-        // ID 포함한 메시지 생성
+        string id = Guid.NewGuid().ToString("N").Substring(0, 8);
         string fullCommand = $"REQ:{id}:{command}";
         string wrapped = '\x02' + fullCommand + '\x03';
         byte[] data = Encoding.ASCII.GetBytes(wrapped);
 
-        // 응답 대기 준비 (ID 기준으로 응답을 기다리는 TaskCompletionSource 생성)
         var tcs = new TaskCompletionSource<string>();
         _responseWaiters.TryAdd(id, tcs);
 
-        // 데이터 전송
         await _stream.WriteAsync(data, 0, data.Length);
         Console.WriteLine($"[SEND] {fullCommand}");
 
-        // 응답 대기 (타임아웃은 선택적으로 구현 가능)
         string response = await tcs.Task;
         return response;
     }
 
     /// <summary>
-    /// 항상 돌아가는 수신 루프. 응답인지 이벤트인지 구분하여 처리한다.
+    /// 항상 도는 수신 루프. 선제 메시지(OP_CLEAR)와 응답 메시지를 구분함
     /// </summary>
     private async Task ReceiveLoopAsync()
     {
@@ -102,26 +94,30 @@ public class ExpertSocketClient
 
                 Console.WriteLine($"[RECV] {message}");
 
-                // 수신 메시지 분석
-                if (message.StartsWith("RES:"))
+                if (message == "OP_CLEAR")
                 {
-                    // RES:id:actualResponse
+                    // 서버가 먼저 보낸 신호 (선제 이벤트)
+                    Console.WriteLine("[EVENT] OP_CLEAR received!");
+                    ProcessOpClearEvent();
+                }
+                else if (message.StartsWith("RES:"))
+                {
+                    // 내가 보낸 명령에 대한 응답 처리
                     string[] parts = message.Split(':');
                     if (parts.Length >= 3)
                     {
                         string id = parts[1];
-                        string body = string.Join(':', parts, 2, parts.Length - 2);
+                        string result = string.Join(':', parts, 2, parts.Length - 2);
 
                         if (_responseWaiters.TryRemove(id, out var tcs))
                         {
-                            tcs.SetResult(body); // 해당 응답 처리 완료
+                            tcs.SetResult(result);
                         }
                     }
                 }
                 else
                 {
-                    // 명령 응답이 아닌 경우 → 선제 신호로 처리
-                    ProcessPassiveEvent(message);
+                    Console.WriteLine($"[WARN] Unknown message format: {message}");
                 }
             }
             catch (Exception ex)
@@ -133,25 +129,12 @@ public class ExpertSocketClient
     }
 
     /// <summary>
-    /// 서버가 선제적으로 보내는 이벤트 처리
+    /// OP_CLEAR 신호 처리 (UI, 상태변경 등)
     /// </summary>
-    private void ProcessPassiveEvent(string message)
+    private void ProcessOpClearEvent()
     {
-        Console.WriteLine($"[EVENT] Passive signal: {message}");
-
-        // 예: 상태 갱신, UI 반영, 로깅 등
-        switch (message)
-        {
-            case "READY":
-                Console.WriteLine("[EVENT] 장비 준비 완료");
-                break;
-            case "ALARM":
-                Console.WriteLine("[EVENT] 장비 경고 발생!");
-                break;
-            default:
-                Console.WriteLine("[EVENT] 기타 수신: " + message);
-                break;
-        }
+        // TODO: 필요 시 이벤트, UI 알림, 로그 처리 등
+        Console.WriteLine("[ACTION] Handling OP_CLEAR signal...");
     }
 
     public void Disconnect()
@@ -162,35 +145,14 @@ public class ExpertSocketClient
         Console.WriteLine("[INFO] Disconnected.");
     }
 }
-서버 측 메시지 포맷 규칙 예시
-너가 보낼 때: "REQ:a1b2c3d4:STATUS_CHECK"
+서버 통신 예시 포맷 요약
+타입	메시지 예시	설명
+내가 보낸 명령	REQ:abc12345:STATUS	명령 송신
+서버 응답	RES:abc12345:OK	명령 응답
+서버 선제신호	OP_CLEAR	서버가 먼저 보내는 신호 (유일)
+정리
+OP_CLEAR → ReceiveLoop에서 문자열로 직접 구분 처리
 
-서버가 응답할 때: "RES:a1b2c3d4:STATUS_OK"
+나머지 메시지 → 응답 포맷(RES:...)만 응답 대기로 넘김
 
-서버가 먼저 보낼 때: "ALARM" 또는 "READY"
-
-사용 예시
-csharp
-코드 복사
-class Program
-{
-    static async Task Main(string[] args)
-    {
-        var client = new ExpertSocketClient();
-        await client.ConnectAsync("10.22.22.22", 2400);
-
-        // 내가 보낸 것에 대한 응답 기다리기
-        string response = await client.SendAndWaitResponseAsync("STATUS_CHECK");
-        Console.WriteLine(">>> 응답결과: " + response);
-
-        // 수신 루프는 자동으로 계속 돌아가며 선제 메시지도 처리됨
-        Console.ReadLine();
-        client.Disconnect();
-    }
-}
-요약
-구분	메시지 형식	처리 방식
-보낸 명령	REQ:{id}:{command}	SendAndWaitResponseAsync()
-응답 메시지	RES:{id}:{result}	ReceiveLoop가 응답 매칭
-선제 이벤트	"READY", "ALARM" 등	ProcessPassiveEvent()에서 분기 처리
-원하면 이걸 WPF MVVM, 로그 목록 바인딩, DataGrid, 타임아웃 처리, 재연결 처리까지 확장 가능해.
+구분 조건이 명확하니 코드도 간결, 실무에도 강력
