@@ -1,39 +1,52 @@
+, 핵심 질문을 정확히 짚었어. 요약하면:
 
-조건 요약
-상대방이 보내는 선제 신호는 하나뿐: OP_CLEAR (STX/ETX로 감싸짐)
+Q. 요청 ID(Map, Dictionary)는 꼭 필요하냐? 그냥 수신 루프에서 OP_CLEAR만 걸러내면 안 되냐?
+A. “조건에 따라 가능함.”
+너처럼 서버에서 보내는 선제 신호가 단 하나(OP_CLEAR) 뿐이고,
+그 외 수신 메시지는 전부 내가 보낸 것에 대한 응답이라면,
+요청 ID 없이도 수신 루프에서 OP_CLEAR만 걸러내고,
+나머지는 기존 방식(보내고 응답 받는 구조)으로 유지 가능해.
 
-그 외 모든 수신은 내가 보낸 명령에 대한 응답
+정확한 구조 이해
+1. 기존 구조
+csharp
+코드 복사
+await stream.WriteAsync(...) // 명령 보냄
+await stream.ReadAsync(...)  // 그에 대한 응답 받음
+이 구조는 명령마다 직접 응답을 받는 일회성 처리야.
 
-그러면 OP_CLEAR만 별도로 처리하고, 나머지는 응답 처리하면 돼!
+2. 추가해야 할 구조
+항상 수신 루프를 돌림
 
-전략 (간단하고 명확하게)
-수신 메시지를 STX/ETX로 클린하게 정리
+거기서 OP_CLEAR만 걸러냄
 
-메시지가 "OP_CLEAR"이면 → 선제 이벤트로 처리
+나머지 메시지는 “명령의 응답일 것이다” → 무시하거나 로그만 찍기
 
-나머지는 모두 → 응답용으로 처리
+단점 (중요)
+이 방식은 단일 응답에만 안전해.
 
-전문가 코드 (주석 포함)
-(딱 너 상황 맞게 OP_CLEAR 구분만 추가한 구조야)
+동시에 2개 이상 명령 보내면 응답이 섞일 수 있음
 
+예: 네가 CMD1, CMD2 동시에 보내면 응답 순서를 구분 못함
+
+결론
+"순차적이고 단일 명령만 보낸다"면,
+ID 없이도 수신 루프에서 OP_CLEAR만 필터링하는 구조 가능.
+
+코드 예제: OP_CLEAR만 걸러내고 나머지는 기존 방식 유지
 csharp
 코드 복사
 using System;
-using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 
-public class ExpertSocketClient
+public class SimpleSocketClient
 {
     private TcpClient _client;
     private NetworkStream _stream;
     private byte[] _buffer = new byte[1024];
     private bool _isConnected = false;
-
-    // 응답 대기 중인 요청 ID 맵
-    private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseWaiters
-        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
 
     /// <summary>
     /// 서버 연결 및 수신 루프 시작
@@ -47,94 +60,90 @@ public class ExpertSocketClient
 
         Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
+        // 수신 루프 실행
         _ = Task.Run(ReceiveLoopAsync);
     }
 
     /// <summary>
-    /// 명령 전송 후 응답 대기 (ID 사용)
+    /// 기존 방식: 명령 보내고 응답 받기 (OP_CLEAR는 여기서 안 다룸)
     /// </summary>
-    public async Task<string> SendAndWaitResponseAsync(string command)
+    public async Task<string> SendAndReceiveAsync(string message)
     {
         if (!_isConnected) return "[ERROR] Not connected.";
 
-        string id = Guid.NewGuid().ToString("N").Substring(0, 8);
-        string fullCommand = $"REQ:{id}:{command}";
-        string wrapped = '\x02' + fullCommand + '\x03';
+        string wrapped = '\x02' + message + '\x03';
         byte[] data = Encoding.ASCII.GetBytes(wrapped);
 
-        var tcs = new TaskCompletionSource<string>();
-        _responseWaiters.TryAdd(id, tcs);
-
+        // 명령 전송
         await _stream.WriteAsync(data, 0, data.Length);
-        Console.WriteLine($"[SEND] {fullCommand}");
+        Console.WriteLine($"[SEND] {message}");
 
-        string response = await tcs.Task;
-        return response;
+        // 응답 수신
+        int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+        if (bytesRead == 0)
+        {
+            Console.WriteLine("[ERROR] Server disconnected.");
+            return "[ERROR] Disconnected.";
+        }
+
+        string response = Encoding.ASCII.GetString(_buffer, 0, bytesRead);
+        string clean = response.Trim('\x02', '\x03');
+
+        // OP_CLEAR는 수신 루프에서 따로 처리됨
+        Console.WriteLine($"[RESP] {clean}");
+        return clean;
     }
 
     /// <summary>
-    /// 항상 도는 수신 루프. 선제 메시지(OP_CLEAR)와 응답 메시지를 구분함
+    /// 수신 루프에서 OP_CLEAR만 걸러내고 나머지는 무시
     /// </summary>
     private async Task ReceiveLoopAsync()
     {
+        byte[] recvBuffer = new byte[1024];
+
         while (_isConnected)
         {
             try
             {
-                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+                int bytesRead = await _stream.ReadAsync(recvBuffer, 0, recvBuffer.Length);
                 if (bytesRead == 0)
                 {
-                    Console.WriteLine("[INFO] Server disconnected.");
+                    Console.WriteLine("[INFO] Server closed connection.");
                     _isConnected = false;
                     break;
                 }
 
-                string raw = Encoding.ASCII.GetString(_buffer, 0, bytesRead);
-                string message = raw.Trim('\x02', '\x03');
+                string received = Encoding.ASCII.GetString(recvBuffer, 0, bytesRead);
+                string message = received.Trim('\x02', '\x03');
 
-                Console.WriteLine($"[RECV] {message}");
-
+                // OP_CLEAR만 처리하고 나머지는 무시
                 if (message == "OP_CLEAR")
                 {
-                    // 서버가 먼저 보낸 신호 (선제 이벤트)
-                    Console.WriteLine("[EVENT] OP_CLEAR received!");
-                    ProcessOpClearEvent();
-                }
-                else if (message.StartsWith("RES:"))
-                {
-                    // 내가 보낸 명령에 대한 응답 처리
-                    string[] parts = message.Split(':');
-                    if (parts.Length >= 3)
-                    {
-                        string id = parts[1];
-                        string result = string.Join(':', parts, 2, parts.Length - 2);
-
-                        if (_responseWaiters.TryRemove(id, out var tcs))
-                        {
-                            tcs.SetResult(result);
-                        }
-                    }
+                    Console.WriteLine("[EVENT] OP_CLEAR received and processed.");
+                    HandleOpClear();
                 }
                 else
                 {
-                    Console.WriteLine($"[WARN] Unknown message format: {message}");
+                    // 응답은 SendAndReceiveAsync에서 처리하므로 여기선 무시
+                    // (동시 요청 시 꼬일 수 있으니 주의!)
+                    Console.WriteLine($"[INFO] Passive message ignored: {message}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ERROR] ReceiveLoop: {ex.Message}");
+                Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
                 _isConnected = false;
             }
         }
     }
 
     /// <summary>
-    /// OP_CLEAR 신호 처리 (UI, 상태변경 등)
+    /// OP_CLEAR 처리
     /// </summary>
-    private void ProcessOpClearEvent()
+    private void HandleOpClear()
     {
-        // TODO: 필요 시 이벤트, UI 알림, 로그 처리 등
-        Console.WriteLine("[ACTION] Handling OP_CLEAR signal...");
+        // TODO: UI 반영, 상태 초기화 등
+        Console.WriteLine("[ACTION] 처리 로직: OP_CLEAR 발생 → 작업 초기화 등.");
     }
 
     public void Disconnect()
@@ -145,14 +154,12 @@ public class ExpertSocketClient
         Console.WriteLine("[INFO] Disconnected.");
     }
 }
-서버 통신 예시 포맷 요약
-타입	메시지 예시	설명
-내가 보낸 명령	REQ:abc12345:STATUS	명령 송신
-서버 응답	RES:abc12345:OK	명령 응답
-서버 선제신호	OP_CLEAR	서버가 먼저 보내는 신호 (유일)
-정리
-OP_CLEAR → ReceiveLoop에서 문자열로 직접 구분 처리
+주의점 정리
+조건	가능 여부	이유
+순차적 명령 1개씩	가능	응답이 꼬일 일 없음
+명령 2개 이상 동시에	불가능	응답 순서 확인 불가 (ID 필요함)
+OP_CLEAR만 감지	가능	if (message == "OP_CLEAR")로 처리
+마무리
+지금 구조에선 ID 없이도 완전 가능
 
-나머지 메시지 → 응답 포맷(RES:...)만 응답 대기로 넘김
-
-구분 조건이 명확하니 코드도 간결, 실무에도 강력
+단, 동시성 or 멀티 명령 구조로 확장할 계획 있으면 ID 방식으로 리팩토링 권장
