@@ -1,53 +1,196 @@
-습니다!
-await Task.Run(() => { while (...) { ... } }); 형태로 while 전체를 Task로 감싸면,
-그 무한 루프가 메인 스레드(UI 스레드)가 아닌 백그라운드 스레드에서 실행되게 됩니다.
 
-예시 1: while을 Task.Run으로 감싸는 패턴
+Q. 상대방이 먼저 보낸 신호인지, 아니면 내가 보낸 명령에 대한 응답인지 어떻게 구분하냐?
+A. 응답을 구분하는 3가지 방법
+메시지 내용으로 구분
+예) 내가 "STATUS_CHECK" 보냈는데 "STATUS:OK"가 오면 응답임
+
+메시지에 고유 ID 또는 명령명 포함
+예) "ID123:STATUS_CHECK" 보냈고, "ID123:STATUS_OK" 오면 응답임
+
+응답 수신 대기 Task와 수신 루프를 분리해서
+응답 대기 Task는 내가 기다리는 응답만 받아서 처리하고
+수신 루프는 나머지 수신을 처리함 (이 방법을 지금 구현할 거야)
+
+전문가 방식: 응답 Task와 항상 수신 루프를 분리
+SendAndWaitResponseAsync() → 보낸 명령에 대한 응답을 기다림
+
+ReceiveLoopAsync() → 모든 메시지를 받고, 응답이면 응답 처리, 아니면 이벤트로 분기
+
+전문가 예시코드 (ID로 구분 + 주석 매우 상세)
 csharp
 코드 복사
-private async Task StartLoopAsync()
+using System;
+using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+public class ExpertSocketClient
 {
-    await Task.Run(() =>
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private byte[] _buffer = new byte[1024];
+    private bool _isConnected = false;
+
+    // 요청 ID와 응답 TaskCompletionSource를 매칭하는 딕셔너리
+    private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseWaiters
+        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
+
+    /// <summary>
+    /// 서버 연결 및 수신 루프 시작
+    /// </summary>
+    public async Task ConnectAsync(string ip, int port)
     {
-        while (true)
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _isConnected = true;
+
+        Console.WriteLine($"[INFO] Connected to {ip}:{port}");
+
+        // 백그라운드에서 수신 루프 시작
+        _ = Task.Run(ReceiveLoopAsync);
+    }
+
+    /// <summary>
+    /// 명령을 보내고 그에 대한 응답을 기다린다 (ID 포함 방식)
+    /// </summary>
+    public async Task<string> SendAndWaitResponseAsync(string command)
+    {
+        if (!_isConnected) return "[ERROR] Not connected.";
+
+        // 고유 ID 생성 (Guid or Timestamp)
+        string id = Guid.NewGuid().ToString("N").Substring(0, 8); // 예: "a1b2c3d4"
+
+        // ID 포함한 메시지 생성
+        string fullCommand = $"REQ:{id}:{command}";
+        string wrapped = '\x02' + fullCommand + '\x03';
+        byte[] data = Encoding.ASCII.GetBytes(wrapped);
+
+        // 응답 대기 준비 (ID 기준으로 응답을 기다리는 TaskCompletionSource 생성)
+        var tcs = new TaskCompletionSource<string>();
+        _responseWaiters.TryAdd(id, tcs);
+
+        // 데이터 전송
+        await _stream.WriteAsync(data, 0, data.Length);
+        Console.WriteLine($"[SEND] {fullCommand}");
+
+        // 응답 대기 (타임아웃은 선택적으로 구현 가능)
+        string response = await tcs.Task;
+        return response;
+    }
+
+    /// <summary>
+    /// 항상 돌아가는 수신 루프. 응답인지 이벤트인지 구분하여 처리한다.
+    /// </summary>
+    private async Task ReceiveLoopAsync()
+    {
+        while (_isConnected)
         {
-            Console.WriteLine("Running in background...");
-            Thread.Sleep(1000); // await를 쓸 수 없으니 Sleep 사용
+            try
+            {
+                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("[INFO] Server disconnected.");
+                    _isConnected = false;
+                    break;
+                }
+
+                string raw = Encoding.ASCII.GetString(_buffer, 0, bytesRead);
+                string message = raw.Trim('\x02', '\x03');
+
+                Console.WriteLine($"[RECV] {message}");
+
+                // 수신 메시지 분석
+                if (message.StartsWith("RES:"))
+                {
+                    // RES:id:actualResponse
+                    string[] parts = message.Split(':');
+                    if (parts.Length >= 3)
+                    {
+                        string id = parts[1];
+                        string body = string.Join(':', parts, 2, parts.Length - 2);
+
+                        if (_responseWaiters.TryRemove(id, out var tcs))
+                        {
+                            tcs.SetResult(body); // 해당 응답 처리 완료
+                        }
+                    }
+                }
+                else
+                {
+                    // 명령 응답이 아닌 경우 → 선제 신호로 처리
+                    ProcessPassiveEvent(message);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] ReceiveLoop: {ex.Message}");
+                _isConnected = false;
+            }
         }
-    });
+    }
+
+    /// <summary>
+    /// 서버가 선제적으로 보내는 이벤트 처리
+    /// </summary>
+    private void ProcessPassiveEvent(string message)
+    {
+        Console.WriteLine($"[EVENT] Passive signal: {message}");
+
+        // 예: 상태 갱신, UI 반영, 로깅 등
+        switch (message)
+        {
+            case "READY":
+                Console.WriteLine("[EVENT] 장비 준비 완료");
+                break;
+            case "ALARM":
+                Console.WriteLine("[EVENT] 장비 경고 발생!");
+                break;
+            default:
+                Console.WriteLine("[EVENT] 기타 수신: " + message);
+                break;
+        }
+    }
+
+    public void Disconnect()
+    {
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        Console.WriteLine("[INFO] Disconnected.");
+    }
 }
-Task.Run(...): 백그라운드 스레드에서 실행
+서버 측 메시지 포맷 규칙 예시
+너가 보낼 때: "REQ:a1b2c3d4:STATUS_CHECK"
 
-await: 이 루프가 끝날 때까지 기다림 (근데 무한 루프니까 안 끝남)
+서버가 응답할 때: "RES:a1b2c3d4:STATUS_OK"
 
-Thread.Sleep(...): await 못 쓰니까 강제 지연
+서버가 먼저 보낼 때: "ALARM" 또는 "READY"
 
-예시 2: while 안에 await도 사용하는 방식 (권장)
+사용 예시
 csharp
 코드 복사
-private async Task StartLoopAsync()
+class Program
 {
-    await Task.Run(async () =>
+    static async Task Main(string[] args)
     {
-        while (true)
-        {
-            Console.WriteLine("Running with await...");
-            await Task.Delay(1000);  // CPU 낭비 없음
-        }
-    });
+        var client = new ExpertSocketClient();
+        await client.ConnectAsync("10.22.22.22", 2400);
+
+        // 내가 보낸 것에 대한 응답 기다리기
+        string response = await client.SendAndWaitResponseAsync("STATUS_CHECK");
+        Console.WriteLine(">>> 응답결과: " + response);
+
+        // 수신 루프는 자동으로 계속 돌아가며 선제 메시지도 처리됨
+        Console.ReadLine();
+        client.Disconnect();
+    }
 }
-이 경우 Task.Run 안에서도 await 사용 가능
-
-CPU 점유 없이 반복 실행 가능
-
-UI 멈춤 현상 없음
-
-비교: 왜 이렇게 해야 할까?
-방식	UI 멈춤?	CPU 낭비?	await 사용 가능?
-while(true)만	O	O	X
-await Task.Run(() => while(true))	X	O (Sleep 필요)	X
-await Task.Run(async () => while(true await))	X	X	O (추천)
-마무리 팁:
-무한 루프 또는 반복 작업은 반드시 await Task.Delay() 또는 백그라운드 스레드(Task.Run) 조합으로 실행해야 UI 멈춤 없이 안정적으로 동작합니다.
-
-가능하면 async Task 함수 내에서 while (true) + await Task.Delay 구조로 사용하세요.
+요약
+구분	메시지 형식	처리 방식
+보낸 명령	REQ:{id}:{command}	SendAndWaitResponseAsync()
+응답 메시지	RES:{id}:{result}	ReceiveLoop가 응답 매칭
+선제 이벤트	"READY", "ALARM" 등	ProcessPassiveEvent()에서 분기 처리
+원하면 이걸 WPF MVVM, 로그 목록 바인딩, DataGrid, 타임아웃 처리, 재연결 처리까지 확장 가능해.
