@@ -1,37 +1,171 @@
-은 지적이야!
-실제로 MainWindow.xaml에서 DataContext를 XAML에 직접 설정하는 방식과
-MainWindow.xaml.cs에서 코드로 설정하는 방식 두 가지가 있어.
-실무에서는 보통 코드에서 설정하는 게 더 안정적이고 명확해.
+구사항을 깔끔하게 요약하면 다음과 같아:
 
-✅ 수정할 부분: MainWindow.xaml.cs에서 DataContext 설정
-[1] MainWindow.xaml: DataContext 제거
-xml
+✅ 목표
+WPF MVVM 구조 유지 (UI 변경 없음)
+
+MSSQL 2014에서 Ping 대상 목록(IP, PC명, 비고) 다운로드
+
+WPF에서 Ping 체크 후 결과(핑결과, 체크시간) DB에 업데이트
+
+UI에 결과 실시간 반영
+
+✅ MSSQL 테이블 구조 예시
+sql
 코드 복사
-<!-- 이 부분 제거해야 함 -->
-<!--
-<Window.DataContext>
-    <local:MainViewModel />
-</Window.DataContext>
--->
-[2] MainWindow.xaml.cs: 코드에서 ViewModel 설정
+CREATE TABLE PingTargets (
+    Id INT PRIMARY KEY IDENTITY(1,1),
+    PCName NVARCHAR(50),
+    IP NVARCHAR(50),
+    Note NVARCHAR(100),
+    PingStatus NVARCHAR(10),
+    CheckedTime DATETIME
+);
+✅ 1. PingTarget.cs (Model – 그대로 유지)
 csharp
 코드 복사
-public partial class MainWindow : Window
+public class PingTarget : INotifyPropertyChanged
 {
-    public MainWindow()
+    public int Id { get; set; }
+    public string PCName { get; set; }
+    public string IP { get; set; }
+    public string Note { get; set; }
+
+    private string _status;
+    public string PingStatus
     {
-        InitializeComponent();
-        DataContext = new MainViewModel();
+        get => _status;
+        set { _status = value; OnPropertyChanged(nameof(PingStatus)); }
     }
+
+    private DateTime? _checkedTime;
+    public DateTime? CheckedTime
+    {
+        get => _checkedTime;
+        set { _checkedTime = value; OnPropertyChanged(nameof(CheckedTime)); }
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+    protected void OnPropertyChanged(string prop) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
 }
-✅ 왜 이렇게 해야 하나?
-방식	설명	추천 여부
-XAML에서 설정	단순하지만 디자인 타임 오류, 복잡한 DI 환경, 리팩터링 시 에러 위험 있음	❌ 큰 프로젝트에서 비추천
-코드에서 설정	명확하고 ViewModel 생성 위치를 정확히 제어 가능	✅ MVVM 전문가들도 선호
-이제 제대로 된 구조야:
+✅ 2. MainViewModel.cs
+csharp
+코드 복사
+public class MainViewModel : INotifyPropertyChanged
+{
+    public ObservableCollection<PingTarget> IPList { get; set; } = new ObservableCollection<PingTarget>();
 
-MainWindow.xaml.cs에서 ViewModel 설정
+    public ICommand StartPingCommand { get; }
 
-MVVM 확장 시에도 유연하게 대응 가능
+    public MainViewModel()
+    {
+        StartPingCommand = new RelayCommand(async () => await StartPingProcessAsync());
+    }
 
-유지보수와 디버깅이 쉬움
+    private async Task StartPingProcessAsync()
+    {
+        await LoadTargetsFromDatabaseAsync();
+        await RunPingAndUpdateAsync();
+    }
+
+    private async Task LoadTargetsFromDatabaseAsync()
+    {
+        IPList.Clear();
+
+        string connStr = "Server=서버명;Database=DB명;User Id=계정;Password=비번;";
+        using SqlConnection conn = new SqlConnection(connStr);
+        await conn.OpenAsync();
+
+        string query = "SELECT Id, PCName, IP, Note FROM PingTargets";
+        using SqlCommand cmd = new SqlCommand(query, conn);
+        using SqlDataReader reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            IPList.Add(new PingTarget
+            {
+                Id = reader.GetInt32(0),
+                PCName = reader.GetString(1),
+                IP = reader.GetString(2),
+                Note = reader.GetString(3)
+            });
+        }
+    }
+
+    private async Task RunPingAndUpdateAsync()
+    {
+        string connStr = "Server=서버명;Database=DB명;User Id=계정;Password=비번;";
+        using SqlConnection conn = new SqlConnection(connStr);
+        await conn.OpenAsync();
+
+        SemaphoreSlim throttler = new SemaphoreSlim(30); // 병렬 제한
+        List<Task> tasks = new();
+
+        foreach (var target in IPList)
+        {
+            await throttler.WaitAsync();
+
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    using Ping ping = new Ping();
+                    var reply = await ping.SendPingAsync(target.IP, 10);
+                    target.PingStatus = reply.Status == IPStatus.Success ? "OK" : "NG";
+                }
+                catch
+                {
+                    target.PingStatus = "NG";
+                }
+                finally
+                {
+                    target.CheckedTime = DateTime.Now;
+
+                    using SqlCommand cmd = new SqlCommand(
+                        "UPDATE PingTargets SET PingStatus = @status, CheckedTime = @time WHERE Id = @id", conn);
+                    cmd.Parameters.AddWithValue("@status", target.PingStatus);
+                    cmd.Parameters.AddWithValue("@time", target.CheckedTime);
+                    cmd.Parameters.AddWithValue("@id", target.Id);
+                    await cmd.ExecuteNonQueryAsync();
+
+                    throttler.Release();
+                }
+            }));
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    public event PropertyChangedEventHandler PropertyChanged;
+}
+✅ 3. MainWindow.xaml (기존 UI 유지 + 컬럼 2개 추가)
+xml
+코드 복사
+<DataGrid ItemsSource="{Binding IPList}" AutoGenerateColumns="False" FontSize="14" IsReadOnly="True">
+    <DataGrid.Columns>
+        <DataGridTextColumn Header="PC Name" Binding="{Binding PCName}" Width="*"/>
+        <DataGridTextColumn Header="IP" Binding="{Binding IP}" Width="*"/>
+        <DataGridTextColumn Header="Note" Binding="{Binding Note}" Width="*"/>
+        <DataGridTextColumn Header="Ping" Binding="{Binding PingStatus}" Width="60"/>
+        <DataGridTextColumn Header="Time" Binding="{Binding CheckedTime}" Width="140"/>
+    </DataGrid.Columns>
+</DataGrid>
+✅ 4. RelayCommand.cs (동일)
+csharp
+코드 복사
+public class RelayCommand : ICommand
+{
+    private readonly Func<Task> _execute;
+    public RelayCommand(Func<Task> execute) => _execute = execute;
+
+    public event EventHandler CanExecuteChanged;
+    public bool CanExecute(object parameter) => true;
+    public async void Execute(object parameter) => await _execute();
+}
+✅ 정리
+항목	내용
+Ping 대상	DB에서 불러옴 (SELECT)
+Ping 결과	PingStatus, CheckedTime DB에 UPDATE
+UI	MVVM 구조로 DataGrid 표시
+병렬	SemaphoreSlim으로 병렬 제한
+성능	100개도 가능함. 안정적.
+이제 Start 버튼만 누르면 DB에서 IP 목록을 받고, Ping 후 결과를 DB에 다시 업데이트하면서 UI에도 반영돼.
