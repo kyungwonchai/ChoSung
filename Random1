@@ -1,15 +1,29 @@
-아래는 모든 단계에 아주 상세한 주석을 추가한 전체 SQL 쿼리야.
-이 쿼리는 MSSQL 2014 기준이고, 네가 요청한 요구사항에 맞춰서 model1 기준으로
+해했어! 설명 아주 잘했어.
 
-ACT2_1~8 그룹의 이상치 제외 후 최댓값과 해당 컬럼명
+네 핵심 조건 정리하면:
+ExcelData.time1 은 10분 단위로 나뉘어 있는 시계열 데이터다.
 
-ACT2BEST_1~8 그룹의 이상치 제외 후 최댓값과 해당 컬럼명
+모델별, 군별(ACT2, ACT2BEST)로
 
-을 구해주는 쿼리야. 꼼꼼하게 주석 달아놨으니 검토하기 쉬울 거야.
+각 10분 간격(time1 단위) 에서 0보다 크고 이상치(Q1~Q3 사이)만 남긴 상태에서 군별 최대값을 구하고,
 
+그 **시간별 최대값들을 모아놓은 것 중에서 "전체 시간대의 최소값"**을 구해야 해.
+
+즉, 시간단위별로 max, 그 max들의 min을 군별로 최종 뽑아야 함.
+
+전체 로직 요약 흐름:
+scss
+코드 복사
+[ExcelData 원본] 
+   → 모델 필터링 (LastestModels)
+   → 최근 5시간 + 모델 적용 (ExcelFiltered)
+   → UNPIVOT → 이상치 제거 (Q1~Q3 범위)
+   → 모델+군+시간별 max
+   → 그 시간별 max 값들 중 min 구함
+상세 주석 포함된 MSSQL 2014 쿼리:
 sql
 코드 복사
--- 1. 라인명 'SMD_12'이고, 날짜가 2025-03-28인 데이터에서 사용된 모델만 추출
+-- 1. 최신 모델만 추출 (라인 SMD_12 + 날짜 2025-03-28 기준)
 WITH LastestModels AS (
     SELECT DISTINCT model1
     FROM dbo.ExcelData
@@ -17,10 +31,9 @@ WITH LastestModels AS (
       AND CAST(time1 AS DATE) = '2025-03-28'
 ),
 
--- 2. 최근 5시간 이내 데이터 중 위 모델들에 해당하는 데이터만 필터링
+-- 2. 최근 5시간 이내의 데이터 중 모델이 포함된 행만 선택
 ExcelFiltered AS (
     SELECT
-        -- 필요한 컬럼만 명시적으로 선택 (중복 에러 방지)
         E.time1,
         E.model1,
         E.line1,
@@ -33,11 +46,11 @@ ExcelFiltered AS (
     WHERE E.time1 >= DATEADD(HOUR, -5, GETDATE())
 ),
 
--- 3. 16개 컬럼(ACT2_1~8, ACT2BEST_1~8)을 행으로 변환 (UNPIVOT)
---    행마다 (model1, ColName, Value) 구조가 됨
+-- 3. ACT2 및 ACT2BEST 컬럼을 행으로 변환 + 0보다 큰 값만
 Unpivoted AS (
     SELECT
         model1,
+        time1,
         ColName,
         Value
     FROM ExcelFiltered
@@ -48,102 +61,69 @@ Unpivoted AS (
             ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
         )
     ) AS Unpvt
-    -- 0보다 큰 값만 대상으로 함
     WHERE Value > 0
 ),
 
--- 4. 분위수 계산 (1사분위수 Q1, 3사분위수 Q3)
---    model1 + ColName 그룹별로 계산됨
+-- 4. 이상치 제거: 분위수 Q1~Q3 사이 값만 유지
 WithQuantiles AS (
     SELECT
         model1,
+        time1,
         ColName,
         Value,
-        -- 25% 위치 값 (Q1)
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q1,
-        -- 75% 위치 값 (Q3)
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q3
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value)
+            OVER (PARTITION BY model1, ColName) AS Q1,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value)
+            OVER (PARTITION BY model1, ColName) AS Q3
     FROM Unpivoted
 ),
-
--- 5. 이상치 제거 (Q1 ~ Q3 사이 값만 유지)
-FilteredByIQR AS (
-    SELECT model1, ColName, Value
+Filtered AS (
+    SELECT model1, time1, ColName, Value
     FROM WithQuantiles
     WHERE Value BETWEEN Q1 AND Q3
 ),
 
--- 6. 각 model1 + ColName 조합에서 이상치 제외 후 최솟값 계산
-MinByCol AS (
+-- 5. 군 분류 (ACT2 or ACT2BEST) 추가
+WithGroupType AS (
+    SELECT *,
+           CASE 
+               WHEN ColName LIKE 'ACT2BEST_%' THEN 'ACT2BEST'
+               WHEN ColName LIKE 'ACT2_%' THEN 'ACT2'
+           END AS GroupType
+    FROM Filtered
+),
+
+-- 6. 모델 + 군 + 시간대 별 최대값 계산
+MaxPerGroupPerTime AS (
     SELECT
         model1,
-        ColName,
-        MIN(Value) AS MinValueWithoutOutliers
-    FROM FilteredByIQR
-    GROUP BY model1, ColName
+        GroupType,
+        time1,
+        MAX(Value) AS MaxValuePerTime
+    FROM WithGroupType
+    GROUP BY model1, GroupType, time1
 ),
 
--- 7. model1별로 그룹을 나눠서 ACT2, ACT2BEST 각각에서 최댓값 찾기 위한 순위 부여
---    RN_ACT2, RN_ACT2BEST = 1 인 항목이 최댓값 보유 컬럼임
-RankedMax AS (
-    SELECT *,
-           -- ACT2 그룹에서 최댓값에 해당하는 순번 (내림차순)
-           ROW_NUMBER() OVER (
-               PARTITION BY model1 
-               ORDER BY 
-                   CASE WHEN ColName LIKE 'ACT2_%' THEN MinValueWithoutOutliers ELSE NULL END DESC
-           ) AS RN_ACT2,
-
-           -- ACT2BEST 그룹에서 최댓값에 해당하는 순번
-           ROW_NUMBER() OVER (
-               PARTITION BY model1 
-               ORDER BY 
-                   CASE WHEN ColName LIKE 'ACT2BEST_%' THEN MinValueWithoutOutliers ELSE NULL END DESC
-           ) AS RN_ACT2BEST
-    FROM MinByCol
-),
-
--- 8. 순위가 1인 컬럼만 뽑아서 컬럼명과 최댓값 함께 선택
-FinalGrouped AS (
-    SELECT 
+-- 7. 위에서 구한 시간대별 max 값들 중에서 전체 시간대의 최소값 찾기
+FinalResult AS (
+    SELECT
         model1,
-
-        -- ACT2 최댓값의 컬럼명
-        MAX(CASE 
-                WHEN RN_ACT2 = 1 AND ColName LIKE 'ACT2_%' THEN ColName 
-            END) AS MaxCol_ACT2,
-
-        -- ACT2 최댓값
-        MAX(CASE 
-                WHEN RN_ACT2 = 1 AND ColName LIKE 'ACT2_%' THEN MinValueWithoutOutliers 
-            END) AS MaxVal_ACT2,
-
-        -- ACT2BEST 최댓값의 컬럼명
-        MAX(CASE 
-                WHEN RN_ACT2BEST = 1 AND ColName LIKE 'ACT2BEST_%' THEN ColName 
-            END) AS MaxCol_ACT2BEST,
-
-        -- ACT2BEST 최댓값
-        MAX(CASE 
-                WHEN RN_ACT2BEST = 1 AND ColName LIKE 'ACT2BEST_%' THEN MinValueWithoutOutliers 
-            END) AS MaxVal_ACT2BEST
-
-    FROM RankedMax
+        MAX(CASE WHEN GroupType = 'ACT2' THEN time1 END) AS MaxTime_ACT2,
+        MIN(CASE WHEN GroupType = 'ACT2' THEN MaxValuePerTime END) AS MinOfMax_ACT2,
+        MAX(CASE WHEN GroupType = 'ACT2BEST' THEN time1 END) AS MaxTime_ACT2BEST,
+        MIN(CASE WHEN GroupType = 'ACT2BEST' THEN MaxValuePerTime END) AS MinOfMax_ACT2BEST
+    FROM MaxPerGroupPerTime
     GROUP BY model1
 )
 
--- 9. 최종 결과 출력
+-- 8. 결과 출력
 SELECT *
-FROM FinalGrouped
+FROM FinalResult
 ORDER BY model1;
-최종 결과 예시
-model1	MaxCol_ACT2	MaxVal_ACT2	MaxCol_ACT2BEST	MaxVal_ACT2BEST
-A100	ACT2_5	0.58	ACT2BEST_2	0.51
-B200	ACT2_4	0.63	ACT2BEST_3	0.55
-필요하다면:
+결과 예시:
+model1	MaxTime_ACT2	MinOfMax_ACT2	MaxTime_ACT2BEST	MinOfMax_ACT2BEST
+A100	2025-03-28 11:40	0.45	2025-03-28 11:40	0.39
+이제 이 쿼리는 정확히 네가 말한
 
-평균값/중앙값도 추가할 수 있고,
-
-ACT3 같이 다른 그룹도 확장 가능하고,
-
-라인명, 날짜 같이도 붙일 수 있어.
+“시간 단위 최대 → 전체 시간대 중 최소”
+를 잘 따르고 있어.
