@@ -1,25 +1,60 @@
-은 xray_data 테이블의 location 컬럼 값이 xray_info 테이블에 존재하지 않는 값들만 조회하는 MSSQL 2014용 쿼리입니다.
+요!
+당신이 말한 것처럼 LastestModels 테이블에는 이미 라인별 최신 모델명이 들어있으므로, 이걸 기준으로 ExcelData에서 최근 5시간 이내 데이터를 필터링하고,
+각 모델별로 ACT2_1~8, ACT2BEST_1~8 총 16개 컬럼에 대해
+0보다 큰 값 중에서 1사분위수(Q1)~3사분위수(Q3) 사이 값들 중 가장 작은 값을 구하는 전체 쿼리를 아래에 다시 정리해서 드릴게요.
 
 sql
 코드 복사
-SELECT *
-FROM xray_data
-WHERE location NOT IN (
-    SELECT DISTINCT location
-    FROM xray_info
-);
-추가 설명:
-NOT IN을 사용하면 xray_info 테이블의 location 컬럼에 없는 값만 필터링합니다.
+-- 최신 모델 기준 + 최근 5시간 + ACT2 계열 이상치 제거 후 최솟값 구하기
+WITH ExcelFiltered AS (
+    SELECT *
+    FROM ExcelData E
+    INNER JOIN LastestModels L ON E.model1 = L.model
+    WHERE E.time1 >= DATEADD(HOUR, -5, GETDATE())
+),
+Unpivoted AS (
+    SELECT
+        model1,
+        ColName,
+        Value
+    FROM ExcelFiltered
+    UNPIVOT (
+        Value FOR ColName IN (
+            ACT2_1, ACT2_2, ACT2_3, ACT2_4, ACT2_5, ACT2_6, ACT2_7, ACT2_8,
+            ACT2BEST_1, ACT2BEST_2, ACT2BEST_3, ACT2BEST_4,
+            ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
+        )
+    ) AS Unpvt
+    WHERE Value > 0
+),
+WithQuantiles AS (
+    SELECT
+        model1,
+        ColName,
+        Value,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q1,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q3
+    FROM Unpivoted
+),
+FilteredByIQR AS (
+    SELECT model1, ColName, Value
+    FROM WithQuantiles
+    WHERE Value BETWEEN Q1 AND Q3
+)
+SELECT
+    model1,
+    ColName,
+    MIN(Value) AS MinValueWithoutOutliers
+FROM FilteredByIQR
+GROUP BY model1, ColName
+ORDER BY model1, ColName;
+핵심 포인트 요약:
+ExcelFiltered: model1이 LastestModels.model과 일치하고 time1이 최근 5시간 이내인 데이터만 선택.
 
-DISTINCT는 중복 방지를 위해 사용했습니다.
+Unpivoted: 16개의 컬럼을 세로로 변환하고 Value > 0 조건으로 필터.
 
-만약 xray_info.location 컬럼에 NULL이 있다면, NOT IN 쿼리는 전체 결과를 반환하지 않을 수 있습니다. 이런 경우엔 아래처럼 LEFT JOIN 방식이 더 안전합니다.
+WithQuantiles: 분위수(Q1, Q3) 계산.
 
-LEFT JOIN 방식 (추천):
-sql
-코드 복사
-SELECT xd.*
-FROM xray_data xd
-LEFT JOIN xray_info xi ON xd.location = xi.location
-WHERE xi.location IS NULL;
-이 방식은 xray_data.location 값이 xray_info에 존재하지 않을 때만 전체 행을 가져옵니다. NULL 문제가 없기 때문에 일반적으로 더 안전합니다.
+FilteredByIQR: 이상치를 제외한 값 필터링 (Q1 ~ Q3).
+
+마지막 SELECT에서 컬럼별로 최소값 출력.
