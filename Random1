@@ -1,29 +1,46 @@
-전 이해했어! 설명 아주 잘했어.
+! 이제 정확히 핵심을 알았어 — 말한 걸 정리해서 아주 정확하게 이해했는지 확인해볼게:
 
-네 핵심 조건 정리하면:
-ExcelData.time1 은 10분 단위로 나뉘어 있는 시계열 데이터다.
+네 요구사항 요약 정리 (정확하게 이해한 버전):
+1. 군이 2개 있음:
+ACT2 군 → ACT2_1 ~ ACT2_8
 
-모델별, 군별(ACT2, ACT2BEST)로
+ACT2BEST 군 → ACT2BEST_1 ~ ACT2BEST_8
 
-각 10분 간격(time1 단위) 에서 0보다 크고 이상치(Q1~Q3 사이)만 남긴 상태에서 군별 최대값을 구하고,
+2. ExcelData에서 각 시간대(time1)마다:
+각 군별로 → 8개 컬럼 중에서 0보다 크고 이상치(Q1~Q3 사이) 값들 중 최댓값을 구함.
 
-그 **시간별 최대값들을 모아놓은 것 중에서 "전체 시간대의 최소값"**을 구해야 해.
+즉, 시간대별로 군당 NECK값 = 가장 높은 정상 값
 
-즉, 시간단위별로 max, 그 max들의 min을 군별로 최종 뽑아야 함.
+3. 최종적으로:
+군별로 시간대별 NECK들이 있을 텐데,
 
-전체 로직 요약 흐름:
-scss
-코드 복사
-[ExcelData 원본] 
-   → 모델 필터링 (LastestModels)
-   → 최근 5시간 + 모델 적용 (ExcelFiltered)
-   → UNPIVOT → 이상치 제거 (Q1~Q3 범위)
-   → 모델+군+시간별 max
-   → 그 시간별 max 값들 중 min 구함
-상세 주석 포함된 MSSQL 2014 쿼리:
+그 중에서 가장 작은 NECK 값을 구하는 것이 목표!
+
+예시로 설명:
+time1	ACT2_1	ACT2_2	...	ACT2_8	→ ACT2 군 최대 (NECK)
+2025-03-28 11:00	0.4	0.5	...	0.45	→ 0.50
+2025-03-28 11:10	0.42	0.48	...	0.40	→ 0.48
+...	...	...		...	...
+최종					→ MIN(NECK들) = 0.48
+이걸 ACT2, ACT2BEST 군 각각 구해야 해.
+
+해결을 위한 쿼리 로직 (설계)
+모델 필터링 (라인 SMD_12, 특정 날짜)
+
+최근 5시간 데이터 필터
+
+UNPIVOT → Value > 0
+
+Q1~Q3 분위수 이상치 제거
+
+model1 + time1 + 군별로 최대값 (NECK) 구하기
+
+그 시간대별 NECK 값들 중 전체 최소값 구하기 (군별로)
+
+이제 정확한 MSSQL 2014 쿼리 (아주 상세 주석 포함):
 sql
 코드 복사
--- 1. 최신 모델만 추출 (라인 SMD_12 + 날짜 2025-03-28 기준)
+-- 1. 모델 추출: 특정 라인의 특정 날짜 모델만 가져오기
 WITH LastestModels AS (
     SELECT DISTINCT model1
     FROM dbo.ExcelData
@@ -31,12 +48,12 @@ WITH LastestModels AS (
       AND CAST(time1 AS DATE) = '2025-03-28'
 ),
 
--- 2. 최근 5시간 이내의 데이터 중 모델이 포함된 행만 선택
+-- 2. 최근 5시간 이내 + 위 모델에 해당하는 데이터만 필터
 ExcelFiltered AS (
     SELECT
         E.time1,
         E.model1,
-        E.line1,
+        -- ACT2 계열 8개 + ACT2BEST 계열 8개
         E.ACT2_1, E.ACT2_2, E.ACT2_3, E.ACT2_4,
         E.ACT2_5, E.ACT2_6, E.ACT2_7, E.ACT2_8,
         E.ACT2BEST_1, E.ACT2BEST_2, E.ACT2BEST_3, E.ACT2BEST_4,
@@ -46,7 +63,7 @@ ExcelFiltered AS (
     WHERE E.time1 >= DATEADD(HOUR, -5, GETDATE())
 ),
 
--- 3. ACT2 및 ACT2BEST 컬럼을 행으로 변환 + 0보다 큰 값만
+-- 3. 행 변환 (UNPIVOT) + 값이 0보다 큰 것만 필터링
 Unpivoted AS (
     SELECT
         model1,
@@ -64,26 +81,25 @@ Unpivoted AS (
     WHERE Value > 0
 ),
 
--- 4. 이상치 제거: 분위수 Q1~Q3 사이 값만 유지
+-- 4. Q1 ~ Q3 분위수 이상치 제거
 WithQuantiles AS (
     SELECT
         model1,
         time1,
         ColName,
         Value,
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value)
-            OVER (PARTITION BY model1, ColName) AS Q1,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value)
-            OVER (PARTITION BY model1, ColName) AS Q3
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q1,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY model1, ColName) AS Q3
     FROM Unpivoted
 ),
+
 Filtered AS (
     SELECT model1, time1, ColName, Value
     FROM WithQuantiles
     WHERE Value BETWEEN Q1 AND Q3
 ),
 
--- 5. 군 분류 (ACT2 or ACT2BEST) 추가
+-- 5. 군 분류 (ACT2, ACT2BEST)
 WithGroupType AS (
     SELECT *,
            CASE 
@@ -93,26 +109,24 @@ WithGroupType AS (
     FROM Filtered
 ),
 
--- 6. 모델 + 군 + 시간대 별 최대값 계산
-MaxPerGroupPerTime AS (
+-- 6. 각 model1 + time1 + 군에서 최대값 (해당 시간대의 NECK)
+TimeGroupNeck AS (
     SELECT
         model1,
-        GroupType,
         time1,
-        MAX(Value) AS MaxValuePerTime
+        GroupType,
+        MAX(Value) AS NeckPerTime
     FROM WithGroupType
-    GROUP BY model1, GroupType, time1
+    GROUP BY model1, time1, GroupType
 ),
 
--- 7. 위에서 구한 시간대별 max 값들 중에서 전체 시간대의 최소값 찾기
+-- 7. 각 model1 + 군에서 시간대별 neck들 중 전체 최소값 추출
 FinalResult AS (
     SELECT
         model1,
-        MAX(CASE WHEN GroupType = 'ACT2' THEN time1 END) AS MaxTime_ACT2,
-        MIN(CASE WHEN GroupType = 'ACT2' THEN MaxValuePerTime END) AS MinOfMax_ACT2,
-        MAX(CASE WHEN GroupType = 'ACT2BEST' THEN time1 END) AS MaxTime_ACT2BEST,
-        MIN(CASE WHEN GroupType = 'ACT2BEST' THEN MaxValuePerTime END) AS MinOfMax_ACT2BEST
-    FROM MaxPerGroupPerTime
+        MIN(CASE WHEN GroupType = 'ACT2' THEN NeckPerTime END) AS MinNeck_ACT2,
+        MIN(CASE WHEN GroupType = 'ACT2BEST' THEN NeckPerTime END) AS MinNeck_ACT2BEST
+    FROM TimeGroupNeck
     GROUP BY model1
 )
 
@@ -121,9 +135,12 @@ SELECT *
 FROM FinalResult
 ORDER BY model1;
 결과 예시:
-model1	MaxTime_ACT2	MinOfMax_ACT2	MaxTime_ACT2BEST	MinOfMax_ACT2BEST
-A100	2025-03-28 11:40	0.45	2025-03-28 11:40	0.39
-이제 이 쿼리는 정확히 네가 말한
+model1	MinNeck_ACT2	MinNeck_ACT2BEST
+A100	0.48	0.42
+B200	0.52	0.40
+핵심 다시 정리:
+시간대별로 군의 8개 중 max = NECK
 
-“시간 단위 최대 → 전체 시간대 중 최소”
-를 잘 따르고 있어.
+이 NECK들을 모아서 전체 중 min(NECK) 찾는 게 최종 목표
+
+군마다 따로 계산
