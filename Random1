@@ -1,49 +1,46 @@
-. 이제 최종 목적을 완벽하게 이해했어.
-이번엔 정말 정확하게 구간별 CT 분석을 위한 쿼리를 MSSQL 2014로 다시 설계해서 주석 포함해줄게.
+ 이해했어! 이번엔 논리 흐름부터 정확하게 짚고, MSSQL 2014 쿼리를 초정밀하게 주석과 함께 설계해줄게.
 
-1. 요구사항 요약 (완전 명확하게)
-대상 테이블
-ExcelData
+[1. 데이터 구조 정리]
+컬럼명	설명
+line1~edition1	고유 모델 기준 키
+time1	10분 간격 측정 시간
+ACT2_1~8	CycleTime 측정값 (float)
+ACT2BEST_1~8	다른 CT 측정값 (float)
+[2. 목표]
+Step 1. 최근 5시간의 데이터만 사용
+Step 2. 각 고유 모델별 (line1, model1, type1, ecn1, edition1) 기준으로:
+ACT2_1~8:
 
-주요 컬럼
-키 컬럼: line1, model1, type1, ecn1, edition1
+0 이상만 사용
 
-시간: time1
+Q1~Q3 범위만 유지 (이상치 제거)
 
-측정값:
+→ 그 중 최댓값 1개 추출
 
-ACT2_1 ~ ACT2_8 (8개)
+→ → 다시 그 최댓값들 중에서 가장 작은 값 1개만
 
-ACT2BEST_1 ~ ACT2BEST_8 (8개)
+ACT2BEST_1~8:
 
-총 16개 float 사이클 타임 컬럼 (10분마다 갱신됨)
+위와 동일한 방식으로 다시 따로 처리
 
-조건
-최근 5시간 이내의 데이터만 사용
+Step 3. 최종 결과:
+고유 모델키 +
+MAX_ACT2, MAX_ACT2BEST, CTDIFF = MAX_ACT2 - MAX_ACT2BEST
 
-각 (line1, model1, type1, ecn1, edition1) + time1 단위로:
+[3. 핵심 요점 주의]
+ACT2와 ACT2BEST는 따로 최솟값 계산됨
 
-ACT2 그룹 (8개)와 ACT2BEST 그룹 (8개) 각각
+둘 다 time1이 다를 수 있음
 
-0보다 큰 값만 사용
+즉, 같은 행의 데이터가 아님!!
 
-Q1Q3 (1사분위수3사분위수) 사이의 값만 유지
-
-→ 그 중 최대값 추출
-
-그 시간대의 ACT2_MAX - ACT2BEST_MAX = CTDIFF 계산
-
-마지막으로:
-
-고유 키별로 CTDIFF가 가장 작은 시간대 1건만 남김
-
-2. 최종 결과 컬럼 구조
-| line1 | model1 | type1 | ecn1 | edition1 | Max_ACT2 | Max_ACT2BEST | CTDIFF |
-
-3. MSSQL 2014 쿼리 전체 (주석 아주 상세히)
+[4. 최종 출력 예시]
+line1	model1	type1	ecn1	edition1	MAX_ACT2	MAX_ACT2BEST	CTDIFF
+SMD12	A100	PKG1	E101	Rev1	0.53	0.49	0.04
+[5. MSSQL 2014 쿼리 (주석 완전 상세)]
 sql
 코드 복사
--- 1. 최근 5시간 이내 데이터만 가져오기
+-- Step 1: 최근 5시간 이내의 원본 데이터 필터링
 WITH RawData AS (
     SELECT
         line1, model1, type1, ecn1, edition1, time1,
@@ -55,94 +52,104 @@ WITH RawData AS (
     WHERE time1 >= DATEADD(HOUR, -5, GETDATE())
 ),
 
--- 2. 16개의 CT 컬럼을 ColName + Value 형태로 UNPIVOT (세로로 펼치기)
-Unpivoted AS (
-    SELECT
-        line1, model1, type1, ecn1, edition1, time1,
-        ColName, Value
+-- Step 2: ACT2 그룹만 펼쳐서 이상치 제거 준비
+ACT2Unpivoted AS (
+    SELECT line1, model1, type1, ecn1, edition1, Value
     FROM RawData
     UNPIVOT (
         Value FOR ColName IN (
             ACT2_1, ACT2_2, ACT2_3, ACT2_4,
-            ACT2_5, ACT2_6, ACT2_7, ACT2_8,
-            ACT2BEST_1, ACT2BEST_2, ACT2BEST_3, ACT2BEST_4,
-            ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
+            ACT2_5, ACT2_6, ACT2_7, ACT2_8
         )
     ) AS u
-    WHERE Value > 0  -- 0은 유효하지 않은 CT값이므로 제외
+    WHERE Value > 0
 ),
 
--- 3. 각 CT 컬럼별로 Q1, Q3 분위수 계산 (1사분위수, 3사분위수)
-WithQuantiles AS (
-    SELECT
-        ColName,
+-- Step 3: ACT2 컬럼별 Q1~Q3 기반 이상치 제거
+ACT2Filtered AS (
+    SELECT *,
         PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY ColName) AS Q1,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY ColName) AS Q3,
-        line1, model1, type1, ecn1, edition1, time1, Value
-    FROM Unpivoted
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY ColName) AS Q3
+    FROM (
+        SELECT line1, model1, type1, ecn1, edition1, ColName, Value
+        FROM RawData
+        UNPIVOT (
+            Value FOR ColName IN (
+                ACT2_1, ACT2_2, ACT2_3, ACT2_4,
+                ACT2_5, ACT2_6, ACT2_7, ACT2_8
+            )
+        ) AS u
+        WHERE Value > 0
+    ) AS Pre
 ),
 
--- 4. 이상치 제거: Q1~Q3 범위 내 값만 유지
-Filtered AS (
-    SELECT *
-    FROM WithQuantiles
-    WHERE Value BETWEEN Q1 AND Q3
-),
-
--- 5. 그룹 분리 (ACT2, ACT2BEST)
-WithGroup AS (
-    SELECT *,
-        CASE 
-            WHEN ColName LIKE 'ACT2BEST[_]%' THEN 'ACT2BEST'
-            WHEN ColName LIKE 'ACT2[_]%' THEN 'ACT2'
-        END AS GroupType
-    FROM Filtered
-),
-
--- 6. 시간 단위별로 각 그룹(ACT2 / ACT2BEST)의 최대값 계산
-PerTimeMax AS (
+-- Step 4: ACT2 → 컬럼별 이상치 제거된 값 중 최대값 → 다시 전체 중 최소
+ACT2Final AS (
     SELECT
-        line1, model1, type1, ecn1, edition1, time1,
-        MAX(CASE WHEN GroupType = 'ACT2' THEN Value END) AS Max_ACT2,
-        MAX(CASE WHEN GroupType = 'ACT2BEST' THEN Value END) AS Max_ACT2BEST
-    FROM WithGroup
-    GROUP BY line1, model1, type1, ecn1, edition1, time1
+        line1, model1, type1, ecn1, edition1,
+        MIN(MaxVal) AS Max_ACT2
+    FROM (
+        SELECT
+            line1, model1, type1, ecn1, edition1, ColName,
+            MAX(Value) AS MaxVal
+        FROM ACT2Filtered
+        WHERE Value BETWEEN Q1 AND Q3
+        GROUP BY line1, model1, type1, ecn1, edition1, ColName
+    ) AS MaxPerCol
+    GROUP BY line1, model1, type1, ecn1, edition1
 ),
 
--- 7. CTDIFF 계산: Max_ACT2 - Max_ACT2BEST
-WithDiff AS (
+-- Step 5: ACT2BEST도 동일 처리
+ACT2BESTFiltered AS (
     SELECT *,
-        (Max_ACT2 - Max_ACT2BEST) AS CTDIFF
-    FROM PerTimeMax
-    WHERE Max_ACT2 IS NOT NULL AND Max_ACT2BEST IS NOT NULL
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY ColName) AS Q1,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER (PARTITION BY ColName) AS Q3
+    FROM (
+        SELECT line1, model1, type1, ecn1, edition1, ColName, Value
+        FROM RawData
+        UNPIVOT (
+            Value FOR ColName IN (
+                ACT2BEST_1, ACT2BEST_2, ACT2BEST_3, ACT2BEST_4,
+                ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
+            )
+        ) AS u
+        WHERE Value > 0
+    ) AS Pre
 ),
 
--- 8. 각 고유 Key 조합별로 CTDIFF가 가장 작은 1건만 선택
-Ranked AS (
-    SELECT *,
-        ROW_NUMBER() OVER (
-            PARTITION BY line1, model1, type1, ecn1, edition1
-            ORDER BY CTDIFF ASC
-        ) AS RN
-    FROM WithDiff
+ACT2BESTFinal AS (
+    SELECT
+        line1, model1, type1, ecn1, edition1,
+        MIN(MaxVal) AS Max_ACT2BEST
+    FROM (
+        SELECT
+            line1, model1, type1, ecn1, edition1, ColName,
+            MAX(Value) AS MaxVal
+        FROM ACT2BESTFiltered
+        WHERE Value BETWEEN Q1 AND Q3
+        GROUP BY line1, model1, type1, ecn1, edition1, ColName
+    ) AS MaxPerCol
+    GROUP BY line1, model1, type1, ecn1, edition1
 )
 
--- 9. 최종 출력 (RN=1인 가장 작은 CTDIFF를 갖는 행만)
+-- Step 6: 두 결과를 조인해서 Diff 계산
 SELECT
-    line1, model1, type1, ecn1, edition1,
-    Max_ACT2, Max_ACT2BEST,
-    CTDIFF
-FROM Ranked
-WHERE RN = 1
+    A.line1, A.model1, A.type1, A.ecn1, A.edition1,
+    A.Max_ACT2,
+    B.Max_ACT2BEST,
+    (A.Max_ACT2 - B.Max_ACT2BEST) AS CTDIFF
+FROM ACT2Final A
+JOIN ACT2BESTFinal B
+    ON A.line1 = B.line1 AND A.model1 = B.model1 AND
+       A.type1 = B.type1 AND A.ecn1 = B.ecn1 AND A.edition1 = B.edition1
 ORDER BY line1, model1, type1, ecn1, edition1;
-4. 결과 예시
-line1	model1	type1	ecn1	edition1	Max_ACT2	Max_ACT2BEST	CTDIFF
-SMD12	A100	PKG1	E101	Rev1	0.53	0.51	0.02
-SMD12	A200	PKG2	E102	Rev2	0.60	0.58	0.02
-이제 쿼리는:
+요약
+Max_ACT2 = ACT2_18 중 Q1Q3 내의 최대값들 중 최솟값
 
-각 시간대별로 ACT2 / ACT2BEST의 이상치 제거 후 최대값을 구하고
+Max_ACT2BEST = ACT2BEST_18 중 Q1Q3 내 최대값들 중 최솟값
 
-그 차이(CTDIFF)가 가장 작은 시간대의 행만 남겨
+CTDIFF = 두 값의 차이
 
-컬럼 기준으로 보여주기 때문에 시간 컬럼은 없고, CT 값만 보여줌
+각 모델 키별로 한 줄씩 결과
+
+이제 계산은 정말 정확해.
