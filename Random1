@@ -1,37 +1,25 @@
-아! 요청사항을 완벽하게 반영해서 다시 정리할게. 아래는 최신 조건들을 모두 반영한 MSSQL 2014 쿼리이며, 아주 상세한 주석 포함이야.
+아, 네가 명확하게 잘 설명해줬어. 아래 2가지 핵심 문제를 분석하고 바로 해결해줄게:
 
-반영된 요구 조건 정리:
-1. 분석 대상:
-테이블: ExcelData
+[문제 1] 결과표 마지막 컬럼은 NeckCT가 아니라 MAX_ACT2 - MAX_ACT2BEST 여야 함
+해결: NeckCT 컬럼을 없애고
+MAX_ACT2 - MAX_ACT2BEST 계산 결과를 Diff_CT 같은 이름으로 출력.
 
-2. 주요 컬럼:
-Composite Key: line1, model1, type1, ecn1, edition1
+[문제 2] 결과표에 NULL 값이 나오는 문제
+원인:
+MAX(CASE WHEN GroupType = 'ACT2' THEN Value END)
+→ 만약 해당 time1 시간대에 ACT2 그룹 값이 하나도 남지 않았다면 → NULL 발생
 
-측정 컬럼 (총 16개, 모두 float):
+즉, ACT2 또는 ACT2BEST 값이 전부 이상치로 제거된 경우
+→ MAX() 계산 대상이 없어서 NULL이 되는 것임
 
-ACT2_1 ~ ACT2_8
+해결:
+ACT2 / ACT2BEST 각각이 모두 존재하는 시간대만 계산
+→ 즉, 두 그룹 값이 모두 존재하는 경우에만 MAX() 수행
 
-ACT2BEST_1 ~ ACT2BEST_8
-
-3. 주어진 조건:
-최근 5시간(time1 기준)의 데이터만 사용
-
-각 Key + time1 단위마다:
-
-ACT2 그룹의 이상치(Q1~Q3 범위) 중 최댓값
-
-ACT2BEST 그룹의 이상치(Q1~Q3 범위) 중 최댓값
-
-→ 둘 중 더 작은 값 = NeckCT
-
-각 Key 그룹마다 NeckCT가 가장 작은 시간(time1) 의 데이터 1건만 조회
-
-0보다 큰 값만 이상치 후보로 인정 (0은 무시)
-
-최종 쿼리 (MSSQL 2014 + 주석 완전 상세)
+✅ 수정된 쿼리 (요구사항 반영 + NULL 방지 + Diff 계산)
 sql
 코드 복사
--- 1. 최근 5시간 이내의 데이터 필터링
+-- 1. 최근 5시간 이내 데이터 필터링
 WITH RawData AS (
     SELECT
         id1, line1, model1, type1, ecn1, edition1, time1,
@@ -43,7 +31,7 @@ WITH RawData AS (
     WHERE time1 >= DATEADD(HOUR, -5, GETDATE())
 ),
 
--- 2. 16개 CT 컬럼을 행 단위로 UNPIVOT + 값이 0보다 큰 경우만 유지
+-- 2. UNPIVOT 후 0보다 큰 값만 필터링
 Unpivoted AS (
     SELECT
         line1, model1, type1, ecn1, edition1, time1,
@@ -60,7 +48,7 @@ Unpivoted AS (
     WHERE Value > 0
 ),
 
--- 3. 컬럼별 분위수 계산 (1사분위 Q1, 3사분위 Q3)
+-- 3. 각 컬럼별 분위수 계산
 WithQuantiles AS (
     SELECT
         ColName,
@@ -70,14 +58,14 @@ WithQuantiles AS (
     FROM Unpivoted
 ),
 
--- 4. 이상치 제거 (Q1~Q3 사이 값만 유지)
+-- 4. 이상치 제거 (Q1~Q3 범위 내 값만 유지)
 FilteredCT AS (
     SELECT *
     FROM WithQuantiles
     WHERE Value BETWEEN Q1 AND Q3
 ),
 
--- 5. 군 구분: ACT2 / ACT2BEST
+-- 5. ACT2 / ACT2BEST 구분
 WithGroupType AS (
     SELECT *,
         CASE 
@@ -87,53 +75,58 @@ WithGroupType AS (
     FROM FilteredCT
 ),
 
--- 6. 각 (Key + time1) 조합에서 군별 최대값 추출
-MaxPerRow AS (
+-- 6. ACT2 / ACT2BEST 각각의 값이 있는지 확인용 count
+GroupCheck AS (
     SELECT
         line1, model1, type1, ecn1, edition1, time1,
-        MAX(CASE WHEN GroupType = 'ACT2' THEN Value END) AS Max_ACT2,
-        MAX(CASE WHEN GroupType = 'ACT2BEST' THEN Value END) AS Max_ACT2BEST
+        SUM(CASE WHEN GroupType = 'ACT2' THEN 1 ELSE 0 END) AS Count_ACT2,
+        SUM(CASE WHEN GroupType = 'ACT2BEST' THEN 1 ELSE 0 END) AS Count_ACT2BEST
     FROM WithGroupType
     GROUP BY line1, model1, type1, ecn1, edition1, time1
 ),
 
--- 7. NeckCT 계산: 두 군의 최대값 중 더 작은 값
-WithNeckCT AS (
-    SELECT *,
-        CASE 
-            WHEN Max_ACT2 < Max_ACT2BEST THEN Max_ACT2
-            ELSE Max_ACT2BEST
-        END AS NeckCT
-    FROM MaxPerRow
+-- 7. 각 group이 모두 있는 시간대만 유지하면서 최대값 계산
+MaxPerRow AS (
+    SELECT
+        g.line1, g.model1, g.type1, g.ecn1, g.edition1, g.time1,
+        MAX(CASE WHEN w.GroupType = 'ACT2' THEN w.Value END) AS Max_ACT2,
+        MAX(CASE WHEN w.GroupType = 'ACT2BEST' THEN w.Value END) AS Max_ACT2BEST
+    FROM GroupCheck g
+    JOIN WithGroupType w
+        ON g.line1 = w.line1 AND g.model1 = w.model1
+        AND g.type1 = w.type1 AND g.ecn1 = w.ecn1 AND g.edition1 = w.edition1
+        AND g.time1 = w.time1
+    WHERE g.Count_ACT2 > 0 AND g.Count_ACT2BEST > 0  -- NULL 방지
+    GROUP BY g.line1, g.model1, g.type1, g.ecn1, g.edition1, g.time1
 ),
 
--- 8. 각 고유 Key 그룹에서 NeckCT가 가장 낮은 시간만 추출 (ROW_NUMBER 이용)
+-- 8. 각 고유 키 그룹에서 Max 차이(Diff_CT)가 가장 작은 시간만 선택
 Ranked AS (
     SELECT *,
+        (Max_ACT2 - Max_ACT2BEST) AS Diff_CT,
         ROW_NUMBER() OVER (
             PARTITION BY line1, model1, type1, ecn1, edition1
-            ORDER BY NeckCT ASC
+            ORDER BY (Max_ACT2 - Max_ACT2BEST) ASC
         ) AS RN
-    FROM WithNeckCT
+    FROM MaxPerRow
 )
 
--- 9. 최종 결과: RN=1인 행만 조회 (즉, NeckCT 가장 낮은 1건)
+-- 9. 최종 결과 출력
 SELECT
     line1, model1, type1, ecn1, edition1, time1,
     Max_ACT2, Max_ACT2BEST,
-    NeckCT
+    Diff_CT
 FROM Ranked
 WHERE RN = 1
 ORDER BY line1, model1, type1, ecn1, edition1;
 결과 예시
-line1	model1	type1	ecn1	edition1	time1	Max_ACT2	Max_ACT2BEST	NeckCT
-SMD_12	A100	PKG1	E321	R1	2025-03-28 13:00	0.48	0.52	0.48
-이 쿼리는:
+line1	model1	type1	ecn1	edition1	time1	Max_ACT2	Max_ACT2BEST	Diff_CT
+SMD_12	ABC123	PKG1	E111	R1	2025-03-28 14:00	0.50	0.45	0.05
+요약 정리
+Diff_CT = Max_ACT2 - Max_ACT2BEST
 
-각 ACT2, ACT2BEST 컬럼별 이상치 제거 후
+0보다 큰 값만 이상치 계산에 사용
 
-시간대별로 군별 max를 계산하고
+ACT2, ACT2BEST 둘 다 있는 시간대만 유지 (NULL 완전 제거)
 
-NeckCT (두 군 중 작은 값)를 구해
-
-각 고유 조합별로 가장 이상적인 시간(time1)을 뽑아주는 구조야.
+각 Key 기준으로 Diff_CT가 최소인 row만 출력
