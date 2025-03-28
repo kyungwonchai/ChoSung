@@ -1,37 +1,53 @@
-아, 네가 명확하게 잘 설명해줬어. 아래 2가지 핵심 문제를 분석하고 바로 해결해줄게:
+전부 반영한 MSSQL 2014 쿼리 전체와 함께 아주 상세한 설명도 포함해서 줄게.
 
-[문제 1] 결과표 마지막 컬럼은 NeckCT가 아니라 MAX_ACT2 - MAX_ACT2BEST 여야 함
-해결: NeckCT 컬럼을 없애고
-MAX_ACT2 - MAX_ACT2BEST 계산 결과를 Diff_CT 같은 이름으로 출력.
+1. 요구사항 핵심 요약 (최종 정리)
+테이블 구조
+테이블 이름: ExcelData
 
-[문제 2] 결과표에 NULL 값이 나오는 문제
-원인:
-MAX(CASE WHEN GroupType = 'ACT2' THEN Value END)
-→ 만약 해당 time1 시간대에 ACT2 그룹 값이 하나도 남지 않았다면 → NULL 발생
+주요 컬럼:
 
-즉, ACT2 또는 ACT2BEST 값이 전부 이상치로 제거된 경우
-→ MAX() 계산 대상이 없어서 NULL이 되는 것임
+id1, line1, model1, type1, ecn1, edition1, time1
 
-해결:
-ACT2 / ACT2BEST 각각이 모두 존재하는 시간대만 계산
-→ 즉, 두 그룹 값이 모두 존재하는 경우에만 MAX() 수행
+ACT1_1 ~ ACT1_8 (float)
 
-✅ 수정된 쿼리 (요구사항 반영 + NULL 방지 + Diff 계산)
+ACT2BEST1_1 ~ ACT2BEST1_8 (float)
+
+의미
+10분 단위 주기로 CT(CycleTime) 16개 값이 측정됨
+
+CT는 생산속도를 의미하며, 0은 잘못된 값(미측정, 정지 등) 으로 간주 → 제외해야 함
+
+line1, model1, type1, ecn1, edition1 이 고유 키 역할 (모델 변경 시만 새로 생김)
+
+목표
+최근 5시간 데이터만 분석
+
+각 고유 키 + time1 단위마다:
+
+ACT1_1~8 중에서 이상치(1Q~3Q) 제거 후 최대값
+
+ACT2BEST1_1~8 중에서 이상치(1Q~3Q) 제거 후 최대값
+
+위에서 계산된 두 값의 차이 (ACT1_MAX - ACT2BEST_MAX) 를 DiffCT 로 저장
+
+고유 키 조합별로 DiffCT가 가장 작은 time1 하나만 조회
+
+2. 최종 MSSQL 2014 쿼리 (전체 주석 포함)
 sql
 코드 복사
--- 1. 최근 5시간 이내 데이터 필터링
+-- 1. 최근 5시간 이내의 원본 데이터 필터링
 WITH RawData AS (
     SELECT
         id1, line1, model1, type1, ecn1, edition1, time1,
-        ACT2_1, ACT2_2, ACT2_3, ACT2_4,
-        ACT2_5, ACT2_6, ACT2_7, ACT2_8,
-        ACT2BEST_1, ACT2BEST_2, ACT2BEST_3, ACT2BEST_4,
-        ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
+        ACT1_1, ACT1_2, ACT1_3, ACT1_4,
+        ACT1_5, ACT1_6, ACT1_7, ACT1_8,
+        ACT2BEST1_1, ACT2BEST1_2, ACT2BEST1_3, ACT2BEST1_4,
+        ACT2BEST1_5, ACT2BEST1_6, ACT2BEST1_7, ACT2BEST1_8
     FROM dbo.ExcelData
     WHERE time1 >= DATEADD(HOUR, -5, GETDATE())
 ),
 
--- 2. UNPIVOT 후 0보다 큰 값만 필터링
+-- 2. UNPIVOT: 16개 CT 컬럼을 행(Row) 형태로 전개
 Unpivoted AS (
     SELECT
         line1, model1, type1, ecn1, edition1, time1,
@@ -39,16 +55,16 @@ Unpivoted AS (
     FROM RawData
     UNPIVOT (
         Value FOR ColName IN (
-            ACT2_1, ACT2_2, ACT2_3, ACT2_4,
-            ACT2_5, ACT2_6, ACT2_7, ACT2_8,
-            ACT2BEST_1, ACT2BEST_2, ACT2BEST_3, ACT2BEST_4,
-            ACT2BEST_5, ACT2BEST_6, ACT2BEST_7, ACT2BEST_8
+            ACT1_1, ACT1_2, ACT1_3, ACT1_4,
+            ACT1_5, ACT1_6, ACT1_7, ACT1_8,
+            ACT2BEST1_1, ACT2BEST1_2, ACT2BEST1_3, ACT2BEST1_4,
+            ACT2BEST1_5, ACT2BEST1_6, ACT2BEST1_7, ACT2BEST1_8
         )
     ) AS u
-    WHERE Value > 0
+    WHERE Value > 0  -- 0은 잘못된 측정값이므로 제외
 ),
 
--- 3. 각 컬럼별 분위수 계산
+-- 3. 분위수 계산: 각 컬럼별 Q1, Q3 구함
 WithQuantiles AS (
     SELECT
         ColName,
@@ -58,75 +74,65 @@ WithQuantiles AS (
     FROM Unpivoted
 ),
 
--- 4. 이상치 제거 (Q1~Q3 범위 내 값만 유지)
+-- 4. 이상치 제거: Q1 ~ Q3 범위 내 값만 유지
 FilteredCT AS (
     SELECT *
     FROM WithQuantiles
     WHERE Value BETWEEN Q1 AND Q3
 ),
 
--- 5. ACT2 / ACT2BEST 구분
-WithGroupType AS (
+-- 5. 그룹 타입 부여: ACT1 / ACT2BEST 구분
+WithGroup AS (
     SELECT *,
         CASE 
-            WHEN ColName LIKE 'ACT2BEST[_]%' THEN 'ACT2BEST'
-            WHEN ColName LIKE 'ACT2[_]%' THEN 'ACT2'
+            WHEN ColName LIKE 'ACT1[_]%' THEN 'ACT1'
+            WHEN ColName LIKE 'ACT2BEST1[_]%' THEN 'ACT2BEST'
         END AS GroupType
     FROM FilteredCT
 ),
 
--- 6. ACT2 / ACT2BEST 각각의 값이 있는지 확인용 count
-GroupCheck AS (
+-- 6. 각 Key + 시간(time1) 단위로 군별 최대값 계산
+MaxPerRow AS (
     SELECT
         line1, model1, type1, ecn1, edition1, time1,
-        SUM(CASE WHEN GroupType = 'ACT2' THEN 1 ELSE 0 END) AS Count_ACT2,
-        SUM(CASE WHEN GroupType = 'ACT2BEST' THEN 1 ELSE 0 END) AS Count_ACT2BEST
-    FROM WithGroupType
+        MAX(CASE WHEN GroupType = 'ACT1' THEN Value END) AS Max_ACT1,
+        MAX(CASE WHEN GroupType = 'ACT2BEST' THEN Value END) AS Max_ACT2BEST
+    FROM WithGroup
     GROUP BY line1, model1, type1, ecn1, edition1, time1
 ),
 
--- 7. 각 group이 모두 있는 시간대만 유지하면서 최대값 계산
-MaxPerRow AS (
-    SELECT
-        g.line1, g.model1, g.type1, g.ecn1, g.edition1, g.time1,
-        MAX(CASE WHEN w.GroupType = 'ACT2' THEN w.Value END) AS Max_ACT2,
-        MAX(CASE WHEN w.GroupType = 'ACT2BEST' THEN w.Value END) AS Max_ACT2BEST
-    FROM GroupCheck g
-    JOIN WithGroupType w
-        ON g.line1 = w.line1 AND g.model1 = w.model1
-        AND g.type1 = w.type1 AND g.ecn1 = w.ecn1 AND g.edition1 = w.edition1
-        AND g.time1 = w.time1
-    WHERE g.Count_ACT2 > 0 AND g.Count_ACT2BEST > 0  -- NULL 방지
-    GROUP BY g.line1, g.model1, g.type1, g.ecn1, g.edition1, g.time1
+-- 7. 각 row마다 차이 계산 (DiffCT = ACT1_MAX - ACT2BEST_MAX)
+WithDiff AS (
+    SELECT *,
+        (Max_ACT1 - Max_ACT2BEST) AS DiffCT
+    FROM MaxPerRow
+    WHERE Max_ACT1 IS NOT NULL AND Max_ACT2BEST IS NOT NULL  -- NULL 제거
 ),
 
--- 8. 각 고유 키 그룹에서 Max 차이(Diff_CT)가 가장 작은 시간만 선택
+-- 8. 고유 키별로 DiffCT가 가장 작은 1건만 선택
 Ranked AS (
     SELECT *,
-        (Max_ACT2 - Max_ACT2BEST) AS Diff_CT,
         ROW_NUMBER() OVER (
             PARTITION BY line1, model1, type1, ecn1, edition1
-            ORDER BY (Max_ACT2 - Max_ACT2BEST) ASC
+            ORDER BY DiffCT ASC
         ) AS RN
-    FROM MaxPerRow
+    FROM WithDiff
 )
 
--- 9. 최종 결과 출력
+-- 9. 최종 출력
 SELECT
     line1, model1, type1, ecn1, edition1, time1,
-    Max_ACT2, Max_ACT2BEST,
-    Diff_CT
+    Max_ACT1, Max_ACT2BEST, DiffCT
 FROM Ranked
 WHERE RN = 1
 ORDER BY line1, model1, type1, ecn1, edition1;
-결과 예시
-line1	model1	type1	ecn1	edition1	time1	Max_ACT2	Max_ACT2BEST	Diff_CT
-SMD_12	ABC123	PKG1	E111	R1	2025-03-28 14:00	0.50	0.45	0.05
-요약 정리
-Diff_CT = Max_ACT2 - Max_ACT2BEST
+3. 결과 예시
+line1	model1	type1	ecn1	edition1	time1	Max_ACT1	Max_ACT2BEST	DiffCT
+SMD_12	ABC123	PKG1	E101	R1	2025-03-28 13:00	0.52	0.48	0.04
+SMD_12	XYZ456	PKG2	E102	R2	2025-03-28 12:40	0.59	0.55	0.04
+4. 추가 팁
+DiffCT가 너무 큰 경우 경고 처리하려면 WHERE DiffCT > 0.1 같은 조건 추가 가능
 
-0보다 큰 값만 이상치 계산에 사용
+상위 3개 시간대를 보고 싶다면 ROW_NUMBER() 대신 RANK()로 바꾸고 WHERE RN <= 3 등으로 조절
 
-ACT2, ACT2BEST 둘 다 있는 시간대만 유지 (NULL 완전 제거)
-
-각 Key 기준으로 Diff_CT가 최소인 row만 출력
+피벗 테이블처럼 가로 출력하고 싶다면 PIVOT도 가능
