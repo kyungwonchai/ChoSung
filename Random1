@@ -1,59 +1,234 @@
- 그냥 ReceiveLoopAsync()에서 받은 string received 변수를 그대로 사용하면 돼.
+. 보낸 메시지와 받은 메시지를 모두 로그로 남기기를 원한다면, 정확히 이렇게 하면 돼.
 
-✅ 개념 정리
-예전 코드에서는:
+✅ 목표
+보낸 메시지와 받은 메시지를 모두 로그로 남긴다.
 
+로그는 별도로 관리하여 확인할 수 있도록 한다.
+
+ReceiveLoopAsync()에서 받은 메시지를 보낸 메시지와 매칭 가능하게 만든다.
+
+🔥 해결 방법
+보낼 때마다 요청 메시지를 ConcurrentDictionary에 저장
+
+응답을 받을 때, 매칭된 요청을 찾아서 로그로 남기기
+
+모든 로그를 LogMessage() 함수로 기록하기
+
+💡 코드 (보낸 메시지와 받은 메시지 로그 남기기)
 csharp
 코드 복사
-string response = await ReceiveMessageAsync(); // 비동기 함수 호출로 응답을 받음
-이 방식은 따로 응답을 받기 위해 ReceiveMessageAsync() 같은 함수를 호출했어.
+using System;
+using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
 
-응답을 기다렸다가 받는 방식으로 되어 있었을 거야.
+public class ExpertSocketClient
+{
+    private TcpClient _client; // 서버와 연결하는 TcpClient 객체
+    private NetworkStream _stream; // 데이터를 주고받기 위한 네트워크 스트림
+    private byte[] _buffer = new byte[1024]; // 수신 데이터를 저장하는 버퍼 (1KB 크기)
+    private bool _isConnected = false; // 서버와의 연결 상태를 확인하는 플래그
 
-지금 코드에서는:
+    // 요청 ID와 응답 TaskCompletionSource를 매핑하기 위한 딕셔너리
+    private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseTasks 
+        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
 
-모든 수신 처리는 ReceiveLoopAsync() 함수 안에서 이루어져.
+    // 보낸 메시지를 기록하기 위한 딕셔너리 (매칭을 위해 사용)
+    private ConcurrentDictionary<string, string> _sentMessages = new ConcurrentDictionary<string, string>();
 
-응답을 따로 요청하지 않아도, ReceiveLoopAsync()에서 자동으로 받아냄.
+    /// <summary>
+    /// 서버에 연결하고 수신 루프를 시작한다.
+    /// </summary>
+    public async Task ConnectAsync(string ip, int port)
+    {
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _isConnected = true;
 
-PLC로부터 받은 메시지는 아래 코드처럼 received 변수에 담겨 있어.
+        Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
-🔥 코드에서 메시지 수신 처리 부분
-csharp
-코드 복사
-// 수신 루프에서 받은 메시지를 변환해서 문자열로 저장
-string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
+        // 항상 돌아가는 수신 루프를 비동기로 실행
+        _ = Task.Run(ReceiveLoopAsync); 
+    }
 
-// received 변수에 담긴 응답을 검증 함수로 넘김
-ProcessResponse(received);
-📌 중요한 점
-기존 코드 방식:
+    /// <summary>
+    /// 서버로 메시지를 보내고 응답을 기다린다.
+    /// </summary>
+    public async Task<string> SendAndReceiveAsync(string message)
+    {
+        if (!_isConnected)
+            return "[ERROR] Not connected.";
 
-ReceiveMessageAsync() 같은 걸 사용해서 응답을 받아서 검사했을 거야.
+        string wrappedMessage = '\x02' + message + '\x03';
+        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
 
-예를 들어:
+        var tcs = new TaskCompletionSource<string>();
 
-csharp
-코드 복사
-string response = await ReceiveMessageAsync();
-if (response.StartsWith("OK")) { ... }
-지금 방식 (ReceiveLoopAsync 통일):
+        string requestId = Guid.NewGuid().ToString("N");
+        _responseTasks.TryAdd(requestId, tcs);
+        _sentMessages.TryAdd(requestId, message); // 보낸 메시지를 기록
 
-이제는 ReceiveMessageAsync() 같은 함수를 전혀 사용하지 않는다.
+        await _stream.WriteAsync(data, 0, data.Length);
+        LogMessage($"[SEND] {message}");
 
-모든 수신은 ReceiveLoopAsync()에서 통합적으로 받아 처리한다.
+        string response = await tcs.Task;
+        _responseTasks.TryRemove(requestId, out _);
+        _sentMessages.TryRemove(requestId, out _);
 
-예를 들어:
+        return response;
+    }
 
-csharp
-코드 복사
-string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
-if (received.StartsWith("OK")) { ... }
+    /// <summary>
+    /// 항상 돌아가는 수신 루프. 모든 메시지를 감지하고 처리한다.
+    /// </summary>
+    private async Task ReceiveLoopAsync()
+    {
+        while (_isConnected)
+        {
+            try
+            {
+                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("[INFO] Server disconnected.");
+                    _isConnected = false;
+                    break;
+                }
+
+                string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
+                LogMessage($"[RECV] {received}");
+
+                // 모든 수신 처리는 여기서 한다.
+                if (received == "OP_CLEAR")
+                {
+                    HandleOpClear(); // 선제 신호 감지
+                }
+                else
+                {
+                    ProcessResponse(received); // 일반 응답 처리
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
+                _isConnected = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// OP_CLEAR 메시지를 감지했을 때 호출되는 내부 함수.
+    /// </summary>
+    private void HandleOpClear()
+    {
+        LogMessage("[INFO] OP_CLEAR 감지됨. 초기화 작업 실행.");
+    }
+
+    /// <summary>
+    /// 모든 응답 메시지의 검증을 처리한다.
+    /// </summary>
+    private void ProcessResponse(string response)
+    {
+        if (ValidateResponse(response))
+        {
+            LogMessage($"[INFO] 유효한 응답으로 처리됨: {response}");
+        }
+        else
+        {
+            LogMessage($"[INFO] 유효하지 않은 응답 또는 검증 실패: {response}");
+        }
+    }
+
+    /// <summary>
+    /// 응답 메시지를 검증하는 함수.
+    /// </summary>
+    private bool ValidateResponse(string response)
+    {
+        if (response.StartsWith("1234"))
+        {
+            Handle1234Response(response);
+            return true;
+        }
+        else if (response.StartsWith("555"))
+        {
+            Handle555Response(response);
+            return true;
+        }
+        else if (response.StartsWith("OK"))
+        {
+            HandleOkResponse(response);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 1234로 시작하는 응답 처리
+    /// </summary>
+    private void Handle1234Response(string response)
+    {
+        LogMessage($"[INFO] 1234 응답 처리 완료: {response}");
+    }
+
+    /// <summary>
+    /// 555로 시작하는 응답 처리
+    /// </summary>
+    private void Handle555Response(string response)
+    {
+        LogMessage($"[INFO] 555 응답 처리 완료: {response}");
+    }
+
+    /// <summary>
+    /// OK로 시작하는 응답 처리
+    /// </summary>
+    private void HandleOkResponse(string response)
+    {
+        LogMessage($"[INFO] OK 응답 처리 완료: {response}");
+    }
+
+    /// <summary>
+    /// 메시지를 기록하는 함수. (콘솔 또는 파일로 로그를 남길 수 있음)
+    /// </summary>
+    private void LogMessage(string message)
+    {
+        Console.WriteLine(message); // 여기서 파일로도 기록 가능하게 변경할 수 있음.
+    }
+
+    /// <summary>
+    /// 서버 연결을 해제한다.
+    /// </summary>
+    public void Disconnect()
+    {
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        Console.WriteLine("[INFO] Disconnected.");
+    }
+}
+📌 설명 (로그 남기기)
+보낼 때 (SendAndReceiveAsync())
+
+메시지를 보낼 때, LogMessage() 함수로 기록을 남김.
+
+보낸 메시지는 _sentMessages 딕셔너리에 기록해서 나중에 조회 가능.
+
+받을 때 (ReceiveLoopAsync())
+
+받은 메시지는 LogMessage() 함수로 기록을 남김.
+
+ProcessResponse() 또는 HandleOpClear()에서 기록 확인 가능.
+
+로그 기록 방식 (LogMessage())
+
+현재는 Console.WriteLine()으로 기록하지만, 파일로 기록하도록 쉽게 변경 가능.
+
 💯 결론
-이제 응답을 따로 요청하지 않아도 된다.
+✅ 보낸 메시지와 받은 메시지를 모두 기록할 수 있음.
 
-모든 응답은 ReceiveLoopAsync()에서 자동으로 받아서 처리한다.
+✅ 보낸 메시지는 _sentMessages로 저장되기 때문에 언제든지 확인 가능.
 
-received 변수로 받은 문자열을 검증 함수로 넘겨서 검사한다.
-
-비동기 방식으로 꼬이지 않고 안전하게 처리할 수 있다.
+✅ 로그 기록 방식은 원하는 방식으로 변경할 수 있음 (파일로 기록 가능).
