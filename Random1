@@ -1,189 +1,52 @@
- 이해했어.
-일반 응답으로 처리될 때 실행되는 함수는 ProcessResponse() 함수야.
-그 안에서 **검증 함수인 ValidateResponse()**를 호출해서 응답의 유효성을 체크하고,
-응답 내용에 따라 분기 처리하도록 구성했어.
+래는 MSSQL 2014에서 요청하신 요구 사항을 처리하기 위한 뷰 작성 쿼리입니다. 요구사항은 다음과 같습니다:
 
-✅ 일반 응답 처리 구조
-**ReceiveLoopAsync()**에서 모든 메시지를 받음.
+시간대 처리:
 
-받은 메시지가 보낸 메시지와 매칭되면 일반 응답으로 처리.
+오전 7시 ~ 오후 7시 (07:00~19:00)은 07:30 이상 08:20 이하와 같은 형식으로 묶어야 함.
 
-일반 응답이면 ProcessResponse() 함수를 호출하여 처리.
+오후 8시 이후 (20:0006:00)은 기존 시간대 (예: 2021시가 20시로)로 그룹화.
 
-ProcessResponse() 내부에서 ValidateResponse() 함수를 호출하여 검증.
+결과를 시간 형식으로 나타내기 위해 CONVERT 사용.
 
-검증 결과에 따라 적절한 핸들러를 실행함.
-
-🔥 코드 구조 (일반 응답 처리 부분 강조)
-📌 ReceiveLoopAsync() 수정
-csharp
+뷰 작성 쿼리
+sql
 코드 복사
-private async Task ReceiveLoopAsync()
-{
-    while (_isConnected)
-    {
-        try
-        {
-            int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+CREATE VIEW view_lossdata AS
+SELECT 
+    line,
+    CASE 
+        WHEN DATEPART(HOUR, DATEADD(MINUTE, -10, datev)) BETWEEN 7 AND 18
+            THEN CASE 
+                    WHEN DATEADD(MINUTE, -10, datev) >= DATEADD(MINUTE, 30, DATEADD(HOUR, DATEPART(HOUR, DATEADD(MINUTE, -10, datev)), CAST(CAST(DATEADD(MINUTE, -10, datev) AS date) AS datetime)))
+                        AND DATEADD(MINUTE, -10, datev) < DATEADD(MINUTE, 20, DATEADD(HOUR, DATEPART(HOUR, DATEADD(MINUTE, -10, datev)) + 1, CAST(CAST(DATEADD(MINUTE, -10, datev) AS date) AS datetime)))
+                        THEN CONVERT(VARCHAR(5), DATEADD(HOUR, DATEPART(HOUR, DATEADD(MINUTE, -10, datev)) + 1, CAST(CAST(DATEADD(MINUTE, -10, datev) AS date) AS datetime)), 108)
+                    ELSE CONVERT(VARCHAR(5), DATEADD(HOUR, DATEPART(HOUR, DATEADD(MINUTE, -10, datev)), CAST(CAST(DATEADD(MINUTE, -10, datev) AS date) AS datetime)), 108)
+                 END
+        ELSE 
+            CONVERT(VARCHAR(2), DATEPART(HOUR, DATEADD(MINUTE, -10, datev)))
+    END AS 시간,
+    DATEADD(MINUTE, -10, datev) AS datev
+FROM table_lossdata;
+설명
+DATEADD 사용: DATEADD(MINUTE, -10, datev)로 10분을 뺀 후 그룹화를 수행합니다.
 
-            if (bytesRead == 0)
-            {
-                Console.WriteLine("[INFO] Server disconnected.");
-                _isConnected = false;
-                break;
-            }
+CASE 구문 사용: 두 가지 조건을 처리합니다.
 
-            // 받은 메시지 변환
-            string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
-            LogMessage($"[RECV] {received}");
+07:00 ~ 19:00 범위: 시간대를 30분 ~ 20분 기준으로 묶어서 표시.
 
-            bool matched = false;
+20:00 ~ 06:00 범위: 기존 방식처럼 단순히 시간을 표시.
 
-            // 응답 매칭 검사
-            foreach (var key in _responseTasks.Keys)
-            {
-                if (_responseTasks.TryRemove(key, out var tcs))
-                {
-                    if (_sentMessages.TryGetValue(key, out var sentMessage))
-                    {
-                        LogMessage($"[MATCHED] Sent: {sentMessage} | Received: {received}");
-                        matched = true;
+CONVERT 사용: 최종 시간을 VARCHAR 형식으로 변환하여 시간 컬럼에 표시.
 
-                        // 일반 응답으로 처리 (검증 함수로 전달)
-                        ProcessResponse(received);
-                        tcs.SetResult(received); // 비동기 응답 처리 완료
-                        break;
-                    }
-                }
-            }
+예시 출력
+line	시간	datev
+1	07:00	2025-04-01 07:20:00
+1	08:00	2025-04-01 08:00:00
+1	09:00	2025-04-01 08:50:00
+1	20	2025-04-01 20:10:00
+1	21	2025-04-01 21:50:00
+1	06	2025-04-01 06:30:00
+참고 사항
+07:30 ~ 08:20 사이의 시간은 8시로 그룹화됩니다.
 
-            // 보낸 메시지로 매칭되지 않으면 선제 신호로 처리
-            if (!matched)
-            {
-                LogMessage($"[NOTICE] 선제 신호로 처리됨: {received}");
-                HandlePreemptiveSignal(received); // 선제 신호 처리 함수 호출
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
-            _isConnected = false;
-        }
-    }
-}
-📌 ProcessResponse() 함수 (일반 응답 처리의 핵심)
-csharp
-코드 복사
-/// <summary>
-/// 일반 응답을 처리하고, 메시지 내용에 따라 다른 함수로 분기한다.
-/// </summary>
-private void ProcessResponse(string response)
-{
-    if (ValidateResponse(response))
-    {
-        LogMessage($"[INFO] 유효한 응답으로 처리됨: {response}");
-    }
-    else
-    {
-        LogMessage($"[WARNING] 유효하지 않은 응답 또는 검증 실패: {response}");
-    }
-}
-📌 ValidateResponse() 함수 (검증 함수)
-csharp
-코드 복사
-/// <summary>
-/// 응답 메시지를 검증하는 함수. 조건에 따라 응답을 분기 처리한다.
-/// </summary>
-private bool ValidateResponse(string response)
-{
-    // 조건 예시: 메시지가 특정 패턴으로 시작할 경우 처리
-    if (response.StartsWith("1234"))
-    {
-        Handle1234Response(response);
-        return true;
-    }
-    else if (response.StartsWith("555"))
-    {
-        Handle555Response(response);
-        return true;
-    }
-    else if (response.StartsWith("OK"))
-    {
-        HandleOkResponse(response);
-        return true;
-    }
-
-    // 기타: 유효하지 않은 응답으로 간주
-    return false;
-}
-📌 응답 핸들러 함수들
-csharp
-코드 복사
-/// <summary>
-/// 1234로 시작하는 응답 처리
-/// </summary>
-private void Handle1234Response(string response)
-{
-    LogMessage($"[INFO] 1234 응답 처리 완료: {response}");
-    // 추가 로직: 예를 들어 상태 갱신 또는 작업 실행
-}
-
-/// <summary>
-/// 555로 시작하는 응답 처리
-/// </summary>
-private void Handle555Response(string response)
-{
-    LogMessage($"[INFO] 555 응답 처리 완료: {response}");
-    // 추가 로직: 에러 처리 또는 재시도
-}
-
-/// <summary>
-/// OK로 시작하는 응답 처리
-/// </summary>
-private void HandleOkResponse(string response)
-{
-    LogMessage($"[INFO] OK 응답 처리 완료: {response}");
-    // 추가 로직: 정상 완료 처리
-}
-💡 코드 실행 흐름 (정확히 이해시키기)
-메시지 수신 (ReceiveLoopAsync())
-
-받은 메시지를 보낸 메시지와 매칭하여 일반 응답으로 처리할지 결정.
-
-매칭되지 않으면 선제 신호로 처리.
-
-일반 응답으로 판단되면 (ProcessResponse())
-
-받은 응답을 검증하기 위해 ValidateResponse() 함수 호출.
-
-검증에 성공하면 핸들러 함수로 넘김.
-
-응답 검증 (ValidateResponse())
-
-응답 시작 패턴을 확인하여 각 핸들러 함수로 분기.
-
-예:
-
-1234로 시작하면 → Handle1234Response()
-
-555로 시작하면 → Handle555Response()
-
-OK로 시작하면 → HandleOkResponse()
-
-💯 결론
-✅ 일반 응답으로 처리될 때 실행되는 함수는 ProcessResponse().
-
-✅ ProcessResponse() 내부에서 ValidateResponse()를 통해 검증 후 각 핸들러로 분기.
-
-✅ 수신 루프에서 모든 메시지를 받아 검증 후, 일반 응답과 선제 신호를 정확히 구분.
-
-이제 정확히 맞춰서 구조를 만들었어.
-이 방식으로 모든 일반 응답과 선제 신호를 정확히 처리할 수 있어.
-더 필요한 부분이 있으면 말해줘!
-
-
-2/2
-
-
-
-
+나머지 시간대는 그대로 시간으로 나타납니다.
