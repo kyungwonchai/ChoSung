@@ -1,76 +1,211 @@
-습니다. os.walk() 대신 os.listdir()를 사용하여 모든 폴더를 검색하도록 수정하겠습니다. 이 방식은 네트워크 공유 폴더에서도 잘 동작할 것입니다.
+아. 이번에는 진짜 완벽하게 전문적인 비동기 구조로 만들어줄게.
 
-코드 (os.listdir() 사용)
-python
+목표 요약
+🔍 요구 사항
+전송한 메시지에 대한 응답은 반드시 내가 보낸 함수에서 가져가야 함
+
+다른 함수에서 보내는 메시지와 서로 충돌 없이 처리해야 함
+
+OP_CLEAR처럼 서버가 먼저 보내는 메시지는 항상 별도로 처리해야 함
+
+완벽하게 비동기적이고 안전한 구조로 구현할 것
+
+핵심 개념
+요청마다 고유 ID를 부여 → 응답을 구분할 수 있게 함
+
+Dictionary로 요청을 추적 (ConcurrentDictionary 사용)
+
+항상 돌고 있는 수신 루프 → 선제 신호(OP_CLEAR)도 안전하게 수신
+
+TaskCompletionSource로 비동기 응답 처리 → 응답을 안전하게 비동기로 받기
+
+비동기 Task로 응답 대기 → 응답 충돌 방지
+
+서버 선제 메시지(OP_CLEAR) 전용 처리기 제공
+
+전문가 코드 (주석 매우 상세하게)
+csharp
 코드 복사
-import os
-import re
-import time
+using System;
+using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
 
-def search_folders(root_dir, folder_pattern):
-    # 시작 시간 측정
-    start_time = time.time()
-    pattern = re.compile(folder_pattern, re.IGNORECASE)
-    matched_paths = []
+public class ExpertSocketClient
+{
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private byte[] _buffer = new byte[1024];
+    private bool _isConnected = false;
 
-    def recursive_search(current_dir):
-        try:
-            # 현재 폴더 내용 확인
-            items = os.listdir(current_dir)
-            for item in items:
-                item_path = os.path.join(current_dir, item)
-                print(f"확인 중: {item_path}")  # 확인용으로 모든 폴더 출력
+    // 요청 ID와 해당 응답을 기다리는 TaskCompletionSource 매핑
+    private ConcurrentDictionary<string, TaskCompletionSource<string>> _pendingRequests 
+        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
 
-                # 폴더인 경우
-                if os.path.isdir(item_path):
-                    # 이름이 패턴에 일치하는지 확인
-                    if pattern.search(item):
-                        matched_paths.append(item_path)
-                        print(f"[발견] {item_path}")
-                    
-                    # 재귀적으로 하위 폴더 검색
-                    recursive_search(item_path)
+    /// <summary>
+    /// 서버와 연결하고, 수신 루프를 시작한다.
+    /// </summary>
+    public async Task ConnectAsync(string ip, int port)
+    {
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _isConnected = true;
 
-        except PermissionError:
-            print(f"[접근 거부] {current_dir}")
-        except Exception as e:
-            print(f"[오류] {current_dir} - {str(e)}")
+        Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
-    # 검색 시작
-    recursive_search(root_dir)
+        // 항상 돌아가는 수신 루프를 비동기로 시작
+        _ = Task.Run(ReceiveLoopAsync);
+    }
 
-    # 종료 시간 측정
-    end_time = time.time()
-    elapsed_time = end_time - start_time
+    /// <summary>
+    /// 비동기로 명령을 보내고, 해당 명령에 대한 응답을 기다린다.
+    /// </summary>
+    public async Task<string> SendAndReceiveAsync(string command)
+    {
+        if (!_isConnected) return "[ERROR] Not connected.";
 
-    # 결과 출력
-    print(f"\n검색 완료! ({elapsed_time:.2f} 초 소요)")
-    print("검색된 폴더 경로 목록:")
-    for path in matched_paths:
-        print(path)
+        // 1. 요청마다 고유한 ID 생성
+        string requestId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
-    return matched_paths
+        // 2. ID를 포함한 메시지 생성
+        string fullMessage = $"REQ:{requestId}:{command}";
+        string wrappedMessage = '\x02' + fullMessage + '\x03';
+        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
 
+        // 3. TaskCompletionSource 생성하여 대기 준비
+        var tcs = new TaskCompletionSource<string>();
+        _pendingRequests.TryAdd(requestId, tcs);
 
-# 사용 예시
-root_directory = r"\\ServerName\SharedFolder"  # 네트워크 경로
-folder_name_pattern = r"PGM\s*공용\s*사용"  # 띄어쓰기가 있거나 없거나 모두 포함
+        // 4. 메시지 전송
+        await _stream.WriteAsync(data, 0, data.Length);
+        Console.WriteLine($"[SEND] {fullMessage}");
 
-search_folders(root_directory, folder_name_pattern)
-코드 설명
-os.listdir(): 현재 디렉토리에 있는 모든 파일과 폴더를 가져옵니다.
+        // 5. 응답을 비동기로 대기 (타임아웃 구현 가능)
+        string response = await tcs.Task;
+        return response;
+    }
 
-os.path.isdir(): 해당 경로가 폴더인지 확인합니다.
+    /// <summary>
+    /// 항상 돌고 있는 수신 루프.
+    /// 수신된 모든 데이터를 처리하고, 응답과 서버 선제 메시지를 구분한다.
+    /// </summary>
+    private async Task ReceiveLoopAsync()
+    {
+        while (_isConnected)
+        {
+            try
+            {
+                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("[INFO] Server disconnected.");
+                    _isConnected = false;
+                    break;
+                }
 
-재귀 함수 (recursive_search) 사용하여 하위 폴더를 모두 검색합니다.
+                string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
+                Console.WriteLine($"[RECV] {received}");
 
-폴더 이름을 정규 표현식(pattern)으로 검색합니다.
+                // 메시지 구분 (응답 메시지 VS 선제 메시지)
+                if (received.StartsWith("RES:"))
+                {
+                    ProcessResponse(received);
+                }
+                else if (received == "OP_CLEAR")
+                {
+                    ProcessOpClear();
+                }
+                else
+                {
+                    Console.WriteLine($"[WARN] Unknown message format: {received}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
+                _isConnected = false;
+            }
+        }
+    }
 
-찾은 폴더 경로를 바로 출력합니다.
+    /// <summary>
+    /// 응답 메시지를 처리한다. (요청 ID 기반)
+    /// </summary>
+    private void ProcessResponse(string message)
+    {
+        // 메시지 형식: "RES:ID:Actual_Response"
+        var parts = message.Split(':', 3); // 최대 3개로 분리
 
-이 방식의 장점
-os.walk() 대신 os.listdir() 사용하여 강제로 모든 폴더를 직접 탐색합니다.
+        if (parts.Length < 3) return; // 형식 오류 방지
 
-접근 권한 오류나 파일 이름 오류도 표시합니다.
+        string requestId = parts[1];
+        string responseContent = parts[2];
 
-네트워크 공유 폴더에서도 잘 동작합니다.
+        if (_pendingRequests.TryRemove(requestId, out var tcs))
+        {
+            tcs.SetResult(responseContent); // 응답을 대기 중인 Task에 전달
+        }
+        else
+        {
+            Console.WriteLine($"[ERROR] Unexpected response ID: {requestId}");
+        }
+    }
+
+    /// <summary>
+    /// 서버의 선제 메시지(OP_CLEAR) 처리
+    /// </summary>
+    private void ProcessOpClear()
+    {
+        Console.WriteLine("[EVENT] OP_CLEAR received. Processing it separately.");
+        // TODO: 필요한 로직 추가 (예: 상태 초기화, UI 갱신 등)
+    }
+
+    /// <summary>
+    /// 연결 해제
+    /// </summary>
+    public void Disconnect()
+    {
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        Console.WriteLine("[INFO] Disconnected.");
+    }
+}
+설명 요약
+서버와 연결 후 → 항상 돌고 있는 ReceiveLoopAsync() 시작
+
+모든 메시지는 수신 루프에서 처리
+
+응답(RES:ID:Response)은 요청 ID와 매칭하여 비동기 응답 처리
+
+선제 메시지(OP_CLEAR)는 별도로 처리
+
+사용 예제
+csharp
+코드 복사
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var client = new ExpertSocketClient();
+        await client.ConnectAsync("10.22.22.22", 2400);
+
+        // 명령을 보냄 (비동기로 응답 받기)
+        var response1 = await client.SendAndReceiveAsync("STATUS");
+        Console.WriteLine($"응답1: {response1}");
+
+        var response2 = await client.SendAndReceiveAsync("RESET");
+        Console.WriteLine($"응답2: {response2}");
+
+        Console.ReadLine(); // 프로그램 종료 방지
+        client.Disconnect();
+    }
+}
+정리
+✅ 응답 충돌 문제 해결 (ID 기반 비동기 처리)
+
+✅ 서버 선제 메시지 안전하게 처리 (OP_CLEAR)
+
+✅ 완전히 비동기적으로 구성
