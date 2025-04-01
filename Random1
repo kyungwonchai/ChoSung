@@ -1,40 +1,12 @@
-거나 검증할 수 있는 구조가 필요해.
+항상 돌고 있는 수신 루프 (ReceiveLoopAsync())를 유지.
 
-🔍 핵심 요구 사항 요약
-PLC 규칙 준수:
+모든 메시지는 수신 루프에서 잡히며, 분류 로직을 추가.
 
-보낼 때는 절대 수정 없이 PLC의 규칙을 따라야 함. (REQ: 같은 거 금지)
+명령을 보낼 때마다 TaskCompletionSource로 비동기 응답을 안전하게 처리.
 
-응답 처리 방식:
+PLC의 선제 메시지 (OP_CLEAR)는 별도의 이벤트로 처리.
 
-기존에는 응답을 받으면 그 내용에 따라 특정 로직을 실행함.
-
-이 기능을 유지하면서 비동기 통신을 안전하게 해야 함.
-
-OP_CLEAR 신호 처리:
-
-항상 별도로 감지되어야 함. (메인 응답 처리 로직과 분리)
-
-응답 검증 함수 추가:
-
-응답이 왔을 때 내용을 확인하고, 그에 따라 다른 함수를 실행할 수 있어야 함.
-
-예를 들어, STATUS_OK가 오면 특정 함수 실행, ERROR가 오면 에러 처리 함수 실행.
-
-💡 코드 설계 방법
-응답 검증 및 처리 기능 추가:
-
-응답을 받으면 그 내용을 파싱하고, 응답 내용에 따라 함수를 실행하도록 변경.
-
-TaskCompletionSource로 비동기 처리 유지:
-
-기존 방식에서 응답을 처리하되, 응답 내용을 파싱하여 조건부로 로직을 실행할 수 있게 만듦.
-
-모든 로직을 주석으로 완벽히 설명:
-
-지금부터 작성하는 코드는 주석을 극도로 상세히 추가할 거야.
-
-🔥 전문가 코드 (주석 매우 상세하게 추가)
+💡 코드 예시 (주석 매우 상세히 추가)
 csharp
 코드 복사
 using System;
@@ -51,23 +23,26 @@ public class ExpertSocketClient
     private bool _isConnected = false; // 서버와 연결 상태를 나타내는 플래그
 
     // 응답 대기를 위한 비동기 처리를 관리하는 리스트 (FIFO 방식)
-    private BlockingCollection<TaskCompletionSource<string>> _responseQueue 
-        = new BlockingCollection<TaskCompletionSource<string>>();
+    private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseTasks 
+        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
+
+    // 선제 신호(OP_CLEAR)를 감지했을 때 발생시키는 이벤트
+    public event Action OnOpClearReceived;
 
     /// <summary>
     /// 서버와 비동기로 연결을 수립하고, 수신 루프를 시작한다.
     /// </summary>
     public async Task ConnectAsync(string ip, int port)
     {
-        _client = new TcpClient(); // TcpClient 객체 생성
-        await _client.ConnectAsync(ip, port); // 서버에 비동기로 연결
-        _stream = _client.GetStream(); // 서버와의 데이터 스트림을 가져옴
-        _isConnected = true; // 연결 상태 플래그를 true로 설정
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _isConnected = true;
 
         Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
         // 수신 루프를 비동기로 실행 (별도의 Task로 실행)
-        _ = Task.Run(ReceiveLoopAsync);
+        _ = Task.Run(ReceiveLoopAsync); // 항상 돌아가면서 메시지를 감지
     }
 
     /// <summary>
@@ -75,32 +50,32 @@ public class ExpertSocketClient
     /// </summary>
     public async Task<string> SendAndReceiveAsync(string message)
     {
-        if (!_isConnected) return "[ERROR] Not connected."; // 연결되지 않은 경우 에러 반환
+        if (!_isConnected) return "[ERROR] Not connected.";
 
         // PLC 규칙에 따라 메시지를 STX와 ETX로 감싼다.
         string wrappedMessage = '\x02' + message + '\x03';
-        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage); // 메시지를 바이트 배열로 변환
+        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
 
-        var tcs = new TaskCompletionSource<string>(); // 응답을 기다리기 위한 비동기 처리 객체 생성
-
-        _responseQueue.Add(tcs); // 응답 대기 목록에 추가 (FIFO 방식으로 순서 유지)
+        // 응답을 받기 위한 TaskCompletionSource를 생성
+        var tcs = new TaskCompletionSource<string>();
+        string requestId = Guid.NewGuid().ToString("N"); // 고유한 요청 ID 생성
+        _responseTasks.TryAdd(requestId, tcs);
 
         // 서버로 메시지 전송
         await _stream.WriteAsync(data, 0, data.Length);
         Console.WriteLine($"[SEND] {message}");
 
-        // 응답을 비동기로 기다림 (수신 루프에서 응답을 처리하여 이 Task를 완료시킴)
+        // 응답을 기다림 (수신 루프에서 응답이 오면 완료됨)
         string response = await tcs.Task;
+        
+        _responseTasks.TryRemove(requestId, out _); // 응답 처리 후 제거
 
-        // 응답 검증 및 후속 처리 함수 호출
-        ProcessResponseContent(response);
-
-        return response; // 응답을 최종 반환
+        return response;
     }
 
     /// <summary>
     /// 서버로부터 오는 모든 데이터를 처리하는 수신 루프.
-    /// OP_CLEAR 메시지를 별도로 처리하고, 나머지는 응답 대기 중인 요청으로 넘김.
+    /// OP_CLEAR 메시지를 별도로 처리하고, 명령 응답은 대응되는 Task로 반환한다.
     /// </summary>
     private async Task ReceiveLoopAsync()
     {
@@ -124,17 +99,20 @@ public class ExpertSocketClient
 
                 if (received == "OP_CLEAR")
                 {
-                    ProcessOpClear(); // OP_CLEAR 신호를 별도로 처리
+                    // 선제 신호(OP_CLEAR)를 감지했을 때 이벤트 발생
+                    OnOpClearReceived?.Invoke();
+                    Console.WriteLine("[EVENT] OP_CLEAR received and processed.");
                 }
                 else
                 {
-                    if (_responseQueue.TryTake(out var tcs))
+                    // 응답을 받아야 할 요청이 있는지 확인
+                    foreach (var key in _responseTasks.Keys)
                     {
-                        tcs.SetResult(received); // 응답 처리 완료 (비동기로 반환)
-                    }
-                    else
-                    {
-                        Console.WriteLine("[ERROR] Received message with no waiting request.");
+                        if (_responseTasks.TryRemove(key, out var tcs))
+                        {
+                            tcs.SetResult(received);
+                            break;
+                        }
                     }
                 }
             }
@@ -147,68 +125,44 @@ public class ExpertSocketClient
     }
 
     /// <summary>
-    /// 응답 내용을 검증하고 그에 따른 로직을 실행한다.
+    /// 서버 연결을 해제한다.
     /// </summary>
-    private void ProcessResponseContent(string response)
+    public void Disconnect()
     {
-        if (response == "STATUS_OK")
-        {
-            Console.WriteLine("[INFO] 장비 상태: 정상");
-            HandleStatusOk();
-        }
-        else if (response == "ERROR")
-        {
-            Console.WriteLine("[INFO] 장비 상태: 에러 발생");
-            HandleError();
-        }
-        else
-        {
-            Console.WriteLine($"[INFO] 기타 응답 처리: {response}");
-        }
-    }
-
-    /// <summary>
-    /// OP_CLEAR 메시지를 처리하는 함수
-    /// </summary>
-    private void ProcessOpClear()
-    {
-        Console.WriteLine("[EVENT] OP_CLEAR received. Resetting state.");
-        HandleOpClear();
-    }
-
-    /// <summary>
-    /// 응답이 STATUS_OK일 때 실행되는 함수
-    /// </summary>
-    private void HandleStatusOk()
-    {
-        Console.WriteLine("[ACTION] 상태 확인: 정상 작동 중.");
-    }
-
-    /// <summary>
-    /// 응답이 ERROR일 때 실행되는 함수
-    /// </summary>
-    private void HandleError()
-    {
-        Console.WriteLine("[ACTION] 에러 발생 처리 중...");
-    }
-
-    /// <summary>
-    /// OP_CLEAR 메시지를 처리하는 함수
-    /// </summary>
-    private void HandleOpClear()
-    {
-        Console.WriteLine("[ACTION] OP_CLEAR 발생 → 시스템 초기화.");
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
+        Console.WriteLine("[INFO] Disconnected.");
     }
 }
-📌 주요 특징
-비동기 TaskCompletionSource 사용:
+📌 코드 설명 (아주 상세하게)
+SendAndReceiveAsync() 메서드:
 
-요청마다 응답을 안전하게 비동기로 받음.
+요청을 보낼 때마다 TaskCompletionSource를 사용해서 비동기로 응답을 기다림.
 
-PLC의 응답 검증 처리 함수 포함:
+PLC로 보내는 메시지는 원본 그대로 전송 (STX/ETX 포함).
 
-ProcessResponseContent() 함수에서 응답 내용을 확인하고, 대응 함수(HandleStatusOk, HandleError)를 호출.
+응답은 ReceiveLoopAsync()에서 잡아서 처리.
 
-PLC 규칙 유지 (REQ: 같은 거 없이 원본 그대로 전송):
+ReceiveLoopAsync() 메서드:
 
-요청 메시지를 STX와 ETX로 감싸서 보내며, PLC 규칙을 절대 깨지 않음.
+항상 돌아가면서 메시지를 감지.
+
+OP_CLEAR 메시지가 오면 즉시 이벤트로 감지 (OnOpClearReceived).
+
+일반 메시지는 TaskCompletionSource로 대기 중인 요청에게 전달.
+
+OnOpClearReceived 이벤트:
+
+PLC에서 먼저 보내는 OP_CLEAR 신호를 잡기 위해 사용.
+
+UI 또는 다른 클래스에서 이 이벤트를 등록해서 원하는 로직을 실행할 수 있음.
+
+🔑 이 구조로 해결된 점
+✅ PLC와의 규칙을 절대 깨지 않음 (명령은 원본 그대로 보냄).
+
+✅ SendAndReceiveAsync()로 응답을 안전하게 비동기 처리.
+
+✅ OP_CLEAR는 항상 별도로 감지 가능 (수신 루프에서 자동 감지).
+
+✅ 응답이 꼬이지 않게 안전하게 처리됨.
