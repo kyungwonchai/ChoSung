@@ -1,187 +1,189 @@
-이제 보낸 메시지(SendAndReceiveAsync())가 있으면 일반 응답으로 처리하고, 없다면 선제 신호로 처리하도록 완벽히 수정할게.
+ 이해했어.
+일반 응답으로 처리될 때 실행되는 함수는 ProcessResponse() 함수야.
+그 안에서 **검증 함수인 ValidateResponse()**를 호출해서 응답의 유효성을 체크하고,
+응답 내용에 따라 분기 처리하도록 구성했어.
 
-✅ 목표
-SendAndReceiveAsync()로 보낸 메시지가 있는 경우 → 일반 응답으로 처리.
+✅ 일반 응답 처리 구조
+**ReceiveLoopAsync()**에서 모든 메시지를 받음.
 
-SendAndReceiveAsync()로 보낸 메시지가 없는 경우 → 선제 신호로 처리.
+받은 메시지가 보낸 메시지와 매칭되면 일반 응답으로 처리.
 
-ReceiveLoopAsync()에서 모든 메시지를 감지하고 정확히 분기 처리.
+일반 응답이면 ProcessResponse() 함수를 호출하여 처리.
 
-🔥 코드 수정 (전체 코드)
+ProcessResponse() 내부에서 ValidateResponse() 함수를 호출하여 검증.
+
+검증 결과에 따라 적절한 핸들러를 실행함.
+
+🔥 코드 구조 (일반 응답 처리 부분 강조)
+📌 ReceiveLoopAsync() 수정
 csharp
 코드 복사
-using System;
-using System.Collections.Concurrent;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-
-public class ExpertSocketClient
+private async Task ReceiveLoopAsync()
 {
-    private TcpClient _client; // 서버와 연결하는 TcpClient 객체
-    private NetworkStream _stream; // 데이터를 주고받기 위한 네트워크 스트림
-    private byte[] _buffer = new byte[1024]; // 수신 데이터를 저장하는 버퍼 (1KB 크기)
-    private bool _isConnected = false; // 서버와의 연결 상태를 확인하는 플래그
-
-    // 요청 ID와 응답 TaskCompletionSource를 매핑하기 위한 딕셔너리
-    private ConcurrentDictionary<string, TaskCompletionSource<string>> _responseTasks 
-        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
-
-    // 보낸 메시지를 기록하기 위한 딕셔너리 (매칭을 위해 사용)
-    private ConcurrentDictionary<string, string> _sentMessages = new ConcurrentDictionary<string, string>();
-
-    /// <summary>
-    /// 서버에 연결하고 수신 루프를 시작한다.
-    /// </summary>
-    public async Task ConnectAsync(string ip, int port)
+    while (_isConnected)
     {
-        _client = new TcpClient();
-        await _client.ConnectAsync(ip, port);
-        _stream = _client.GetStream();
-        _isConnected = true;
-
-        Console.WriteLine($"[INFO] Connected to {ip}:{port}");
-
-        // 항상 돌아가는 수신 루프를 비동기로 실행
-        _ = Task.Run(ReceiveLoopAsync); 
-    }
-
-    /// <summary>
-    /// 서버로 메시지를 보내고 응답을 기다린다.
-    /// </summary>
-    public async Task<string> SendAndReceiveAsync(string message)
-    {
-        if (!_isConnected)
-            return "[ERROR] Not connected.";
-
-        string wrappedMessage = '\x02' + message + '\x03';
-        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
-
-        var tcs = new TaskCompletionSource<string>();
-
-        // 고유한 요청 ID 생성
-        string requestId = Guid.NewGuid().ToString("N");
-
-        // 보낸 메시지와 요청 ID를 매칭하여 저장
-        _responseTasks.TryAdd(requestId, tcs);
-        _sentMessages.TryAdd(requestId, message); 
-
-        // 서버로 메시지 전송
-        await _stream.WriteAsync(data, 0, data.Length);
-        LogMessage($"[SEND] [{requestId}] {message}");
-
-        // 응답을 기다림
-        string response = await tcs.Task;
-        _responseTasks.TryRemove(requestId, out _);
-        _sentMessages.TryRemove(requestId, out _);
-
-        return response;
-    }
-
-    /// <summary>
-    /// 항상 돌아가는 수신 루프. 모든 메시지를 감지하고 처리한다.
-    /// </summary>
-    private async Task ReceiveLoopAsync()
-    {
-        while (_isConnected)
+        try
         {
-            try
+            int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+
+            if (bytesRead == 0)
             {
-                int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
+                Console.WriteLine("[INFO] Server disconnected.");
+                _isConnected = false;
+                break;
+            }
 
-                if (bytesRead == 0)
+            // 받은 메시지 변환
+            string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
+            LogMessage($"[RECV] {received}");
+
+            bool matched = false;
+
+            // 응답 매칭 검사
+            foreach (var key in _responseTasks.Keys)
+            {
+                if (_responseTasks.TryRemove(key, out var tcs))
                 {
-                    Console.WriteLine("[INFO] Server disconnected.");
-                    _isConnected = false;
-                    break;
-                }
-
-                // 받은 메시지 변환
-                string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
-                LogMessage($"[RECV] {received}");
-
-                bool matched = false;
-
-                // 응답 매칭 검사
-                foreach (var key in _responseTasks.Keys)
-                {
-                    if (_responseTasks.TryRemove(key, out var tcs))
+                    if (_sentMessages.TryGetValue(key, out var sentMessage))
                     {
-                        if (_sentMessages.TryGetValue(key, out var sentMessage))
-                        {
-                            LogMessage($"[MATCHED] Sent: {sentMessage} | Received: {received}");
-                            matched = true;
-                            tcs.SetResult(received); // 일반 응답으로 처리
-                            break;
-                        }
+                        LogMessage($"[MATCHED] Sent: {sentMessage} | Received: {received}");
+                        matched = true;
+
+                        // 일반 응답으로 처리 (검증 함수로 전달)
+                        ProcessResponse(received);
+                        tcs.SetResult(received); // 비동기 응답 처리 완료
+                        break;
                     }
                 }
-
-                // 보낸 메시지로 매칭되지 않으면 선제 신호로 처리
-                if (!matched)
-                {
-                    LogMessage($"[NOTICE] 선제 신호로 처리됨: {received}");
-                    HandlePreemptiveSignal(received); // 선제 신호 처리 함수 호출
-                }
             }
-            catch (Exception ex)
+
+            // 보낸 메시지로 매칭되지 않으면 선제 신호로 처리
+            if (!matched)
             {
-                Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
-                _isConnected = false;
+                LogMessage($"[NOTICE] 선제 신호로 처리됨: {received}");
+                HandlePreemptiveSignal(received); // 선제 신호 처리 함수 호출
             }
         }
-    }
-
-    /// <summary>
-    /// 선제 신호를 처리하는 함수 (보낸 메시지가 없을 때 호출됨)
-    /// </summary>
-    private void HandlePreemptiveSignal(string message)
-    {
-        Console.WriteLine($"[PREEMPTIVE] 처리된 선제 신호: {message}");
-        // 추가로 원하는 처리를 여기서 작성
-    }
-
-    /// <summary>
-    /// 메시지를 기록하는 함수. (콘솔 또는 파일로 로그를 남길 수 있음)
-    /// </summary>
-    private void LogMessage(string message)
-    {
-        Console.WriteLine(message);
-    }
-
-    /// <summary>
-    /// 서버 연결을 해제한다.
-    /// </summary>
-    public void Disconnect()
-    {
-        _isConnected = false;
-        _stream?.Close();
-        _client?.Close();
-        Console.WriteLine("[INFO] Disconnected.");
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERROR] ReceiveLoop exception: {ex.Message}");
+            _isConnected = false;
+        }
     }
 }
-📌 코드 설명 (완벽히 이해시키기)
-일반 응답 처리 (SendAndReceiveAsync())
+📌 ProcessResponse() 함수 (일반 응답 처리의 핵심)
+csharp
+코드 복사
+/// <summary>
+/// 일반 응답을 처리하고, 메시지 내용에 따라 다른 함수로 분기한다.
+/// </summary>
+private void ProcessResponse(string response)
+{
+    if (ValidateResponse(response))
+    {
+        LogMessage($"[INFO] 유효한 응답으로 처리됨: {response}");
+    }
+    else
+    {
+        LogMessage($"[WARNING] 유효하지 않은 응답 또는 검증 실패: {response}");
+    }
+}
+📌 ValidateResponse() 함수 (검증 함수)
+csharp
+코드 복사
+/// <summary>
+/// 응답 메시지를 검증하는 함수. 조건에 따라 응답을 분기 처리한다.
+/// </summary>
+private bool ValidateResponse(string response)
+{
+    // 조건 예시: 메시지가 특정 패턴으로 시작할 경우 처리
+    if (response.StartsWith("1234"))
+    {
+        Handle1234Response(response);
+        return true;
+    }
+    else if (response.StartsWith("555"))
+    {
+        Handle555Response(response);
+        return true;
+    }
+    else if (response.StartsWith("OK"))
+    {
+        HandleOkResponse(response);
+        return true;
+    }
 
-요청 ID를 생성하고 _sentMessages에 기록.
+    // 기타: 유효하지 않은 응답으로 간주
+    return false;
+}
+📌 응답 핸들러 함수들
+csharp
+코드 복사
+/// <summary>
+/// 1234로 시작하는 응답 처리
+/// </summary>
+private void Handle1234Response(string response)
+{
+    LogMessage($"[INFO] 1234 응답 처리 완료: {response}");
+    // 추가 로직: 예를 들어 상태 갱신 또는 작업 실행
+}
 
-_responseTasks로 응답을 비동기로 기다림.
+/// <summary>
+/// 555로 시작하는 응답 처리
+/// </summary>
+private void Handle555Response(string response)
+{
+    LogMessage($"[INFO] 555 응답 처리 완료: {response}");
+    // 추가 로직: 에러 처리 또는 재시도
+}
 
-선제 신호 처리 (ReceiveLoopAsync())
+/// <summary>
+/// OK로 시작하는 응답 처리
+/// </summary>
+private void HandleOkResponse(string response)
+{
+    LogMessage($"[INFO] OK 응답 처리 완료: {response}");
+    // 추가 로직: 정상 완료 처리
+}
+💡 코드 실행 흐름 (정확히 이해시키기)
+메시지 수신 (ReceiveLoopAsync())
 
-받은 메시지가 _responseTasks에 등록된 요청 ID로 매칭되면 일반 응답으로 처리.
+받은 메시지를 보낸 메시지와 매칭하여 일반 응답으로 처리할지 결정.
 
-매칭되지 않는 메시지는 모두 선제 신호로 처리 (HandlePreemptiveSignal()).
+매칭되지 않으면 선제 신호로 처리.
 
-로그 기록 (LogMessage())
+일반 응답으로 판단되면 (ProcessResponse())
 
-보낸 메시지, 받은 메시지, 매칭 여부를 모두 기록.
+받은 응답을 검증하기 위해 ValidateResponse() 함수 호출.
 
-선제 신호로 처리된 메시지도 별도로 기록.
+검증에 성공하면 핸들러 함수로 넘김.
+
+응답 검증 (ValidateResponse())
+
+응답 시작 패턴을 확인하여 각 핸들러 함수로 분기.
+
+예:
+
+1234로 시작하면 → Handle1234Response()
+
+555로 시작하면 → Handle555Response()
+
+OK로 시작하면 → HandleOkResponse()
 
 💯 결론
-✅ 보낸 메시지가 있으면 일반 응답으로 처리.
+✅ 일반 응답으로 처리될 때 실행되는 함수는 ProcessResponse().
 
-✅ 보낸 메시지가 없으면 선제 신호로 처리.
+✅ ProcessResponse() 내부에서 ValidateResponse()를 통해 검증 후 각 핸들러로 분기.
 
-✅ 모든 메시지 로그로 확인 가능.
+✅ 수신 루프에서 모든 메시지를 받아 검증 후, 일반 응답과 선제 신호를 정확히 구분.
+
+이제 정확히 맞춰서 구조를 만들었어.
+이 방식으로 모든 일반 응답과 선제 신호를 정확히 처리할 수 있어.
+더 필요한 부분이 있으면 말해줘!
+
+
+2/2
+
+
+
+
