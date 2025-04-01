@@ -1,6 +1,35 @@
-좋아. 이제 너가 원하는 방식으로 동작 원리와 순서에 대한 설명을 포함한 매우 상세한 주석을 추가한 코드를 제공할게.
+, 이제 확실하게 정리해서 너의 요구 사항을 정확히 반영할게.
 
-전문가 수준의 비동기 소켓 클라이언트 (상세 주석 포함)
+🔍 너의 조건 요약
+PLC와 통신 규칙은 절대 수정할 수 없다.
+
+PLC에게 보내는 메시지 형식은 변경 불가 (절대 REQ: 같은 걸 붙이면 안 됨).
+
+PLC에서 오는 응답은 내가 보낸 명령의 응답으로만 처리해야 함.
+
+서버(PLC)에서 먼저 보내는 OP_CLEAR 신호는 항상 수신할 수 있어야 함.
+
+내가 보낸 명령과 응답은 꼬이면 안 됨. (비동기 충돌 방지 필수)
+
+✅ 문제를 해결하기 위해 할 일
+보낼 때 원본 메시지를 그대로 보내야 함. (REQ: 같은 거 추가 금지)
+
+내가 보낸 요청과 응답을 안전하게 구분하기 위해, 내부적으로 TaskCompletionSource를 사용.
+
+PLC에서 먼저 보내는 OP_CLEAR 신호는 별도로 항상 감지할 수 있도록 처리.
+
+PLC와의 규칙을 절대 깨지 않으면서, 응답 대기를 안전하게 비동기 처리.
+
+💡 솔루션 설계
+요청 ID를 쓰지 않는다. (PLC 규칙을 유지하기 위해)
+
+명령을 보낼 때마다 새로운 TaskCompletionSource를 사용하여 응답 대기.
+
+수신 루프는 계속 돌아가며, OP_CLEAR를 독립적으로 처리.
+
+PLC의 응답을 정확히 구분하기 위해 요청과 응답의 관계를 명확히 처리.
+
+🔥 코드 예시 (주석 매우 상세히 추가)
 csharp
 코드 복사
 using System;
@@ -11,65 +40,58 @@ using System.Threading.Tasks;
 
 public class ExpertSocketClient
 {
-    private TcpClient _client; // 서버와의 TCP 연결을 위한 TcpClient 객체
-    private NetworkStream _stream; // 데이터 송수신을 위한 스트림
+    private TcpClient _client; // 서버와의 연결을 담당하는 TcpClient 객체
+    private NetworkStream _stream; // 데이터 송수신을 위한 네트워크 스트림
     private byte[] _buffer = new byte[1024]; // 수신 데이터를 저장할 버퍼
-    private bool _isConnected = false; // 현재 연결 상태를 나타내는 플래그
+    private bool _isConnected = false; // 연결 상태를 확인하는 플래그
 
-    // 요청 ID와 해당 응답을 기다리는 TaskCompletionSource 매핑하는 비동기 딕셔너리
-    private ConcurrentDictionary<string, TaskCompletionSource<string>> _pendingRequests 
-        = new ConcurrentDictionary<string, TaskCompletionSource<string>>();
+    // 응답 대기를 위한 요청 리스트 (비동기적으로 응답을 받기 위해 사용)
+    private BlockingCollection<TaskCompletionSource<string>> _responseQueue 
+        = new BlockingCollection<TaskCompletionSource<string>>();
 
     /// <summary>
-    /// 서버와 연결하고, 비동기 수신 루프를 시작한다.
+    /// 서버와 연결을 맺고 수신 루프를 시작한다.
     /// </summary>
     public async Task ConnectAsync(string ip, int port)
     {
-        _client = new TcpClient(); // TcpClient 객체 생성
-        await _client.ConnectAsync(ip, port); // 서버와 비동기적으로 연결 시도
-        _stream = _client.GetStream(); // 연결된 스트림을 가져옴
-        _isConnected = true; // 연결 성공 여부 설정
+        _client = new TcpClient();
+        await _client.ConnectAsync(ip, port);
+        _stream = _client.GetStream();
+        _isConnected = true;
 
         Console.WriteLine($"[INFO] Connected to {ip}:{port}");
 
-        // 항상 돌아가는 수신 루프를 비동기로 시작 (Task.Run으로 백그라운드에서 실행)
+        // 항상 돌아가는 수신 루프 시작
         _ = Task.Run(ReceiveLoopAsync);
     }
 
     /// <summary>
-    /// 서버로 명령을 비동기로 보내고, 해당 명령에 대한 응답을 기다린다.
-    /// 요청마다 고유 ID를 부여하여 응답을 정확히 구분한다.
+    /// 명령을 서버로 보내고, 해당 응답을 기다린다.
+    /// PLC의 메시지 규칙을 깨지 않기 위해 그대로 보낸다.
     /// </summary>
-    public async Task<string> SendAndReceiveAsync(string command)
+    public async Task<string> SendAndReceiveAsync(string message)
     {
-        if (!_isConnected) return "[ERROR] Not connected."; // 연결되지 않은 상태에서는 에러 리턴
+        if (!_isConnected) return "[ERROR] Not connected.";
 
-        // 1. 요청마다 고유한 ID를 생성 (Guid로 고유 ID 생성)
-        string requestId = Guid.NewGuid().ToString("N").Substring(0, 8); // 예: "d4a3b6f9"
+        // 보낼 메시지를 PLC 규칙에 맞게 그대로 전송 (REQ: 같은 거 붙이지 않음)
+        string wrappedMessage = '\x02' + message + '\x03'; // STX/ETX로 감싼다.
+        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage);
 
-        // 2. 요청 메시지를 고유 ID와 함께 구성
-        string fullMessage = $"REQ:{requestId}:{command}"; // 예: "REQ:d4a3b6f9:STATUS"
-        string wrappedMessage = '\x02' + fullMessage + '\x03'; // STX(시작), ETX(종료)로 감싸기
-        byte[] data = Encoding.ASCII.GetBytes(wrappedMessage); // 문자열을 바이트 배열로 변환
+        var tcs = new TaskCompletionSource<string>(); // 응답을 비동기로 받을 준비
 
-        // 3. TaskCompletionSource 생성하여 응답 대기를 준비
-        var tcs = new TaskCompletionSource<string>();
+        _responseQueue.Add(tcs); // 응답 대기 리스트에 추가
 
-        // 4. 고유 ID를 키로 사용하여 대기 목록에 추가 (비동기 응답 처리를 위해)
-        _pendingRequests.TryAdd(requestId, tcs);
+        await _stream.WriteAsync(data, 0, data.Length); // 메시지 전송
+        Console.WriteLine($"[SEND] {message}");
 
-        // 5. 서버로 메시지 전송 (비동기적으로 전송)
-        await _stream.WriteAsync(data, 0, data.Length);
-        Console.WriteLine($"[SEND] {fullMessage}");
-
-        // 6. 해당 요청의 응답을 비동기로 대기 (여기서 응답을 기다림)
+        // 응답 대기 (비동기로 처리됨)
         string response = await tcs.Task;
         return response;
     }
 
     /// <summary>
-    /// 항상 돌아가는 수신 루프.
-    /// 서버에서 보내는 모든 데이터를 처리하고, 응답과 선제 메시지를 구분한다.
+    /// 서버로부터 수신된 모든 데이터를 처리하는 루프.
+    /// OP_CLEAR와 일반 응답을 구분하여 처리한다.
     /// </summary>
     private async Task ReceiveLoopAsync()
     {
@@ -77,10 +99,8 @@ public class ExpertSocketClient
         {
             try
             {
-                // 서버로부터 데이터를 비동기로 읽음
                 int bytesRead = await _stream.ReadAsync(_buffer, 0, _buffer.Length);
 
-                // 서버 연결이 끊어졌을 경우 (0바이트를 수신)
                 if (bytesRead == 0)
                 {
                     Console.WriteLine("[INFO] Server disconnected.");
@@ -88,22 +108,26 @@ public class ExpertSocketClient
                     break;
                 }
 
-                // 수신된 바이트 배열을 문자열로 변환
+                // 수신된 메시지를 문자열로 변환
                 string received = Encoding.ASCII.GetString(_buffer, 0, bytesRead).Trim('\x02', '\x03');
                 Console.WriteLine($"[RECV] {received}");
 
-                // 응답 메시지와 선제 메시지(OP_CLEAR)를 구분하여 처리
-                if (received.StartsWith("RES:"))
+                // 1. 선제 신호(OP_CLEAR) 처리
+                if (received == "OP_CLEAR")
                 {
-                    ProcessResponse(received); // 응답 메시지 처리
-                }
-                else if (received == "OP_CLEAR")
-                {
-                    ProcessOpClear(); // 서버의 선제 메시지 처리 (특수 처리)
+                    ProcessOpClear();
                 }
                 else
                 {
-                    Console.WriteLine($"[WARN] Unknown message format: {received}");
+                    // 2. 일반 응답 처리
+                    if (_responseQueue.TryTake(out var tcs))
+                    {
+                        tcs.SetResult(received); // 응답을 비동기로 반환
+                    }
+                    else
+                    {
+                        Console.WriteLine("[ERROR] Received message with no waiting request.");
+                    }
                 }
             }
             catch (Exception ex)
@@ -115,76 +139,49 @@ public class ExpertSocketClient
     }
 
     /// <summary>
-    /// 응답 메시지를 처리한다.
-    /// 요청 ID를 기준으로 대기 중인 요청을 완료시킨다.
-    /// </summary>
-    private void ProcessResponse(string message)
-    {
-        var parts = message.Split(':', 3); // 메시지를 ':' 기준으로 최대 3개로 분리
-
-        if (parts.Length < 3) return; // 형식 오류 방지
-
-        string requestId = parts[1]; // 요청 ID 추출
-        string responseContent = parts[2]; // 응답 내용 추출
-
-        // 요청 ID가 대기 목록에 있는지 확인하고, 응답을 전달한다.
-        if (_pendingRequests.TryRemove(requestId, out var tcs))
-        {
-            tcs.SetResult(responseContent); // 응답을 TaskCompletionSource에 설정하여 대기 중인 Task를 완료시킴
-        }
-        else
-        {
-            Console.WriteLine($"[ERROR] Unexpected response ID: {requestId}");
-        }
-    }
-
-    /// <summary>
-    /// 서버의 선제 메시지(OP_CLEAR) 처리
+    /// PLC의 선제 신호인 OP_CLEAR를 처리한다.
     /// </summary>
     private void ProcessOpClear()
     {
-        Console.WriteLine("[EVENT] OP_CLEAR received. Processing it separately.");
-        // 여기에서 필요한 로직을 구현 (예: UI 초기화, 로그 기록 등)
+        Console.WriteLine("[EVENT] OP_CLEAR received. Handling as a separate event.");
+        // 필요 시 추가 처리 로직 작성
     }
 
     /// <summary>
-    /// 서버 연결을 해제한다.
+    /// 연결을 해제한다.
     /// </summary>
     public void Disconnect()
     {
-        _isConnected = false; // 연결 상태 플래그 해제
-        _stream?.Close(); // 스트림 닫기
-        _client?.Close(); // TCP 클라이언트 닫기
+        _isConnected = false;
+        _stream?.Close();
+        _client?.Close();
         Console.WriteLine("[INFO] Disconnected.");
     }
 }
-✅ 코드 동작 원리와 순서
-연결 (ConnectAsync):
+📌 코드 설명
+응답을 기다리는 방식:
 
-서버와 연결을 맺고, 수신 루프(ReceiveLoopAsync())를 항상 돌림.
+BlockingCollection으로 요청마다 TaskCompletionSource를 추가.
 
-연결이 끊어지면 _isConnected 플래그로 중단 처리.
+응답이 오면 해당 Task를 완료시켜 비동기 결과를 반환.
 
-명령 전송 및 응답 대기 (SendAndReceiveAsync):
+PLC와의 규칙 유지:
 
-고유한 요청 ID 생성 후 메시지에 포함.
+메시지에 REQ: 같은 걸 붙이지 않음.
 
-비동기적으로 메시지 전송 (WriteAsync()).
-
-응답은 TaskCompletionSource를 이용해 비동기 대기.
+보내는 메시지는 원본 그대로 STX/ETX로 감싼 상태로 전송.
 
 수신 루프 (ReceiveLoopAsync):
 
-모든 수신 데이터는 이 루프에서 받음.
+항상 서버로부터 메시지를 비동기로 수신.
 
-응답 메시지(RES:...)와 선제 메시지(OP_CLEAR)를 구분하여 처리.
+OP_CLEAR 메시지는 별도로 처리.
 
-응답 처리 (ProcessResponse):
+다른 메시지는 BlockingCollection에서 요청과 매칭시켜 비동기로 반환.
 
-요청 ID와 매칭되는 요청의 응답을 찾아서 완료시킴.
+🚀 결론
+✅ PLC 규칙을 절대 깨트리지 않음.
 
-선제 메시지 처리 (ProcessOpClear):
+✅ 응답과 선제 신호를 안전하게 분리.
 
-별도로 처리하며, 다른 메시지와 충돌하지 않도록 분리.
-
-코드가 완벽히 이해될 수 있도록 주석과 흐름을 자세히 설명했어.
+✅ 응답 충돌 없이 안전하게 비동기 처리.
