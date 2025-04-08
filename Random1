@@ -1,3 +1,171 @@
+겠습니다. 요구사항을 다음과 같이 변경하시는군요.
+
+마스터 데이터 관리 탭: 항상 보이도록 변경합니다.
+편집 권한: 마스터 키가 확인된 상태(IsMasterModeEnabled가 true)에서만 해당 탭의 내용(목록 항목 이름 수정, 추가, 삭제 버튼, 저장 버튼)이 활성화되도록 변경합니다. 마스터 키가 확인되지 않으면 읽기 전용 상태가 됩니다.
+UI 변경: 각 마스터 데이터 목록(표) 옆(또는 위/아래)에 해당 목록에 대한 "추가", "삭제" 버튼을 명확하게 배치합니다.
+이 변경사항을 반영하기 위해 다음 파일들을 수정해야 합니다.
+
+ViewModels/MainViewModel.cs: IsMasterModeEnabled 상태가 변경될 때 MasterDataViewModel에도 알려주는 로직 추가.
+ViewModels/MasterDataViewModel.cs: IsMasterModeEnabled 속성을 추가하고, Command의 실행 가능 여부(CanExecute 또는 실행 로직 내부) 및 저장 로직에서 이 상태를 확인하도록 수정.
+Views/MainWindow.xaml: 마스터 데이터 탭의 Visibility 바인딩 제거, 마스터 데이터 탭 내부 컨트롤(GridControl의 TableView, 추가/삭제/저장 버튼)의 IsEnabled 속성을 MasterDataViewModel의 IsMasterModeEnabled 속성에 바인딩. 각 목록별 추가/삭제 버튼 배치 확인.
+수정된 파일들의 전체 코드를 여기에 바로 작성해 드리겠습니다.
+
+1. ViewModels/MainViewModel.cs (수정)
+
+IsMasterModeEnabled 속성의 set 접근자에서 MasterDataVM의 상태도 업데이트하도록 수정합니다.
+
+C#
+
+// 필요한 네임스페이스
+using LockerManagementApp.Data;
+using LockerManagementApp.Models;
+using LockerManagementApp.Infrastructure;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Configuration;
+using System.Data.Entity;
+using System.Data.Entity.Infrastructure;
+using System.Linq;
+using System.Security;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Runtime.InteropServices;
+
+namespace LockerManagementApp.ViewModels
+{
+    /// <summary>
+    /// 메인 ViewModel (IsMasterModeEnabled 전파 로직 추가)
+    /// </summary>
+    public class MainViewModel : ViewModelBase, IDisposable
+    {
+        private LockerDbContext _context;
+        private ObservableCollection<LockerAssignment> _lockerAssignments;
+        private LockerAssignment _selectedAssignment;
+        private string _statusBarText = "준비 완료";
+        private string _currentAdmin = "홍길동A";
+
+        private SecureString _masterPasswordInput;
+        private bool _isMasterModeEnabled = false; // 마스터 관리 탭 활성화 여부
+
+        private ObservableCollection<LockerType> _allLockerTypes;
+        private ObservableCollection<Floor> _allFloors;
+        private ObservableCollection<Zone> _allZones;
+        private ObservableCollection<SubPart> _allSubParts;
+        private ObservableCollection<Administrator> _allAdministrators;
+
+        // 자식 ViewModel 인스턴스
+        public MasterDataViewModel MasterDataVM { get; private set; }
+        public LogViewModel LogVM { get; private set; }
+
+        #region Public Properties
+        public ObservableCollection<LockerAssignment> LockerAssignments { get => _lockerAssignments; set => SetProperty(ref _lockerAssignments, value); }
+        public LockerAssignment SelectedAssignment { get => _selectedAssignment; set { if (SetProperty(ref _selectedAssignment, value)) { ((RelayCommand)DeleteCommand).RaiseCanExecuteChanged(); ((RelayCommand)ClearAssignmentCommand).RaiseCanExecuteChanged(); } } }
+        public string StatusBarText { get => _statusBarText; set => SetProperty(ref _statusBarText, value); }
+        public SecureString MasterPasswordInput { get => _masterPasswordInput; set => SetProperty(ref _masterPasswordInput, value); }
+
+        /// <summary>
+        /// 마스터 관리 모드 활성화 여부. 변경 시 MasterDataViewModel에도 상태를 전파합니다.
+        /// </summary>
+        public bool IsMasterModeEnabled
+        {
+            get => _isMasterModeEnabled;
+            set
+            {
+                // SetProperty를 사용하여 값 변경 및 UI 알림 처리
+                if (SetProperty(ref _isMasterModeEnabled, value))
+                {
+                    // *** 수정된 부분: MasterDataViewModel에 상태 전파 ***
+                    if (MasterDataVM != null)
+                    {
+                        MasterDataVM.IsMasterModeEnabled = value;
+                    }
+                    StatusBarText = value ? "마스터 관리자 모드가 활성화되었습니다." : "마스터 관리자 모드가 비활성화되었습니다.";
+                }
+            }
+        }
+
+        public ObservableCollection<LockerType> AllLockerTypes { get => _allLockerTypes; set => SetProperty(ref _allLockerTypes, value); }
+        public ObservableCollection<Floor> AllFloors { get => _allFloors; set => SetProperty(ref _allFloors, value); }
+        public ObservableCollection<Zone> AllZones { get => _allZones; set => SetProperty(ref _allZones, value); }
+        public ObservableCollection<SubPart> AllSubParts { get => _allSubParts; set => SetProperty(ref _allSubParts, value); }
+        public ObservableCollection<Administrator> AllAdministrators { get => _allAdministrators; set => SetProperty(ref _allAdministrators, value); }
+        #endregion
+
+        #region Commands
+        public ICommand LoadDataCommand { get; }
+        public ICommand SaveChangesCommand { get; }
+        public ICommand AddNewCommand { get; }
+        public ICommand DeleteCommand { get; }
+        public ICommand ClearAssignmentCommand { get; }
+        public ICommand CheckMasterPasswordCommand { get; }
+        public ICommand RefreshMasterDataCommand { get; }
+        #endregion
+
+        public MainViewModel()
+        {
+            try { _context = new LockerDbContext(); }
+            catch (Exception ex) { MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error); StatusBarText = "DB 연결 오류!"; return; }
+
+            _lockerAssignments = new ObservableCollection<LockerAssignment>();
+            _allLockerTypes = new ObservableCollection<LockerType>();
+            _allFloors = new ObservableCollection<Floor>();
+            _allZones = new ObservableCollection<Zone>();
+            _allSubParts = new ObservableCollection<SubPart>();
+            _allAdministrators = new ObservableCollection<Administrator>();
+
+            MasterDataVM = new MasterDataViewModel(); // 각자 DbContext 생성
+            LogVM = new LogViewModel();             // 각자 DbContext 생성
+
+            LoadDataCommand = new RelayCommand(async _ => await LoadInitialDataAsync());
+            SaveChangesCommand = new RelayCommand(async _ => await SaveChangesAsync());
+            AddNewCommand = new RelayCommand(AddNewLocker);
+            DeleteCommand = new RelayCommand(async _ => await DeleteSelectedAsync(), _ => SelectedAssignment != null);
+            ClearAssignmentCommand = new RelayCommand(ClearSelectedAssignment, _ => SelectedAssignment != null && SelectedAssignment.IsAssigned);
+            CheckMasterPasswordCommand = new RelayCommand(CheckMasterPassword);
+            RefreshMasterDataCommand = new RelayCommand(async _ => await LoadMasterDataAsync());
+
+            if (_context != null) { _ = LoadInitialDataAsync(); }
+        }
+
+        private async Task LoadInitialDataAsync() { await LoadMasterDataAsync(); await LoadAssignmentsAsync(); }
+        private async Task LoadAssignmentsAsync() { if (_context == null) return; StatusBarText = "사물함 목록 로딩 중..."; try { var assignments = await _context.LockerAssignments.OrderBy(l => l.Floor).ThenBy(l => l.Zone).ThenBy(l => l.SpecificLocation).ToListAsync(); LockerAssignments = new ObservableCollection<LockerAssignment>(assignments); StatusBarText = $"총 {LockerAssignments.Count}개 로드 완료."; } catch (Exception ex) { HandleGenericException("사물함 목록 로딩", ex); } }
+        private async Task LoadMasterDataAsync() { if (_context == null) return; StatusBarText = "마스터 데이터(콤보박스용) 로딩 중..."; try { AllLockerTypes = new ObservableCollection<LockerType>(await _context.LockerTypes.OrderBy(t => t.Name).AsNoTracking().ToListAsync()); AllFloors = new ObservableCollection<Floor>(await _context.Floors.OrderBy(f => f.Name).AsNoTracking().ToListAsync()); AllZones = new ObservableCollection<Zone>(await _context.Zones.OrderBy(z => z.Name).AsNoTracking().ToListAsync()); AllSubParts = new ObservableCollection<SubPart>(await _context.SubParts.OrderBy(p => p.Name).AsNoTracking().ToListAsync()); AllAdministrators = new ObservableCollection<Administrator>(await _context.Administrators.OrderBy(a => a.Name).AsNoTracking().ToListAsync()); StatusBarText = "마스터 데이터(콤보박스용) 로드 완료."; } catch (InvalidOperationException ioEx) when (ioEx.Message.Contains("DataReader")) { HandleGenericException("마스터 데이터 로딩 (DataReader 충돌 가능성)", ioEx); MessageBox.Show("데이터 로딩 중 충돌 발생. App.config 연결 문자열에 MultipleActiveResultSets=True; 옵션 확인 또는 재시도.", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); } catch (Exception ex) { HandleGenericException("마스터 데이터 로딩", ex); } }
+
+        /// <summary>
+        /// 마스터 키 비밀번호 확인 로직 (IsMasterModeEnabled 설정 시 MasterDataVM에도 전파)
+        /// </summary>
+        private void CheckMasterPassword(object parameter) { try { string storedMasterKey = ConfigurationManager.AppSettings["MasterKey"]; if (string.IsNullOrEmpty(storedMasterKey)) { MessageBox.Show("App.config에 마스터 키(MasterKey) 없음.", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Warning); return; } string plainPassword = ConvertToUnsecureString(MasterPasswordInput); if (plainPassword == storedMasterKey) { IsMasterModeEnabled = true; /* 상태 변경 및 전파 */ MessageBox.Show("마스터 키 확인 완료.", "성공", MessageBoxButton.OK, MessageBoxImage.Information); } else { IsMasterModeEnabled = false; /* 상태 변경 및 전파 */ MessageBox.Show("마스터 키 불일치.", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } } catch (ConfigurationErrorsException confEx) { MessageBox.Show($"설정 파일 오류:\n{confEx.Message}", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Error); } catch (Exception ex) { MessageBox.Show($"마스터 키 확인 오류: {ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
+
+        #region CRUD 및 기타 메서드 (이전과 동일)
+        private async Task SaveChangesAsync() { if (_context == null) return; StatusBarText = "변경 사항 저장 중..."; List<DbEntityEntry> allChangedEntriesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var changedLockerEntries = _context.ChangeTracker.Entries<LockerAssignment>().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified).ToList(); var allItemsToCheck = LockerAssignments.ToList(); var duplicates = allItemsToCheck.GroupBy(l => new { l.Floor, l.Zone, l.SpecificLocation }).Where(g => g.Count() > 1).Select(g => g.Key); if (duplicates.Any()) { MessageBox.Show($"저장 불가: 중복 위치 발견 - {string.Join(", ", duplicates.Select(d => $"{d.Floor}-{d.Zone}-{d.SpecificLocation}"))}", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); RollbackChanges(allChangedEntriesForRollback); return; } foreach(var entry in changedLockerEntries) { entry.Entity.Administrator = _currentAdmin; } int changedCount = await _context.SaveChangesAsync(); StatusBarText = $"성공적으로 {changedCount}개 저장됨."; } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(allChangedEntriesForRollback); } catch (Exception ex) { HandleGenericException("저장", ex); RollbackChanges(allChangedEntriesForRollback); } }
+        private void RollbackChanges(IEnumerable<DbEntityEntry> changedEntries) { if (_context == null || changedEntries == null) return; foreach (var entry in changedEntries.ToList()) { switch (entry.State) { case EntityState.Modified: entry.CurrentValues.SetValues(entry.OriginalValues); entry.State = EntityState.Unchanged; break; case EntityState.Added: entry.State = EntityState.Detached; if (entry.Entity is LockerAssignment addedEntity && LockerAssignments.Contains(addedEntity)) LockerAssignments.Remove(addedEntity); break; case EntityState.Deleted: entry.State = EntityState.Unchanged; break; } } StatusBarText = "변경 롤백됨."; }
+        private void AddNewLocker(object parameter) { if (_context == null) return; var newAssignment = new LockerAssignment { LockerType = AllLockerTypes.FirstOrDefault()?.Name ?? "개인사물함", Floor = AllFloors.FirstOrDefault()?.Name ?? "1", Zone = AllZones.FirstOrDefault()?.Name ?? "A", SpecificLocation = "새 위치-" + Guid.NewGuid().ToString("N").Substring(0, 4), Administrator = _currentAdmin, LastUpdated = DateTime.Now }; LockerAssignments.Add(newAssignment); _context.LockerAssignments.Add(newAssignment); SelectedAssignment = newAssignment; StatusBarText = "새 사물함 추가됨. 저장 필요."; }
+        private async Task DeleteSelectedAsync() { if (_context == null || SelectedAssignment == null) return; if (MessageBox.Show($"'{SelectedAssignment.Floor}-{SelectedAssignment.Zone}-{SelectedAssignment.SpecificLocation}' 삭제?", "확인", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) { StatusBarText = "삭제 중..."; List<DbEntityEntry> changesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var assignmentToDelete = SelectedAssignment; var entry = _context.Entry(assignmentToDelete); if (entry.State == EntityState.Detached) { _context.LockerAssignments.Attach(assignmentToDelete); } _context.LockerAssignments.Remove(assignmentToDelete); int changedCount = await _context.SaveChangesAsync(); LockerAssignments.Remove(assignmentToDelete); SelectedAssignment = null; StatusBarText = $"성공적으로 {changedCount}개 삭제됨."; } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } catch (Exception ex) { HandleGenericException("삭제", ex); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } } }
+        private void ClearSelectedAssignment(object parameter) { if (_context == null || SelectedAssignment == null) return; SelectedAssignment.UserName = null; SelectedAssignment.KnoxId = null; SelectedAssignment.SubPart = null; _context.Entry(SelectedAssignment).State = EntityState.Modified; SelectedAssignment.Administrator = _currentAdmin; StatusBarText = "배정 해제됨. 저장 필요."; }
+        #endregion
+
+        #region Helper Methods
+        private void HandleGenericException(string operation, Exception ex) { StatusBarText = $"{operation} 오류: {ex.Message}"; MessageBox.Show($"{operation} 중 오류 발생:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); }
+        private void HandleDbUpdateException(DbUpdateException dbEx) { var innerExMsg = dbEx.InnerException?.InnerException?.Message ?? dbEx.InnerException?.Message ?? dbEx.Message; StatusBarText = $"DB 업데이트 오류: {innerExMsg}"; MessageBox.Show($"DB 작업 오류:\n{innerExMsg}\n\n{dbEx.ToString()}", "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); try { foreach(var entry in dbEx.Entries) { entry.Reload(); } } catch { /* Reload 실패 무시 */ } }
+        private string ConvertToUnsecureString(SecureString securePassword) { if (securePassword == null) return string.Empty; IntPtr ptr = IntPtr.Zero; try { ptr = Marshal.SecureStringToGlobalAllocUnicode(securePassword); return Marshal.PtrToStringUni(ptr); } finally { Marshal.ZeroFreeGlobalAllocUnicode(ptr); } }
+        #endregion
+
+        #region IDisposable 구현
+        private bool disposed = false;
+        protected virtual void Dispose(bool disposing) { if (!disposed) { if (disposing) { _context?.Dispose(); MasterDataVM?.Dispose(); LogVM?.Dispose(); } disposed = true; } } // 자식 ViewModel Dispose 호출 추가
+        public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
+        #endregion
+    }
+}
+2. ViewModels/MasterDataViewModel.cs (수정)
+
+IsMasterModeEnabled 속성 추가
+Command들의 CanExecute 조건 또는 실행 로직 시작 부분에서 IsMasterModeEnabled 확인
+SaveChangesCommand 실행 시 IsMasterModeEnabled 확인 추가
+C#
+
 using LockerManagementApp.Data;
 using LockerManagementApp.Models;
 using LockerManagementApp.Infrastructure;
@@ -137,7 +305,7 @@ namespace LockerManagementApp.ViewModels
         #endregion
     }
 }
-3. ViewModels/LogViewModel.cs (수정)
+3. ViewModels/LogViewModel.cs (수정)   
 
 (이전 최종 버전과 동일 - 자체 DbContext 생성 및 관리)
 
@@ -183,7 +351,7 @@ namespace LockerManagementApp.ViewModels
         #endregion
     }
 }
-4. Views/MainWindow.xaml (수정)
+4. Views/MainWindow.xaml (수정)   
 
 마스터 데이터 탭의 Visibility 바인딩 제거.
 마스터 데이터 탭 내부의 버튼들(추가, 삭제, 저장)과 그리드(TableView의 AllowEditing)의 IsEnabled 속성을 MasterDataVM.IsMasterModeEnabled에 바인딩합니다.
@@ -350,3 +518,9 @@ namespace LockerManagementApp.Views
     }
 }
 핵심 변경 사항:
+
+MainViewModel.cs: IsMasterModeEnabled 속성의 set 접근자에서 MasterDataVM.IsMasterModeEnabled = value; 코드를 추가하여 상태 변경 시 MasterDataViewModel에도 알려주도록 했습니다. 또한 Dispose 메서드에서 자식 ViewModel의 Dispose도 호출하도록 추가했습니다 (자식 ViewModel이 IDisposable을 구현했으므로).
+MasterDataViewModel.cs: IsMasterModeEnabled 속성을 추가했습니다. 각 Command의 CanExecute 메서드(또는 실행 로직 시작 부분)와 SaveMasterDataChangesAsync 메서드 시작 부분에서 IsMasterModeEnabled 값을 확인하여 마스터 모드가 아닐 때는 작업을 수행하지 않도록 수정했습니다. IsMasterModeEnabled 값이 변경될 때 Command들의 CanExecute 상태를 갱신하기 위해 RaiseCanExecuteChanged() 호출 로직을 추가했습니다.
+MainWindow.xaml:
+"마스터 데이터 관리" 탭의 Visibility 바인딩을 제거하여 항상 보이도록 했습니다.
+해당 탭 내부의 "추가", "삭제", "저장" 버튼들의 IsEnabled 속성을 MasterDataVM.IsMasterModeEnabled에 바인딩했습니다. (삭제 버튼의 경우, 항목 선택 여부도 함께 고려해야 완벽하지만 일단 마스터 모드에 따라 활성화/비활성화되도록 했습니다.)
