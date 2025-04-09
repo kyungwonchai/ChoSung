@@ -1,18 +1,3 @@
-네, 알겠습니다. "추가" 작업 시 로그를 포함한 어떠한 디버그 출력도 나오지 않는다는 것은, 저장 로직(MainViewModel.SaveChangesAsync) 자체가 실행되지 않거나 시작 직후 중단될 가능성을 시사합니다. 이는 "저장" 버튼이 비활성화되어 있거나, 버튼 클릭 시 Command 실행 조건(CanSaveChangesExecute)이 충족되지 않기 때문일 수 있습니다.
-
-가장 의심스러운 부분은 AddNewLocker 메서드에서 새 LockerAssignment 객체를 DbContext에 추가한 후, DbContext가 이 변경 사항을 제대로 인지하지 못하여 CanSaveChangesExecute 메서드가 false를 반환하는 경우입니다.
-
-해결 및 진단 방향:
-
-AddNewLocker 메서드 확인: 새 LockerAssignment 객체를 생성하고 _context.LockerAssignments.Add(newAssignment)를 호출한 직후, 해당 객체의 상태(_context.Entry(newAssignment).State)가 실제로 Added로 변경되었는지 디버그 출력으로 확인합니다.
-CanSaveChangesExecute 메서드 확인: 이 메서드가 호출될 때마다 _context.ChangeTracker.HasChanges()의 결과값이 무엇인지 디버그 출력으로 확인합니다. '새 행 추가' 직후 이 메서드가 호출될 때 HasChanges()가 true를 반환해야 합니다.
-수정해야 할 파일 목록:
-
-ViewModels/MainViewModel.cs
-아래는 위 진단 방향에 따라 디버그 출력을 추가한 MainViewModel.cs 파일 전체 코드(주석 제외)입니다.
-
-C#
-
 using LockerManagementApp.Data;
 using LockerManagementApp.Models;
 using LockerManagementApp.Infrastructure;
@@ -97,25 +82,7 @@ namespace LockerManagementApp.ViewModels
         }
 
         private bool CanExecuteCommand(object parameter) => !_disposed;
-
-        private bool CanSaveChangesExecute(object parameter)
-        {
-            if (_disposed || _context == null) return false;
-            bool hasChanges = false;
-            try
-            {
-                hasChanges = _context.ChangeTracker.HasChanges();
-                // *** 추가: CanExecute 호출 시 HasChanges 결과 확인 ***
-                Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] CanSaveChangesExecute 호출됨: HasChanges={hasChanges}");
-            }
-            catch(Exception ex)
-            {
-                 Debug.WriteLine($"!!! CanSaveChangesExecute 확인 중 오류: {ex.Message}");
-                 return false;
-            }
-            return hasChanges;
-        }
-
+        private bool CanSaveChangesExecute(object parameter) { if (_disposed || _context == null) return false; try { bool hasChanges = _context.ChangeTracker.HasChanges(); Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] CanSaveChangesExecute 호출됨: HasChanges={hasChanges}"); return hasChanges; } catch(Exception ex) { Debug.WriteLine($"!!! CanSaveChangesExecute 확인 중 오류: {ex.Message}"); return false; } }
         private bool CanDeleteExecute(object parameter) => !_disposed && SelectedAssignment != null;
         private bool CanClearAssignmentExecute(object parameter) => !_disposed && SelectedAssignment != null && SelectedAssignment.IsAssigned;
 
@@ -127,102 +94,65 @@ namespace LockerManagementApp.ViewModels
         private void OpenLogWindow(object parameter) { if (!CanExecuteCommand(parameter)) return; try { using (var logVM = new LogViewModel()) { var logWindow = new LogWindow { DataContext = logVM, Owner = Application.Current.MainWindow }; logWindow.ShowDialog(); } } catch (Exception ex) { if (!App.IsShuttingDown && !_disposed) MessageBox.Show($"로그 보기 창 열기 오류:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); else Debug.WriteLine($"종료 중 로그 보기 창 열기 오류 무시됨: {ex.Message}"); } }
 
         #region CRUD 및 기타 메서드
-        private async Task SaveChangesAsync()
-        {
-            if (!CanSaveChangesExecute(null)) { StatusBarText = "저장할 변경 사항이 없습니다."; return; }
-            StatusBarText = "변경 사항 저장 중...";
-            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel SaveChangesAsync 시작: HasChanges={_context.ChangeTracker.HasChanges()}");
-            foreach(var entry in _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged && e.State != EntityState.Detached)) { Debug.WriteLine($"  - 추적된 엔티티 (MainVM): {entry.Entity.GetType().Name}, 상태: {entry.State}"); }
-            List<DbEntityEntry> allChangedEntriesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList();
-            try
-            {
-                var changedLockerEntries = _context.ChangeTracker.Entries<LockerAssignment>().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified).ToList();
-                var allItemsToCheck = LockerAssignments.ToList(); var duplicates = allItemsToCheck.GroupBy(l => new { l.Floor, l.Zone, l.SpecificLocation }).Where(g => g.Count() > 1).Select(g => g.Key); if (duplicates.Any()) { MessageBox.Show($"저장 불가: 중복 위치 발견 - {string.Join(", ", duplicates.Select(d => $"{d.Floor}-{d.Zone}-{d.SpecificLocation}"))}", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); RollbackChanges(allChangedEntriesForRollback); return; }
-                foreach(var entry in changedLockerEntries) { entry.Entity.Administrator = _currentAdmin; }
-
-                Debug.WriteLine($"  -> MainVM _context.SaveChangesAsync(_cts.Token) 호출 시도...");
-                int changedCount = await _context.SaveChangesAsync(_cts.Token);
-                Debug.WriteLine($"  -> MainVM _context.SaveChangesAsync 완료. 결과 = {changedCount}");
-
-                StatusBarText = $"성공적으로 {changedCount}개 저장됨.";
-                (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            }
-            catch (OperationCanceledException) { Debug.WriteLine("SaveChangesAsync 작업 취소됨."); StatusBarText = "저장 작업 취소됨."; RollbackChanges(allChangedEntriesForRollback); }
-            catch (DbEntityValidationException vex) { HandleValidationException(vex); RollbackChanges(allChangedEntriesForRollback); }
-            catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(allChangedEntriesForRollback); }
-            catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("저장", ex); RollbackChanges(allChangedEntriesForRollback); }
-            finally { Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel SaveChangesAsync 종료."); }
-        }
+        private async Task SaveChangesAsync() { if (!CanSaveChangesExecute(null)) { StatusBarText = "저장할 변경 사항이 없습니다."; return; } StatusBarText = "변경 사항 저장 중..."; Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel SaveChangesAsync 시작: HasChanges={_context.ChangeTracker.HasChanges()}"); foreach(var entry in _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged && e.State != EntityState.Detached)) { Debug.WriteLine($"  - 추적된 엔티티 (MainVM): {entry.Entity.GetType().Name}, 상태: {entry.State}"); } List<DbEntityEntry> allChangedEntriesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var changedLockerEntries = _context.ChangeTracker.Entries<LockerAssignment>().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified).ToList(); var allItemsToCheck = LockerAssignments.ToList(); var duplicates = allItemsToCheck.GroupBy(l => new { l.Floor, l.Zone, l.SpecificLocation }).Where(g => g.Count() > 1).Select(g => g.Key); if (duplicates.Any()) { MessageBox.Show($"저장 불가: 중복 위치 발견 - {string.Join(", ", duplicates.Select(d => $"{d.Floor}-{d.Zone}-{d.SpecificLocation}"))}", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); RollbackChanges(allChangedEntriesForRollback); return; } foreach(var entry in changedLockerEntries) { entry.Entity.Administrator = _currentAdmin; } Debug.WriteLine($"  -> MainVM _context.SaveChangesAsync 호출 시도..."); _context.IsMasterSave = false; int changedCount = await _context.SaveChangesAsync(_cts.Token); Debug.WriteLine($"  -> MainVM _context.SaveChangesAsync 완료. 결과 = {changedCount}"); StatusBarText = $"성공적으로 {changedCount}개 저장됨."; (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); } catch (OperationCanceledException) { Debug.WriteLine("SaveChangesAsync 작업 취소됨."); StatusBarText = "저장 작업 취소됨."; RollbackChanges(allChangedEntriesForRollback); } catch (DbEntityValidationException vex) { HandleValidationException(vex); RollbackChanges(allChangedEntriesForRollback); } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(allChangedEntriesForRollback); } catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("저장", ex); RollbackChanges(allChangedEntriesForRollback); } finally { Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel SaveChangesAsync 종료."); } }
         private void RollbackChanges(IEnumerable<DbEntityEntry> changedEntries) { if (_context == null || _disposed || changedEntries == null) return; foreach (var entry in changedEntries.ToList()) { switch (entry.State) { case EntityState.Modified: try { entry.Reload(); } catch { entry.State = EntityState.Unchanged; } break; case EntityState.Added: entry.State = EntityState.Detached; if (entry.Entity is LockerAssignment addedEntity && LockerAssignments.Contains(addedEntity)) LockerAssignments.Remove(addedEntity); break; case EntityState.Deleted: entry.State = EntityState.Unchanged; break; } } StatusBarText = "변경 롤백됨."; (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); }
 
         /// <summary>
-        /// 새 사물함 행 추가 (추가 후 상태 확인 Debug 추가)
+        /// 새 사물함 행 추가 (사용자 확인 추가)
         /// </summary>
         private void AddNewLocker(object parameter)
         {
             if (!CanExecuteCommand(parameter)) return;
+
+            // *** 추가: 확인 메시지 박스 ***
+            if (MessageBox.Show("새로운 사물함 정보를 추가하시겠습니까?", "새 사물함 추가", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.No)
+            {
+                return; // 사용자가 '아니오' 선택 시 중단
+            }
+
             var newAssignment = new LockerAssignment { LockerType = AllLockerTypes.FirstOrDefault()?.Name ?? "개인사물함", Floor = AllFloors.FirstOrDefault()?.Name ?? "1", Zone = AllZones.FirstOrDefault()?.Name ?? "A", SpecificLocation = "새 위치-" + Guid.NewGuid().ToString("N").Substring(0, 4), Administrator = _currentAdmin, LastUpdated = DateTime.Now };
-            LockerAssignments.Add(newAssignment); // UI 컬렉션에 추가
-            _context.LockerAssignments.Add(newAssignment); // DbContext에 추가
+            LockerAssignments.Add(newAssignment);
+            _context.LockerAssignments.Add(newAssignment);
             SelectedAssignment = newAssignment;
             StatusBarText = "새 사물함 추가됨. 저장 필요.";
 
-            // *** 추가: 엔티티 추가 후 상태 및 HasChanges 확인 ***
             try
             {
                 var entryState = _context.Entry(newAssignment).State;
                 bool hasChangesNow = _context.ChangeTracker.HasChanges();
                 Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] AddNewLocker 완료: 새 엔티티 상태 = {entryState}, HasChanges = {hasChangesNow}");
-                if (entryState != EntityState.Added || !hasChangesNow)
-                {
-                     Debug.WriteLine("!!! 경고: AddNewLocker 후 엔티티 상태가 Added가 아니거나 HasChanges가 false입니다.");
-                }
+                if (entryState != EntityState.Added || !hasChangesNow) { Debug.WriteLine("!!! 경고: AddNewLocker 후 엔티티 상태가 Added가 아니거나 HasChanges가 false입니다."); }
             }
-            catch (Exception ex)
-            {
-                 Debug.WriteLine($"!!! AddNewLocker 상태 확인 중 오류: {ex.Message}");
-            }
-            // --- 추가 끝 ---
+            catch (Exception ex) { Debug.WriteLine($"!!! AddNewLocker 상태 확인 중 오류: {ex.Message}"); }
 
-            (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); // 저장 버튼 상태 갱신
+            (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged();
         }
 
-        private async Task DeleteSelectedAsync() { if (!CanDeleteExecute(null)) return; if (MessageBox.Show($"'{SelectedAssignment.Floor}-{SelectedAssignment.Zone}-{SelectedAssignment.SpecificLocation}' 삭제?", "확인", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) { StatusBarText = "삭제 중..."; List<DbEntityEntry> changesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var assignmentToDelete = SelectedAssignment; var entry = _context.Entry(assignmentToDelete); if (entry.State == EntityState.Detached) { _context.LockerAssignments.Attach(assignmentToDelete); } _context.LockerAssignments.Remove(assignmentToDelete); int changedCount = await _context.SaveChangesAsync(_cts.Token); LockerAssignments.Remove(assignmentToDelete); SelectedAssignment = null; StatusBarText = $"성공적으로 {changedCount}개 삭제됨."; (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); } catch (OperationCanceledException) { Debug.WriteLine("DeleteSelectedAsync 작업 취소됨."); StatusBarText = "삭제 작업 취소됨."; RollbackChanges(changesForRollback); } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("삭제", ex); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } } }
+        private async Task DeleteSelectedAsync() { if (!CanDeleteExecute(null)) return; if (MessageBox.Show($"'{SelectedAssignment.Floor}-{SelectedAssignment.Zone}-{SelectedAssignment.SpecificLocation}' 삭제?", "확인", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) { StatusBarText = "삭제 중..."; List<DbEntityEntry> changesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var assignmentToDelete = SelectedAssignment; var entry = _context.Entry(assignmentToDelete); if (entry.State == EntityState.Detached) { _context.LockerAssignments.Attach(assignmentToDelete); } _context.LockerAssignments.Remove(assignmentToDelete); _context.IsMasterSave = false; int changedCount = await _context.SaveChangesAsync(_cts.Token); LockerAssignments.Remove(assignmentToDelete); SelectedAssignment = null; StatusBarText = $"성공적으로 {changedCount}개 삭제됨."; (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); } catch (OperationCanceledException) { Debug.WriteLine("DeleteSelectedAsync 작업 취소됨."); StatusBarText = "삭제 작업 취소됨."; RollbackChanges(changesForRollback); } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("삭제", ex); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } } }
         private void ClearSelectedAssignment(object parameter) { if (!CanClearAssignmentExecute(parameter)) return; SelectedAssignment.UserName = null; SelectedAssignment.KnoxId = null; SelectedAssignment.SubPart = null; _context.Entry(SelectedAssignment).State = EntityState.Modified; SelectedAssignment.Administrator = _currentAdmin; StatusBarText = "배정 해제됨. 저장 필요."; (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); }
         #endregion
 
-        #region Backup Logic (CSV - 이전과 동일)
+        #region Backup Logic (CSV)
         private bool BackupDataToCsv() { string backupDir = @"C:\agent"; string fileName = $"LockerBackup_{DateTime.Now:yyyyMMdd_HHmmss}.csv"; string filePath = Path.Combine(backupDir, fileName); StatusBarText = "데이터 백업 시작..."; try { Directory.CreateDirectory(backupDir); using (var backupContext = new LockerDbContext()) using (var writer = new StreamWriter(filePath, false, Encoding.UTF8)) { WriteTableToCsv<LockerType>(backupContext, writer); WriteTableToCsv<Floor>(backupContext, writer); WriteTableToCsv<Zone>(backupContext, writer); WriteTableToCsv<SubPart>(backupContext, writer); WriteTableToCsv<Administrator>(backupContext, writer); WriteTableToCsv<LockerAssignment>(backupContext, writer); WriteTableToCsv<AuditLog>(backupContext, writer); } StatusBarText = $"데이터 백업 완료: {filePath}"; if (!_disposed && !App.IsShuttingDown) MessageBox.Show($"데이터가 다음 위치에 백업되었습니다:\n{filePath}", "백업 완료", MessageBoxButton.OK, MessageBoxImage.Information); return true; } catch (Exception ex) { StatusBarText = $"데이터 백업 실패: {ex.Message}"; if (!_disposed && !App.IsShuttingDown) MessageBox.Show($"데이터 백업 중 오류가 발생했습니다:\n{ex.ToString()}", "백업 오류", MessageBoxButton.OK, MessageBoxImage.Error); return false; } }
         private void WriteTableToCsv<T>(LockerDbContext context, StreamWriter writer) where T : class { var dbSet = context.Set<T>(); var entityType = typeof(T); var properties = entityType.GetProperties().Where(p => p.GetGetMethod().IsVirtual == false).ToList(); writer.WriteLine($"--- Table: {entityType.Name} ---"); writer.WriteLine(string.Join(",", properties.Select(p => EscapeCsvValue(p.Name)))); foreach (var entity in dbSet.AsNoTracking()) { var values = properties.Select(p => EscapeCsvValue(p.GetValue(entity)?.ToString() ?? "")); writer.WriteLine(string.Join(",", values)); } writer.WriteLine(); writer.WriteLine(); }
         private string EscapeCsvValue(string value) { if (string.IsNullOrEmpty(value)) return ""; if (value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n")) { return $"\"{value.Replace("\"", "\"\"")}\""; } return value; }
         #endregion
 
-        #region Highlight Logic (이전과 동일)
+        #region Highlight Logic
         public void UpdateHighlightInfo(string fieldName, LockerAssignment currentItem) { var targetColumns = new List<string> { "LockerType", "Floor", "Zone", "SubPart", "Administrator" }; if (currentItem != null && fieldName != null && targetColumns.Contains(fieldName)) { var propertyInfo = typeof(LockerAssignment).GetProperty(fieldName); if (propertyInfo != null) { SelectedCellValue = propertyInfo.GetValue(currentItem); SelectedCellColumnFieldName = fieldName; } else { ClearHighlightInfo(); } } else { ClearHighlightInfo(); } }
         private void ClearHighlightInfo() { SelectedCellValue = null; SelectedCellColumnFieldName = null; }
         #endregion
 
-        #region Helper Methods (이전과 동일)
+        #region Helper Methods
         private void HandleGenericException(string operation, Exception ex) { if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 {operation} 오류 무시됨: {ex.Message}"); return; } StatusBarText = $"{operation} 오류: {ex.Message}"; MessageBox.Show($"{operation} 중 오류 발생:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); }
         private void HandleDbUpdateException(DbUpdateException dbEx) { if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 DB 업데이트 오류 무시됨: {dbEx.Message}"); return; } Exception innerMostException = dbEx; while (innerMostException.InnerException != null) innerMostException = innerMostException.InnerException; string innerExMsg = innerMostException.Message; var validationErrors = dbEx.Entries.SelectMany(e => e.GetValidationResult().ValidationErrors); string validationErrorMsg = ""; if (validationErrors.Any()) validationErrorMsg = "\n\n유효성 검사 오류:\n" + string.Join("\n", validationErrors.Select(err => $" - {err.PropertyName}: {err.ErrorMessage}")); StatusBarText = $"DB 업데이트 오류: {innerExMsg}"; MessageBox.Show($"데이터베이스 작업 중 오류가 발생했습니다:\n{innerExMsg}{validationErrorMsg}\n\n(전체 오류: {dbEx.ToString()})", "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); try { foreach(var entry in dbEx.Entries) { entry.Reload(); } } catch { /* Reload 실패 무시 */ } }
         private void HandleValidationException(DbEntityValidationException vex) { if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 유효성 검사 오류 무시됨: {vex.Message}"); return; } var errorMessages = vex.EntityValidationErrors.SelectMany(x => x.ValidationErrors).Select(x => $"{x.PropertyName}: {x.ErrorMessage}"); var fullErrorMessage = string.Join("\n", errorMessages); var exceptionMessage = $"데이터 유효성 검사 오류:\n{fullErrorMessage}"; StatusBarText = "데이터 유효성 검사 오류 발생"; MessageBox.Show(exceptionMessage, "유효성 검사 오류", MessageBoxButton.OK, MessageBoxImage.Warning); Debug.WriteLine($"!!! DbEntityValidationException 발생:\n{exceptionMessage}\n{vex.ToString()}"); }
         private string ConvertToUnsecureString(SecureString securePassword) { if (securePassword == null) return string.Empty; IntPtr ptr = IntPtr.Zero; try { ptr = Marshal.SecureStringToGlobalAllocUnicode(securePassword); return Marshal.PtrToStringUni(ptr); } finally { Marshal.ZeroFreeGlobalAllocUnicode(ptr); } }
         #endregion
 
-        #region IDisposable 구현 (이전과 동일)
+        #region IDisposable 구현
         protected virtual void Dispose(bool disposing) { if (!_disposed) { _disposed = true; if (disposing) { Debug.WriteLine("MainViewModel Dispose 시작..."); try { _cts?.Cancel(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CTS Cancel 오류: {ex.Message}"); } try { _cts?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CTS Dispose 오류: {ex.Message}"); } try { _context?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainViewModel DbContext Dispose 오류: {ex.Message}"); } try { LogVM?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! LogViewModel Dispose 오류: {ex.Message}"); } Debug.WriteLine("MainViewModel 리소스 해제 완료."); } } }
         public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
         #endregion
     }
 }
-핵심 변경 사항:
-
-AddNewLocker 메서드:
-_context.LockerAssignments.Add(newAssignment); 호출 직후에 Debug.WriteLine을 추가하여, 새로 추가된 LockerAssignment 객체의 상태(_context.Entry(newAssignment).State)와 DbContext의 전체 변경 상태(_context.ChangeTracker.HasChanges())를 출력합니다.
-CanSaveChangesExecute 메서드:
-메서드가 호출될 때마다 _context.ChangeTracker.HasChanges()의 결과값을 디버그 출력하도록 추가했습니다.
-다음 단계:
-
-코드 적용 및 빌드: 위 코드로 MainViewModel.cs 파일을 업데이트하고 솔루션을 다시 빌드합니다.
-테스트 및 디버그 출력 확인:
-메인 화면에서 "새 사물함 추가" 버튼을 클릭합니다.
