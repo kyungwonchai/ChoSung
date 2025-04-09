@@ -1,104 +1,160 @@
-료 후에 오류 창이 뜨는 것은 정말 답답한 상황입니다. 원인을 명확히 파악하기 위해 몇 가지 추가적인 조치와 디버깅 방법을 시도해 보겠습니다.
+, "초기화 오류"라는 창 제목과 오류 발생 시점을 고려할 때, 애플리케이션 시작 시 또는 ViewModel이 처음 생성될 때 LockerDbContext 인스턴스를 만드는 과정 자체에서 예외가 발생하고, 이 예외가 제대로 처리되지 않아 프로그램 종료 시점에 시스템 오류 창으로 나타날 가능성이 가장 높습니다.
 
-오류 원인 재분석:
-
-창이 닫힌 후에 "DB 컨텍스트 생성 오류"가 발생한다면, 이는 애플리케이션 종료 프로세스가 진행되는 동안 예상치 못한 코드(아마도 백그라운드 스레드나 완료되지 않은 비동기 작업의 후속 처리)가 new LockerDbContext()를 다시 호출하려고 시도하고, 이때 필요한 환경(예: 설정 파일 접근)이 이미 정리되었거나 불안정하여 발생하는 것일 수 있습니다. 또는, Dispose 과정 자체에서 발생하는 예외가 처리되지 않아 시스템 오류 창으로 나타날 수도 있습니다.
+이전 답변에서 종료 시점의 비동기 처리 문제에 집중했지만, 오류 메시지를 고려하면 DbContext 생성 실패가 근본 원인일 수 있습니다. 이는 주로 App.config 파일의 연결 문자열 문제(이름 불일치, 내용 오류, 파일 누락/권한 등) 또는 Entity Framework 6 자체의 설정 문제일 가능성이 큽니다.
 
 해결 및 진단 방향:
 
-전역 예외 처리기 확인 (App.xaml.cs): DispatcherUnhandledException 핸들러에서 e.Handled = true; 설정이 누락되면 UI 스레드에서 발생하는 처리되지 않은 예외가 앱을 강제 종료시키고 시스템 오류 창을 띄울 수 있습니다. 이 부분을 확실히 설정합니다.
-Dispose 메서드 안정성 강화 (MainViewModel.cs, LogViewModel.cs): Dispose 메서드 내에서 다른 객체(특히 DbContext)를 Dispose 할 때 발생하는 예외를 잡아서 최소한 앱 크래시는 막도록 합니다.
-DbContext 생성 시점 추적: LockerDbContext 생성자에 디버그 출력문을 추가하여, 종료 과정에서 의도치 않게 생성자가 호출되는지 확인합니다.
-디버깅 중단점 설정 (중요):
-App.xaml.cs: App_DispatcherUnhandledException, TaskScheduler_UnobservedTaskException, CurrentDomain_UnhandledException 메서드 내부에 중단점을 설정합니다. 종료 시 오류가 발생할 때 이 중 하나에서 멈춘다면, 전달되는 Exception 객체의 ToString() 내용 전체(특히 InnerException) 를 확인하는 것이 결정적입니다.
-LockerDbContext.cs: LockerDbContext() 생성자 내부에 중단점을 설정합니다. 만약 프로그램 종료 후에 여기서 멈춘다면, Visual Studio의 호출 스택(Call Stack) 창을 통해 어떤 코드 경로에서 이 생성자를 호출하는지 확인해야 합니다.
+LockerDbContext 생성자 안정성 강화: 생성자 내부에서 연결 문자열을 읽어오는 GetConnectionString 메서드의 오류 처리를 강화하고, 생성 직후 간단한 DB 연결 테스트(선택 사항)를 추가하여 연결 문자열 자체의 유효성 및 DB 접근 가능성을 빠르게 확인하도록 합니다.
+ViewModel 생성자 오류 처리 강화: MainViewModel, LogViewModel 등의 생성자에서 new LockerDbContext()를 호출하는 부분을 try-catch로 감싸고, 예외 발생 시 ex.ToString()을 사용하여 가장 상세한 오류 정보(InnerException 포함) 를 즉시 MessageBox로 표시하도록 합니다. 이렇게 하면 오류의 근본 원인을 파악하는 데 도움이 됩니다.
+전역 예외 처리기 확인 (App.xaml.cs): 여전히 중요합니다. 처리되지 않은 예외가 발생했을 때 최소한 디버그 출력이라도 남기고 앱 크래시를 방지하는 역할을 합니다.
 수정해야 할 파일 목록:
 
-App.xaml.cs (전역 예외 처리기 확인 및 강화)
-ViewModels/MainViewModel.cs (Dispose 안정성 강화)
-Data/LockerDbContext.cs (생성자 추적 코드 추가)
-(ViewModels/LogViewModel.cs의 Dispose 수정은 MainViewModel과 유사하므로 생략)
+Data/LockerDbContext.cs (생성자 및 연결 문자열 로드 수정)
+ViewModels/MainViewModel.cs (생성자 try-catch 강화)
+App.xaml.cs (전역 예외 처리기 최종 확인)
+(ViewModels/LogViewModel.cs의 생성자 수정은 MainViewModel과 유사하므로 생략)
 아래에 이 3개 파일의 수정된 전체 코드(주석 제외)를 작성합니다.
 
-1. App.xaml.cs (수정)
+1. Data/LockerDbContext.cs (수정)
 
 C#
 
+using LockerManagementApp.Models;
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data.Entity;
+using System.Data.Entity.Infrastructure;
+using System.Data.Entity.Validation;
+using System.Linq;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Threading;
+using Newtonsoft.Json;
+using System.Diagnostics;
+using System.Data.SqlClient; // SqlException
 
-namespace LockerManagementApp
+namespace LockerManagementApp.Data
 {
-    public partial class App : Application
+    public class LockerDbContext : DbContext
     {
-        public static bool IsShuttingDown { get; private set; } = false;
+        public DbSet<LockerAssignment> LockerAssignments { get; set; }
+        public DbSet<AuditLog> AuditLogs { get; set; }
+        public DbSet<LockerType> LockerTypes { get; set; }
+        public DbSet<Floor> Floors { get; set; }
+        public DbSet<Zone> Zones { get; set; }
+        public DbSet<SubPart> SubParts { get; set; }
+        public DbSet<Administrator> Administrators { get; set; }
 
-        protected override void OnStartup(StartupEventArgs e)
+        private const string ConnectionStringName = "LockerDbConnection";
+
+        public LockerDbContext() : base(GetConnectionString())
         {
-            base.OnStartup(e);
-            SetupGlobalExceptionHandling();
-            Debug.WriteLine("애플리케이션 시작됨.");
-        }
-
-        protected override void OnExit(ExitEventArgs e)
-        {
-            Debug.WriteLine("애플리케이션 종료 시작됨.");
-            IsShuttingDown = true;
-            base.OnExit(e);
-            Debug.WriteLine("애플리케이션 종료 완료.");
-        }
-
-        #region 전역 예외 처리 (Global Exception Handling)
-
-        private void SetupGlobalExceptionHandling()
-        {
-            DispatcherUnhandledException += App_DispatcherUnhandledException;
-            TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
-            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
-            Debug.WriteLine("전역 예외 처리기 설정 완료.");
-        }
-
-        private void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
-        {
-            Debug.WriteLine("--- DispatcherUnhandledException 발생 ---");
-            LogAndShowException(e.Exception, "UI Thread Exception");
-            e.Handled = true; // *** 중요: 앱 크래시 방지 ***
-        }
-
-        private void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
-        {
-            Debug.WriteLine("--- TaskScheduler_UnobservedTaskException 발생 ---");
-            LogAndShowException(e.Exception, "Background Task Exception");
-            e.SetObserved();
-        }
-
-        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
-        {
-            Debug.WriteLine("--- CurrentDomain_UnhandledException 발생 ---");
-            LogAndShowException((Exception)e.ExceptionObject, "AppDomain Exception", !e.IsTerminating);
-        }
-
-        private void LogAndShowException(Exception exception, string source, bool showMessageBox = true)
-        {
-            string errorMessage = $"예기치 않은 오류 발생 ({source}):\n\n{exception.ToString()}";
-            Debug.WriteLine($"*** 예외 발생 ({source}) ***\n{errorMessage}");
-
-            if (showMessageBox && !IsShuttingDown)
+            try
             {
-                try { MessageBox.Show(errorMessage, "애플리케이션 오류", MessageBoxButton.OK, MessageBoxImage.Error); }
-                catch (Exception msgEx) { Debug.WriteLine($"*** 메시지 박스 표시 실패 ({source}) ***\n{msgEx.ToString()}"); }
+                // 데이터베이스 존재 여부 확인 (연결 테스트) - 선택 사항
+                // Database.Exists()는 DB가 없으면 생성을 시도할 수 있으므로 주의
+                // 간단히 연결만 테스트하려면 Open/Close 사용
+                // this.Database.Connection.Open();
+                // this.Database.Connection.Close();
+                // Debug.WriteLine("DbContext 생성자: 데이터베이스 연결 테스트 성공.");
+            }
+            catch (SqlException sqlEx) // DB 연결 관련 오류
+            {
+                 Debug.WriteLine($"!!! DbContext 생성자: 데이터베이스 연결 실패 (SqlException): {sqlEx.Message}");
+                 throw new Exception($"데이터베이스 연결에 실패했습니다. 연결 문자열 및 서버 상태를 확인하세요. (원본 오류: {sqlEx.Message})", sqlEx);
+            }
+            catch (Exception ex) // 기타 오류 (설정 오류 등 포함)
+            {
+                 Debug.WriteLine($"!!! DbContext 생성자: 예외 발생: {ex.ToString()}");
+                 // GetConnectionString에서 예외가 발생하면 이 catch로 올 수 있음
+                 throw; // ViewModel 생성자에서 잡도록 다시 던짐
             }
         }
 
+        private static string GetConnectionString()
+        {
+            string connectionString = null;
+            try
+            {
+                var connectionStringSetting = ConfigurationManager.ConnectionStrings[ConnectionStringName];
+                if (connectionStringSetting == null || string.IsNullOrWhiteSpace(connectionStringSetting.ConnectionString))
+                {
+                    throw new ConfigurationErrorsException($"App.config 파일에서 '{ConnectionStringName}' 이름의 연결 문자열을 찾을 수 없거나 비어 있습니다.");
+                }
+                connectionString = connectionStringSetting.ConnectionString;
+                Debug.WriteLine($"ConnectionString '{ConnectionStringName}' 로드 성공.");
+                return connectionString;
+            }
+            catch (ConfigurationErrorsException confEx)
+            {
+                 Debug.WriteLine($"!!! 설정 파일 오류: {confEx.ToString()}");
+                 // App.config 파일 자체를 읽지 못하거나 섹션 오류 발생 시
+                 throw new Exception("App.config 파일을 읽거나 해석하는 중 오류가 발생했습니다.", confEx);
+            }
+            catch (Exception ex)
+            {
+                 Debug.WriteLine($"!!! 연결 문자열 로드 중 예외 발생: {ex.ToString()}");
+                 throw new Exception($"App.config에서 연결 문자열 '{ConnectionStringName}'을(를) 읽는 중 오류 발생.", ex);
+            }
+        }
+
+        protected override void OnModelCreating(DbModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.UserName).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.KnoxId).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.SubPart).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.Administrator).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.TransferStatus).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.Details).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.Remarks).IsOptional();
+            modelBuilder.Entity<LockerAssignment>().Property(p => p.Notes).IsOptional();
+            base.OnModelCreating(modelBuilder);
+        }
+
+        protected override DbEntityValidationResult ValidateEntity(DbEntityEntry entityEntry, IDictionary<object, object> items)
+        {
+            var result = base.ValidateEntity(entityEntry, items);
+            if (entityEntry.Entity is LockerAssignment assignment && (entityEntry.State == EntityState.Added || entityEntry.State == EntityState.Modified)) { var userNameErrors = result.ValidationErrors.Where(err => err.PropertyName == nameof(LockerAssignment.UserName) && string.IsNullOrWhiteSpace(assignment.UserName)).ToList(); if (userNameErrors.Any()) { Debug.WriteLine($"경고: LockerAssignment(ID:{assignment.Id})의 UserName 필수 오류를 무시합니다."); foreach (var error in userNameErrors) { result.ValidationErrors.Remove(error); } } }
+            return result;
+        }
+
+        #region SaveChanges Overrides for Audit Logging
+        public override int SaveChanges()
+        {
+            List<AuditLog> auditEntries = null;
+            #region Logging Enable/Disable
+            // try { auditEntries = CreateAuditEntries(); } catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
+            // if (auditEntries != null && auditEntries.Any()) { try { this.AuditLogs.AddRange(auditEntries); } catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 AddRange 중 오류 발생: {ex.ToString()}"); } }
+            #endregion
+            try { return base.SaveChanges(); }
+            catch (DbEntityValidationException vex) { LogValidationErrors(vex); throw; }
+            catch (DbUpdateException dbEx) { LogDbUpdateException(dbEx); throw; }
+            catch (Exception ex) { Debug.WriteLine($"!!! SaveChanges 중 일반 오류 (동기): {ex.ToString()}"); throw; }
+        }
+        public override async Task<int> SaveChangesAsync()
+        {
+             List<AuditLog> auditEntries = null;
+            #region Logging Enable/Disable
+            // try { auditEntries = CreateAuditEntries(); } catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
+            // if (auditEntries != null && auditEntries.Any()) { try { this.AuditLogs.AddRange(auditEntries); } catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 AddRange 중 오류 발생: {ex.ToString()}"); } }
+            #endregion
+            try { return await base.SaveChangesAsync(); }
+            catch (DbEntityValidationException vex) { LogValidationErrors(vex); throw; }
+            catch (DbUpdateException dbEx) { LogDbUpdateException(dbEx); throw; }
+            catch (Exception ex) { Debug.WriteLine($"!!! SaveChangesAsync 중 일반 오류 (비동기): {ex.ToString()}"); throw; }
+        }
+        private List<AuditLog> CreateAuditEntries() { string currentUserName = System.Threading.Thread.CurrentPrincipal?.Identity?.Name ?? "UnknownUser"; var auditEntries = new List<AuditLog>(); var changedEntries = ChangeTracker.Entries().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified || e.State == EntityState.Deleted).ToList(); var jsonSettings = new JsonSerializerSettings { ReferenceLoopHandling = ReferenceLoopHandling.Ignore, PreserveReferencesHandling = PreserveReferencesHandling.None, Formatting = Formatting.None }; foreach (var entry in changedEntries) { if (entry.Entity is AuditLog) continue; var auditEntry = new AuditLog { Timestamp = DateTime.Now, UserName = currentUserName, TableName = entry.Entity.GetType().Name, Action = entry.State.ToString() }; try { auditEntry.RecordId = entry.State == EntityState.Deleted ? entry.OriginalValues["Id"]?.ToString() : entry.CurrentValues["Id"]?.ToString() ?? "N/A"; } catch (Exception ex) { Debug.WriteLine($"감사 로그: 'Id' PK 조회 실패 ({auditEntry.TableName}) - {ex.Message}"); auditEntry.RecordId = "PK Error"; } var oldValues = new Dictionary<string, object>(); var newValues = new Dictionary<string, object>(); var affectedColumns = new List<string>(); if (entry.State == EntityState.Added) { foreach (var pn in entry.CurrentValues.PropertyNames) newValues[pn] = entry.CurrentValues[pn]; try { auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"!!! 감사 로그 Added 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; } } else if (entry.State == EntityState.Deleted) { foreach (var pn in entry.OriginalValues.PropertyNames) oldValues[pn] = entry.OriginalValues[pn]; try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"!!! 감사 로그 Deleted 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } } else if (entry.State == EntityState.Modified) { foreach (var pn in entry.OriginalValues.PropertyNames) { var ov = entry.OriginalValues[pn]; var cv = entry.CurrentValues[pn]; if (!Equals(ov, cv)) { affectedColumns.Add(pn); oldValues[pn] = ov; newValues[pn] = cv; } } if (affectedColumns.Any()) { auditEntry.AffectedColumns = string.Join(",", affectedColumns); try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"!!! 감사 로그 Modified Old 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } try { auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"!!! 감사 로그 Modified New 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; } } else continue; } auditEntries.Add(auditEntry); } UpdateLockerAssignmentTimestamps(changedEntries); return auditEntries; }
+        private void UpdateLockerAssignmentTimestamps(List<DbEntityEntry> changedEntries) { var lockerEntries = changedEntries.Where(e => e.Entity is LockerAssignment && (e.State == EntityState.Added || e.State == EntityState.Modified)); foreach (var entry in lockerEntries) { ((LockerAssignment)entry.Entity).LastUpdated = DateTime.Now; } }
+        #endregion
+
+        #region Error Logging Helpers
+        private void LogDbUpdateException(DbUpdateException dbEx) { Debug.WriteLine($"!!! DbUpdateException 발생: {dbEx.Message}"); var innerEx = dbEx.InnerException; while (innerEx != null) { Debug.WriteLine($"  InnerException: {innerEx.Message}"); innerEx = innerEx.InnerException; } foreach (var entry in dbEx.Entries) { Debug.WriteLine($"  - 오류 엔티티: {entry.Entity.GetType().Name}, 상태: {entry.State}"); } }
+        private void LogValidationErrors(DbEntityValidationException vex) { Debug.WriteLine($"!!! DbEntityValidationException 발생: {vex.Message}"); foreach (var validationErrors in vex.EntityValidationErrors) { Debug.WriteLine($"  - 엔티티 타입: {validationErrors.Entry.Entity.GetType().Name}, 상태: {validationErrors.Entry.State}"); foreach (var validationError in validationErrors.ValidationErrors) { Debug.WriteLine($"    - 속성: {validationError.PropertyName}, 오류: {validationError.ErrorMessage}"); } } }
         #endregion
     }
 }
 2. ViewModels/MainViewModel.cs (수정)
 
-Dispose 메서드 내부 호출을 try-catch로 감쌉니다.
+생성자 try-catch 블록에서 MessageBox 호출 시 ex.ToString()을 사용하여 상세 오류를 표시하도록 합니다.
 
 C#
 
@@ -177,7 +233,24 @@ namespace LockerManagementApp.ViewModels
 
         public MainViewModel()
         {
-            try { _context = new LockerDbContext(); } catch (Exception ex) { if (!App.IsShuttingDown) MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error); else Debug.WriteLine($"종료 중 DB 컨텍스트 생성 오류 무시됨: {ex.Message}"); StatusBarText = "DB 연결 오류!"; return; }
+            try
+            {
+                _context = new LockerDbContext();
+                StatusBarText = "데이터베이스 연결 준비 완료.";
+            }
+            catch (Exception ex)
+            {
+                // *** 수정: 생성자 오류 시 상세 메시지 표시 확인 ***
+                if (!App.IsShuttingDown)
+                {
+                    // ToString()을 사용하여 InnerException 정보 포함
+                    MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+                else { Debug.WriteLine($"종료 중 DB 컨텍스트 생성 오류 무시됨: {ex.Message}"); }
+                StatusBarText = "DB 연결 오류!";
+                return; // 초기화 중단
+            }
+
             _lockerAssignments = new ObservableCollection<LockerAssignment>(); _allLockerTypes = new ObservableCollection<LockerType>(); _allFloors = new ObservableCollection<Floor>(); _allZones = new ObservableCollection<Zone>(); _allSubParts = new ObservableCollection<SubPart>(); _allAdministrators = new ObservableCollection<Administrator>();
             LogVM = new LogViewModel();
             LoadDataCommand = new RelayCommand(async _ => await LoadInitialDataAsync(), CanExecuteCommand); SaveChangesCommand = new RelayCommand(async _ => await SaveChangesAsync(), CanSaveChangesExecute); AddNewCommand = new RelayCommand(AddNewLocker, CanExecuteCommand); DeleteCommand = new RelayCommand(async _ => await DeleteSelectedAsync(), CanDeleteExecute); ClearAssignmentCommand = new RelayCommand(ClearSelectedAssignment, CanClearAssignmentExecute); CheckMasterPasswordCommand = new RelayCommand(CheckMasterPassword, CanExecuteCommand); RefreshMasterDataCommand = new RelayCommand(async _ => await LoadMasterDataAsync(), CanExecuteCommand); OpenMasterDataWindowCommand = new RelayCommand(OpenMasterDataWindow, CanExecuteCommand);
@@ -222,130 +295,63 @@ namespace LockerManagementApp.ViewModels
         #endregion
 
         #region IDisposable 구현 (Dispose 내부 try-catch 추가)
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposed)
-            {
-                _disposed = true;
-                if (disposing)
-                {
-                    Debug.WriteLine("MainViewModel Dispose 시작...");
-                    try { _cts?.Cancel(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CancellationTokenSource Cancel 오류: {ex.Message}"); }
-                    try { _cts?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CancellationTokenSource Dispose 오류: {ex.Message}"); }
-                    try { _context?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainViewModel DbContext Dispose 오류: {ex.Message}"); }
-                    try { LogVM?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! LogViewModel Dispose 오류: {ex.Message}"); }
-                    Debug.WriteLine("MainViewModel 리소스 해제 완료.");
-                }
-            }
-        }
+        protected virtual void Dispose(bool disposing) { if (!_disposed) { _disposed = true; if (disposing) { Debug.WriteLine("MainViewModel Dispose 시작..."); try { _cts?.Cancel(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CTS Cancel 오류: {ex.Message}"); } try { _cts?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainVM CTS Dispose 오류: {ex.Message}"); } try { _context?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! MainViewModel DbContext Dispose 오류: {ex.Message}"); } try { LogVM?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! LogViewModel Dispose 오류: {ex.Message}"); } Debug.WriteLine("MainViewModel 리소스 해제 완료."); } } }
         public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
         #endregion
     }
 }
-3. ViewModels/LogViewModel.cs (수정)
+3. App.config (확인용)
 
-Dispose 메서드 내부의 _context.Dispose() 호출을 try-catch로 감쌉니다.
+configSections, connectionStrings, entityFramework 섹션이 올바르게 포함되어 있는지 다시 확인합니다.
 
-C#
+XML
 
-using LockerManagementApp.Data;
-using LockerManagementApp.Models;
-using LockerManagementApp.Infrastructure;
-using System;
-using System.Collections.ObjectModel;
-using System.Data.Entity;
-using System.Diagnostics;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Input;
-using System.Data.SqlClient;
-using System.Data.Entity.Core;
-using System.Collections.Generic;
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <configSections>
+    <section name="entityFramework" type="System.Data.Entity.Internal.ConfigFile.EntityFrameworkSection, EntityFramework, Version=6.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" requirePermission="false" />
+  </configSections>
 
-namespace LockerManagementApp.ViewModels
-{
-    public class LogViewModel : ViewModelBase, IDisposable
-    {
-        private readonly LockerDbContext _context;
-        private ObservableCollection<AuditLog> _auditLogs;
-        private string _statusMessage;
-        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
-        private bool _disposed = false;
+  <appSettings>
+    <add key="MasterKey" value="admin123" />
+  </appSettings>
 
-        public ObservableCollection<AuditLog> AuditLogs { get => _auditLogs; set => SetProperty(ref _auditLogs, value); }
-        public string StatusMessage { get => _statusMessage; set => SetProperty(ref _statusMessage, value); }
-        public ICommand LoadLogsCommand { get; }
+  <connectionStrings>
+    <add name="LockerDbConnection"
+         connectionString="Server=YOUR_SERVER_NAME;Database=LockerManagementDB;Trusted_Connection=True;MultipleActiveResultSets=True;"
+         providerName="System.Data.SqlClient"/>
+  </connectionStrings>
 
-        public LogViewModel()
-        {
-            AuditLogs = new ObservableCollection<AuditLog>();
-            try { _context = new LockerDbContext(); }
-            catch (Exception ex)
-            {
-                if (!App.IsShuttingDown) MessageBox.Show($"[Log] DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error);
-                else Debug.WriteLine($"종료 중 [Log] DB 컨텍스트 생성 오류 무시됨: {ex.Message}");
-                StatusMessage = "[Log] DB 연결 오류!"; LoadLogsCommand = new RelayCommand(_ => { }, _ => !_disposed); return;
-            }
-            LoadLogsCommand = new RelayCommand(async _ => await LoadLogsAsync(), CanExecuteLoadLogs);
-            if (_context != null) { _ = LoadLogsAsync(); }
-        }
+  <startup>
+    <supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.8" />
+  </startup>
 
-        public async Task LoadLogsAsync()
-        {
-            if (!CanExecuteLoadLogs()) return;
-            StatusMessage = "로그 로딩 중...";
-            (LoadLogsCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            List<AuditLog> logs = null;
-            try
-            {
-                if (!CanExecuteLoadLogs()) return;
-                logs = await _context.AuditLogs.OrderByDescending(log => log.Timestamp).Take(1000).AsNoTracking().ToListAsync(_cts.Token);
-                if (_disposed || _cts.IsCancellationRequested) { Debug.WriteLine("LoadLogsAsync 작업 취소됨 (await 이후)."); return; }
-                Application.Current.Dispatcher.Invoke(() =>
-                {
-                    if (_disposed || _cts.IsCancellationRequested || Application.Current == null) return;
-                    AuditLogs = new ObservableCollection<AuditLog>(logs);
-                    StatusMessage = $"총 {AuditLogs.Count}개 로그 로드.";
-                });
-            }
-            catch (OperationCanceledException) { Debug.WriteLine("LoadLogsAsync 작업 취소됨."); if (!_disposed) StatusMessage = "로그 로딩 취소됨."; }
-            catch (ObjectDisposedException) { Debug.WriteLine("LoadLogsAsync 실행 중 DbContext Dispose됨."); if (!_disposed) StatusMessage = "로그 로딩 중 오류 발생 (컨텍스트 해제됨)."; }
-            catch (SqlException sqlEx) { if (CanExecuteLoadLogs() && !App.IsShuttingDown) { StatusMessage = $"로그 로딩 DB 오류: {sqlEx.Message}"; MessageBox.Show(StatusMessage, "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
-            catch (EntityException entityEx) { if (CanExecuteLoadLogs() && !App.IsShuttingDown) { StatusMessage = $"로그 로딩 EF 오류: {entityEx.Message}"; MessageBox.Show(StatusMessage, "EF 오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
-            catch (Exception ex) { if (CanExecuteLoadLogs() && !App.IsShuttingDown) { StatusMessage = $"로그 로딩 오류: {ex.Message}"; MessageBox.Show(StatusMessage, "오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
-            finally { /* finally에서는 UI 업데이트 제거됨 */ }
-        }
+  <entityFramework>
+    <defaultConnectionFactory type="System.Data.Entity.Infrastructure.LocalDbConnectionFactory, EntityFramework">
+      <parameters> <parameter value="mssqllocaldb" /> </parameters>
+    </defaultConnectionFactory>
+    <providers>
+      <provider invariantName="System.Data.SqlClient" type="System.Data.Entity.SqlServer.SqlProviderServices, EntityFramework.SqlServer" />
+    </providers>
+  </entityFramework>
+</configuration>
+ 1 핵심 변경 사항 및 확인:   
+1.
+learn.microsoft.com
+learn.microsoft.com
 
-        private bool CanExecuteLoadLogs(object parameter = null) => !_disposed && _context != null && !_cts.IsCancellationRequested;
+LockerDbContext.cs:
+GetConnectionString 메서드에 try-catch를 추가하여 App.config 파일 자체를 읽거나 해석하는 중 발생하는 ConfigurationErrorsException을 잡고 명확한 예외를 다시 던지도록 수정했습니다.
+생성자에서 DB 연결 테스트 코드는 주석 처리했습니다 (선택 사항).
+MainViewModel.cs / LogViewModel.cs:
+생성자의 DbContext 생성 catch 블록에서 App.IsShuttingDown 플래그를 확인하여, 종료 중이 아닐 때만 MessageBox를 표시하도록 수정했습니다.
+App.xaml.cs:
+전역 예외 처리기 설정(SetupGlobalExceptionHandling)이 OnStartup에서 호출되는지 확인합니다.
+DispatcherUnhandledException 핸들러에서 e.Handled = true가 설정되어 있는지 확인합니다.
+LogAndShowException 메서드에서 !App.IsShuttingDown 조건을 확인하여 종료 중에는 MessageBox를 표시하지 않도록 합니다.
+다음 단계 및 진단:
 
-        #region IDisposable 구현 (Dispose 내부 try-catch 추가)
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposed)
-            {
-                 _disposed = true;
-                if (disposing)
-                {
-                    Debug.WriteLine("LogViewModel Dispose 시작...");
-                    try { _cts?.Cancel(); } catch (Exception ex) { Debug.WriteLine($"!!! LogVM CancellationTokenSource Cancel 오류: {ex.Message}"); }
-                    try { _cts?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! LogVM CancellationTokenSource Dispose 오류: {ex.Message}"); }
-                    // *** 수정: DbContext Dispose 호출을 try-catch로 감쌈 ***
-                    try { _context?.Dispose(); } catch (Exception ex) { Debug.WriteLine($"!!! LogViewModel DbContext Dispose 오류: {ex.Message}"); }
-                    Debug.WriteLine("LogViewModel 리소스 해제 완료.");
-                }
-            }
-        }
-        public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
-        #endregion
-    }
-}
-핵심 변경 사항:
-
-App.xaml.cs: SetupGlobalExceptionHandling 호출이 OnStartup에 있는지, DispatcherUnhandledException 핸들러에 e.Handled = true가 있는지 확인합니다. LogAndShowException에서 !App.IsShuttingDown 조건으로 종료 시 메시지 박스를 막습니다.
-MainViewModel.cs / LogViewModel.cs: Dispose 메서드 내부에서 _context.Dispose() 및 다른 Dispose 호출(예: LogVM.Dispose())을 각각 try-catch 블록으로 감쌌습니다. 이를 통해 Dispose 과정 자체에서 예외가 발생하더라도 상위로 전파되어 앱이 비정상 종료되는 것을 방지하고, 대신 오류를 디버그 출력 창에 기록합니다.
-LockerDbContext.cs: 생성자에서 연결 문자열을 명시적으로 읽어오도록 수정했습니다 (GetConnectionString 메서드 사용). 이는 특정 ViewModel에서만 연결 문자열을 찾지 못하는 문제를 해결하는 데 도움이 될 수 있습니다.
-디버깅 강조:
-
-만약 이 코드를 적용한 후에도 종료 시 "초기화 오류" 창이 계속 나타난다면, 이는 App.xaml.cs의 전역 예외 처리기가 제대로 동작하지 않거나(e.Handled = true 누락 등), 예상치 못한 스레드에서 예외가 발생하여 처리기를 우회하는 등 더 깊은 문제가 있을 수 있습니다.
+코드 적용 및 빌드: 위 코드로 해당 파일들을 업데이트하고 솔루션 정리 및 다시 빌드를 수행합니다.
+오류 재현: 프로그램을 실행했다가 정상적으로 종료합니다.
+오류 확인:
+만약 여전히 "초기화 오류" 시스템 창이 뜬다면: 이는 App.xaml.cs의 전역 예외 처리기가 제대로 동작하지 않거나(특히 DispatcherUnhandledException의 e.Handled = true 부분), 또는 처리기가 잡을 수 없는 매우 낮은 수준의 오류일 수 있습니다. 이 경우, Visual Studio의 출력(Output) 창이나 Windows 이벤트 뷰어의 애플리케이션 로그에 더 자세한 정보가 있는지 확인해야 합니다.
