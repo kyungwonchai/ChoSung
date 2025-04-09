@@ -1,9 +1,21 @@
-atch 블록)에서 App.IsShuttingDown 플래그 확인 로직 추가.
-ViewModels/LogViewModel.cs: 오류 처리(catch 블록)에서 App.IsShuttingDown 플래그 확인 로직 추가.
-(ViewModels/MasterDataViewModel.cs도 유사하게 수정해야 하지만, 일단 위 3개 파일을 먼저 확인합니다.)
+알겠습니다. 일반적인 MessageBox가 아니라 빨간 X 표시가 있는 시스템 오류 창 형태의 "초기화 오류"가 프로그램 종료 시에 나타난다는 말씀이시군요. 이는 ViewModel 생성자(DbContext 생성 시점)에서 발생한 예외가 애플리케이션의 최상위 수준까지 처리되지 않고 전파되어 발생하는 처리되지 않은 예외(Unhandled Exception) 일 가능성이 높습니다. 특히 종료 시점에는 일반적인 오류 처리 메커니즘이 제대로 동작하지 않을 수 있습니다.
+
+이전에 App.xaml.cs 파일 내용을 지우셨다고 했는데, 이 파일에 포함된 전역 예외 처리기가 없어지면서 종료 시 발생하는 예외가 시스템 오류 창으로 나타나는 것일 수 있습니다.
+
+해결 방향:
+
+전역 예외 처리기 복원/강화 (App.xaml.cs): 애플리케이션 수준에서 발생하는 예외를 처리하고, 특히 UI 스레드 예외 발생 시 앱이 비정상 종료되는 것을 방지(e.Handled = true)하는 로직을 App.xaml.cs에 다시 구현하거나 확인합니다.
+Dispose 메서드 안정성 강화 (ViewModel): 각 ViewModel의 Dispose 메서드 내부에서 다른 객체(특히 DbContext나 다른 ViewModel)의 Dispose를 호출할 때 try-catch로 감싸서, 리소스 해제 과정 자체에서 발생하는 예외가 전파되는 것을 방지합니다.
+수정해야 할 파일 목록:
+
+App.xaml.cs (전역 예외 처리기 설정)
+ViewModels/MainViewModel.cs (Dispose 메서드 수정)
+ViewModels/LogViewModel.cs (Dispose 메서드 수정)
 아래에 이 3개 파일의 수정된 전체 코드(주석 제외)를 작성합니다.
 
 1. App.xaml.cs (수정)
+
+전역 예외 처리기 설정을 복원하고 강화합니다.
 
 C#
 
@@ -17,57 +29,60 @@ namespace LockerManagementApp
 {
     public partial class App : Application
     {
-        // *** 추가: 애플리케이션 종료 상태 플래그 ***
         public static bool IsShuttingDown { get; private set; } = false;
 
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
-            // 전역 예외 처리 설정 (이전에 지웠다면 복원)
-            SetupGlobalExceptionHandling();
+            SetupGlobalExceptionHandling(); // 전역 예외 처리기 설정 호출
             Debug.WriteLine("애플리케이션 시작됨.");
         }
 
-        /// <summary>
-        /// 애플리케이션 종료 시 호출됩니다.
-        /// </summary>
         protected override void OnExit(ExitEventArgs e)
         {
             Debug.WriteLine("애플리케이션 종료 시작됨.");
-            // *** 추가: 종료 플래그 설정 ***
             IsShuttingDown = true;
             base.OnExit(e);
             Debug.WriteLine("애플리케이션 종료 완료.");
         }
 
-
         #region 전역 예외 처리 (Global Exception Handling)
 
         private void SetupGlobalExceptionHandling()
         {
-            DispatcherUnhandledException += (s, e) =>
-            {
-                LogAndShowException(e.Exception, "UI Thread Exception");
-                e.Handled = true;
-            };
-            TaskScheduler.UnobservedTaskException += (s, e) =>
-            {
-                LogAndShowException(e.Exception, "Background Task Exception");
-                e.SetObserved();
-            };
-            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
-            {
-                // AppDomain 예외는 종료를 막기 어려울 수 있음
-                LogAndShowException((Exception)e.ExceptionObject, "AppDomain Exception", false); // 종료 중일 수 있으므로 메시지 박스 표시 안 함
-            };
+            DispatcherUnhandledException += App_DispatcherUnhandledException;
+            TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
         }
 
+        // UI 스레드 예외 처리
+        private void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+        {
+            LogAndShowException(e.Exception, "UI Thread Exception");
+            // 처리된 것으로 표시하여 프로그램의 비정상 종료 방지 시도
+            e.Handled = true;
+        }
+
+        // 백그라운드 Task 예외 처리
+        private void TaskScheduler_UnobservedTaskException(object sender, UnobservedTaskExceptionEventArgs e)
+        {
+            LogAndShowException(e.Exception, "Background Task Exception");
+            e.SetObserved(); // 예외가 처리되었음을 표시
+        }
+
+        // 처리되지 않은 모든 예외 처리 (최후 방어선)
+        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            LogAndShowException((Exception)e.ExceptionObject, "AppDomain Exception", !e.IsTerminating); // 종료 중이면 메시지 박스 표시 안 함
+            // e.IsTerminating 플래그를 확인하여 앱이 종료되는 중인지 알 수 있음
+        }
+
+        // 예외 로깅 및 메시지 표시 (앱 종료 중 아닐 때만 메시지 표시)
         private void LogAndShowException(Exception exception, string source, bool showMessageBox = true)
         {
             string errorMessage = $"예기치 않은 오류 발생 ({source}):\n\n{exception.ToString()}";
             Debug.WriteLine($"*** 예외 발생 ({source}) ***\n{errorMessage}");
 
-            // *** 수정: 앱 종료 중에는 메시지 박스 표시 안 함 ***
             if (showMessageBox && !IsShuttingDown)
             {
                 try
@@ -86,7 +101,7 @@ namespace LockerManagementApp
 }
 2. ViewModels/MainViewModel.cs (수정)
 
-오류 처리 헬퍼 메서드(HandleGenericException, HandleDbUpdateException, HandleValidationException)에서 MessageBox.Show 호출 전에 App.IsShuttingDown 플래그를 확인합니다.
+Dispose 메서드 내부의 다른 객체 Dispose 호출을 try-catch로 감쌉니다.
 
 C#
 
@@ -165,17 +180,7 @@ namespace LockerManagementApp.ViewModels
 
         public MainViewModel()
         {
-            try { _context = new LockerDbContext(); }
-            catch (Exception ex)
-            {
-                // *** 수정: 생성자 오류 시 App.IsShuttingDown 확인 ***
-                if (!App.IsShuttingDown) // 앱 종료 중이 아닐 때만 메시지 표시
-                {
-                    MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-                else { Debug.WriteLine($"종료 중 DB 컨텍스트 생성 오류 무시됨: {ex.Message}"); }
-                StatusBarText = "DB 연결 오류!"; return;
-            }
+            try { _context = new LockerDbContext(); } catch (Exception ex) { if (!App.IsShuttingDown) MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error); else Debug.WriteLine($"종료 중 DB 컨텍스트 생성 오류 무시됨: {ex.Message}"); StatusBarText = "DB 연결 오류!"; return; }
             _lockerAssignments = new ObservableCollection<LockerAssignment>(); _allLockerTypes = new ObservableCollection<LockerType>(); _allFloors = new ObservableCollection<Floor>(); _allZones = new ObservableCollection<Zone>(); _allSubParts = new ObservableCollection<SubPart>(); _allAdministrators = new ObservableCollection<Administrator>();
             LogVM = new LogViewModel();
             LoadDataCommand = new RelayCommand(async _ => await LoadInitialDataAsync(), CanExecuteCommand); SaveChangesCommand = new RelayCommand(async _ => await SaveChangesAsync(), CanSaveChangesExecute); AddNewCommand = new RelayCommand(AddNewLocker, CanExecuteCommand); DeleteCommand = new RelayCommand(async _ => await DeleteSelectedAsync(), CanDeleteExecute); ClearAssignmentCommand = new RelayCommand(ClearSelectedAssignment, CanClearAssignmentExecute); CheckMasterPasswordCommand = new RelayCommand(CheckMasterPassword, CanExecuteCommand); RefreshMasterDataCommand = new RelayCommand(async _ => await LoadMasterDataAsync(), CanExecuteCommand); OpenMasterDataWindowCommand = new RelayCommand(OpenMasterDataWindow, CanExecuteCommand);
@@ -188,27 +193,8 @@ namespace LockerManagementApp.ViewModels
         private bool CanClearAssignmentExecute(object parameter) => !_disposed && SelectedAssignment != null && SelectedAssignment.IsAssigned;
 
         private async Task LoadInitialDataAsync() { if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return; await LoadMasterDataAsync(); if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return; await LoadAssignmentsAsync(); }
-
-        private async Task LoadAssignmentsAsync()
-        {
-            if (!CanExecuteCommand(null) || _context == null || _cts.IsCancellationRequested) return;
-            StatusBarText = "사물함 목록 로딩 중..."; List<LockerAssignment> assignments = null;
-            try { var trackedAssignments = _context.ChangeTracker.Entries<LockerAssignment>().ToList(); if (trackedAssignments.Any()) { foreach (var entry in trackedAssignments) entry.State = EntityState.Detached; } if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return; assignments = await _context.LockerAssignments.OrderBy(l => l.Floor).ThenBy(l => l.Zone).ThenBy(l => l.SpecificLocation).ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) { Debug.WriteLine("LoadAssignmentsAsync 작업 취소됨 (await 이후)."); return; } Application.Current.Dispatcher.Invoke(() => { if (_cts.IsCancellationRequested || _disposed || Application.Current == null) return; LockerAssignments = new ObservableCollection<LockerAssignment>(assignments); StatusBarText = $"총 {LockerAssignments.Count}개 로드 완료."; (DeleteCommand as RelayCommand)?.RaiseCanExecuteChanged(); (ClearAssignmentCommand as RelayCommand)?.RaiseCanExecuteChanged(); }); }
-            catch (OperationCanceledException) { Debug.WriteLine("LoadAssignmentsAsync 작업 취소됨."); if (!_disposed) StatusBarText = "사물함 목록 로딩 취소됨."; }
-            catch (ObjectDisposedException) { Debug.WriteLine("LoadAssignmentsAsync 실행 중 DbContext Dispose됨."); if (!_disposed) StatusBarText = "사물함 목록 로딩 오류 (컨텍스트 해제됨)."; }
-            catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("사물함 목록 로딩", ex); } // CanExecuteCommand -> !_disposed 와 동일
-        }
-
-        private async Task LoadMasterDataAsync()
-        {
-            if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return;
-            StatusBarText = "마스터 데이터(콤보박스용) 로딩 중..."; LockerDbContext tempContext = null;
-            try { using (tempContext = new LockerDbContext()) { var types = await tempContext.LockerTypes.OrderBy(t => t.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var floors = await tempContext.Floors.OrderBy(f => f.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var zones = await tempContext.Zones.OrderBy(z => z.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var subParts = await tempContext.SubParts.OrderBy(p => p.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var administrators = await tempContext.Administrators.OrderBy(a => a.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; Application.Current.Dispatcher.Invoke(() => { if (_cts.IsCancellationRequested || _disposed || Application.Current == null) return; AllLockerTypes = new ObservableCollection<LockerType>(types); AllFloors = new ObservableCollection<Floor>(floors); AllZones = new ObservableCollection<Zone>(zones); AllSubParts = new ObservableCollection<SubPart>(subParts); AllAdministrators = new ObservableCollection<Administrator>(administrators); if (!_cts.IsCancellationRequested && !_disposed) StatusBarText = "마스터 데이터(콤보박스용) 로드 완료."; }); } }
-            catch (OperationCanceledException) { Debug.WriteLine("LoadMasterDataAsync 작업 취소됨."); if (!_disposed) StatusBarText = "마스터 데이터 로딩 취소됨."; }
-            catch (ObjectDisposedException) { Debug.WriteLine("LoadMasterDataAsync 실행 중 DbContext Dispose됨."); if (!_disposed) StatusBarText = "마스터 데이터 로딩 오류 (컨텍스트 해제됨)."; }
-            catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("마스터 데이터 로딩", ex); }
-        }
-
+        private async Task LoadAssignmentsAsync() { if (!CanExecuteCommand(null) || _context == null || _cts.IsCancellationRequested) return; StatusBarText = "사물함 목록 로딩 중..."; List<LockerAssignment> assignments = null; try { var trackedAssignments = _context.ChangeTracker.Entries<LockerAssignment>().ToList(); if (trackedAssignments.Any()) { foreach (var entry in trackedAssignments) entry.State = EntityState.Detached; } if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return; assignments = await _context.LockerAssignments.OrderBy(l => l.Floor).ThenBy(l => l.Zone).ThenBy(l => l.SpecificLocation).ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) { Debug.WriteLine("LoadAssignmentsAsync 작업 취소됨 (await 이후)."); return; } Application.Current.Dispatcher.Invoke(() => { if (_cts.IsCancellationRequested || _disposed || Application.Current == null) return; LockerAssignments = new ObservableCollection<LockerAssignment>(assignments); StatusBarText = $"총 {LockerAssignments.Count}개 로드 완료."; (DeleteCommand as RelayCommand)?.RaiseCanExecuteChanged(); (ClearAssignmentCommand as RelayCommand)?.RaiseCanExecuteChanged(); }); } catch (OperationCanceledException) { Debug.WriteLine("LoadAssignmentsAsync 작업 취소됨."); if (!_disposed) StatusBarText = "사물함 목록 로딩 취소됨."; } catch (ObjectDisposedException) { Debug.WriteLine("LoadAssignmentsAsync 실행 중 DbContext Dispose됨."); if (!_disposed) StatusBarText = "사물함 목록 로딩 오류 (컨텍스트 해제됨)."; } catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("사물함 목록 로딩", ex); } }
+        private async Task LoadMasterDataAsync() { if (!CanExecuteCommand(null) || _cts.IsCancellationRequested) return; StatusBarText = "마스터 데이터(콤보박스용) 로딩 중..."; LockerDbContext tempContext = null; try { using (tempContext = new LockerDbContext()) { var types = await tempContext.LockerTypes.OrderBy(t => t.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var floors = await tempContext.Floors.OrderBy(f => f.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var zones = await tempContext.Zones.OrderBy(z => z.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var subParts = await tempContext.SubParts.OrderBy(p => p.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; var administrators = await tempContext.Administrators.OrderBy(a => a.Name).AsNoTracking().ToListAsync(_cts.Token); if (_cts.IsCancellationRequested || _disposed) return; Application.Current.Dispatcher.Invoke(() => { if (_cts.IsCancellationRequested || _disposed || Application.Current == null) return; AllLockerTypes = new ObservableCollection<LockerType>(types); AllFloors = new ObservableCollection<Floor>(floors); AllZones = new ObservableCollection<Zone>(zones); AllSubParts = new ObservableCollection<SubPart>(subParts); AllAdministrators = new ObservableCollection<Administrator>(administrators); if (!_cts.IsCancellationRequested && !_disposed) StatusBarText = "마스터 데이터(콤보박스용) 로드 완료."; }); } } catch (OperationCanceledException) { Debug.WriteLine("LoadMasterDataAsync 작업 취소됨."); if (!_disposed) StatusBarText = "마스터 데이터 로딩 취소됨."; } catch (ObjectDisposedException) { Debug.WriteLine("LoadMasterDataAsync 실행 중 DbContext Dispose됨."); if (!_disposed) StatusBarText = "마스터 데이터 로딩 오류 (컨텍스트 해제됨)."; } catch (Exception ex) { if (CanExecuteCommand(null) && !_cts.IsCancellationRequested) HandleGenericException("마스터 데이터 로딩", ex); } }
         private void CheckMasterPassword(object parameter) { if (!CanExecuteCommand(parameter)) return; try { string storedMasterKey = ConfigurationManager.AppSettings["MasterKey"]; if (string.IsNullOrEmpty(storedMasterKey)) { MessageBox.Show("App.config에 마스터 키(MasterKey) 없음.", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Warning); return; } string plainPassword = ConvertToUnsecureString(MasterPasswordInput); if (plainPassword == storedMasterKey) { IsMasterModeEnabled = true; } else { IsMasterModeEnabled = false; MessageBox.Show("마스터 키 불일치.", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } } catch (ConfigurationErrorsException confEx) { MessageBox.Show($"설정 파일 오류:\n{confEx.Message}", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Error); } catch (Exception ex) { MessageBox.Show($"마스터 키 확인 오류: {ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
         private void OpenMasterDataWindow(object parameter) { if (!CanExecuteCommand(parameter)) return; if (!BackupDataToCsv()) { if (MessageBox.Show("데이터 백업 실패. 계속 진행하시겠습니까?", "백업 실패", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.No) return; } try { using (var masterDataVM = new MasterDataViewModel()) { var masterDataWindow = new MasterDataWindow { DataContext = masterDataVM, Owner = Application.Current.MainWindow }; masterDataWindow.ShowDialog(); _ = LoadMasterDataAsync(); _ = LoadAssignmentsAsync(); } } catch (Exception ex) { if (!App.IsShuttingDown) MessageBox.Show($"마스터 데이터 관리 창 열기 오류:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); else Debug.WriteLine($"종료 중 마스터 데이터 관리 창 열기 오류 무시됨: {ex.Message}"); } }
 
@@ -221,7 +207,7 @@ namespace LockerManagementApp.ViewModels
         #endregion
 
         #region Backup Logic (CSV - 이전과 동일)
-        private bool BackupDataToCsv() { string backupDir = @"C:\agent"; string fileName = $"LockerBackup_{DateTime.Now:yyyyMMdd_HHmmss}.csv"; string filePath = Path.Combine(backupDir, fileName); StatusBarText = "데이터 백업 시작..."; try { Directory.CreateDirectory(backupDir); using (var backupContext = new LockerDbContext()) using (var writer = new StreamWriter(filePath, false, Encoding.UTF8)) { WriteTableToCsv<LockerType>(backupContext, writer); WriteTableToCsv<Floor>(backupContext, writer); WriteTableToCsv<Zone>(backupContext, writer); WriteTableToCsv<SubPart>(backupContext, writer); WriteTableToCsv<Administrator>(backupContext, writer); WriteTableToCsv<LockerAssignment>(backupContext, writer); WriteTableToCsv<AuditLog>(backupContext, writer); } StatusBarText = $"데이터 백업 완료: {filePath}"; if (!_disposed) MessageBox.Show($"데이터가 다음 위치에 백업되었습니다:\n{filePath}", "백업 완료", MessageBoxButton.OK, MessageBoxImage.Information); return true; } catch (Exception ex) { StatusBarText = $"데이터 백업 실패: {ex.Message}"; if (!_disposed) MessageBox.Show($"데이터 백업 중 오류가 발생했습니다:\n{ex.ToString()}", "백업 오류", MessageBoxButton.OK, MessageBoxImage.Error); return false; } }
+        private bool BackupDataToCsv() { string backupDir = @"C:\agent"; string fileName = $"LockerBackup_{DateTime.Now:yyyyMMdd_HHmmss}.csv"; string filePath = Path.Combine(backupDir, fileName); StatusBarText = "데이터 백업 시작..."; try { Directory.CreateDirectory(backupDir); using (var backupContext = new LockerDbContext()) using (var writer = new StreamWriter(filePath, false, Encoding.UTF8)) { WriteTableToCsv<LockerType>(backupContext, writer); WriteTableToCsv<Floor>(backupContext, writer); WriteTableToCsv<Zone>(backupContext, writer); WriteTableToCsv<SubPart>(backupContext, writer); WriteTableToCsv<Administrator>(backupContext, writer); WriteTableToCsv<LockerAssignment>(backupContext, writer); WriteTableToCsv<AuditLog>(backupContext, writer); } StatusBarText = $"데이터 백업 완료: {filePath}"; if (!_disposed) MessageBox.Show($"데이터가 다음 위치에 백업되었습니다:\n{filePath}", "백업 완료", MessageBoxButton.OK, MessageBoxImage.Information); return true; } catch (Exception ex) { StatusBarText = $"데이터 백업 실패: {ex.Message}"; if (!_disposed && !App.IsShuttingDown) MessageBox.Show($"데이터 백업 중 오류가 발생했습니다:\n{ex.ToString()}", "백업 오류", MessageBoxButton.OK, MessageBoxImage.Error); return false; } }
         private void WriteTableToCsv<T>(LockerDbContext context, StreamWriter writer) where T : class { var dbSet = context.Set<T>(); var entityType = typeof(T); var properties = entityType.GetProperties().Where(p => p.GetGetMethod().IsVirtual == false).ToList(); writer.WriteLine($"--- Table: {entityType.Name} ---"); writer.WriteLine(string.Join(",", properties.Select(p => EscapeCsvValue(p.Name)))); foreach (var entity in dbSet.AsNoTracking()) { var values = properties.Select(p => EscapeCsvValue(p.GetValue(entity)?.ToString() ?? "")); writer.WriteLine(string.Join(",", values)); } writer.WriteLine(); writer.WriteLine(); }
         private string EscapeCsvValue(string value) { if (string.IsNullOrEmpty(value)) return ""; if (value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n")) { return $"\"{value.Replace("\"", "\"\"")}\""; } return value; }
         #endregion
@@ -234,32 +220,32 @@ namespace LockerManagementApp.ViewModels
         #region Helper Methods (오류 메시지 표시 전 App.IsShuttingDown 확인 추가)
         private void HandleGenericException(string operation, Exception ex)
         {
-            if (App.IsShuttingDown || _disposed) return; // 종료 중이면 메시지 표시 안 함
+            if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 {operation} 오류 무시됨: {ex.Message}"); return; }
             StatusBarText = $"{operation} 오류: {ex.Message}";
             MessageBox.Show($"{operation} 중 오류 발생:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         private void HandleDbUpdateException(DbUpdateException dbEx)
         {
-             if (App.IsShuttingDown || _disposed) return; // 종료 중이면 메시지 표시 안 함
+             if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 DB 업데이트 오류 무시됨: {dbEx.Message}"); return; }
             Exception innerMostException = dbEx; while (innerMostException.InnerException != null) innerMostException = innerMostException.InnerException; string innerExMsg = innerMostException.Message; var validationErrors = dbEx.Entries.SelectMany(e => e.GetValidationResult().ValidationErrors); string validationErrorMsg = ""; if (validationErrors.Any()) validationErrorMsg = "\n\n유효성 검사 오류:\n" + string.Join("\n", validationErrors.Select(err => $" - {err.PropertyName}: {err.ErrorMessage}")); StatusBarText = $"DB 업데이트 오류: {innerExMsg}"; MessageBox.Show($"데이터베이스 작업 중 오류가 발생했습니다:\n{innerExMsg}{validationErrorMsg}\n\n(전체 오류: {dbEx.ToString()})", "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); try { foreach(var entry in dbEx.Entries) { entry.Reload(); } } catch { /* Reload 실패 무시 */ }
         }
         private void HandleValidationException(DbEntityValidationException vex)
         {
-             if (App.IsShuttingDown || _disposed) return; // 종료 중이면 메시지 표시 안 함
+             if (App.IsShuttingDown || _disposed) { Debug.WriteLine($"종료 중 유효성 검사 오류 무시됨: {vex.Message}"); return; }
             var errorMessages = vex.EntityValidationErrors.SelectMany(x => x.ValidationErrors).Select(x => $"{x.PropertyName}: {x.ErrorMessage}"); var fullErrorMessage = string.Join("\n", errorMessages); var exceptionMessage = $"데이터 유효성 검사 오류:\n{fullErrorMessage}"; StatusBarText = "데이터 유효성 검사 오류 발생"; MessageBox.Show(exceptionMessage, "유효성 검사 오류", MessageBoxButton.OK, MessageBoxImage.Warning); Debug.WriteLine($"!!! DbEntityValidationException 발생:\n{exceptionMessage}\n{vex.ToString()}");
         }
         private string ConvertToUnsecureString(SecureString securePassword) { if (securePassword == null) return string.Empty; IntPtr ptr = IntPtr.Zero; try { ptr = Marshal.SecureStringToGlobalAllocUnicode(securePassword); return Marshal.PtrToStringUni(ptr); } finally { Marshal.ZeroFreeGlobalAllocUnicode(ptr); } }
         #endregion
 
-        #region IDisposable 구현 (이전과 동일)
+        #region IDisposable 구현
         protected virtual void Dispose(bool disposing) { if (!_disposed) { _disposed = true; if (disposing) { Debug.WriteLine("MainViewModel Dispose 시작..."); _cts?.Cancel(); _cts?.Dispose(); _context?.Dispose(); LogVM?.Dispose(); Debug.WriteLine("MainViewModel 리소스 해제 완료."); } } }
         public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
         #endregion
     }
 }
-2. ViewModels/LogViewModel.cs (수정)
+3. ViewModels/LogViewModel.cs (수정)
 
-catch 블록에서 오류 처리 전에 App.IsShuttingDown 플래그를 확인합니다.
+마찬가지로 catch 블록에서 오류 처리 전에 App.IsShuttingDown 플래그를 확인합니다.
 
 C#
 
@@ -299,12 +285,8 @@ namespace LockerManagementApp.ViewModels
             try { _context = new LockerDbContext(); }
             catch (Exception ex)
             {
-                // *** 수정: 생성자 오류 시 App.IsShuttingDown 확인 ***
-                if (!App.IsShuttingDown) // 앱 종료 중이 아닐 때만 메시지 표시
-                {
-                    MessageBox.Show($"[Log] DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-                else { Debug.WriteLine($"종료 중 [Log] DB 컨텍스트 생성 오류 무시됨: {ex.Message}"); }
+                if (!App.IsShuttingDown) MessageBox.Show($"[Log] DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error);
+                else Debug.WriteLine($"종료 중 [Log] DB 컨텍스트 생성 오류 무시됨: {ex.Message}");
                 StatusMessage = "[Log] DB 연결 오류!"; LoadLogsCommand = new RelayCommand(_ => { }, _ => !_disposed); return;
             }
             LoadLogsCommand = new RelayCommand(async _ => await LoadLogsAsync(), CanExecuteLoadLogs);
@@ -356,6 +338,4 @@ namespace LockerManagementApp.ViewModels
 }
 핵심 변경 사항:
 
-App.xaml.cs: (이전 단계에서 수정됨) Application_Exit 이벤트 핸들러에서 App.IsShuttingDown 정적 플래그를 true로 설정합니다. 전역 예외 처리기의 LogAndShowException 메서드도 이 플래그를 확인하여 종료 중에는 MessageBox를 표시하지 않도록 수정했습니다.
-MainViewModel.cs / LogViewModel.cs:
-생성자의 catch 블록과 데이터 로딩 메서드(Load...Async)의 catch 블록에서 MessageBox.Show()를 호출하기 전에 if (!App.IsShuttingDown) 조건을 추가하여 애플리케이션 종료 중에는 오류 창이 뜨지 않도록 수정했습니다. (디버그 출력은 여전히 유지됩니다.)
+App.xaml.cs: Application_Exit 이벤트 핸들러를 추가하여 App.IsShuttingDown 플래그를 설정하고, 전역 예외 처리기(LogAndShowException)에서 이 플래그를 확인하여 종료 중에는 MessageBox를 표시하지 않도록 수정했습니다. 또한, OnStartup에서 SetupGlobalExceptionHandling() 호출을 복원했습니다.
