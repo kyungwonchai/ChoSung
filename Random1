@@ -1,11 +1,15 @@
-네, 알겠습니다. 디버그 로그가 무한대로 출력되는 현상은 로그를 기록하는 로직 자체가 또 다른 변경으로 감지되어 다시 로그를 생성하려고 시도하면서 발생하는 무한 루프일 가능성이 매우 높습니다.
+ 정말 죄송합니다. 디버그 로그는 정상적으로 보이는데 실제 로그 저장이 안 되고, 이제는 저장 시 "변경 엔티티 감지됨" 로그가 무한으로 출력된다면, SaveChanges 재정의 로직 자체에 문제가 있는 것이 확실해 보입니다.
 
-LockerDbContext.cs의 SaveChanges/SaveChangesAsync 메서드가 호출될 때 CreateAuditEntries가 실행되고, 여기서 생성된 AuditLog 객체가 AuditLogs.AddRange()를 통해 컨텍스트에 추가됩니다. 이때 추가된 AuditLog 객체 자체가 'Added' 상태가 되는데, CreateAuditEntries 메서드 내부에서 이 AuditLog 객체의 변경을 제대로 건너뛰지 못하면, 다음번 변경 감지 시 이 AuditLog 객체에 대한 로그를 또 생성하려고 시도하게 되어 무한 루프가 발생할 수 있습니다.
+문제 원인 재분석:
 
-해결 방법:
+SaveChanges 메서드 안에서 로그를 생성(CreateAuditEntries)하고 컨텍스트에 추가(AuditLogs.AddRange)한 뒤 base.SaveChanges()를 호출하는 현재 구조는, base.SaveChanges()가 호출될 때 원본 데이터 변경과 로그 데이터 추가를 모두 처리하게 됩니다. 이때 AuditLog 엔티티가 Added 상태로 추가되는 것 자체가 DbContext에게는 또 다른 '변경 사항'으로 인식될 수 있습니다. 만약 어떤 이유로든 base.SaveChanges() 호출 이후에도 DbContext가 여전히 변경 사항이 있다고 판단하거나, SaveChanges 메서드가 비정상적으로 다시 호출되는 상황이 발생하면, 로그 추가 -> 저장 -> 변경 감지 -> 로그 추가 -> 저장... 의 무한 루프가 발생할 수 있습니다.
 
-CreateAuditEntries 메서드 내부의 foreach 루프 시작 부분에서, 현재 처리 중인 엔티티가 AuditLog 타입인지 가장 먼저 확인하고, 맞다면 즉시 다음 엔티티로 넘어가도록 (continue) 하여 AuditLog 자체에 대한 로그 생성을 확실하게 방지합니다. 또한, 진단을 위해 추가했던 AddRange 이후의 ChangeTracker 확인 로그는 제거하여 혼란을 줄입니다.
+해결 방법 (로직 변경):
 
+로그 저장을 원본 데이터 저장과 분리하는 방식으로 변경합니다.
+
+SaveChanges 재정의 메서드에서 원본 데이터 변경만 먼저 저장 (base.SaveChanges() 호출).
+원본 데이터 저장이 성공했을 경우(result > 0), 그 후에 로그를 생성(CreateAuditEntries)하고 별도로 로그만 저장합니다. 로그 저장 시에는 오류가 발생해도 원본 데이터 저장 결과에 영향을 주지 않도록 try-catch로 감쌉니다.
 수정해야 할 파일 목록:
 
 Data/LockerDbContext.cs
@@ -73,103 +77,141 @@ namespace LockerManagementApp.Data
             return result;
         }
 
-        #region SaveChanges Overrides for Audit Logging (무한 루프 방지)
+        #region SaveChanges Overrides for Audit Logging (로그 저장 분리)
 
         public override int SaveChanges()
         {
             Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChanges(동기) Override 시작...");
+            // 1. 로그 생성을 위해 변경 전 상태 캡처
             List<AuditLog> auditEntries = null;
-            try
-            {
-                auditEntries = CreateAuditEntries(false); // isMaster는 기본값 false 전달
-                Debug.WriteLine($"  -> 생성된 로그 수 = {auditEntries?.Count ?? 0}");
-            }
+            try { auditEntries = CreateAuditEntries(false); Debug.WriteLine($"  -> 생성된 로그 수 = {auditEntries?.Count ?? 0}"); }
             catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
 
-            if (auditEntries != null && auditEntries.Any())
-            {
-                try
-                {
-                    Debug.WriteLine($"  -> 로그 {auditEntries.Count}개 AddRange 시도...");
-                    this.AuditLogs.AddRange(auditEntries);
-                    Debug.WriteLine($"  -> 로그 AddRange 완료.");
-                }
-                catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 AddRange 중 오류 발생: {ex.ToString()}"); }
-            }
-            else { Debug.WriteLine("  -> 추가할 로그 없음 (변경 없거나 로그 생성 실패)."); }
-
+            int result = 0;
             try
             {
-                Debug.WriteLine($"  -> base.SaveChanges() 호출 시도...");
-                var result = base.SaveChanges();
-                Debug.WriteLine($"  -> base.SaveChanges() 완료. 결과 = {result}");
-                return result;
+                // 2. 원본 데이터 변경 사항만 먼저 저장
+                Debug.WriteLine($"  -> base.SaveChanges() 호출 시도 (원본 데이터)...");
+                result = base.SaveChanges();
+                Debug.WriteLine($"  -> base.SaveChanges() 완료 (원본 데이터). 결과 = {result}");
             }
             catch (DbEntityValidationException vex) { LogValidationErrors(vex); throw; }
             catch (DbUpdateException dbEx) { LogDbUpdateException(dbEx); throw; }
             catch (Exception ex) { Debug.WriteLine($"!!! SaveChanges 중 일반 오류 (동기): {ex.ToString()}"); throw; }
-            finally { Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChanges(동기) Override 종료."); }
-        }
 
-        // isMaster 파라미터를 받는 SaveChangesAsync 오버로드
-        public async Task<int> SaveChangesAsync(bool isMaster)
-        {
-             Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(비동기, isMaster={isMaster}) Override 시작...");
-             List<AuditLog> auditEntries = null;
-            try
-            {
-                auditEntries = CreateAuditEntries(isMaster); // isMaster 전달
-                Debug.WriteLine($"  -> 생성된 로그 수 = {auditEntries?.Count ?? 0}");
-            }
-            catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
-
-            if (auditEntries != null && auditEntries.Any())
+            // 3. 원본 저장이 성공했고 생성된 로그가 있으면 로그만 별도로 저장
+            if (result > 0 && auditEntries != null && auditEntries.Any())
             {
                 try
                 {
-                    Debug.WriteLine($"  -> 로그 {auditEntries.Count}개 AddRange 시도...");
+                    Debug.WriteLine($"  -> 로그 {auditEntries.Count}개 AddRange 및 SaveChanges 시도...");
                     this.AuditLogs.AddRange(auditEntries);
-                    Debug.WriteLine($"  -> 로그 AddRange 완료.");
+                    base.SaveChanges(); // 로그만 저장 (별도 트랜잭션 또는 컨텍스트 관리 필요 시 수정)
+                    Debug.WriteLine($"  -> 로그 저장 완료.");
                 }
-                catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 AddRange 중 오류 발생: {ex.ToString()}"); }
+                catch (Exception ex)
+                {
+                    // 로그 저장 실패는 기록만 하고 무시 (원본 작업은 이미 커밋됨)
+                    Debug.WriteLine($"!!! 감사 로그 저장 실패 (동기): {ex.ToString()}");
+                }
             }
-             else { Debug.WriteLine("  -> 추가할 로그 없음 (변경 없거나 로그 생성 실패)."); }
+            else if (result <= 0) { Debug.WriteLine("  -> 원본 데이터 변경 없음. 로그 저장 안 함."); }
+            else { Debug.WriteLine("  -> 추가할 로그 없음."); }
 
+            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChanges(동기) Override 종료.");
+            return result; // 원본 데이터 저장 결과 반환
+        }
+
+        public override async Task<int> SaveChangesAsync()
+        {
+             Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(비동기) Override 시작...");
+             List<AuditLog> auditEntries = null;
+            try { auditEntries = CreateAuditEntries(false); Debug.WriteLine($"  -> 생성된 로그 수 = {auditEntries?.Count ?? 0}"); }
+            catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
+
+            int result = 0;
             try
             {
-                Debug.WriteLine($"  -> base.SaveChangesAsync() 호출 시도...");
-                var result = await base.SaveChangesAsync(); // CancellationToken 없는 기본 오버로드 호출
-                Debug.WriteLine($"  -> base.SaveChangesAsync() 완료. 결과 = {result}");
-                return result;
+                Debug.WriteLine($"  -> base.SaveChangesAsync() 호출 시도 (원본 데이터)...");
+                result = await base.SaveChangesAsync(); // 원본 데이터 변경 사항만 먼저 저장
+                Debug.WriteLine($"  -> base.SaveChangesAsync() 완료 (원본 데이터). 결과 = {result}");
             }
             catch (DbEntityValidationException vex) { LogValidationErrors(vex); throw; }
             catch (DbUpdateException dbEx) { LogDbUpdateException(dbEx); throw; }
             catch (Exception ex) { Debug.WriteLine($"!!! SaveChangesAsync 중 일반 오류 (비동기): {ex.ToString()}"); throw; }
-            finally { Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(비동기) Override 종료."); }
+
+            if (result > 0 && auditEntries != null && auditEntries.Any())
+            {
+                try
+                {
+                    Debug.WriteLine($"  -> 로그 {auditEntries.Count}개 AddRange 및 SaveChangesAsync 시도...");
+                    this.AuditLogs.AddRange(auditEntries);
+                    await base.SaveChangesAsync(); // 로그만 저장
+                    Debug.WriteLine($"  -> 로그 저장 완료.");
+                }
+                catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 저장 실패 (비동기): {ex.ToString()}"); }
+            }
+             else if (result <= 0) { Debug.WriteLine("  -> 원본 데이터 변경 없음. 로그 저장 안 함."); }
+             else { Debug.WriteLine("  -> 추가할 로그 없음."); }
+
+            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(비동기) Override 종료.");
+            return result; // 원본 데이터 저장 결과 반환
         }
 
-        // CancellationToken을 받는 SaveChangesAsync 오버라이드는 isMaster=false로 위임
-        public override Task<int> SaveChangesAsync(CancellationToken cancellationToken)
+        // isMaster 파라미터를 받는 SaveChanges 오버로드는 제거하거나, 위 로직을 반영하여 수정해야 합니다.
+        // ViewModel에서는 이제 기본 SaveChanges/SaveChangesAsync만 호출하면 됩니다.
+        // public int SaveChanges(bool isMaster) { ... }
+        // public Task<int> SaveChangesAsync(bool isMaster) { ... }
+
+        // CancellationToken을 받는 SaveChangesAsync 오버라이드
+        public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken)
         {
-            Debug.WriteLine($"경고: SaveChangesAsync(CancellationToken) 오버라이드가 호출되었습니다. isMaster=false로 처리합니다.");
-            // CancellationToken은 현재 로직에서 명시적으로 사용하지 않으므로 isMaster 받는 버전 호출
-            return SaveChangesAsync(false);
+             Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(CancellationToken) Override 시작...");
+             List<AuditLog> auditEntries = null;
+            try { auditEntries = CreateAuditEntries(false); Debug.WriteLine($"  -> 생성된 로그 수 = {auditEntries?.Count ?? 0}"); } // isMaster 기본값 false
+            catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}"); }
+
+            int result = 0;
+            try
+            {
+                Debug.WriteLine($"  -> base.SaveChangesAsync(cancellationToken) 호출 시도 (원본 데이터)...");
+                result = await base.SaveChangesAsync(cancellationToken); // 원본 데이터 저장 + CancellationToken 전달
+                Debug.WriteLine($"  -> base.SaveChangesAsync(cancellationToken) 완료 (원본 데이터). 결과 = {result}");
+            }
+            catch (DbEntityValidationException vex) { LogValidationErrors(vex); throw; }
+            catch (DbUpdateException dbEx) { LogDbUpdateException(dbEx); throw; }
+            catch (OperationCanceledException) { Debug.WriteLine("SaveChangesAsync(CancellationToken) 작업 취소됨."); throw; } // 취소 예외는 다시 던짐
+            catch (Exception ex) { Debug.WriteLine($"!!! SaveChangesAsync(CancellationToken) 중 일반 오류 (비동기): {ex.ToString()}"); throw; }
+
+            if (result > 0 && auditEntries != null && auditEntries.Any())
+            {
+                if (cancellationToken.IsCancellationRequested) { Debug.WriteLine("  -> 작업 취소 요청으로 로그 저장 건너뜀."); return result; }
+                try
+                {
+                    Debug.WriteLine($"  -> 로그 {auditEntries.Count}개 AddRange 및 SaveChangesAsync 시도...");
+                    this.AuditLogs.AddRange(auditEntries);
+                    // 로그 저장 시에는 CancellationToken을 전달하지 않거나, 별도 관리 필요
+                    await base.SaveChangesAsync(); // 로그만 저장
+                    Debug.WriteLine($"  -> 로그 저장 완료.");
+                }
+                catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 저장 실패 (비동기): {ex.ToString()}"); }
+            }
+             else if (result <= 0) { Debug.WriteLine("  -> 원본 데이터 변경 없음. 로그 저장 안 함."); }
+             else { Debug.WriteLine("  -> 추가할 로그 없음."); }
+
+            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] SaveChangesAsync(CancellationToken) Override 종료.");
+            return result;
         }
 
 
-        /// <summary>
-        /// 감사 로그 엔트리 생성 (AuditLog 자체 로깅 방지 강화)
-        /// </summary>
         private List<AuditLog> CreateAuditEntries(bool isMaster)
         {
             Debug.WriteLine("  CreateAuditEntries 시작...");
             string currentPrincipalName = System.Threading.Thread.CurrentPrincipal?.Identity?.Name;
             string userNameForLog = $"{(isMaster ? "[마스터]" : "[일반]")}{currentPrincipalName ?? "UnknownUser"}";
             var auditEntries = new List<AuditLog>();
-            var changedEntries = ChangeTracker.Entries()
-                                     .Where(e => e.State != EntityState.Unchanged &&
-                                                 e.State != EntityState.Detached)
-                                     .ToList(); // AuditLog 필터링은 루프 내에서 수행
+            // 중요: 로그를 추가하기 전에 변경된 엔티티 목록을 가져옵니다.
+            var changedEntries = ChangeTracker.Entries().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified || e.State == EntityState.Deleted).ToList();
 
             if (!changedEntries.Any()) { Debug.WriteLine("  CreateAuditEntries: 감지된 변경 엔티티 없음."); return auditEntries; }
 
@@ -178,30 +220,22 @@ namespace LockerManagementApp.Data
 
             foreach (var entry in changedEntries)
             {
-                // *** 수정: 루프 시작 시 AuditLog 타입인지 가장 먼저 확인 ***
-                if (entry.Entity is AuditLog)
-                {
-                    Debug.WriteLine("    - AuditLog 엔티티 변경 감지됨 (로깅 건너뜀).");
-                    continue; // AuditLog 자체의 변경은 로깅하지 않음
-                }
+                if (entry.Entity is AuditLog) { Debug.WriteLine("    - AuditLog 엔티티 변경 감지됨 (로깅 건너뜀)."); continue; }
 
                 var auditEntry = new AuditLog { Timestamp = DateTime.Now, UserName = userNameForLog, TableName = entry.Entity.GetType().Name, Action = entry.State.ToString() };
                 try { auditEntry.RecordId = entry.State == EntityState.Deleted ? entry.OriginalValues["Id"]?.ToString() : entry.CurrentValues["Id"]?.ToString() ?? "N/A"; } catch (Exception ex) { Debug.WriteLine($"    - 감사 로그: 'Id' PK 조회 실패 ({auditEntry.TableName}) - {ex.Message}"); auditEntry.RecordId = "PK Error"; }
                 var oldValues = new Dictionary<string, object>(); var newValues = new Dictionary<string, object>(); var affectedColumns = new List<string>();
-
-                // 값 변경 로깅 로직 (이전과 동일)
                 if (entry.State == EntityState.Added) { foreach (var pn in entry.CurrentValues.PropertyNames) newValues[pn] = entry.CurrentValues[pn]; try { auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Added 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; } }
                 else if (entry.State == EntityState.Deleted) { foreach (var pn in entry.OriginalValues.PropertyNames) oldValues[pn] = entry.OriginalValues[pn]; try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Deleted 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } }
                 else if (entry.State == EntityState.Modified) { bool hasChanges = false; foreach (var pn in entry.OriginalValues.PropertyNames) { var ov = entry.OriginalValues[pn]; var cv = entry.CurrentValues[pn]; if (!Equals(ov, cv)) { hasChanges = true; affectedColumns.Add(pn); oldValues[pn] = ov; newValues[pn] = cv; } } if (hasChanges) { auditEntry.AffectedColumns = string.Join(",", affectedColumns); try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Modified Old 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } try { auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Modified New 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; } } else { Debug.WriteLine($"    - 엔티티 {auditEntry.TableName} (ID: {auditEntry.RecordId})는 Modified 상태지만 실제 값 변경 없음. 로그 건너뜀."); continue; } }
-
                 auditEntries.Add(auditEntry);
                 Debug.WriteLine($"    - 로그 생성됨: {auditEntry.TableName}, Action: {auditEntry.Action}, RecordId: {auditEntry.RecordId}");
             }
+            // 타임스탬프 업데이트는 원본 저장 전에 수행되어야 함
             UpdateLockerAssignmentTimestamps(changedEntries);
             Debug.WriteLine("  CreateAuditEntries 종료.");
             return auditEntries;
         }
-
         private void UpdateLockerAssignmentTimestamps(List<DbEntityEntry> changedEntries) { var lockerEntries = changedEntries.Where(e => e.Entity is LockerAssignment && (e.State == EntityState.Added || e.State == EntityState.Modified)); int count = 0; foreach (var entry in lockerEntries) { ((LockerAssignment)entry.Entity).LastUpdated = DateTime.Now; count++; } if (count > 0) Debug.WriteLine($"UpdateLockerAssignmentTimestamps: {count}개 LockerAssignment 타임스탬프 업데이트됨."); }
 
         #endregion
@@ -214,17 +248,7 @@ namespace LockerManagementApp.Data
 }
 핵심 변경 사항:
 
-CreateAuditEntries 메서드: foreach (var entry in changedEntries) 루프 시작 부분에 if (entry.Entity is AuditLog) continue; 조건을 가장 먼저 배치하여, 처리 대상 엔티티가 AuditLog 자체인 경우 즉시 다음 엔티티로 넘어가도록 명확히 수정했습니다. 이를 통해 AuditLog 추가로 인해 다시 AuditLog가 생성되는 무한 루프를 방지합니다.
-SaveChanges/SaveChangesAsync 오버로드: ViewModel에서 isMaster 플래그를 전달받는 오버로드를 명확히 하고, CancellationToken만 받는 기본 오버라이드는 isMaster=false로 위임하도록 수정했습니다. (ViewModel 코드에서 SaveChangesAsync(isMaster, cancellationToken) 대신 SaveChangesAsync(isMaster)를 호출하도록 수정했으므로 이 부분은 이제 안전합니다.)
-다음 단계:
-
-코드 적용 및 빌드: 위 코드로 LockerDbContext.cs 파일을 업데이트하고 솔루션을 다시 빌드합니다.
-테스트 및 디버그 출력 확인:
-메인 화면 또는 마스터 데이터 관리 화면에서 데이터를 수정/추가/삭제하고 저장 버튼을 클릭합니다.
-Visual Studio의 출력(Output) 창을 확인합니다.
-이제 로그가 무한대로 찍히지 않아야 합니다.
-SaveChanges... Override 시작... 부터 SaveChanges... Override 종료. 까지의 로그가 한 번의 저장 작업에 대해 한 번만 나타나야 합니다.
-CreateAuditEntries: 감지된 변경 엔티티 수 = ... 가 예상한 변경 수 + 생성될 로그 수만큼 나오는지 확인합니다. (예: 사물함 1개 수정 시 -> 변경 엔티티 2개 (LockerAssignment, AuditLog))
-- 로그 생성됨: ... 메시지가 예상한 만큼(보통 1개 또는 수정된 엔티티당 1개) 나타나는지 확인합니다.
--> ChangeTracker 확인: ...개의 AuditLog 엔티티가 Added 상태임. 메시지에 예상한 로그 수가 표시되는지 확인합니다.
--> base.SaveChanges() 완료. 결과 = ... 메시지의 결과 숫자가 (원본 변경 수 + 로그 수)와 일치하는지 확인합니다.
+SaveChanges/SaveChangesAsync 로직 변경:
+메서드 시작 시 CreateAuditEntries를 호출하여 로그 목록(auditEntries)을 미리 생성합니다.
+base.SaveChanges() 또는 base.SaveChangesAsync()를 호출하여 원본 데이터 변경 사항만 먼저 저장합니다.
+원본 저장이 성공하면 (result > 0), 생성해 두었던 auditEntries를 this.AuditLogs.AddRange()로 컨텍스트에 추가하고, 다시 base.SaveChanges() 또는 base.SaveChangesAsync()를 호출하여 로그만 저장합니다.
