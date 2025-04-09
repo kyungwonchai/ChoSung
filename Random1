@@ -1,164 +1,37 @@
+송합니다. 이전에 제공된 LockerDbContext.cs 코드의 로그 기록 로직에 문제가 있었습니다. 특히 SaveChanges 메서드 내에서 로그를 저장하기 위해 base.SaveChanges()를 불필요하게 두 번 호출하는 구조였고, 기본 키(Id)를 가져오는 부분도 모든 엔티티에 적용하기에는 불안정했습니다.
 
-마스터 데이터 저장 버튼 비활성화 문제: MasterDataWindow에서 표의 값을 수정해도 저장 버튼이 활성화되지 않는 것은, 데이터를 로드할 때 AsNoTracking()을 사용하여 Entity Framework가 변경 사항을 감지하지 못하기 때문일 가능성이 높습니다. AsNoTracking()을 제거하여 엔티티가 추적되도록 수정합니다.
-사물함 관리 저장 시 에러: 메인 화면에서 저장 시 발생하는 원인 모를 에러는 데이터베이스 제약 조건 위반, 로그 기록 중 오류 등 다양한 원인이 있을 수 있습니다. DbContext의 SaveChanges 메서드에서 로그 저장 부분을 try-catch로 감싸서 로그 기록 실패가 전체 저장 작업을 방해하지 않도록 하고, 오류 발생 시 좀 더 명확한 정보를 얻도록 시도합니다.
-수정해야 할 파일 목록:
+오류를 수정한 LockerDbContext.cs 파일 전체 코드를 다시 드리겠습니다.
 
-ViewModels/MasterDataViewModel.cs (AsNoTracking 제거)
-Data/LockerDbContext.cs (로그 저장 로직 오류 처리 강화)
-ViewModels/MainViewModel.cs (오류 처리 확인 및 컨텍스트 제공용)
-아래에 이 3개 파일의 수정된 전체 코드를 작성합니다.
+수정 내용:
 
-1. ViewModels/MasterDataViewModel.cs (수정)
-
-LoadAllMasterDataAsync 메서드에서 .AsNoTracking() 호출을 제거합니다.
-
+SaveChanges / SaveChangesAsync 수정:
+변경 사항을 감지하고 로그 엔트리를 생성하는(CreateAuditEntries) 로직은 유지합니다.
+생성된 로그 엔트리(AuditLog)를 AuditLogs DbSet에 추가(AddRange) 합니다.
+단 한 번의 base.SaveChanges() 또는 base.SaveChangesAsync() 호출을 통해 원래의 변경 사항과 새로 추가된 로그 항목이 동시에 데이터베이스 트랜잭션으로 저장되도록 구조를 변경합니다.
+별도의 SaveAuditLogs / SaveAuditLogsAsync 메서드를 제거합니다.
+기본 키(RecordId) 가져오기 개선: entry.Property("Id") 대신 Entity Framework 메타데이터를 사용하여 엔티티의 기본 키 값을 더 안정적으로 가져오도록 수정합니다.
 C#
 
-using LockerManagementApp.Data;
-using LockerManagementApp.Models;
-using LockerManagementApp.Infrastructure;
-using System;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
-using System.Data.Entity;
-using System.Data.Entity.Infrastructure;
-using System.Linq;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Input;
-using System.Collections.Generic;
-using System.Diagnostics;
-
-namespace LockerManagementApp.ViewModels
-{
-    /// <summary>
-    /// 마스터 데이터 관리 ViewModel (AsNoTracking 제거)
-    /// </summary>
-    public class MasterDataViewModel : ViewModelBase, IDisposable
-    {
-        private readonly LockerDbContext _context;
-        private bool _disposed = false;
-
-        #region Observable Collections & Properties
-        public ObservableCollection<LockerType> LockerTypes { get; set; }
-        public ObservableCollection<Floor> Floors { get; set; }
-        public ObservableCollection<Zone> Zones { get; set; }
-        public ObservableCollection<SubPart> SubParts { get; set; }
-        public ObservableCollection<Administrator> Administrators { get; set; }
-        private object _selectedItem;
-        public object SelectedItem { get => _selectedItem; set { if (SetProperty(ref _selectedItem, value)) RaiseCanExecuteChanged(); } }
-        private string _statusMessage;
-        public string StatusMessage { get => _statusMessage; set => SetProperty(ref _statusMessage, value); }
-        #endregion
-
-        #region Commands
-        public ICommand LoadAllMasterDataCommand { get; }
-        public ICommand AddItemCommand { get; }
-        public ICommand DeleteItemCommand { get; }
-        public ICommand SaveChangesCommand { get; }
-        #endregion
-
-        public MasterDataViewModel()
-        {
-            try { _context = new LockerDbContext(); }
-            catch (Exception ex) { MessageBox.Show($"[MasterData] DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error); StatusMessage = "[MasterData] DB 연결 오류!"; LockerTypes = new ObservableCollection<LockerType>(); Floors = new ObservableCollection<Floor>(); Zones = new ObservableCollection<Zone>(); SubParts = new ObservableCollection<SubPart>(); Administrators = new ObservableCollection<Administrator>(); LoadAllMasterDataCommand = new RelayCommand(_ => { }, _ => false); AddItemCommand = new RelayCommand(_ => { }, _ => false); DeleteItemCommand = new RelayCommand(_ => { }, _ => false); SaveChangesCommand = new RelayCommand(_ => { }, _ => false); return; }
-
-            LockerTypes = new ObservableCollection<LockerType>(); Floors = new ObservableCollection<Floor>(); Zones = new ObservableCollection<Zone>(); SubParts = new ObservableCollection<SubPart>(); Administrators = new ObservableCollection<Administrator>();
-            LoadAllMasterDataCommand = new RelayCommand(async _ => await LoadAllMasterDataAsync());
-            AddItemCommand = new RelayCommand(AddItem, CanAddItemExecute);
-            DeleteItemCommand = new RelayCommand(DeleteItem, CanDeleteItemExecute);
-            SaveChangesCommand = new RelayCommand(async _ => await SaveMasterDataChangesAsync(), CanSaveChangesExecute);
-            if (_context != null) { _ = LoadAllMasterDataAsync(); }
-        }
-
-        #region Data Loading and CRUD Methods
-        /// <summary>
-        /// 모든 마스터 데이터를 로드합니다. (AsNoTracking 제거)
-        /// </summary>
-        public async Task LoadAllMasterDataAsync()
-        {
-             if (_context == null || _disposed) return;
-             StatusMessage = "마스터 데이터 로딩 중...";
-             try
-             {
-                 // *** 수정된 부분: AsNoTracking() 제거 ***
-                 // 엔티티 변경 추적을 위해 AsNoTracking()을 사용하지 않습니다.
-                 var lockerTypes = await _context.LockerTypes.OrderBy(x => x.Name).ToListAsync();
-                 LockerTypes.Clear(); lockerTypes.ForEach(LockerTypes.Add);
-
-                 var floors = await _context.Floors.OrderBy(x => x.Name).ToListAsync();
-                 Floors.Clear(); floors.ForEach(Floors.Add);
-
-                 var zones = await _context.Zones.OrderBy(x => x.Name).ToListAsync();
-                 Zones.Clear(); zones.ForEach(Zones.Add);
-
-                 var subParts = await _context.SubParts.OrderBy(x => x.Name).ToListAsync();
-                 SubParts.Clear(); subParts.ForEach(SubParts.Add);
-
-                 var administrators = await _context.Administrators.OrderBy(x => x.Name).ToListAsync();
-                 Administrators.Clear(); administrators.ForEach(Administrators.Add);
-
-                 StatusMessage = "마스터 데이터 로드 완료.";
-                 RaiseCanExecuteChanged(); // 로드 후 CanExecute 상태 갱신
-             }
-             catch (Exception ex)
-             {
-                 StatusMessage = $"마스터 데이터 로딩 오류: {ex.Message}";
-                 MessageBox.Show(StatusMessage, "오류", MessageBoxButton.OK, MessageBoxImage.Error);
-             }
-        }
-
-        // CanExecute 메서드 (이전과 동일, _disposed 확인 포함)
-        private bool CanAddItemExecute(object parameter) => !_disposed && _context != null && parameter is string category && !string.IsNullOrEmpty(category);
-        private bool CanDeleteItemExecute(object parameter) => !_disposed && _context != null && SelectedItem != null;
-        private bool CanSaveChangesExecute(object parameter) { if (_disposed || _context == null) return false; try { return _context.ChangeTracker.HasChanges(); } catch (ObjectDisposedException) { return false; } catch (Exception ex) { Debug.WriteLine($"CanSaveChangesExecute 확인 중 오류: {ex.Message}"); return false; } }
-
-        // AddItem, DeleteItem, GetItemName, HasAssociatedAssignments (이전과 동일)
-        private void AddItem(object parameter) { if (!CanAddItemExecute(parameter)) return; if (parameter is string category) { try { object newItem = null; switch (category.ToLower()) { case "lockertype": newItem = _context.LockerTypes.Add(new LockerType { Name = "새 종류" }); LockerTypes.Add((LockerType)newItem); break; case "floor": newItem = _context.Floors.Add(new Floor { Name = "새 층" }); Floors.Add((Floor)newItem); break; case "zone": newItem = _context.Zones.Add(new Zone { Name = "새 구역" }); Zones.Add((Zone)newItem); break; case "subpart": newItem = _context.SubParts.Add(new SubPart { Name = "새 소파트" }); SubParts.Add((SubPart)newItem); break; case "administrator": newItem = _context.Administrators.Add(new Administrator { Name = "새 관리자" }); Administrators.Add((Administrator)newItem); break; default: MessageBox.Show("알 수 없는 카테고리.", "오류"); return; } SelectedItem = newItem; StatusMessage = "새 항목 추가됨. 저장 필요."; RaiseCanExecuteChanged(); } catch (Exception ex) { StatusMessage = $"항목 추가 오류: {ex.Message}"; MessageBox.Show(StatusMessage, "오류", MessageBoxButton.OK, MessageBoxImage.Error); } } }
-        private void DeleteItem(object parameter) { if (!CanDeleteItemExecute(parameter)) return; string itemName = GetItemName(SelectedItem); if (itemName == null) return; string confirmMessage = $"'{itemName}' 삭제?"; if (HasAssociatedAssignments(SelectedItem, itemName)) { confirmMessage += "\n\n경고: 사용 중인 사물함 정보가 있습니다!"; } if (MessageBox.Show(confirmMessage, "삭제 확인", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) { try { object entityToDelete = SelectedItem; var entry = _context.Entry(entityToDelete); if (entry.State == EntityState.Detached) _context.Set(entityToDelete.GetType()).Attach(entityToDelete); entry.State = EntityState.Deleted; if (SelectedItem is LockerType lt1) LockerTypes.Remove(lt1); else if (SelectedItem is Floor f1) Floors.Remove(f1); else if (SelectedItem is Zone z1) Zones.Remove(z1); else if (SelectedItem is SubPart sp1) SubParts.Remove(sp1); else if (SelectedItem is Administrator ad1) Administrators.Remove(ad1); SelectedItem = null; StatusMessage = "항목 삭제 대기 중. 저장 필요."; RaiseCanExecuteChanged(); } catch (Exception ex) { StatusMessage = $"항목 삭제 오류: {ex.Message}"; MessageBox.Show(StatusMessage, "오류", MessageBoxButton.OK, MessageBoxImage.Error); _ = LoadAllMasterDataAsync(); } } }
-        private string GetItemName(object item) { return item?.GetType().GetProperty("Name")?.GetValue(item)?.ToString(); }
-        private bool HasAssociatedAssignments(object item, string itemName) { if (_context == null || _disposed || item == null || string.IsNullOrEmpty(itemName)) return false; try { if (item is LockerType) return _context.LockerAssignments.Any(a => a.LockerType == itemName); if (item is Floor) return _context.LockerAssignments.Any(a => a.Floor == itemName); if (item is Zone) return _context.LockerAssignments.Any(a => a.Zone == itemName); if (item is SubPart) return _context.LockerAssignments.Any(a => a.SubPart == itemName); if (item is Administrator) return _context.LockerAssignments.Any(a => a.Administrator == itemName); } catch (Exception ex) { Debug.WriteLine($"연관 데이터 확인 오류: {ex.Message}"); return true; } return false; }
-
-        // SaveMasterDataChangesAsync, RollbackMasterDataChanges, HandleDbUpdateExceptionForMasterData (이전과 동일)
-        private async Task SaveMasterDataChangesAsync() { if (!CanSaveChangesExecute(null)) { StatusMessage = "저장할 변경 사항이 없습니다."; return; } StatusMessage = "마스터 데이터 저장 중..."; List<DbEntityEntry> changesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); using (var transaction = _context.Database.BeginTransaction()) { try { Debug.WriteLine("마스터 데이터 저장 시작 - 트랜잭션 시작됨."); var modifiedNameEntries = _context.ChangeTracker.Entries().Where(e => e.State == EntityState.Modified && (e.Entity is LockerType || e.Entity is Floor || e.Entity is Zone || e.Entity is SubPart || e.Entity is Administrator)).Select(e => new { Entry = e, EntityType = e.Entity.GetType(), OriginalName = e.OriginalValues["Name"]?.ToString(), CurrentName = e.CurrentValues["Name"]?.ToString() }).Where(x => x.OriginalName != null && x.CurrentName != null && x.OriginalName != x.CurrentName).ToList(); Debug.WriteLine($"이름 변경 감지된 마스터 데이터 수: {modifiedNameEntries.Count}"); foreach (var modified in modifiedNameEntries) { StatusMessage = $"'{modified.OriginalName}' -> '{modified.CurrentName}' 연쇄 업데이트 중..."; Debug.WriteLine($"연쇄 업데이트 시도: Type={modified.EntityType.Name}, Original='{modified.OriginalName}', New='{modified.CurrentName}'"); int updatedCount = 0; string updateSql = ""; string targetColumn = ""; if (modified.EntityType == typeof(LockerType)) targetColumn = "LockerType"; else if (modified.EntityType == typeof(Floor)) targetColumn = "Floor"; else if (modified.EntityType == typeof(Zone)) targetColumn = "Zone"; else if (modified.EntityType == typeof(SubPart)) targetColumn = "SubPart"; else if (modified.EntityType == typeof(Administrator)) targetColumn = "Administrator"; if (!string.IsNullOrEmpty(targetColumn)) { updateSql = $"UPDATE LockerAssignments SET [{targetColumn}] = {{0}} WHERE [{targetColumn}] = {{1}}"; try { updatedCount = await _context.Database.ExecuteSqlCommandAsync(updateSql, modified.CurrentName, modified.OriginalName); StatusMessage = $"'{modified.OriginalName}' -> '{modified.CurrentName}' ({updatedCount}개 업데이트 완료)."; Debug.WriteLine($"  SQL 실행 성공: {updateSql} | Params: '{modified.CurrentName}', '{modified.OriginalName}' | Rows Affected: {updatedCount}"); } catch (Exception sqlEx) { Debug.WriteLine($"*** 연쇄 업데이트 SQL 실행 오류! SQL: {updateSql}, Params: '{modified.CurrentName}', '{modified.OriginalName}'\n*** 오류: {sqlEx.ToString()}"); StatusMessage = $"'{modified.OriginalName}' 연쇄 업데이트 중 오류 발생!"; throw new Exception($"연쇄 업데이트 SQL 실행 실패 ({modified.OriginalName} -> {modified.CurrentName}): {sqlEx.Message}", sqlEx); } } else { Debug.WriteLine($"  경고: 엔티티 타입 '{modified.EntityType.Name}'에 대한 대상 컬럼을 찾을 수 없습니다."); } } Debug.WriteLine("마스터 데이터 변경 사항 저장 시도 (SaveChangesAsync)..."); int masterDataChanges = await _context.SaveChangesAsync(); Debug.WriteLine($"마스터 데이터 SaveChanges 완료. 변경 건수: {masterDataChanges}"); transaction.Commit(); Debug.WriteLine("트랜잭션 커밋 완료."); StatusMessage = $"마스터 데이터 변경 사항 ({masterDataChanges}건) 및 연쇄 업데이트가 성공적으로 저장되었습니다."; } catch (DbUpdateException dbEx) { Debug.WriteLine($"*** 마스터 데이터 SaveChanges 중 DbUpdateException 발생! 트랜잭션 롤백 시도...\n*** 오류: {dbEx.ToString()}"); try { transaction.Rollback(); Debug.WriteLine("트랜잭션 롤백 완료."); } catch (Exception rbEx) { Debug.WriteLine($"*** 트랜잭션 롤백 중 오류 발생!\n*** 오류: {rbEx.ToString()}"); } HandleDbUpdateExceptionForMasterData(dbEx); RollbackMasterDataChanges(changesForRollback); } catch (Exception ex) { Debug.WriteLine($"*** 마스터 데이터 저장/연쇄 업데이트 중 오류 발생! 트랜잭션 롤백 시도...\n*** 오류: {ex.ToString()}"); try { transaction.Rollback(); Debug.WriteLine("트랜잭션 롤백 완료."); } catch (Exception rbEx) { Debug.WriteLine($"*** 트랜잭션 롤백 중 오류 발생!\n*** 오류: {rbEx.ToString()}"); } StatusMessage = $"마스터 데이터 저장 중 오류 발생: {ex.Message}"; MessageBox.Show($"{StatusMessage}\n\n자세한 내용은 출력 창을 확인하세요.", "저장 오류", MessageBoxButton.OK, MessageBoxImage.Error); RollbackMasterDataChanges(changesForRollback); } } await LoadAllMasterDataAsync(); RaiseCanExecuteChanged(); }
-        private void RollbackMasterDataChanges(List<DbEntityEntry> changedEntries) { if (_context == null || _disposed || changedEntries == null) return; foreach (var entry in changedEntries) { switch (entry.State) { case EntityState.Modified: try { entry.Reload(); } catch { entry.State = EntityState.Unchanged; } break; case EntityState.Added: entry.State = EntityState.Detached; break; case EntityState.Deleted: entry.State = EntityState.Unchanged; break; } } StatusMessage = "마스터 데이터 변경 롤백됨."; _ = LoadAllMasterDataAsync(); }
-        private void HandleDbUpdateExceptionForMasterData(DbUpdateException dbEx) { var innerExMsg = dbEx.InnerException?.InnerException?.Message ?? dbEx.InnerException?.Message ?? dbEx.Message; StatusMessage = $"DB 업데이트 오류: {innerExMsg}"; MessageBox.Show($"DB 작업 오류:\n{innerExMsg}\n\n{dbEx.ToString()}", "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); }
-        #endregion
-
-        private void RaiseCanExecuteChanged() { (LoadAllMasterDataCommand as RelayCommand)?.RaiseCanExecuteChanged(); (AddItemCommand as RelayCommand)?.RaiseCanExecuteChanged(); (DeleteItemCommand as RelayCommand)?.RaiseCanExecuteChanged(); (SaveChangesCommand as RelayCommand)?.RaiseCanExecuteChanged(); }
-        #region IDisposable 구현
-        // private bool disposed = false; // 클래스 멤버 변수로 이동됨
-        protected virtual void Dispose(bool disposing) { if (!_disposed) { if (disposing) { _context?.Dispose(); } _disposed = true; } }
-        public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
-        #endregion
-    }
-}
- 1 2. Data/LockerDbContext.cs (수정)   
-1.
-github.com
-github.com
-
-SaveChanges 및 SaveChangesAsync 메서드 내에서 감사 로그를 저장하는 SaveAuditLogs/SaveAuditLogsAsync 호출 부분을 try-catch 블록으로 감싸서 로그 저장 실패 시 예외를 기록하고, 원래의 SaveChanges 결과는 정상적으로 반환하도록 수정합니다.
-
-C#
-
+// 필요한 네임스페이스
 using LockerManagementApp.Models;
 using System;
 using System.Collections.Generic;
 using System.Data.Entity;
-using System.Data.Entity.Infrastructure;
-using System.Diagnostics; // Debug.WriteLine 사용
+using System.Data.Entity.Infrastructure; // DbEntityEntry, ObjectContext 사용
+using System.Data.Entity.Core.Objects; // ObjectContext 사용
 using System.Linq;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization; // 또는 Newtonsoft.Json
+using System.Diagnostics; // Debug.WriteLine 사용
 
 namespace LockerManagementApp.Data
 {
     /// <summary>
-    /// Entity Framework 6 DbContext 클래스 (로그 저장 오류 처리 강화)
+    /// Entity Framework 6 DbContext 클래스 (로그 저장 로직 수정)
     /// </summary>
     public class LockerDbContext : DbContext
     {
+        // --- 테이블 매핑을 위한 DbSet 속성들 ---
         public DbSet<LockerAssignment> LockerAssignments { get; set; }
         public DbSet<AuditLog> AuditLogs { get; set; }
         public DbSet<LockerType> LockerTypes { get; set; }
@@ -167,205 +40,187 @@ namespace LockerManagementApp.Data
         public DbSet<SubPart> SubParts { get; set; }
         public DbSet<Administrator> Administrators { get; set; }
 
-        public LockerDbContext() : base("name=LockerDbConnection") { }
-
-        protected override void OnModelCreating(DbModelBuilder modelBuilder) { base.OnModelCreating(modelBuilder); }
-
-        #region SaveChanges Overrides for Audit Logging (Error Handling Added)
+        /// <summary>
+        /// 기본 생성자. App.config의 "LockerDbConnection" 연결 문자열을 사용합니다.
+        /// </summary>
+        public LockerDbContext() : base("name=LockerDbConnection")
+        {
+            // 데이터베이스 초기화 전략 설정 (선택 사항)
+            // Database.SetInitializer<LockerDbContext>(null);
+        }
 
         /// <summary>
-        /// 동기 방식 변경 사항 저장 시 감사 로그를 기록합니다. (로그 저장 오류 처리 추가)
+        /// 모델(테이블) 생성 시 추가 구성을 위한 메서드입니다 (Fluent API).
+        /// </summary>
+        protected override void OnModelCreating(DbModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+        }
+
+        #region SaveChanges Overrides for Audit Logging (Revised Logic)
+
+        /// <summary>
+        /// 동기 방식 변경 사항 저장 시 감사 로그를 기록합니다. (수정된 로직)
         /// </summary>
         public override int SaveChanges()
         {
-            List<AuditLog> auditEntries = null;
+            // 1. 로그 엔트리 생성
+            List<AuditLog> auditEntries = CreateAuditEntries();
+
+            // 2. 생성된 로그 엔트리를 컨텍스트에 추가 (아직 DB 저장 전)
+            if (auditEntries != null && auditEntries.Any())
+            {
+                this.AuditLogs.AddRange(auditEntries);
+            }
+
+            // 3. 단 한 번의 SaveChanges 호출로 원본 변경 + 로그 추가를 함께 저장
             try
             {
-                auditEntries = CreateAuditEntries(); // 변경 내용 기반으로 로그 엔트리 생성
+                return base.SaveChanges();
+            }
+            catch (DbUpdateException dbEx)
+            {
+                // 저장 실패 시 로그 (필요 시 추가 처리)
+                Debug.WriteLine($"!!! SaveChanges 실패 (동기): {dbEx.ToString()}");
+                throw; // 예외를 다시 던져 상위에서 처리하도록 함
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}");
-                // 로그 생성 실패 시에도 일단 기본 저장은 시도할 수 있음 (선택 사항)
+                Debug.WriteLine($"!!! SaveChanges 중 일반 오류 (동기): {ex.ToString()}");
+                throw;
             }
-
-            var result = base.SaveChanges(); // 실제 DB 변경 적용
-
-            if (result > 0 && auditEntries != null && auditEntries.Any()) // 변경 성공 및 기록할 로그가 있으면
-            {
-                // *** 수정된 부분: 로그 저장 부분을 try-catch로 감쌈 ***
-                try
-                {
-                    SaveAuditLogs(auditEntries); // 로그 저장
-                }
-                catch (Exception ex)
-                {
-                    // 로그 저장 실패는 기록만 하고 무시 (원본 작업 결과는 유지)
-                    Debug.WriteLine($"!!! 감사 로그 저장 실패 (동기): {ex.ToString()}");
-                }
-            }
-            return result;
         }
 
         /// <summary>
-        /// 비동기 방식 변경 사항 저장 시 감사 로그를 기록합니다. (로그 저장 오류 처리 추가)
+        /// 비동기 방식 변경 사항 저장 시 감사 로그를 기록합니다. (수정된 로직)
         /// </summary>
         public override async Task<int> SaveChangesAsync()
         {
-            List<AuditLog> auditEntries = null;
+            // 1. 로그 엔트리 생성
+            List<AuditLog> auditEntries = CreateAuditEntries();
+
+            // 2. 생성된 로그 엔트리를 컨텍스트에 추가 (아직 DB 저장 전)
+            if (auditEntries != null && auditEntries.Any())
+            {
+                this.AuditLogs.AddRange(auditEntries);
+            }
+
+            // 3. 단 한 번의 SaveChangesAsync 호출로 원본 변경 + 로그 추가를 함께 저장
             try
             {
-                auditEntries = CreateAuditEntries(); // 변경 내용 기반으로 로그 엔트리 생성
+                return await base.SaveChangesAsync();
+            }
+            catch (DbUpdateException dbEx)
+            {
+                Debug.WriteLine($"!!! SaveChangesAsync 실패 (비동기): {dbEx.ToString()}");
+                throw;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"!!! 감사 로그 생성 중 오류 발생: {ex.ToString()}");
+                Debug.WriteLine($"!!! SaveChangesAsync 중 일반 오류 (비동기): {ex.ToString()}");
+                throw;
             }
+        }
 
-            var result = await base.SaveChangesAsync(); // 실제 DB 변경 적용
+        /// <summary>
+        /// 현재 변경 추적 중인 엔티티를 기반으로 감사 로그 엔트리 목록을 생성합니다.
+        /// </summary>
+        private List<AuditLog> CreateAuditEntries()
+        {
+            string currentUserName = System.Threading.Thread.CurrentPrincipal?.Identity?.Name ?? "UnknownUser";
+            var auditEntries = new List<AuditLog>();
+            var changedEntries = ChangeTracker.Entries()
+                .Where(e => e.State == EntityState.Added || e.State == EntityState.Modified || e.State == EntityState.Deleted)
+                .ToList();
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
-            if (result > 0 && auditEntries != null && auditEntries.Any()) // 변경 성공 및 기록할 로그가 있으면
+            foreach (var entry in changedEntries)
             {
-                // *** 수정된 부분: 로그 저장 부분을 try-catch로 감쌈 ***
+                if (entry.Entity is AuditLog) continue; // 로그 자체는 로깅 안 함
+
+                var auditEntry = new AuditLog
+                {
+                    Timestamp = DateTime.Now,
+                    UserName = currentUserName,
+                    TableName = entry.Entity.GetType().Name,
+                    Action = entry.State.ToString()
+                };
+
+                // *** 수정된 부분: 기본 키 값을 더 안정적으로 가져오기 ***
                 try
                 {
-                    await SaveAuditLogsAsync(auditEntries); // 로그 저장 (비동기)
+                    // EF 메타데이터를 통해 기본 키 값 가져오기
+                    var objectContext = ((IObjectContextAdapter)this).ObjectContext;
+                    var objectSet = objectContext.CreateObjectSet(entry.Entity.GetType());
+                    var entityKey = objectContext.CreateEntityKey(objectSet.EntitySet.Name, entry.Entity);
+                    auditEntry.RecordId = string.Join(",", entityKey.EntityKeyValues.Select(kv => kv.Value)); // 복합키 고려
                 }
                 catch (Exception ex)
                 {
-                    // 로그 저장 실패는 기록만 하고 무시
-                    Debug.WriteLine($"!!! 감사 로그 저장 실패 (비동기): {ex.ToString()}");
+                    Debug.WriteLine($"감사 로그: 기본 키 값 가져오기 실패 ({auditEntry.TableName}) - {ex.Message}");
+                    auditEntry.RecordId = "PK Error";
                 }
+
+
+                var oldValues = new Dictionary<string, object>();
+                var newValues = new Dictionary<string, object>();
+                var affectedColumns = new List<string>();
+
+                if (entry.State == EntityState.Added)
+                {
+                    foreach (var propertyName in entry.CurrentValues.PropertyNames) newValues[propertyName] = entry.CurrentValues[propertyName];
+                    try { auditEntry.NewValues = serializer.Serialize(newValues); } catch { auditEntry.NewValues = "Serialization Error"; }
+                }
+                else if (entry.State == EntityState.Deleted)
+                {
+                    foreach (var propertyName in entry.OriginalValues.PropertyNames) oldValues[propertyName] = entry.OriginalValues[propertyName];
+                    try { auditEntry.OldValues = serializer.Serialize(oldValues); } catch { auditEntry.OldValues = "Serialization Error"; }
+                }
+                else if (entry.State == EntityState.Modified)
+                {
+                    foreach (var propertyName in entry.OriginalValues.PropertyNames)
+                    {
+                        var originalValue = entry.OriginalValues[propertyName];
+                        var currentValue = entry.CurrentValues[propertyName];
+                        if (!Equals(originalValue, currentValue)) { affectedColumns.Add(propertyName); oldValues[propertyName] = originalValue; newValues[propertyName] = currentValue; }
+                    }
+                    if (affectedColumns.Any())
+                    {
+                        auditEntry.AffectedColumns = string.Join(",", affectedColumns);
+                        try { auditEntry.OldValues = serializer.Serialize(oldValues); } catch { auditEntry.OldValues = "Serialization Error"; }
+                        try { auditEntry.NewValues = serializer.Serialize(newValues); } catch { auditEntry.NewValues = "Serialization Error"; }
+                    }
+                    else continue; // 실제 변경된 속성 없으면 로그 건너뜀
+                }
+                auditEntries.Add(auditEntry);
             }
-            return result;
+            // LockerAssignment의 LastUpdated 업데이트는 여기서 호출 유지
+            UpdateLockerAssignmentTimestamps(changedEntries);
+            return auditEntries;
         }
 
-        // CreateAuditEntries, SaveAuditLogs, SaveAuditLogsAsync, UpdateLockerAssignmentTimestamps 메서드 (이전과 동일)
-        private List<AuditLog> CreateAuditEntries() { string currentUserName = System.Threading.Thread.CurrentPrincipal?.Identity?.Name ?? "UnknownUser"; var auditEntries = new List<AuditLog>(); var changedEntries = ChangeTracker.Entries().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified || e.State == EntityState.Deleted).ToList(); var serializer = new JavaScriptSerializer(); serializer.MaxJsonLength = int.MaxValue; foreach (var entry in changedEntries) { if (entry.Entity is AuditLog) continue; var auditEntry = new AuditLog { Timestamp = DateTime.Now, UserName = currentUserName, TableName = entry.Entity.GetType().Name, Action = entry.State.ToString() }; try { auditEntry.RecordId = entry.Property("Id").CurrentValue?.ToString(); } catch { auditEntry.RecordId = "N/A"; } var oldValues = new Dictionary<string, object>(); var newValues = new Dictionary<string, object>(); var affectedColumns = new List<string>(); if (entry.State == EntityState.Added) { foreach (var pn in entry.CurrentValues.PropertyNames) newValues[pn] = entry.CurrentValues[pn]; try { auditEntry.NewValues = serializer.Serialize(newValues); } catch { auditEntry.NewValues = "Serialization Error"; } } else if (entry.State == EntityState.Deleted) { foreach (var pn in entry.OriginalValues.PropertyNames) oldValues[pn] = entry.OriginalValues[pn]; try { auditEntry.OldValues = serializer.Serialize(oldValues); } catch { auditEntry.OldValues = "Serialization Error"; } } else if (entry.State == EntityState.Modified) { foreach (var pn in entry.OriginalValues.PropertyNames) { var ov = entry.OriginalValues[pn]; var cv = entry.CurrentValues[pn]; if (!Equals(ov, cv)) { affectedColumns.Add(pn); oldValues[pn] = ov; newValues[pn] = cv; } } if (affectedColumns.Any()) { auditEntry.AffectedColumns = string.Join(",", affectedColumns); try { auditEntry.OldValues = serializer.Serialize(oldValues); } catch { auditEntry.OldValues = "Serialization Error"; } try { auditEntry.NewValues = serializer.Serialize(newValues); } catch { auditEntry.NewValues = "Serialization Error"; } } else continue; } auditEntries.Add(auditEntry); } UpdateLockerAssignmentTimestamps(changedEntries); return auditEntries; }
-        private void SaveAuditLogs(List<AuditLog> auditEntries) { if (auditEntries != null && auditEntries.Any()) { this.AuditLogs.AddRange(auditEntries); base.SaveChanges(); } } // 여기서는 예외 처리 안 함 (SaveChanges 오버라이드에서 처리)
-        private async Task SaveAuditLogsAsync(List<AuditLog> auditEntries) { if (auditEntries != null && auditEntries.Any()) { this.AuditLogs.AddRange(auditEntries); await base.SaveChangesAsync(); } } // 여기서는 예외 처리 안 함
-        private void UpdateLockerAssignmentTimestamps(List<DbEntityEntry> changedEntries) { var lockerEntries = changedEntries.Where(e => e.Entity is LockerAssignment && (e.State == EntityState.Added || e.State == EntityState.Modified)); foreach (var entry in lockerEntries) ((LockerAssignment)entry.Entity).LastUpdated = DateTime.Now; }
+        // SaveAuditLogs, SaveAuditLogsAsync 메서드는 제거됨
 
-        #endregion
-    }
-}
-3. ViewModels/MainViewModel.cs (확인용)
-
-(이전 최종 버전과 동일 - OpenMasterDataWindow에서 임시 컨텍스트 사용 확인)
-
-C#
-
-// 필요한 네임스페이스
-using LockerManagementApp.Data;
-using LockerManagementApp.Models;
-using LockerManagementApp.Infrastructure;
-using LockerManagementApp.Views;
-using System;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.Configuration;
-using System.Data.Entity;
-using System.Data.Entity.Infrastructure;
-using System.Linq;
-using System.Security;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Input;
-using System.Runtime.InteropServices;
-using System.IO;
-using System.Text;
-using System.Windows.Threading;
-
-namespace LockerManagementApp.ViewModels
-{
-    public class MainViewModel : ViewModelBase, IDisposable
-    {
-        private LockerDbContext _context;
-        private ObservableCollection<LockerAssignment> _lockerAssignments;
-        private LockerAssignment _selectedAssignment;
-        private string _statusBarText = "준비 완료";
-        private string _currentAdmin = "홍길동A";
-        private SecureString _masterPasswordInput;
-        private bool _isMasterModeEnabled = false;
-        private ObservableCollection<LockerType> _allLockerTypes;
-        private ObservableCollection<Floor> _allFloors;
-        private ObservableCollection<Zone> _allZones;
-        private ObservableCollection<SubPart> _allSubParts;
-        private ObservableCollection<Administrator> _allAdministrators;
-        public LogViewModel LogVM { get; private set; }
-
-        #region Public Properties
-        public ObservableCollection<LockerAssignment> LockerAssignments { get => _lockerAssignments; set => SetProperty(ref _lockerAssignments, value); }
-        public LockerAssignment SelectedAssignment { get => _selectedAssignment; set { if (SetProperty(ref _selectedAssignment, value)) { ((RelayCommand)DeleteCommand).RaiseCanExecuteChanged(); ((RelayCommand)ClearAssignmentCommand).RaiseCanExecuteChanged(); } } }
-        public string StatusBarText { get => _statusBarText; set => SetProperty(ref _statusBarText, value); }
-        public SecureString MasterPasswordInput { get => _masterPasswordInput; set => SetProperty(ref _masterPasswordInput, value); }
-        public bool IsMasterModeEnabled { get => _isMasterModeEnabled; set => SetProperty(ref _isMasterModeEnabled, value); }
-        public ObservableCollection<LockerType> AllLockerTypes { get => _allLockerTypes; set => SetProperty(ref _allLockerTypes, value); }
-        public ObservableCollection<Floor> AllFloors { get => _allFloors; set => SetProperty(ref _allFloors, value); }
-        public ObservableCollection<Zone> AllZones { get => _allZones; set => SetProperty(ref _allZones, value); }
-        public ObservableCollection<SubPart> AllSubParts { get => _allSubParts; set => SetProperty(ref _allSubParts, value); }
-        public ObservableCollection<Administrator> AllAdministrators { get => _allAdministrators; set => SetProperty(ref _allAdministrators, value); }
-        #endregion
-
-        #region Commands
-        public ICommand LoadDataCommand { get; }
-        public ICommand SaveChangesCommand { get; }
-        public ICommand AddNewCommand { get; }
-        public ICommand DeleteCommand { get; }
-        public ICommand ClearAssignmentCommand { get; }
-        public ICommand CheckMasterPasswordCommand { get; }
-        public ICommand RefreshMasterDataCommand { get; }
-        public ICommand OpenMasterDataWindowCommand { get; }
-        #endregion
-
-        public MainViewModel()
+        /// <summary>
+        /// 변경된 LockerAssignment 엔티티의 LastUpdated 타임스탬프를 업데이트합니다.
+        /// </summary>
+        private void UpdateLockerAssignmentTimestamps(List<DbEntityEntry> changedEntries)
         {
-            try { _context = new LockerDbContext(); } catch (Exception ex) { MessageBox.Show($"DB 컨텍스트 생성 오류:\n{ex.ToString()}", "초기화 오류", MessageBoxButton.OK, MessageBoxImage.Error); StatusBarText = "DB 연결 오류!"; return; }
-            _lockerAssignments = new ObservableCollection<LockerAssignment>(); _allLockerTypes = new ObservableCollection<LockerType>(); _allFloors = new ObservableCollection<Floor>(); _allZones = new ObservableCollection<Zone>(); _allSubParts = new ObservableCollection<SubPart>(); _allAdministrators = new ObservableCollection<Administrator>();
-            LogVM = new LogViewModel();
-            LoadDataCommand = new RelayCommand(async _ => await LoadInitialDataAsync()); SaveChangesCommand = new RelayCommand(async _ => await SaveChangesAsync()); AddNewCommand = new RelayCommand(AddNewLocker); DeleteCommand = new RelayCommand(async _ => await DeleteSelectedAsync(), _ => SelectedAssignment != null); ClearAssignmentCommand = new RelayCommand(ClearSelectedAssignment, _ => SelectedAssignment != null && SelectedAssignment.IsAssigned); CheckMasterPasswordCommand = new RelayCommand(CheckMasterPassword); RefreshMasterDataCommand = new RelayCommand(async _ => await LoadMasterDataAsync()); OpenMasterDataWindowCommand = new RelayCommand(OpenMasterDataWindow);
-            if (_context != null) { _ = LoadInitialDataAsync(); }
+            var lockerEntries = changedEntries
+                .Where(e => e.Entity is LockerAssignment && (e.State == EntityState.Added || e.State == EntityState.Modified));
+            foreach (var entry in lockerEntries)
+            {
+                ((LockerAssignment)entry.Entity).LastUpdated = DateTime.Now;
+            }
         }
 
-        private async Task LoadInitialDataAsync() { await LoadMasterDataAsync(); await LoadAssignmentsAsync(); }
-        private async Task LoadAssignmentsAsync() { if (_context == null) return; StatusBarText = "사물함 목록 로딩 중..."; try { var assignments = await _context.LockerAssignments.OrderBy(l => l.Floor).ThenBy(l => l.Zone).ThenBy(l => l.SpecificLocation).ToListAsync(); LockerAssignments = new ObservableCollection<LockerAssignment>(assignments); StatusBarText = $"총 {LockerAssignments.Count}개 로드 완료."; } catch (Exception ex) { HandleGenericException("사물함 목록 로딩", ex); } }
-        private async Task LoadMasterDataAsync() { StatusBarText = "마스터 데이터(콤보박스용) 로딩 중..."; LockerDbContext tempContext = null; try { using (tempContext = new LockerDbContext()) { AllLockerTypes = new ObservableCollection<LockerType>(await tempContext.LockerTypes.OrderBy(t => t.Name).AsNoTracking().ToListAsync()); AllFloors = new ObservableCollection<Floor>(await tempContext.Floors.OrderBy(f => f.Name).AsNoTracking().ToListAsync()); AllZones = new ObservableCollection<Zone>(await tempContext.Zones.OrderBy(z => z.Name).AsNoTracking().ToListAsync()); AllSubParts = new ObservableCollection<SubPart>(await tempContext.SubParts.OrderBy(p => p.Name).AsNoTracking().ToListAsync()); AllAdministrators = new ObservableCollection<Administrator>(await tempContext.Administrators.OrderBy(a => a.Name).AsNoTracking().ToListAsync()); } StatusBarText = "마스터 데이터(콤보박스용) 로드 완료."; } catch (InvalidOperationException ioEx) when (ioEx.Message.Contains("DataReader")) { HandleGenericException("마스터 데이터 로딩 (DataReader 충돌 가능성)", ioEx); MessageBox.Show("데이터 로딩 중 충돌 발생. App.config 연결 문자열에 MultipleActiveResultSets=True; 옵션 확인 또는 재시도.", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); } catch (Exception ex) { HandleGenericException("마스터 데이터 로딩", ex); } }
-        private void CheckMasterPassword(object parameter) { try { string storedMasterKey = ConfigurationManager.AppSettings["MasterKey"]; if (string.IsNullOrEmpty(storedMasterKey)) { MessageBox.Show("App.config에 마스터 키(MasterKey) 없음.", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Warning); return; } string plainPassword = ConvertToUnsecureString(MasterPasswordInput); if (plainPassword == storedMasterKey) { IsMasterModeEnabled = true; StatusBarText = "마스터 모드 활성화."; MessageBox.Show("마스터 키 확인 완료.", "성공", MessageBoxButton.OK, MessageBoxImage.Information); } else { IsMasterModeEnabled = false; MessageBox.Show("마스터 키 불일치.", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } } catch (ConfigurationErrorsException confEx) { MessageBox.Show($"설정 파일 오류:\n{confEx.Message}", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Error); } catch (Exception ex) { MessageBox.Show($"마스터 키 확인 오류: {ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
-        private void OpenMasterDataWindow(object parameter) { if (!BackupDataToCsv()) { if (MessageBox.Show("데이터 백업 실패. 계속 진행하시겠습니까?", "백업 실패", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.No) return; } try { var masterDataVM = new MasterDataViewModel(); var masterDataWindow = new MasterDataWindow { DataContext = masterDataVM, Owner = Application.Current.MainWindow }; masterDataWindow.ShowDialog(); _ = LoadMasterDataAsync(); /* 콤보박스 목록 새로고침 */ _ = LoadAssignmentsAsync(); /* 사물함 목록 새로고침 */ } catch (Exception ex) { MessageBox.Show($"마스터 데이터 관리 창 열기 오류:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); } }
-
-        #region CRUD 및 기타 메서드
-        private async Task SaveChangesAsync() { if (_context == null) return; StatusBarText = "변경 사항 저장 중..."; List<DbEntityEntry> allChangedEntriesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var changedLockerEntries = _context.ChangeTracker.Entries<LockerAssignment>().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified).ToList(); var allItemsToCheck = LockerAssignments.ToList(); var duplicates = allItemsToCheck.GroupBy(l => new { l.Floor, l.Zone, l.SpecificLocation }).Where(g => g.Count() > 1).Select(g => g.Key); if (duplicates.Any()) { MessageBox.Show($"저장 불가: 중복 위치 발견 - {string.Join(", ", duplicates.Select(d => $"{d.Floor}-{d.Zone}-{d.SpecificLocation}"))}", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); RollbackChanges(allChangedEntriesForRollback); return; } foreach(var entry in changedLockerEntries) { entry.Entity.Administrator = _currentAdmin; } int changedCount = await _context.SaveChangesAsync(); StatusBarText = $"성공적으로 {changedCount}개 저장됨."; } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(allChangedEntriesForRollback); } catch (Exception ex) { HandleGenericException("저장", ex); RollbackChanges(allChangedEntriesForRollback); } }
-        private void RollbackChanges(IEnumerable<DbEntityEntry> changedEntries) { if (_context == null || changedEntries == null) return; foreach (var entry in changedEntries.ToList()) { switch (entry.State) { case EntityState.Modified: entry.CurrentValues.SetValues(entry.OriginalValues); entry.State = EntityState.Unchanged; break; case EntityState.Added: entry.State = EntityState.Detached; if (entry.Entity is LockerAssignment addedEntity && LockerAssignments.Contains(addedEntity)) LockerAssignments.Remove(addedEntity); break; case EntityState.Deleted: entry.State = EntityState.Unchanged; break; } } StatusBarText = "변경 롤백됨."; }
-        private void AddNewLocker(object parameter) { if (_context == null) return; var newAssignment = new LockerAssignment { LockerType = AllLockerTypes.FirstOrDefault()?.Name ?? "개인사물함", Floor = AllFloors.FirstOrDefault()?.Name ?? "1", Zone = AllZones.FirstOrDefault()?.Name ?? "A", SpecificLocation = "새 위치-" + Guid.NewGuid().ToString("N").Substring(0, 4), Administrator = _currentAdmin, LastUpdated = DateTime.Now }; LockerAssignments.Add(newAssignment); _context.LockerAssignments.Add(newAssignment); SelectedAssignment = newAssignment; StatusBarText = "새 사물함 추가됨. 저장 필요."; }
-        private async Task DeleteSelectedAsync() { if (_context == null || SelectedAssignment == null) return; if (MessageBox.Show($"'{SelectedAssignment.Floor}-{SelectedAssignment.Zone}-{SelectedAssignment.SpecificLocation}' 삭제?", "확인", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes) { StatusBarText = "삭제 중..."; List<DbEntityEntry> changesForRollback = _context.ChangeTracker.Entries().Where(e => e.State != EntityState.Unchanged).ToList(); try { var assignmentToDelete = SelectedAssignment; var entry = _context.Entry(assignmentToDelete); if (entry.State == EntityState.Detached) { _context.LockerAssignments.Attach(assignmentToDelete); } _context.LockerAssignments.Remove(assignmentToDelete); int changedCount = await _context.SaveChangesAsync(); LockerAssignments.Remove(assignmentToDelete); SelectedAssignment = null; StatusBarText = $"성공적으로 {changedCount}개 삭제됨."; } catch (DbUpdateException dbEx) { HandleDbUpdateException(dbEx); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } catch (Exception ex) { HandleGenericException("삭제", ex); RollbackChanges(changesForRollback); await LoadAssignmentsAsync(); } } }
-        private void ClearSelectedAssignment(object parameter) { if (_context == null || SelectedAssignment == null) return; SelectedAssignment.UserName = null; SelectedAssignment.KnoxId = null; SelectedAssignment.SubPart = null; _context.Entry(SelectedAssignment).State = EntityState.Modified; SelectedAssignment.Administrator = _currentAdmin; StatusBarText = "배정 해제됨. 저장 필요."; }
-        #endregion
-
-        #region Backup Logic (CSV)
-        private bool BackupDataToCsv() { string backupDir = @"C:\agent"; string fileName = $"LockerBackup_{DateTime.Now:yyyyMMdd_HHmmss}.csv"; string filePath = Path.Combine(backupDir, fileName); StatusBarText = "데이터 백업 시작..."; try { Directory.CreateDirectory(backupDir); using (var backupContext = new LockerDbContext()) using (var writer = new StreamWriter(filePath, false, Encoding.UTF8)) { WriteTableToCsv<LockerType>(backupContext, writer); WriteTableToCsv<Floor>(backupContext, writer); WriteTableToCsv<Zone>(backupContext, writer); WriteTableToCsv<SubPart>(backupContext, writer); WriteTableToCsv<Administrator>(backupContext, writer); WriteTableToCsv<LockerAssignment>(backupContext, writer); WriteTableToCsv<AuditLog>(backupContext, writer); } StatusBarText = $"데이터 백업 완료: {filePath}"; MessageBox.Show($"데이터가 다음 위치에 백업되었습니다:\n{filePath}", "백업 완료", MessageBoxButton.OK, MessageBoxImage.Information); return true; } catch (Exception ex) { StatusBarText = $"데이터 백업 실패: {ex.Message}"; MessageBox.Show($"데이터 백업 중 오류가 발생했습니다:\n{ex.ToString()}", "백업 오류", MessageBoxButton.OK, MessageBoxImage.Error); return false; } }
-        private void WriteTableToCsv<T>(LockerDbContext context, StreamWriter writer) where T : class { var dbSet = context.Set<T>(); var entityType = typeof(T); var properties = entityType.GetProperties().Where(p => p.GetGetMethod().IsVirtual == false).ToList(); writer.WriteLine($"--- Table: {entityType.Name} ---"); writer.WriteLine(string.Join(",", properties.Select(p => EscapeCsvValue(p.Name)))); foreach (var entity in dbSet.AsNoTracking()) { var values = properties.Select(p => EscapeCsvValue(p.GetValue(entity)?.ToString() ?? "")); writer.WriteLine(string.Join(",", values)); } writer.WriteLine(); writer.WriteLine(); } // Include only non-virtual properties
-        private string EscapeCsvValue(string value) { if (string.IsNullOrEmpty(value)) return ""; if (value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n")) { return $"\"{value.Replace("\"", "\"\"")}\""; } return value; }
-        #endregion
-
-        #region Helper Methods
-        private void HandleGenericException(string operation, Exception ex) { StatusBarText = $"{operation} 오류: {ex.Message}"; MessageBox.Show($"{operation} 중 오류 발생:\n{ex.ToString()}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); }
-        private void HandleDbUpdateException(DbUpdateException dbEx) { var innerExMsg = dbEx.InnerException?.InnerException?.Message ?? dbEx.InnerException?.Message ?? dbEx.Message; StatusBarText = $"DB 업데이트 오류: {innerExMsg}"; MessageBox.Show($"DB 작업 오류:\n{innerExMsg}\n\n{dbEx.ToString()}", "DB 오류", MessageBoxButton.OK, MessageBoxImage.Error); try { foreach(var entry in dbEx.Entries) { entry.Reload(); } } catch { /* Reload 실패 무시 */ } }
-        private string ConvertToUnsecureString(SecureString securePassword) { if (securePassword == null) return string.Empty; IntPtr ptr = IntPtr.Zero; try { ptr = Marshal.SecureStringToGlobalAllocUnicode(securePassword); return Marshal.PtrToStringUni(ptr); } finally { Marshal.ZeroFreeGlobalAllocUnicode(ptr); } }
-        #endregion
-
-        #region IDisposable 구현
-        private bool disposed = false;
-        protected virtual void Dispose(bool disposing) { if (!disposed) { if (disposing) { _context?.Dispose(); LogVM?.Dispose(); } disposed = true; } }
-        public void Dispose() { Dispose(true); GC.SuppressFinalize(this); }
         #endregion
     }
 }
 핵심 변경 사항:
 
-MainViewModel.cs:
-OpenMasterDataWindow 메서드에서 ShowDialog() 이후에 LoadAssignmentsAsync() 호출을 추가하여, 마스터 데이터 변경에 따른 연쇄 업데이트 결과가 메인 그리드에도 반영되도록 했습니다.
-LoadMasterDataAsync 메서드를 수정하여 내부적으로 임시 DbContext를 생성하고 using 문으로 감싸서 사용 후 즉시 Dispose 하도록 변경했습니다. 이를 통해 MainViewModel의 주 _context와의 잠재적 충돌을 방지하고 "DbContext Disposed" 오류를 해결합니다. Dispatcher.BeginInvoke는 이제 필요하지 않습니다.
-CSV 백업 로직의 WriteTableToCsv 메서드에서 가상(navigation) 속성을 제외하도록 수정했습니다 (.Where(p => p.GetGetMethod().IsVirtual == false)).
-MasterDataViewModel.cs:
-SaveMasterDataChangesAsync의 연쇄 업데이트 SQL 실행 부분(ExecuteSqlCommandAsync)을 감싸는 try-catch 블록에서 예외 발생 시 throw new Exception(...)을 사용하여 트랜잭션 롤백을 확실히 유도하도록 수정했습니다.
-Views/MainWindow.xaml:
+SaveChanges/SaveChangesAsync 로직 변경:
+CreateAuditEntries()를 호출하여 로그 목록을 먼저 만듭니다.
+만들어진 로그 목록(auditEntries)을 this.AuditLogs.AddRange()를 사용하여 컨텍스트에 추가합니다.
+base.SaveChanges() 또는 base.SaveChangesAsync()를 한 번만 호출하여 원본 데이터 변경과 로그 추가를 하나의 트랜잭션으로 처리합니다.
+별도의 SaveAuditLogs/SaveAuditLogsAsync 메서드를 제거했습니다.
