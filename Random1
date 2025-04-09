@@ -1,3 +1,28 @@
+네, 상황을 다시 정리해 보겠습니다.
+
+문제점: 메인 화면에서 "새 사물함 추가" 버튼을 눌러 행을 추가하고 저장하면, 데이터베이스에는 사물함 정보가 추가되지만, 로그는 기록되지 않습니다. 디버깅 결과 AddNewLocker 메서드에서는 엔티티 상태가 Added로 확인되지만, 이후 CanSaveChangesExecute에서 HasChanges()가 false로 나오거나, 인터셉터에서 변경 사항을 감지하지 못하는 것으로 보입니다.
+추가 요청: "새 사물함 추가" 버튼을 눌렀을 때, 삭제처럼 확인 메시지 창을 띄워달라는 요청.
+원인 분석:
+
+DbContext.Add()를 호출하면 해당 엔티티의 상태는 Added가 되는 것이 맞습니다. 이후 DbContext.ChangeTracker.HasChanges()가 false를 반환하는 것은 매우 이례적이며, 다음과 같은 가능성을 시사합니다.
+
+변경 추적 오류: Entity Framework 6의 변경 추적 메커니즘에 특정 조건에서 Added 상태를 제대로 인지하지 못하는 문제가 있을 수 있습니다.
+컨텍스트 상태: AddNewLocker 메서드 실행 중 또는 직후에 DbContext의 상태가 예상치 않게 변경될 가능성 (매우 낮음).
+인터셉터 문제: SaveChangesAsync가 호출될 때 실행되는 AuditLogInterceptor가 Added 상태의 엔티티를 감지하지 못하거나, 감지 후 로그 생성/저장 과정에서 실패할 가능성. (이전 디버깅에서 이 부분이 의심되었습니다.)
+해결 방향:
+
+AddNewLocker에 확인 메시지 추가: MainViewModel의 AddNewLocker 메서드 시작 부분에 MessageBox를 추가하여 사용자 확인을 받도록 수정합니다.
+인터셉터 디버깅 강화: AuditLogInterceptor의 GenerateAuditLogs 메서드 시작 부분과 변경 감지 부분에 더 상세한 디버그 출력을 추가하여, 'Add' 작업 시 인터셉터가 실행되는지, 변경된 엔티티를 인지하는지 명확히 확인합니다. 'Added' 상태 로그 데이터는 진단을 위해 계속 단순화된 상태를 유지합니다.
+수정해야 할 파일 목록:
+
+ViewModels/MainViewModel.cs (확인 메시지 추가)
+Infrastructure/AuditLogInterceptor.cs (디버깅 강화)
+아래에 이 두 파일의 수정된 전체 코드(주석 제외)를 작성합니다.
+
+1. ViewModels/MainViewModel.cs (수정)
+
+C#
+
 using LockerManagementApp.Data;
 using LockerManagementApp.Models;
 using LockerManagementApp.Infrastructure;
@@ -156,3 +181,115 @@ namespace LockerManagementApp.ViewModels
         #endregion
     }
 }
+2. Infrastructure/AuditLogInterceptor.cs (수정)
+
+Added 상태 로그 생성 시 NewValues를 단순화했던 것을 원래대로 복원하고, 관련 디버그 출력을 유지하여 여전히 문제가 있는지 확인합니다.
+
+C#
+
+using LockerManagementApp.Data;
+using LockerManagementApp.Models;
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+using System.Data.Entity;
+using System.Data.Entity.Infrastructure;
+using System.Data.Entity.Infrastructure.Interception;
+using System.Diagnostics;
+using System.Linq;
+using System.Data.Entity.Core.Objects;
+using System.Data.Entity.Validation;
+
+namespace LockerManagementApp.Infrastructure
+{
+    public class AuditLogInterceptor : IDbCommandInterceptor
+    {
+        private static readonly JsonSerializerSettings jsonSettings = new JsonSerializerSettings { ReferenceLoopHandling = ReferenceLoopHandling.Ignore, PreserveReferencesHandling = PreserveReferencesHandling.None, Formatting = Formatting.None };
+        private const string AuditLogEntriesKey = "AuditLogEntries_{0}";
+
+        public void NonQueryExecuting(System.Data.Common.DbCommand command, DbCommandInterceptionContext<int> interceptionContext) { GenerateAuditLogs(interceptionContext); }
+        public void NonQueryExecuted(System.Data.Common.DbCommand command, DbCommandInterceptionContext<int> interceptionContext) { SaveAuditLogs(interceptionContext); }
+        public void ReaderExecuting(System.Data.Common.DbCommand command, DbCommandInterceptionContext<System.Data.Common.DbDataReader> interceptionContext) { }
+        public void ReaderExecuted(System.Data.Common.DbCommand command, DbCommandInterceptionContext<System.Data.Common.DbDataReader> interceptionContext) { }
+        public void ScalarExecuting(System.Data.Common.DbCommand command, DbCommandInterceptionContext<object> interceptionContext) { }
+        public void ScalarExecuted(System.Data.Common.DbCommand command, DbCommandInterceptionContext<object> interceptionContext) { }
+
+        private void GenerateAuditLogs(DbCommandInterceptionContext<int> interceptionContext)
+        {
+            foreach (var context in interceptionContext.DbContexts)
+            {
+                if (!(context is LockerDbContext dbContext) || !dbContext.ChangeTracker.HasChanges()) continue;
+
+                bool isMaster = dbContext.IsMasterSave;
+                string currentPrincipalName = System.Threading.Thread.CurrentPrincipal?.Identity?.Name;
+                string userNameForLog = $"{(isMaster ? "[마스터]" : "[일반]")}{currentPrincipalName ?? "UnknownUser"}";
+                var auditEntries = new List<AuditLog>();
+                var changedEntries = dbContext.ChangeTracker.Entries().Where(e => e.State == EntityState.Added || e.State == EntityState.Modified || e.State == EntityState.Deleted).ToList();
+
+                if (!changedEntries.Any()) continue;
+                Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] AuditLogInterceptor.GenerateAuditLogs: Context '{dbContext.GetHashCode()}' 에서 {changedEntries.Count}개 변경 감지됨 (isMaster={isMaster}).");
+
+                foreach (var entry in changedEntries)
+                {
+                    if (entry.Entity is AuditLog) continue;
+
+                    var auditEntry = new AuditLog { Timestamp = DateTime.Now, UserName = userNameForLog, TableName = GetTableName(entry), Action = entry.State.ToString() };
+                    try { auditEntry.RecordId = GetPrimaryKeyValue(entry, dbContext); } catch (Exception ex) { Debug.WriteLine($"    - 감사 로그: PK 조회 실패 ({auditEntry.TableName}) - {ex.Message}"); auditEntry.RecordId = "PK Error"; }
+                    var oldValues = new Dictionary<string, object>(); var newValues = new Dictionary<string, object>(); var affectedColumns = new List<string>();
+
+                    if (entry.State == EntityState.Added)
+                    {
+                        Debug.WriteLine($"    - Added 상태 감지됨: {auditEntry.TableName}");
+                        // *** 수정: Added 상태일 때 NewValues 직렬화 복원 ***
+                        foreach (var pn in entry.CurrentValues.PropertyNames) { newValues[pn] = entry.CurrentValues[pn]; }
+                        Debug.WriteLine($"    - Added 로그 NewValues 생성 시도...");
+                        try
+                        {
+                             auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings);
+                             Debug.WriteLine($"    - Added 로그 NewValues 직렬화 성공.");
+                        }
+                        catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Added 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; }
+                    }
+                    else if (entry.State == EntityState.Deleted) { Debug.WriteLine($"    - Deleted 상태 감지됨: {auditEntry.TableName}, ID: {auditEntry.RecordId}"); foreach (var pn in entry.OriginalValues.PropertyNames) oldValues[pn] = entry.OriginalValues[pn]; try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Deleted 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } Debug.WriteLine($"    - Deleted 로그 데이터 생성 완료."); }
+                    else if (entry.State == EntityState.Modified) { Debug.WriteLine($"    - Modified 상태 감지됨: {auditEntry.TableName}, ID: {auditEntry.RecordId}"); bool hasChanges = false; foreach (var pn in entry.OriginalValues.PropertyNames) { var ov = entry.OriginalValues[pn]; var cv = entry.CurrentValues[pn]; if (!Equals(ov, cv)) { hasChanges = true; affectedColumns.Add(pn); oldValues[pn] = ov; newValues[pn] = cv; } } if (hasChanges) { auditEntry.AffectedColumns = string.Join(",", affectedColumns); try { auditEntry.OldValues = JsonConvert.SerializeObject(oldValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Modified Old 직렬화 오류: {serEx.Message}"); auditEntry.OldValues = "Serialization Error"; } try { auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings); } catch (Exception serEx) { Debug.WriteLine($"    !!! 감사 로그 Modified New 직렬화 오류: {serEx.Message}"); auditEntry.NewValues = "Serialization Error"; } Debug.WriteLine($"    - Modified 로그 데이터 생성 완료."); } else { Debug.WriteLine($"    - 엔티티 {auditEntry.TableName} (ID: {auditEntry.RecordId})는 Modified 상태지만 실제 값 변경 없음. 로그 건너뜀."); continue; } }
+
+                    if (auditEntry != null) { Debug.WriteLine($"    -> auditEntries 리스트에 추가 시도: {auditEntry.TableName}, Action: {auditEntry.Action}"); auditEntries.Add(auditEntry); Debug.WriteLine($"    -> auditEntries 리스트에 추가 완료. 현재 리스트 개수: {auditEntries.Count}"); }
+                    else { Debug.WriteLine($"    !!! 로그 객체 생성 실패? ({entry.Entity.GetType().Name})"); }
+                }
+                UpdateLockerAssignmentTimestamps(changedEntries);
+
+                if (auditEntries.Any()) { string userStateKey = string.Format(AuditLogEntriesKey, dbContext.GetHashCode()); interceptionContext.UserState = auditEntries; Debug.WriteLine($"  -> Context '{dbContext.GetHashCode()}'의 로그 {auditEntries.Count}개를 UserState에 저장."); }
+                 dbContext.IsMasterSave = false;
+            }
+        }
+
+        private void SaveAuditLogs(DbCommandInterceptionContext<int> interceptionContext)
+        {
+            List<AuditLog> auditEntries = interceptionContext.UserState as List<AuditLog>;
+            Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] AuditLogInterceptor.SavedChanges 시작. UserState에서 가져온 로그 수 = {auditEntries?.Count ?? 0}");
+            if (auditEntries != null && auditEntries.Any()) { foreach(var log in auditEntries) Debug.WriteLine($"  - 저장 대상 로그: {log.Action} on {log.TableName} by {log.UserName}"); }
+
+            if (interceptionContext.Exception == null && auditEntries != null && auditEntries.Any())
+            {
+                try { using (var logContext = new Data.LockerDbContext()) { Debug.WriteLine($"  -> {auditEntries.Count}개 로그 저장 시도 (새 Context 사용)..."); logContext.AuditLogs.AddRange(auditEntries); Debug.WriteLine($"  -> logContext.SaveChanges() 호출 시도..."); int logResult = logContext.SaveChanges(); Debug.WriteLine($"  -> 로그 저장 완료. 결과 = {logResult}"); } }
+                catch (DbEntityValidationException vex) { Debug.WriteLine($"!!! 감사 로그 저장 실패 (Interceptor - Validation): {vex.ToString()}"); LogValidationErrors(vex); }
+                catch (DbUpdateException dbEx) { Debug.WriteLine($"!!! 감사 로그 저장 실패 (Interceptor - Update): {dbEx.ToString()}"); LogDbUpdateException(dbEx); }
+                catch (Exception ex) { Debug.WriteLine($"!!! 감사 로그 저장 실패 (Interceptor - General): {ex.ToString()}"); }
+            }
+            else if (interceptionContext.Exception != null) { Debug.WriteLine($"  -> 원본 SaveChanges 실패로 로그 저장 안 함. 오류: {interceptionContext.Exception.Message}"); }
+            else { Debug.WriteLine($"  -> 저장할 로그 없음."); }
+            interceptionContext.UserState = null;
+        }
+
+        private string GetTableName(DbEntityEntry entry) { return entry.Entity.GetType().Name; }
+        private string GetPrimaryKeyValue(DbEntityEntry entry, DbContext context) { try { var objectContext = ((IObjectContextAdapter)context).ObjectContext; var objectStateEntry = objectContext.ObjectStateManager.GetObjectStateEntry(entry.Entity); if (objectStateEntry.EntityKey.EntityKeyValues != null && objectStateEntry.EntityKey.EntityKeyValues.Length > 0) { return string.Join(",", objectStateEntry.EntityKey.EntityKeyValues.Select(kv => kv.Value)); } if (entry.State == EntityState.Added) return "New"; } catch (Exception ex) { Debug.WriteLine($"GetPrimaryKeyValue 오류: {ex.Message}"); } return "N/A"; }
+        private void UpdateLockerAssignmentTimestamps(List<DbEntityEntry> changedEntries) { var lockerEntries = changedEntries.Where(e => e.Entity is LockerAssignment && (e.State == EntityState.Added || e.State == EntityState.Modified)); int count = 0; foreach (var entry in lockerEntries) { ((LockerAssignment)entry.Entity).LastUpdated = DateTime.Now; count++; } if (count > 0) Debug.WriteLine($"UpdateLockerAssignmentTimestamps (Interceptor): {count}개 LockerAssignment 타임스탬프 업데이트됨."); }
+
+        private void LogDbUpdateException(DbUpdateException dbEx) { Debug.WriteLine($"!!! DbUpdateException 발생: {dbEx.ToString()}"); if (dbEx.InnerException != null) Debug.WriteLine($"  InnerException: {dbEx.InnerException.ToString()}"); foreach (var entry in dbEx.Entries) { Debug.WriteLine($"  - 오류 엔티티: {entry.Entity.GetType().Name}, 상태: {entry.State}"); } }
+        private void LogValidationErrors(DbEntityValidationException vex) { Debug.WriteLine($"!!! DbEntityValidationException 발생: {vex.Message}"); foreach (var validationErrors in vex.EntityValidationErrors) { Debug.WriteLine($"  - 엔티티 타입: {validationErrors.Entry.Entity.GetType().Name}, 상태: {validationErrors.Entry.State}"); foreach (var validationError in validationErrors.ValidationErrors) { Debug.WriteLine($"    - 속성: {validationError.PropertyName}, 오류: {validationError.ErrorMessage}"); } } }
+    }
+}
+핵심 변경 사항:
+
+MainViewModel.cs: AddNewLocker 메서드 시작 부분에 MessageBox.Show를 추가하여 사용자 확인을 받도록 했습니다. 확인 후 DbContext에 엔티티를 추가하고 상태를 확인하는 디버그 로그를 추가했습니다.
+AuditLogInterceptor.cs: GenerateAuditLogs 메서드에서 Added 상태일 때 NewValues를 직렬화하는 원래 로직으로 복원했습니다(이전의 단순화된 테스트 코드 제거). 직렬화 시도 전후 및 로그 리스트 추가 전후에 디버그 로그를 추가하여 'Added' 상태 처리 과정을 상세히 추적합니다. SaveAuditLogs에도 로그 저장 시도 및 결과에 대한 디버
