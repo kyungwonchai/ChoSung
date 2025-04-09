@@ -1,16 +1,21 @@
-네, 알겠습니다. 상황을 정확히 이해했습니다. 수정 작업 시에는 로그가 정상적으로 기록되는데, 추가 작업 시에만 로그가 기록되지 않는 문제군요. 디버그 출력 상으로는 저장이 완료된 것처럼 보이지만 실제 로그 테이블에는 Added 로그가 누락되는 현상입니다.
+네, 알겠습니다. 로그가 기록되지 않는 문제가 '추가' 작업 시에만 발생하고, '수정' 시에는 로그가 남는다는 점은 매우 중요한 단서입니다. 이는 SaveChanges 재정의나 인터셉터 로직 자체는 실행되지만, Added 상태의 엔티티를 처리하는 과정에 특정한 문제가 있음을 시사합니다.
 
-이 문제는 로그 기록 로직의 핵심인 Infrastructure/AuditLogInterceptor.cs 파일 내, 특히 Added 상태의 엔티티를 처리하는 부분(GenerateAuditLogs 메서드) 또는 생성된 로그를 최종 저장하는 부분(SaveAuditLogs 메서드)에 문제가 있을 가능성이 높습니다.
+MainViewModel은 단순히 _context.LockerAssignments.Add()를 호출하고 _context.SaveChangesAsync()를 호출할 뿐이므로, MainViewModel 자체보다는 로그 생성 로직이 담긴 Infrastructure/AuditLogInterceptor.cs 파일의 GenerateAuditLogs 메서드 내부에서 Added 상태를 처리하는 부분을 더 면밀히 조사해야 합니다.
 
-진단 및 해결 방향:
+가능한 원인:
 
-GenerateAuditLogs 메서드에서 Added 상태의 엔티티를 감지했을 때, 로그 객체(AuditLog)가 정상적으로 생성되고 임시 목록(auditEntries)에 추가되는지 상세히 추적합니다.
-SaveAuditLogs 메서드가 호출될 때, GenerateAuditLogs에서 생성된 로그 목록(auditEntries)이 interceptionContext.UserState를 통해 제대로 전달되는지 확인합니다.
-로그 저장(logContext.SaveChanges()) 호출 전후의 상태를 확인합니다.
+Added 상태 엔티티의 NewValues 직렬화 실패 (이전에 try-catch를 추가했지만, 여전히 문제가 있을 수 있음)
+Added 상태 엔티티의 RecordId 처리 문제 ("New" 값 또는 PK 조회 로직)
+Added 상태 로그 객체가 auditEntries 리스트에 추가되지 않음
+SaveAuditLogs 메서드에서 Added 로그 저장 시 오류 발생 (다른 상태 로그는 저장되는데 Added만 실패)
+해결 방향:
+
+AuditLogInterceptor.cs 파일의 GenerateAuditLogs 메서드 내 if (entry.State == EntityState.Added) 블록과, SaveAuditLogs 메서드 시작 부분 및 로그 저장 부분에 더 상세한 디버그 출력을 추가하여 정확히 어느 지점에서 'Added' 로그 처리가 누락되거나 실패하는지 추적합니다.
+
 수정해야 할 파일 목록:
 
 Infrastructure/AuditLogInterceptor.cs
-아래는 위 진단 방향에 따라 디버그 출력을 추가하여 수정한 AuditLogInterceptor.cs 파일 전체 코드(주석 제외)입니다.
+아래는 디버깅 출력이 더욱 강화된 AuditLogInterceptor.cs 파일 전체 코드(주석 제외)입니다. MainViewModel.cs는 이전 최종 버전과 동일하게 사용하시면 됩니다.
 
 C#
 
@@ -66,7 +71,7 @@ namespace LockerManagementApp.Infrastructure
                     if (entry.State == EntityState.Added)
                     {
                         Debug.WriteLine($"    - Added 상태 감지됨: {auditEntry.TableName}");
-                        foreach (var pn in entry.CurrentValues.PropertyNames) newValues[pn] = entry.CurrentValues[pn];
+                        foreach (var pn in entry.CurrentValues.PropertyNames) { newValues[pn] = entry.CurrentValues[pn]; }
                         try
                         {
                              auditEntry.NewValues = JsonConvert.SerializeObject(newValues, jsonSettings);
@@ -79,8 +84,10 @@ namespace LockerManagementApp.Infrastructure
 
                     if (auditEntry != null)
                     {
+                        // *** 추가: 로그 리스트에 추가하기 직전 로그 ***
+                        Debug.WriteLine($"    -> auditEntries 리스트에 추가 시도: {auditEntry.TableName}, Action: {auditEntry.Action}");
                         auditEntries.Add(auditEntry);
-                        Debug.WriteLine($"    - 로그 생성됨 (List 추가 완료): {auditEntry.TableName}, Action: {auditEntry.Action}, RecordId: {auditEntry.RecordId}, User: {auditEntry.UserName}");
+                        Debug.WriteLine($"    -> auditEntries 리스트에 추가 완료. 현재 리스트 개수: {auditEntries.Count}");
                     } else { Debug.WriteLine($"    !!! 로그 객체 생성 실패? ({entry.Entity.GetType().Name})"); }
                 }
                 UpdateLockerAssignmentTimestamps(changedEntries);
@@ -97,9 +104,11 @@ namespace LockerManagementApp.Infrastructure
 
         private void SaveAuditLogs(DbCommandInterceptionContext<int> interceptionContext)
         {
-            // *** 추가: UserState에서 로그 가져오는지 확인 ***
             List<AuditLog> auditEntries = interceptionContext.UserState as List<AuditLog>;
+            // *** 추가: UserState에서 가져온 로그 수 상세 출력 ***
             Debug.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] AuditLogInterceptor.SavedChanges 시작. UserState에서 가져온 로그 수 = {auditEntries?.Count ?? 0}");
+            if (auditEntries != null) foreach(var log in auditEntries) Debug.WriteLine($"  - 저장 대상 로그: {log.Action} on {log.TableName}");
+
 
             if (interceptionContext.Exception == null && auditEntries != null && auditEntries.Any())
             {
@@ -109,6 +118,8 @@ namespace LockerManagementApp.Infrastructure
                     {
                         Debug.WriteLine($"  -> {auditEntries.Count}개 로그 저장 시도 (새 Context 사용)...");
                         logContext.AuditLogs.AddRange(auditEntries);
+                        // *** 추가: 로그 저장 SaveChanges 호출 전후 로그 ***
+                        Debug.WriteLine($"  -> logContext.SaveChanges() 호출 시도...");
                         int logResult = logContext.SaveChanges();
                         Debug.WriteLine($"  -> 로그 저장 완료. 결과 = {logResult}");
                     }
@@ -128,23 +139,28 @@ namespace LockerManagementApp.Infrastructure
 핵심 변경 사항:
 
 GenerateAuditLogs 메서드:
-if (entry.State == EntityState.Added) 블록 내부에 Debug.WriteLine을 추가하여, Added 상태 감지, 직렬화 성공, 리스트 추가 완료 시점을 명확히 출력합니다.
+if (entry.State == EntityState.Added) 블록 내부에 진입했는지 확인하는 Debug.WriteLine 추가.
+Added 상태 로그 객체의 NewValues 직렬화 성공 여부 로그 추가.
+auditEntries.Add(auditEntry) 호출 직전과 직후에 로그를 추가하여, 리스트에 실제로 추가되는지 확인.
 SaveAuditLogs 메서드:
-메서드 시작 시 interceptionContext.UserState에서 가져온 로그 목록(auditEntries)의 개수를 출력하여, GenerateAuditLogs에서 생성된 로그가 제대로 전달되었는지 확인합니다.
-로그 저장(logContext.SaveChanges()) 후 결과(영향받은 행 수)를 출력합니다.
+메서드 시작 시 interceptionContext.UserState에서 가져온 auditEntries 리스트의 개수를 명시적으로 출력.
+가져온 각 로그의 Action과 TableName을 출력하여 어떤 로그를 저장하려고 하는지 확인.
+로그를 저장하는 logContext.SaveChanges() 호출 직전과 직후, 그리고 결과값을 출력하는 Debug.WriteLine 추가.
 다음 단계:
 
-NuGet 패키지: Newtonsoft.Json 패키지가 설치되어 있는지 확인합니다.
 코드 적용 및 빌드: 위 코드로 AuditLogInterceptor.cs 파일을 업데이트하고 솔루션을 다시 빌드합니다.
 테스트 및 디버그 출력 확인:
 메인 화면(사물함 관리) 에서 새로운 행을 추가하고 저장 버튼을 클릭합니다.
-Visual Studio의 출력(Output) 창을 주의 깊게 확인합니다.
-GenerateAuditLogs 메서드 로그:
+Visual Studio의 출력(Output) 창을 매우 주의 깊게 확인합니다.
+GenerateAuditLogs 로그:
 Added 상태 감지됨: LockerAssignment 메시지가 나타나나요?
-Added 로그 NewValues 직렬화 성공. 메시지가 나타나나요? (만약 "직렬화 오류"가 뜨면 알려주세요.)
-로그 생성됨 (List 추가 완료): LockerAssignment, Action: Added... 메시지가 나타나나요?
+Added 로그 NewValues 직렬화 성공. 메시지가 나타나나요?
+auditEntries 리스트에 추가 시도: LockerAssignment, Action: Added 메시지가 나타나나요?
+auditEntries 리스트에 추가 완료. 현재 리스트 개수: 1 (또는 그 이상) 메시지가 나타나나요?
 UserState에 저장. 메시지에 올바른 로그 개수(최소 1개)가 표시되나요?
-SaveAuditLogs 메서드 로그:
+SaveAuditLogs 로그:
 SavedChanges 시작. UserState에서 가져온 로그 수 = ... 메시지에 올바른 로그 개수(최소 1개)가 표시되나요?
+저장 대상 로그: Added on LockerAssignment 메시지가 나타나나요?
 로그 저장 시도... 메시지가 나타나나요?
+logContext.SaveChanges() 호출 시도... 메시지가 나타나나요?
 로그 저장 완료. 결과 = ... 메시지가 나타나고, 결과 숫자가 0보다 큰가요?
