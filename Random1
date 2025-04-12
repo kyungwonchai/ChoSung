@@ -1,148 +1,720 @@
- 에러 CS1729: 'MemoListViewModel'에는 인수를 1개 사용하는 생성자가 포함되어 있지 않습니다.
+P 기반 구현을 위한 수정/신규 파일 최종 코드:
 
-에러 원인: 이 에러는 MainViewModel.cs 파일 안에서 MemoListViewModel 객체를 생성할 때 발생합니다. 현재 MainViewModel 코드는 MemoListViewModel을 만들 때 IMemoService 타입의 인자(_memoService) 하나를 넘겨주려고 시도하고 있습니다. (아래 코드 참고)
+주의: 아래 제공되는 IPMemoService와 MemoReceiverService 코드는 IP 기반 통신의 기본적인 개념과 구조를 보여주는 스케치 코드입니다. 실제 안정적인 작동을 위해서는 네트워크 프로그래밍(소켓, 스레딩, 비동기 처리), 오류 처리, 보안(암호화 등), 방화벽/NAT 문제 해결 등 매우 복잡하고 전문적인 구현이 필요합니다. 이 점을 반드시 인지하고 참고용으로 사용해 주십시오.
 
+1. IMemoService.cs (수정된 인터페이스)
+
+CreateMemoAsync 가 수신자 정보(여기서는 IP 목록)를 받을 수 있도록 수정합니다.
+위치: MemoAppMGSP/Services/Interfaces/IMemoService.cs (또는 SharedModels)
 C#
 
-// MainViewModel.cs 생성자 내부
-_memoListViewModel = new MemoListViewModel(_memoService /*, 다른 서비스들... */);
-하지만, 이전에 제공했던 MemoListViewModel.cs 코드의 생성자는 인자를 받지 않도록 되어 있거나, 인자를 받는 부분이 주석 처리되어 있었기 때문에 이 에러가 발생한 것입니다.
+// MemoAppMGSP/Services/Interfaces/IMemoService.cs
+using MemoAppMGSP.SharedModels;
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
-해결 방법: MemoListViewModel이 생성될 때 IMemoService를 받을 수 있도록 MemoListViewModel.cs 파일의 생성자를 수정해야 합니다.
+namespace MemoAppMGSP.Services.Interfaces
+{
+    public interface IMemoService
+    {
+        // DB에서 받는 메모 조회 (UserMemo 활용은 여전히 유효 가능)
+        Task<IEnumerable<UserMemoInfo>> GetUserMemosWithStatusAsync(Guid userId);
+        Task<Memo> GetMemoByIdAsync(Guid memoId);
 
-MemoListViewModel.cs (수정된 최종 코드):
+        // --- !!! 수정: 메모 생성 시 수신자 엔드포인트 목록 전달 !!! ---
+        /// <summary>
+        /// 새 메모를 생성하고 DB에 저장한 뒤, 지정된 수신자들에게 직접 전송을 시도합니다.
+        /// </summary>
+        /// <param name="memo">생성할 메모 객체 (SenderId 포함)</param>
+        /// <param name="recipientEndpoints">수신자 엔드포인트 목록 (예: "IP주소:포트" 또는 IP 주소)</param>
+        /// <returns>DB 저장 및 전송 시도 후 성공 여부 (전송 실패해도 DB 저장 성공 시 true 반환 가능 - 정책 결정 필요)</returns>
+        Task<bool> CreateMemoAsync(Memo memo, List<string> recipientEndpoints);
 
+        // 메모 업데이트는 DB만 수정할 가능성이 높음 (별도 전송 기능 필요 시 추가)
+        Task<bool> UpdateMemoAsync(Memo memo);
+
+        // 상태 변경은 DB의 UserMemos 테이블 대상 (ApiMemoService 구현과 유사할 수 있음 - DB 직접 접근)
+        Task<bool> MarkMemoAsReadAsync(Guid userId, Guid memoId, bool isRead);
+        Task<bool> SetPersonalStatusAsync(Guid userId, Guid memoId, bool isPersonal);
+        Task<bool> MarkMemoAsDeletedByReceiverAsync(Guid userId, Guid memoId);
+        Task<bool> MarkMemoAsDeletedBySenderAsync(Guid senderId, Guid memoId);
+    }
+}
+2. IPMemoService.cs (신규 구현 클래스 - 개념 코드)
+
+IMemoService 인터페이스를 구현합니다.
+DB 저장 로직과 TCP/IP 소켓 전송 로직을 포함합니다.
+위치: MemoAppMGSP/Services/Implementations/IPMemoService.cs
 C#
 
-// MemoAppMGSP/ViewModels/MemoListViewModel.cs
+// MemoAppMGSP/Services/Implementations/IPMemoService.cs
+using MemoAppMGSP.SharedModels;
+using MemoAppMGSP.Services.Interfaces;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+// using YourDataAccessLayer; // DB 접근 로직 필요 (예: EF Core DbContext 또는 Dapper 등)
+
+namespace MemoAppMGSP.Services.Implementations
+{
+    /// <summary>
+    /// IMemoService 인터페이스의 IP 기반 직접 통신 구현체 (개념 증명 코드).
+    /// 주의: 실제 사용에는 많은 개선과 예외 처리, 보안 강화가 필요합니다.
+    /// </summary>
+    public class IPMemoService : IMemoService
+    {
+        // private readonly YourDbContext _dbContext; // DB 컨텍스트 주입 필요
+        private readonly IAuthService _authService;
+        private const int TARGET_PORT = 12345; // 수신 클라이언트 포트 (고정 약속)
+
+        public IPMemoService(IAuthService authService /*, YourDbContext dbContext */)
+        {
+            _authService = authService ?? throw new ArgumentNullException(nameof(authService));
+            // _dbContext = dbContext;
+        }
+
+        public async Task<bool> CreateMemoAsync(Memo memo, List<string> recipientEndpoints)
+        {
+            if (memo == null || recipientEndpoints == null || !recipientEndpoints.Any())
+                return false;
+
+            // 1. ---!!! DB에 메모 저장 (Memos, MemoRecipients 테이블 등) !!!---
+            bool dbSaved = false;
+            try
+            {
+                // TODO: DB 저장 로직 구현 (_dbContext 사용)
+                //      - Memos 테이블에 memo 저장
+                //      - recipientEndpoints 정보를 기반으로 MemoRecipients 테이블에 각 수신자 정보 저장
+                //      - 트랜잭션 사용 권장
+                // await _dbContext.SaveChangesAsync();
+                dbSaved = true; // 임시
+                Debug.WriteLine($"DB: Memo {memo.MemoId} and recipients saved conceptually.");
+            }
+            catch (Exception dbEx)
+            {
+                Debug.WriteLine($"[ERROR] IPMemoService - DB Save Error: {dbEx.Message}");
+                return false; // DB 저장 실패
+            }
+
+            if (!dbSaved) return false; // DB 저장 실패 시 전송 안 함
+
+            // 2. ---!!! 각 수신자에게 IP 기반으로 직접 전송 시도 !!!---
+            // (이 부분은 백그라운드에서 비동기적으로 실행하고 즉시 true를 반환하는 것을 고려할 수 있음)
+            string memoJson = JsonConvert.SerializeObject(memo);
+            byte[] dataToSend = Encoding.UTF8.GetBytes(memoJson);
+            int successfulSends = 0;
+
+            // 병렬 처리 고려 (하지만 동시 연결 수 제한 주의)
+            foreach (var endpoint in recipientEndpoints)
+            {
+                // TODO: endpoint 문자열에서 IP 주소 파싱/검증 로직 필요
+                string targetIp = endpoint; // 실제로는 파싱/검증 필요
+
+                bool sent = await SendTcpDataAsync(targetIp, TARGET_PORT, dataToSend);
+                if (sent) successfulSends++;
+            }
+
+            Debug.WriteLine($"IPMemoService: Attempted to send to {recipientEndpoints.Count} recipients, {successfulSends} successful.");
+
+            // DB 저장이 성공했으면 true 반환 (전송 실패 여부와 관계없이)
+            return true;
+        }
+
+        /// <summary>
+        /// 특정 IP 주소와 포트로 TCP 데이터를 전송하는 도우미 메서드 (간략화됨)
+        /// </summary>
+        private async Task<bool> SendTcpDataAsync(string ipAddress, int port, byte[] data)
+        {
+            TcpClient client = null;
+            try
+            {
+                client = new TcpClient();
+                // 연결 타임아웃 설정 (예: 5초)
+                var connectTask = client.ConnectAsync(ipAddress, port);
+                if (await Task.WhenAny(connectTask, Task.Delay(5000)) == connectTask && client.Connected)
+                {
+                    using (var stream = client.GetStream())
+                    {
+                        // 데이터 길이 전송 (4바이트)
+                        byte[] lengthBytes = BitConverter.GetBytes(data.Length);
+                        await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length);
+                        // 실제 데이터 전송
+                        await stream.WriteAsync(data, 0, data.Length);
+                        await stream.FlushAsync();
+                        Debug.WriteLine($"TCP Send Success to {ipAddress}:{port}");
+                        return true;
+                    }
+                }
+                else
+                {
+                    Debug.WriteLine($"[WARN] TCP Connect Failed (Timeout or Error) to {ipAddress}:{port}");
+                    // 타임아웃 시 connectTask 취소 고려
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ERROR] TCP Send Error to {ipAddress}:{port}: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                client?.Close(); // 또는 client?.Dispose();
+            }
+        }
+
+
+        // --- 다른 IMemoService 메서드 구현 ---
+        public Task<IEnumerable<UserMemoInfo>> GetUserMemosWithStatusAsync(Guid userId)
+        {
+            // TODO: DB에서 직접 조회하는 로직 구현 (_dbContext 사용)
+            throw new NotImplementedException();
+        }
+
+        public Task<Memo> GetMemoByIdAsync(Guid memoId)
+        {
+            // TODO: DB에서 직접 조회하는 로직 구현
+            throw new NotImplementedException();
+        }
+
+        public Task<bool> UpdateMemoAsync(Memo memo)
+        {
+            // TODO: DB 업데이트 로직 구현 (메모 수정 후 재전송은 정책 결정 필요)
+            throw new NotImplementedException();
+        }
+
+        // UserMemos 상태 변경 메서드들 (DB 직접 업데이트)
+        public Task<bool> MarkMemoAsReadAsync(Guid userId, Guid memoId, bool isRead)
+        {
+            // TODO: DB의 UserMemos 테이블 업데이트 로직 구현
+            throw new NotImplementedException();
+        }
+        public Task<bool> SetPersonalStatusAsync(Guid userId, Guid memoId, bool isPersonal)
+        {
+             // TODO: DB의 UserMemos 테이블 업데이트 로직 구현
+            throw new NotImplementedException();
+        }
+        public Task<bool> MarkMemoAsDeletedByReceiverAsync(Guid userId, Guid memoId)
+        {
+             // TODO: DB의 UserMemos 테이블 업데이트 로직 구현
+            throw new NotImplementedException();
+        }
+        public Task<bool> MarkMemoAsDeletedBySenderAsync(Guid senderId, Guid memoId)
+        {
+             // TODO: DB의 Memos 테이블 업데이트 로직 구현
+            throw new NotImplementedException();
+        }
+    }
+}
+3. MemoReceiverService.cs (신규 구현 클래스 - 개념 코드)
+
+백그라운드에서 TCP 리스닝 실행, 메모 수신 시 이벤트 발생
+위치: MemoAppMGSP/Services/Implementations/MemoReceiverService.cs
+C#
+
+// MemoAppMGSP/Services/Implementations/MemoReceiverService.cs (개념 코드)
+using MemoAppMGSP.SharedModels; // Memo, MemoEventArgs 사용
+using System;
+using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using System.Windows; // Application.Current.Dispatcher
+
+namespace MemoAppMGSP.Services.Implementations
+{
+    /// <summary>
+    /// 다른 클라이언트로부터 TCP/IP 소켓을 통해 메모를 수신하는 서비스입니다.
+    /// 앱 시작 시 StartListening() 호출 필요. 종료 시 StopListening()/Dispose() 호출 필요.
+    /// </summary>
+    public class MemoReceiverService : IDisposable
+    {
+        private TcpListener _listener;
+        private readonly int _listeningPort = 12345; // 수신 대기 포트 (고정 약속)
+        private CancellationTokenSource _cts;
+        private volatile bool _isRunning = false; // 스레드 안전 고려
+        private readonly object _lock = new object(); // 시작/중지 동기화
+
+        /// <summary>
+        /// 새 메모 수신 시 발생하는 이벤트입니다. UI 스레드에서 발생하도록 처리됩니다.
+        /// </summary>
+        public event EventHandler<MemoEventArgs> MemoReceived;
+
+        public MemoReceiverService(int? port = null) // 포트 변경 가능하도록
+        {
+            if (port.HasValue) _listeningPort = port.Value;
+        }
+
+        /// <summary>
+        /// 메모 수신 리스너를 시작합니다. 실패 시 false 반환.
+        /// </summary>
+        public bool StartListening()
+        {
+            lock (_lock)
+            {
+                if (_isRunning) return true; // 이미 실행 중
+
+                try
+                {
+                    _cts = new CancellationTokenSource();
+                    var token = _cts.Token;
+                    _listener = new TcpListener(IPAddress.Any, _listeningPort);
+                    _listener.Start();
+                    _isRunning = true;
+
+                    // 리스닝 루프를 별도 스레드에서 실행
+                    Task.Run(() => ListenLoop(token), token);
+
+                    Debug.WriteLine($"TCP Listener started on port {_listeningPort}.");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ERROR] Failed to start TCP Listener on port {_listeningPort}: {ex.Message}");
+                    _isRunning = false;
+                    return false; // 시작 실패
+                }
+            }
+        }
+
+        /// <summary>
+        /// 클라이언트 연결을 기다리고 처리하는 메인 루프 (백그라운드 스레드)
+        /// </summary>
+        private async Task ListenLoop(CancellationToken token)
+        {
+             Debug.WriteLine("Listener loop running...");
+            while (!token.IsCancellationRequested && _listener != null)
+            {
+                try
+                {
+                    // 클라이언트 연결 비동기 대기
+                    TcpClient client = await _listener.AcceptTcpClientAsync();
+                    Debug.WriteLine($"Client connected from {client?.Client?.RemoteEndPoint}");
+
+                    // 연결된 클라이언트 처리 (별도 Task로 분리하여 다른 연결 대기 가능)
+                    _ = Task.Run(async () => await HandleClientAsync(client, token), token);
+                }
+                catch (ObjectDisposedException) when (token.IsCancellationRequested) { break; } // 정상 종료
+                catch (SocketException sockEx) when (sockEx.SocketErrorCode == SocketError.Interrupted || token.IsCancellationRequested) { break; } // 정상 종료
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ERROR] AcceptTcpClientAsync Error in loop: {ex.Message}");
+                    if (!_isRunning) break; // 서비스 중지 시 루프 탈출
+                    await Task.Delay(1000); // 오류 시 잠시 대기
+                }
+            }
+             Debug.WriteLine("Listener loop stopped.");
+             _listener?.Stop(); // 루프 종료 시 리스너 확실히 중지
+        }
+
+        /// <summary>
+        /// 연결된 클라이언트로부터 데이터를 수신하고 처리합니다.
+        /// </summary>
+        private async Task HandleClientAsync(TcpClient client, CancellationToken token)
+        {
+             if (client == null) return;
+             using (client) // using으로 자동 Dispose 보장
+             using (var stream = client.GetStream())
+             {
+                try
+                {
+                     // 데이터 길이(4바이트) 읽기 시도
+                     byte[] lengthBuffer = new byte[4];
+                     int bytesRead = await ReadExactlyAsync(stream, lengthBuffer, 4, token);
+                     if (bytesRead < 4 || token.IsCancellationRequested) return; // 길이 정보 못 읽으면 종료
+
+                     int dataLength = BitConverter.ToInt32(lengthBuffer, 0);
+                     // 비정상적인 데이터 길이 체크 (예: 0 이하 또는 매우 큰 값)
+                     if (dataLength <= 0 || dataLength > 10 * 1024 * 1024) // 10MB 제한 예시
+                     {
+                          Debug.WriteLine($"[WARN] Invalid data length received: {dataLength}");
+                          return;
+                     }
+
+                     // 실제 메모 데이터 읽기
+                     byte[] dataBuffer = new byte[dataLength];
+                     bytesRead = await ReadExactlyAsync(stream, dataBuffer, dataLength, token);
+                     if (bytesRead < dataLength || token.IsCancellationRequested) return; // 전체 데이터 못 읽으면 종료
+
+                     // JSON 역직렬화
+                     string memoJson = Encoding.UTF8.GetString(dataBuffer);
+                     Memo receivedMemo = JsonConvert.DeserializeObject<Memo>(memoJson);
+
+                     if (receivedMemo != null)
+                     {
+                         Debug.WriteLine($"Received Memo: {receivedMemo.Title} from {client.Client.RemoteEndPoint}");
+                         // 이벤트 발생 (UI 스레드에서 처리되도록)
+                         OnMemoReceived(new MemoEventArgs(receivedMemo));
+                         // TODO: 여기서 DB에 IsRead 업데이트 등을 수행할 수도 있음
+                     }
+                      else { Debug.WriteLine("[WARN] Failed to deserialize received memo data."); }
+                }
+                catch (OperationCanceledException) { Debug.WriteLine("Client handling cancelled."); }
+                catch (System.IO.IOException ioEx) { Debug.WriteLine($"[WARN] IO Error handling client {client?.Client?.RemoteEndPoint}: {ioEx.Message}"); } // 연결 끊김 등
+                catch (Exception ex) { Debug.WriteLine($"[ERROR] HandleClient Error: {ex.Message}"); }
+            } // client 및 stream 자동 Dispose
+        }
+
+        /// <summary>
+        /// 스트림에서 요청된 바이트 수만큼 정확히 읽어옵니다. (타임아웃 고려 필요)
+        /// </summary>
+        private async Task<int> ReadExactlyAsync(NetworkStream stream, byte[] buffer, int bytesToRead, CancellationToken token)
+        {
+            int totalBytesRead = 0;
+            // TODO: NetworkStream 타임아웃 설정 고려 (stream.ReadTimeout)
+            try
+            {
+                while (totalBytesRead < bytesToRead && !token.IsCancellationRequested)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer, totalBytesRead, bytesToRead - totalBytesRead, token);
+                    if (bytesRead == 0) throw new System.IO.EndOfStreamException("Connection closed prematurely."); // 연결 끊김
+                    totalBytesRead += bytesRead;
+                }
+            }
+            catch(System.IO.IOException ex) when (ex.InnerException is SocketException sockEx && (sockEx.SocketErrorCode == SocketError.TimedOut || sockEx.SocketErrorCode == SocketError.ConnectionReset))
+            {
+                Debug.WriteLine($"Read timeout or connection reset: {ex.Message}");
+                return totalBytesRead; // 타임아웃 시 읽은 만큼만 반환
+            }
+            return totalBytesRead;
+        }
+
+        /// <summary>
+        /// MemoReceived 이벤트를 UI 스레드에서 안전하게 발생시킵니다.
+        /// </summary>
+        protected virtual void OnMemoReceived(MemoEventArgs e)
+        {
+             EventHandler<MemoEventArgs> handler = MemoReceived;
+             if (handler != null)
+             {
+                 Action action = () => handler.Invoke(this, e);
+                 // WPF 애플리케이션의 Dispatcher를 사용하여 UI 스레드에서 실행
+                 if (Application.Current != null) Application.Current.Dispatcher.Invoke(action);
+                 else action(); // Dispatcher 사용 불가 시 직접 호출 (UI 스레드 아닐 수 있음 주의)
+             }
+        }
+
+        /// <summary>
+        /// 메모 수신 리스너를 중지합니다.
+        /// </summary>
+        public void StopListening()
+        {
+            lock (_lock)
+            {
+                if (!_isRunning) return;
+                _isRunning = false; // 플래그 먼저 설정
+                try
+                {
+                    _cts?.Cancel(); // 진행 중인 비동기 작업 취소 요청
+                    _listener?.Stop(); // 즉시 리스닝 중단 (AcceptTcpClientAsync 등에서 예외 발생 유도)
+                }
+                catch (Exception ex) { Debug.WriteLine($"Error stopping listener: {ex.Message}"); }
+                finally
+                {
+                     _cts?.Dispose();
+                     _cts = null;
+                     _listener = null; // 참조 해제
+                     Debug.WriteLine("TCP Listener stopped and resources released.");
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            StopListening();
+            GC.SuppressFinalize(this);
+        }
+    }
+}
+4. MemoEditorViewModel.cs (수정본 - IP 기반)
+
+RecipientInput 사용 및 IPMemoService 호출 반영
+C#
+
+// MemoAppMGSP/ViewModels/MemoEditorViewModel.cs (IP 기반 최종 수정본)
 using MemoAppMGSP.Infrastructure.Commands;
 using MemoAppMGSP.Models;
-using MemoAppMGSP.Services.Interfaces; // IMemoService 사용
-using System; // Guid, Exception 등
+using MemoAppMGSP.Services.Interfaces;
+using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Windows;
 using System.Windows.Input;
 
 namespace MemoAppMGSP.ViewModels
 {
-    public class MemoListViewModel : ViewModelBase
+    public class MemoEditorViewModel : ViewModelBase
     {
-        // --- Dependencies ---
-        private readonly IMemoService _memoService; // *** 필드 선언 ***
-        // private readonly IDialogService _dialogService;
-        // private readonly IAuthService _authService;
+        // --- !!! 서비스 타입 변경 가능성 !!! ---
+        private readonly IMemoService _memoService; // IPMemoService 인스턴스가 주입되어야 함
+        private readonly IAuthService _authService;
+        private readonly Action _closeViewAction;
 
-        // --- Backing Fields --- (이전과 동일)
-        private ObservableCollection<MemoViewModel> _memos = new ObservableCollection<MemoViewModel>();
-        private MemoViewModel _selectedMemo;
-        private bool _isLoading = false;
-        private string _loadingMessage = string.Empty;
+        // --- Backing Fields & Properties ---
+        private Guid _memoId = Guid.Empty;
+        private string _title = string.Empty;
+        public string Title { get => _title; set => SetProperty(ref _title, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged()); }
+        private string _content = string.Empty;
+        public string Content { get => _content; set => SetProperty(ref _content, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged()); }
+        private bool _isPopup = false;
+        public bool IsPopup { get => _isPopup; set => SetProperty(ref _isPopup, value); }
 
-        // --- Properties for Binding --- (이전과 동일)
-        public ObservableCollection<MemoViewModel> Memos { /* ... */ }
-        public MemoViewModel SelectedMemo { /* ... */ }
-        public bool IsLoading { /* ... */ }
-        public string LoadingMessage { /* ... */ }
+        private string _recipientInput = string.Empty; // UI 입력값 (쉼표 구분 IP 또는 사용자명 등)
+        public string RecipientInput { get => _recipientInput; set => SetProperty(ref _recipientInput, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged()); }
 
-        // --- Commands --- (이전과 동일)
-        public ICommand RefreshCommand { get; }
-        public ICommand DeleteMemoCommand { get; }
+        private bool _isEditing = false;
+        public bool IsEditing => _isEditing;
+        public string EditorWindowTitle { get; private set; } = "새 메모 작성";
+        private bool _isBusy = false;
+        public bool IsBusy { get => _isBusy; private set => SetProperty(ref _isBusy, value); }
+        private string _busyMessage = string.Empty;
+        public string BusyMessage { get => _busyMessage; private set => SetProperty(ref _busyMessage, value); }
 
-        // --- !!! 생성자 수정 !!! ---
-        /// <summary>
-        /// MemoListViewModel의 새 인스턴스를 초기화합니다.
-        /// IMemoService를 주입받습니다.
-        /// </summary>
-        /// <param name="memoService">메모 데이터 처리를 위한 서비스</param>
-        public MemoListViewModel(IMemoService memoService /*, 다른 서비스들 주입 */)
+        public ICommand SaveCommand { get; }
+        public ICommand CancelCommand { get; }
+
+        // 생성자 (IAuthService 추가 주입)
+        public MemoEditorViewModel(Action closeViewAction, IMemoService memoService, IAuthService authService)
         {
-            // *** 서비스 주입 받기 ***
+            _closeViewAction = closeViewAction;
             _memoService = memoService ?? throw new ArgumentNullException(nameof(memoService));
-            // _dialogService = dialogService;
-            // _authService = authService;
+            _authService = authService ?? throw new ArgumentNullException(nameof(authService));
 
-            // 명령 초기화
-            RefreshCommand = new RelayCommand(async (_) => await LoadMemosAsync());
-            DeleteMemoCommand = new RelayCommand(ExecuteDeleteMemo, CanExecuteDeleteMemo);
-
-            // 생성 시 초기 메모 로드
-            _ = LoadMemosAsync();
+            SaveCommand = new RelayCommand(async (_) => await ExecuteSaveAsync(), CanExecuteSave);
+            CancelCommand = new RelayCommand(ExecuteCancel);
+            // TODO: 기존 메모 편집용 생성자 구현 필요
         }
 
-        // --- Public Methods ---
-        public async Task LoadMemosAsync()
+        private async Task ExecuteSaveAsync()
         {
-            // --- !!! _memoService 사용 확인 !!! ---
-            if (IsLoading || _memoService == null) return; // _memoService null 체크 추가
-            IsLoading = true;
-            // ... (이전 LoadMemosAsync 로직 - _memoService를 사용하여 데이터 로드) ...
-            // 예시: var userMemoData = await _memoService.GetUserMemosWithStatusAsync(currentUserId);
-             Memos.Clear(); // Clear 전에 null 체크 불필요 (컬렉션은 생성자에서 초기화)
-             SelectedMemo = null;
-            try {
-                // 임시 Mock 데이터 대신 실제 서비스 호출 필요
-                Guid currentUserId = _authService?.GetCurrentUser()?.Id ?? Guid.Empty; // 현재 사용자 ID 가져오기 (IAuthService 필요)
-                if(currentUserId != Guid.Empty)
+            if (IsBusy || _memoService == null || _authService == null) return;
+
+            var currentUser = _authService.GetCurrentUser();
+            if (currentUser == null) { MessageBox.Show("로그인 정보가 없습니다."); return; }
+
+            // 받는 사람 목록 처리 (쉼표, 세미콜론, 공백으로 구분 가정)
+            List<string> recipientEndpoints = _recipientInput.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                                                    .Select(s => s.Trim())
+                                                    .Where(s => !string.IsNullOrEmpty(s))
+                                                    .ToList();
+            if (!recipientEndpoints.Any()) { MessageBox.Show("받는 사람을 입력하세요 (IP 또는 사용자명)."); return; }
+
+            // TODO: 실제로는 사용자명 -> IP 주소 변환 로직 필요
+
+            IsBusy = true;
+            BusyMessage = "메모 저장 및 전송 중...";
+
+            try
+            {
+                Memo memo = new Memo
                 {
-                    var userMemoData = await _memoService.GetUserMemosWithStatusAsync(currentUserId);
-                    if (userMemoData != null)
-                    {
-                        foreach (var data in userMemoData.OrderByDescending(d => d.Memo.CreatedAtUtc))
-                        {
-                             Memos.Add(new MemoViewModel(data.Memo, data.IsRead, data.IsPersonal));
-                        }
-                        LoadingMessage = $"총 {Memos.Count}개의 메모 로드 완료.";
-                    } else { LoadingMessage = "메모 로드 실패 (서비스 결과 없음)."; }
-                } else { LoadingMessage = "메모 로드 실패 (사용자 정보 없음)."; }
+                    MemoId = _isEditing ? _memoId : Guid.NewGuid(),
+                    Title = this.Title,
+                    Content = this.Content,
+                    SenderId = currentUser.Id,
+                    IsPopup = this.IsPopup,
+                    CreatedAtUtc = DateTime.UtcNow,
+                    UpdatedAtUtc = DateTime.UtcNow,
+                };
 
-            } catch (Exception ex) {
-                 Debug.WriteLine($"Error loading memos: {ex.Message}");
-                 LoadingMessage = $"오류 발생: {ex.Message}";
-            } finally { IsLoading = false; }
-        }
+                // --- !!! IPMemoService의 CreateMemoAsync 호출 (수신자 목록 전달) !!! ---
+                bool success = await _memoService.CreateMemoAsync(memo, recipientEndpoints);
 
-        // --- Command Methods --- (이전과 동일, 내부에서 _memoService 사용 필요 시 확인)
-        private async void ExecuteDeleteMemo(object parameter)
-        {
-             if (SelectedMemo == null || _memoService == null) return; // _memoService null 체크 추가
-
-            // ... (이전 삭제 로직 - _memoService.MarkMemoAsDeletedByReceiverAsync 호출 등) ...
-            bool confirmed = true; // 실제로는 _dialogService 사용
-            if (confirmed) {
-                 StatusMessage = $"'{SelectedMemo.Title}' 삭제 처리 중...";
-                 try {
-                    Guid currentUserId = _authService?.GetCurrentUser()?.Id ?? Guid.Empty;
-                     if(currentUserId != Guid.Empty) {
-                        bool success = await _memoService.MarkMemoAsDeletedByReceiverAsync(currentUserId, SelectedMemo.Id);
-                         if (success) {
-                             Memos.Remove(SelectedMemo);
-                             SelectedMemo = null;
-                             StatusMessage = "메모 삭제 완료.";
-                         } else { StatusMessage = "메모 삭제 실패."; }
-                     } else { StatusMessage = "메모 삭제 실패 (사용자 정보 없음)."; }
-                 } catch(Exception ex) { StatusMessage = $"삭제 중 오류: {ex.Message}"; }
+                if (success)
+                {
+                    Debug.WriteLine("Save/Send successful! Closing view...");
+                     MessageBox.Show("메모를 저장하고 전송을 시도했습니다."); // 성공 피드백
+                    if (_closeViewAction != null) _closeViewAction.Invoke();
+                }
+                else { MessageBox.Show("메모 저장 또는 전송에 실패했습니다."); }
             }
+            catch (Exception ex) { MessageBox.Show($"오류 발생: {ex.Message}"); }
+            finally { IsBusy = false; }
         }
 
-        private bool CanExecuteDeleteMemo(object parameter)
+        private bool CanExecuteSave(object parameter)
         {
-            return SelectedMemo != null && !IsLoading;
+            return (!string.IsNullOrWhiteSpace(Title) || !string.IsNullOrWhiteSpace(Content))
+                   && !string.IsNullOrWhiteSpace(_recipientInput) && !IsBusy;
         }
-
-        // Helper property
-        private string _statusMessage = string.Empty;
-        public string StatusMessage { get => _statusMessage; private set => SetProperty(ref _statusMessage, value); }
+        private void ExecuteCancel(object parameter) { if (_closeViewAction != null) _closeViewAction.Invoke(); }
     }
 }
-수정 내용: 생성자 파라미터에 IMemoService memoService를 추가하고, 전달받은 memoService를 내부 필드 _memoService에 저장하도록 수정했습니다. 이제 MainViewModel에서 new MemoListViewModel(_memoService) 코드가 정상적으로 작동할 것입니다. LoadMemosAsync와 ExecuteDeleteMemo 내부에서도 _memoService를 사용하도록 예시 코드를 보강했습니다. (실제 로직 구현 시 IAuthService 등 추가 주입이 필요할 수 있습니다.)
-2. IPMemoService.cs 파일 삭제 여부
+5. App.xaml.cs (수정본 - IP 기반)
 
-답변: 네, 이전에 잠시 논의했던 IP 주소 기반 직접 통신 방식을 사용하지 않고, 현재 클라이언트-서버 방식으로 계속 진행하신다면 IPMemoService.cs 파일은 더 이상 필요 없으므로 삭제하셔도 됩니다. 혼란을 피하기 위해 지우는 것이 좋습니다.
-다음 단계:
+MemoReceiverService 시작 및 IPMemoService 사용 예시
+C#
 
-위에 제공된 코드로 MemoListViewModel.cs 파일을 업데이트합니다.
-솔루션을 **정리(Clean)**하고 **다시 빌드(Rebuild)**하여 에러가 사라졌는지 확인합니다.
-이제 CS1729 에러는 해결될 것입니
+// MemoAppMGSP/App.xaml.cs
+using MemoAppMGSP.Services.Implementations; // 서비스 구현체
+using MemoAppMGSP.Services.Interfaces;     // 서비스 인터페이스
+using MemoAppMGSP.ViewModels;             // ViewModel
+using System;
+using System.Configuration;
+using System.Net.Http; // HttpClient
+using System.Windows;
+
+namespace MemoAppMGSP
+{
+    public partial class App : Application
+    {
+        // 서비스 인스턴스 관리 (간단한 형태, DI 컨테이너 사용 권장)
+        private IAuthService _authService;
+        private IMemoService _memoService;
+        private IDialogService _dialogService;
+        private MemoReceiverService _memoReceiverService; // 알림 수신 서비스
+        private INotificationService _dummyNotificationService; // SignalR 방식 안쓰므로 임시 처리
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+
+            // --- 서비스 객체 생성 ---
+            _authService = new MockAuthService(); // 임시 Mock, 실제 구현 필요
+            _dialogService = new DialogService();
+
+            // ---!!! IPMemoService 사용 !!!---
+            _memoService = new IPMemoService(_authService /*, dbContext */); // DB 접근 로직 필요
+
+            // ---!!! MemoReceiverService 생성 및 시작 !!!---
+            _memoReceiverService = new MemoReceiverService();
+            bool listenerStarted = _memoReceiverService.StartListening();
+            if (!listenerStarted)
+            {
+                 _dialogService.ShowError("수신 오류", "메모 수신 서비스를 시작할 수 없습니다.\n다른 프로그램이 해당 포트를 사용 중일 수 있습니다.");
+                 // 앱 종료 또는 기능 제한 고려
+            }
+            // 수신 이벤트 구독 (예: MainViewModel 에서 처리)
+            // _memoReceiverService.MemoReceived += (sender, args) => { /* MainViewModel에 전달 */ };
+
+            // ---!!! SignalR 방식 안쓰므로 임시 Dummy 구현 !!!---
+            // INotificationService 가 필요한 곳에 전달하기 위함 (MainViewModel 생성자 등)
+             _dummyNotificationService = new DummyNotificationService();
+
+
+            // --- 메인 윈도우 및 ViewModel 생성/연결 ---
+            // MainViewModel 생성 시 필요한 서비스들 전달
+            var mainViewModel = new MainViewModel(_memoService, _authService, _dialogService, _dummyNotificationService);
+            var mainWindow = new MainWindow();
+            mainWindow.DataContext = mainViewModel;
+            mainWindow.Show();
+
+            // MainViewModel이 MemoReceiverService 이벤트 구독하게 연결
+            mainViewModel.SubscribeMemoReceiver(_memoReceiverService); // MainViewModel에 메서드 추가 필요
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            // 앱 종료 시 리소스 정리
+            _memoReceiverService?.Dispose(); // 리스너 서비스 중지 및 정리
+            // MainViewModel 등 다른 IDisposable 객체 정리
+            if (MainWindow?.DataContext is IDisposable disposable)
+            {
+                 disposable.Dispose();
+            }
+            base.OnExit(e);
+        }
+
+        // INotificationService 임시 Dummy 구현 (SignalR 방식 안쓸 때)
+        private class DummyNotificationService : INotificationService
+        {
+            public event EventHandler<MemoEventArgs> MemoReceived; // 이벤트는 있지만 발생 안함
+            public Task StartAsync() => Task.CompletedTask;
+            public Task StopAsync() => Task.CompletedTask;
+        }
+         // TODO: MainViewModel에 SubscribeMemoReceiver 메서드 추가 구현
+         // 예시: public void SubscribeMemoReceiver(MemoReceiverService receiver) { if(receiver!=null) receiver.MemoReceived += NotificationService_MemoReceived; }
+         //       MainViewModel의 Dispose 에는 구독 해제 로직 추가
+    }
+}
+6. Memo.cs (수정본 - SharedModels)
+
+ReceiverId 제거 또는 주석 처리 (여러 명에게 보낼 수 있으므로)
+C#
+
+// MemoAppMGSP.SharedModels/Memo.cs
+using System;
+namespace MemoAppMGSP.SharedModels
+{
+    public class Memo
+    {
+        public Guid MemoId { get; set; }
+        public string Title { get; set; }
+        public string Content { get; set; }
+        public Guid SenderId { get; set; }
+        // public Guid ReceiverId { get; set; } // ---!!! 단일 수신자 제거 또는 주석 처리 !!!---
+        public DateTime CreatedAtUtc { get; set; }
+        public DateTime UpdatedAtUtc { get; set; }
+        public bool IsPopup { get; set; }
+        public bool IsDeletedBySender { get; set; }
+
+        public Memo() { /* ... 기본값 설정 ... */ MemoId = Guid.NewGuid(); /* ... */ }
+    }
+}
+7. User.cs (수정본 - SharedModels)
+
+IP 주소 필드 추가 고려 (단, IP는 변경될 수 있어 신뢰성 낮음)
+C#
+
+// MemoAppMGSP.SharedModels/User.cs
+using System;
+namespace MemoAppMGSP.SharedModels
+{
+    public class User
+    {
+        public Guid Id { get; set; }
+        public string Username { get; set; }
+        public string DisplayName { get; set; }
+        public string PasswordHash { get; set; }
+        public bool IsAdmin { get; set; }
+        public DateTime CreatedAtUtc { get; set; }
+        public bool IsActive { get; set; }
+
+        // ---!!! IP 주소 필드 추가 (선택적, 관리 및 신뢰성 문제 고려) !!!---
+        public string LastKnownIpAddress { get; set; }
+
+        public User() { /* ... 기본값 설정 ... */ }
+    }
+}
+8. DB 스키마 변경 (개념 SQL)
+
+Memos 테이블에서 ReceiverId 제거
+MemoRecipients 테이블 추가 (메모 ID와 수신자 User ID 연결)
+SQL
+
+-- Memos 테이블 수정 (ReceiverId 제거)
+-- ALTER TABLE Memos DROP CONSTRAINT FK_Memos_Receiver; -- 외래 키 먼저 제거
+-- ALTER TABLE Memos DROP COLUMN ReceiverId;
+-- (주의: 이미 데이터가 있다면 마이그레이션 필요)
+
+-- MemoRecipients 테이블 생성 예시
+CREATE TABLE MemoRecipients (
+    MemoRecipientId BIGINT PRIMARY KEY IDENTITY(1,1),
+    MemoId UNIQUEIDENTIFIER NOT NULL,
+    RecipientUserId UNIQUEIDENTIFIER NOT NULL,
+    -- 필요 시 전송 시간, 상태 등 추가 가능
+
+    CONSTRAINT FK_MemoRecipients_Memo FOREIGN KEY (MemoId) REFERENCES Memos(MemoId) ON DELETE CASCADE,
+    CONSTRAINT FK_MemoRecipients_User FOREIGN KEY (RecipientUserId) REFERENCES Users(UserId) ON DELETE CASCADE, -- User 삭제 시 같이 삭제 (정책)
+    CONSTRAINT UQ_MemoRecipients_Memo_User UNIQUE (MemoId, RecipientUserId) -- 특정 메모에 동일 수신자 중복 방지
+);
+GO
+CREATE INDEX IX_MemoRecipients_RecipientUserId ON MemoRecipients(RecipientUserId);
+GO
+다시 한번 강조:
+
+IP 기반 직접 통신 방식은 구현이 매우 복잡하고 어렵습니다. 위에 제공된 코드는 핵심 로직의 개념적인 구조를 보여주는 것이며, 실제 안정적인 서비스를 위해서는 방화벽, NAT, 동적 IP, 보안(암호화), 오류 처리, 스레딩 등 수많은 문제들을 해결해야 합니다.
+
+진행하시기 전에 이 방식의 어려움과 복잡성을 충분히 인지하시고, 정말로 이 방식이 최선인지 다시 한번 검토해 보시기를 강력히 권장합니다.
+
+만약 이 방향으로 계속 진행하신다면, 우선 IPMemoService의 DB 저장 로직과 MemoReceiverService의 기본적인 TCP 리스닝 및 데이터 수신 로직부터 단계적으로 구현
