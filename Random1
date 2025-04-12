@@ -1,9 +1,404 @@
-를 다시 드리겠습니다. 이 코드는 "로그인 불필요, IP 기억" 요구사항과 이전 에러 수정 내용을 모두 반영한 버전입니다. 기존 파일 내용을 완전히 삭제하고 아래 코드로 덮어쓰는 것을 권장합니다.
+로그인/인증 완전 제거: IAuthService, MockAuthService, User 모델의 PasswordHash 등 관련 코드 모두 제거.
+IP 기반 식별: UserId(Guid) 대신 IP 주소(string) 또는 로컬 식별자(예: PC 이름 - string) 사용.
+모델 통일: MemoAppMGSP.SharedModels 프로젝트를 중심으로 Memo, User(또는 ClientInfo) 모델 정의를 확정하고, 클라이언트/서버 모두 이를 참조.
+서버 역할 축소: 서버(MemoAppMGSP.Server)는 DB 저장/조회 API 역할만 수행 (SignalR Hub 불필요 또는 역할 변경). IP 기반 통신에서는 서버가 메시지 중계 안 함. (단, 현재 에러 목록에 서버 쪽 에러도 있으니 일단 수정은 포함)
+클라이언트 역할 증대: IPMemoService (DB 저장 + TCP 전송), MemoReceiverService (TCP 수신) 구현.
+참조 및 설정 확인: 프로젝트 참조, using 문, xmlns 매핑, NuGet 패키지, 설정 파일(App.config, appsettings.json) 점검.
+A. 공유 모델 프로젝트 (MemoAppMGSP.SharedModels)
 
-1. IMemoService.cs (최종본 - 인터페이스)
+이 프로젝트가 .NET Standard 2.0 으로 되어 있는지 확인하세요.
+아래 파일들만 이 프로젝트 안에 있고, 네임스페이스가 MemoAppMGSP.SharedModels 인지 확인하세요.
+1. Memo.cs (최종 수정본 - SharedModels)
 
-CreateMemoAsync 시그니처 확인.
-위치: MemoAppMGSP/Services/Interfaces/IMemoService.cs
+C#
+
+// MemoAppMGSP.SharedModels/Memo.cs
+using System;
+
+namespace MemoAppMGSP.SharedModels
+{
+    /// <summary>
+    /// 메모 데이터 모델 (로그인 불필요, IP 기반 버전)
+    /// </summary>
+    public class Memo
+    {
+        public Guid MemoId { get; set; }
+        public string Title { get; set; }
+        public string Content { get; set; }
+        /// <summary>
+        /// 보내는 사람 식별자 (예: PC 이름, 설정된 이름)
+        /// </summary>
+        public string SenderName { get; set; }
+        public DateTime CreatedAtUtc { get; set; }
+        public DateTime UpdatedAtUtc { get; set; }
+        /// <summary>
+        /// 받는 클라이언트에서 팝업 여부 결정 시 참고할 플래그
+        /// </summary>
+        public bool IsPopup { get; set; }
+        // DB 저장용 상태 필드들 (필요 시)
+        // public bool IsDeletedBySender { get; set; }
+
+        public Memo()
+        {
+            MemoId = Guid.NewGuid();
+            try { SenderName = Environment.MachineName; } catch { SenderName = "UnknownSender"; }
+            CreatedAtUtc = DateTime.UtcNow;
+            UpdatedAtUtc = DateTime.UtcNow;
+        }
+    }
+}
+2. User.cs (최종 수정본 - SharedModels)
+
+로그인 관련 정보 제거. 필요 시 클라이언트 식별 정보만 남깁니다. (이 모델 자체의 필요성도 낮음)
+C#
+
+// MemoAppMGSP.SharedModels/User.cs
+using System;
+
+namespace MemoAppMGSP.SharedModels
+{
+    /// <summary>
+    /// 사용자(클라이언트) 식별 정보 (로그인 없는 버전).
+    /// 간단한 식별자(PC 이름 등)만 필요할 수 있습니다.
+    /// </summary>
+    public class User // 또는 ClientInfo
+    {
+        /// <summary>
+        /// 클라이언트를 식별하는 고유 문자열 (예: PC이름, Guid 등)
+        /// </summary>
+        public string Identifier { get; set; }
+
+        /// <summary>
+        /// 표시 이름
+        /// </summary>
+        public string DisplayName { get; set; }
+
+        // 참고용 정보
+        public string LastKnownIpAddress { get; set; }
+
+        public User()
+        {
+            Identifier = Environment.MachineName;
+            DisplayName = Environment.UserName;
+        }
+    }
+}
+3. UserMemoInfo.cs (최종본 - SharedModels)
+
+IMemoService.GetUserMemosWithStatusAsync 반환 타입. Memo 모델을 포함합니다.
+C#
+
+// MemoAppMGSP.SharedModels/UserMemoInfo.cs
+using System;
+
+namespace MemoAppMGSP.SharedModels
+{
+    public class UserMemoInfo
+    {
+        public Memo Memo { get; set; } // 수정된 Memo 모델 참조
+        public bool IsRead { get; set; }
+        public bool IsPersonal { get; set; }
+        // 수신자 입장에서 삭제 여부 등 추가 가능
+        // public bool IsDeletedByReceiver { get; set; }
+    }
+}
+4. MemoEventArgs.cs (최종본 - SharedModels)
+
+MemoReceiverService에서 사용하는 이벤트 데이터 클래스입니다.
+C#
+
+// MemoAppMGSP.SharedModels/MemoEventArgs.cs
+using System;
+
+namespace MemoAppMGSP.SharedModels
+{
+    public class MemoEventArgs : EventArgs
+    {
+        public Memo ReceivedMemo { get; private set; }
+
+        public MemoEventArgs(Memo receivedMemo)
+        {
+            ReceivedMemo = receivedMemo ?? throw new ArgumentNullException(nameof(receivedMemo));
+        }
+    }
+}
+B. 서버 프로젝트 (MemoAppMGSP.Server)
+
+주의: IP 기반 직접 통신에서는 이 서버 프로젝트의 역할이 DB 관리 API 제공으로 축소되거나 불필요할 수 있습니다. 하지만 에러 목록에 이 프로젝트 관련 에러가 있으므로, 수정된 모델 기준으로 코드를 다시 제공합니다. SignalR Hub 관련 코드는 제거하거나 주석 처리합니다.
+필수 NuGet 패키지: Microsoft.EntityFrameworkCore, Microsoft.EntityFrameworkCore.SqlServer
+프로젝트 참조: MemoAppMGSP.SharedModels 참조 추가.
+1. Data/MSMDDbContext.cs (최종 수정본 - Server)
+
+using Microsoft.EntityFrameworkCore; 추가.
+OnModelCreating 에서 수정된 User, Memo 모델 기준으로 설정. (PasswordHash, ReceiverId 등 없음)
+SignalRConnections 관련 DbSet 및 설정은 제거 (IP 기반이므로 불필요).
+C#
+
+// MemoAppMGSP.Server/Data/MSMDDbContext.cs
+using Microsoft.EntityFrameworkCore;
+using MemoAppMGSP.SharedModels; // 공유 모델 사용
+// using MemoAppMGSP.Server.Data; // SignalRConnection 제거됨
+
+namespace MemoAppMGSP.Server.Data
+{
+    public class MSMDDbContext : DbContext
+    {
+        public DbSet<User> Users { get; set; } // 간소화된 User 모델
+        public DbSet<Memo> Memos { get; set; } // 수정된 Memo 모델
+        // public DbSet<UserMemo> UserMemos { get; set; } // 필요 시
+        // public DbSet<MemoRecipient> MemoRecipients { get; set; } // 수신자 목록 테이블 엔티티 필요 시
+        // public DbSet<SignalRConnection> SignalRConnections { get; set; } // !!! 제거 !!!
+
+        public MSMDDbContext(DbContextOptions<MSMDDbContext> options) : base(options) { }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<User>(entity =>
+            {
+                entity.ToTable("Users");
+                entity.HasKey(e => e.Identifier); // 기본 키 변경 (또는 다른 속성 사용)
+                entity.Property(e => e.Identifier).HasMaxLength(100).IsRequired();
+                entity.HasIndex(e => e.Identifier).IsUnique(); // 식별자 고유
+                entity.Property(e => e.DisplayName).HasMaxLength(150);
+                // PasswordHash 등 제거됨
+            });
+
+            modelBuilder.Entity<Memo>(entity =>
+            {
+                entity.ToTable("Memos");
+                entity.HasKey(e => e.MemoId);
+                entity.Property(e => e.Title).HasMaxLength(255);
+                entity.Property(e => e.SenderName).HasMaxLength(100).IsRequired(); // SenderName 사용
+                // ReceiverId 제거됨
+                entity.HasIndex(e => e.CreatedAtUtc, "IX_Memos_CreatedAtUtc").IsDescending();
+                entity.HasIndex(e => e.SenderName, "IX_Memos_SenderName"); // SenderName 인덱스
+            });
+
+            // !!! SignalRConnections 테이블 설정 제거 !!!
+
+            // TODO: MemoRecipients 테이블 엔티티 및 설정 추가 필요
+            /*
+            modelBuilder.Entity<MemoRecipient>(entity => {
+                entity.ToTable("MemoRecipients");
+                entity.HasKey(e => e.MemoRecipientId);
+                entity.Property(e => e.RecipientIpAddress).HasMaxLength(45).IsRequired(); // IP 주소 저장
+                entity.HasOne<Memo>().WithMany().HasForeignKey(e => e.MemoId).OnDelete(DeleteBehavior.Cascade);
+                entity.HasIndex(e => e.MemoId);
+                entity.HasIndex(e => e.RecipientIpAddress);
+            });
+            */
+        }
+    }
+}
+2. Controllers/MemosController.cs (최종 수정본 - Server)
+
+IHubContext 및 IServerNotificationService 의존성 제거.
+DB 저장 로직에서 수정된 Memo 모델 사용 (SenderName 등).
+UserMemos, MemoRecipients 테이블 관련 로직 추가 필요 (TODO)
+C#
+
+// MemoAppMGSP.Server/Controllers/MemosController.cs
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Threading.Tasks;
+using MemoAppMGSP.SharedModels; // 공유 모델 사용
+using MemoAppMGSP.Server.Data;   // DbContext 사용
+using Microsoft.EntityFrameworkCore; // EF Core 사용
+
+namespace MemoAppMGSP.Server.Controllers
+{
+    [Route("api/[controller]")]
+    [ApiController]
+    public class MemosController : ControllerBase
+    {
+        // private readonly IHubContext<MemoHub> _hubContext; // !!! 제거 !!!
+        // private readonly IServerNotificationService _notificationService; // !!! 제거 !!!
+        private readonly MSMDDbContext _dbContext; // DB Context 직접 사용 (Repository 패턴 권장)
+
+        public MemosController(MSMDDbContext dbContext) // DbContext 주입
+        {
+            _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> CreateMemo([FromBody] Memo memo) // 입력 모델 확인 (SenderName 등 포함)
+        {
+            // 유효성 검사 (SenderName 필수)
+            if (memo == null || string.IsNullOrWhiteSpace(memo.SenderName))
+            {
+                return BadRequest("Invalid memo data. SenderName is required.");
+            }
+
+            memo.MemoId = Guid.NewGuid(); // 서버에서 ID 생성
+            memo.CreatedAtUtc = DateTime.UtcNow;
+            memo.UpdatedAtUtc = DateTime.UtcNow;
+
+            try
+            {
+                // --- DB 저장 (Memos 테이블) ---
+                _dbContext.Memos.Add(memo);
+
+                // --- !!! TODO: 수신자 목록 처리 (클라이언트가 별도 API 호출 또는 다른 방식 사용?) !!! ---
+                // IP 기반 직접 통신이므로, 서버는 수신자 목록을 DB에 기록하는 역할만 할 수 있음.
+                // 클라이언트가 메모 생성 후 별도로 수신자 목록 API를 호출하거나,
+                // CreateMemo 요청 본문에 수신자 IP 목록을 포함시켜 여기서 MemoRecipients 테이블에 저장 필요.
+                // 예시: if (request.RecipientIps != null) { foreach (ip in request.RecipientIps) { _dbContext.MemoRecipients.Add(new MemoRecipient{ MemoId = memo.MemoId, RecipientIpAddress = ip }); } }
+
+                await _dbContext.SaveChangesAsync();
+                Console.WriteLine($"[INFO] Controller: Memo {memo.MemoId} from {memo.SenderName} saved to DB.");
+
+                // --- !!! SignalR 알림 발송 로직 제거 !!! ---
+
+                return Ok(memo); // 저장된 메모 반환
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Controller: Error saving memo to DB: {ex.Message}");
+                // TODO: 로깅
+                return StatusCode(500, "Database error while saving memo.");
+            }
+        }
+
+        // TODO: 메모 조회 API (본인 식별 방법 정의 필요 - 예: SenderName 기준?)
+        /*
+        [HttpGet("sent/{senderName}")]
+        public async Task<ActionResult<IEnumerable<Memo>>> GetSentMemos(string senderName)
+        {
+             if (string.IsNullOrWhiteSpace(senderName)) return BadRequest();
+             var memos = await _dbContext.Memos
+                                .Where(m => m.SenderName == senderName)
+                                .OrderByDescending(m => m.CreatedAtUtc)
+                                .ToListAsync();
+             return Ok(memos);
+        }
+        */
+
+        // TODO: 기타 필요한 API 엔드포인트 구현 (메모 ID로 조회, 상태 업데이트 등)
+    }
+}
+3. Program.cs (최종 수정본 - Server)
+
+SignalR 관련 설정 제거.
+MSMDDbContext 등록 확인.
+ServerNotificationService 등록 제거.
+C#
+
+// MemoAppMGSP.Server/Program.cs
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+// using MemoAppMGSP.Server.Services.Interfaces; // 제거됨
+// using MemoAppMGSP.Server.Services.Implementations; // 제거됨
+using MemoAppMGSP.Server.Data;
+using Microsoft.EntityFrameworkCore;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// CORS 설정 (클라이언트 접근 허용)
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowMemoClient",
+        policy => policy.WithOrigins("null") // WPF 클라이언트
+                        .AllowAnyHeader()
+                        .AllowAnyMethod()
+                        // .AllowCredentials()); // SignalR 사용 안 하므로 제거 가능
+                        );
+});
+
+// --- SignalR 서비스 추가 제거 ---
+// builder.Services.AddSignalR();
+
+// API 컨트롤러 사용 설정
+builder.Services.AddControllers();
+
+// --- DB 컨텍스트 등록 ---
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+builder.Services.AddDbContext<MSMDDbContext>(options => options.UseSqlServer(connectionString)); // MSMDDbContext 사용
+
+// --- 서비스 등록 ---
+// TODO: 리포지토리 등 필요한 서비스 등록
+// builder.Services.AddScoped<IMemoRepository, MemoRepository>();
+// !!! ServerNotificationService 등록 제거 !!!
+// builder.Services.AddScoped<IServerNotificationService, ServerNotificationService>();
+
+
+var app = builder.Build();
+
+// 파이프라인 설정
+if (app.Environment.IsDevelopment()) { /* Swagger 등 */ }
+// app.UseHttpsRedirection();
+app.UseRouting();
+app.UseCors("AllowMemoClient"); // CORS 적용
+// app.UseAuthentication();
+// app.UseAuthorization();
+app.MapControllers(); // 컨트롤러 매핑
+
+// --- SignalR Hub 매핑 제거 ---
+// app.MapHub<MemoHub>("/memohub");
+
+app.Run();
+4. MemoHub.cs 파일 삭제:
+
+IP 기반 직접 통신 방식에서는 서버의 SignalR Hub가 필요 없으므로, MemoAppMGSP.Server 프로젝트에서 MemoHub.cs 파일을 삭제합니다.
+C. 클라이언트 프로젝트 (MemoAppMGSP)
+
+필수 NuGet 패키지: Newtonsoft.Json, System.Configuration.ConfigurationManager (SignalR Client 패키지 불필요)
+프로젝트 참조: MemoAppMGSP.SharedModels 참조 확인.
+1. App.xaml.cs (최종 수정본 - Client)
+
+IAuthService 제거.
+IPMemoService (DB+TCP 전송), MemoReceiverService (TCP 수신) 사용.
+ServerNotificationService/DummyNotificationService 제거.
+MainViewModel 생성 시 MemoReceiverService 전달 방식 변경 없음 (이전 코드 유지).
+C#
+
+// MemoAppMGSP/App.xaml.cs
+using MemoAppMGSP.Services.Implementations;
+using MemoAppMGSP.Services.Interfaces;
+using MemoAppMGSP.ViewModels;
+using System;
+using System.Configuration;
+using System.Net.Http; // ApiMemoService 대신 IPMemoService 사용 시 불필요 가능성
+using System.Windows;
+
+namespace MemoAppMGSP
+{
+    public partial class App : Application
+    {
+        private IMemoService _memoService; // IPMemoService 사용
+        private IDialogService _dialogService;
+        private MemoReceiverService _memoReceiverService;
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+
+            _dialogService = new DialogService();
+
+            // IPMemoService 생성 (DB 접근 로직 필요 시 DbContext 등 주입)
+            _memoService = new IPMemoService(/* dbContext */);
+
+            // MemoReceiverService 생성 및 시작
+            _memoReceiverService = new MemoReceiverService();
+            bool listenerStarted = _memoReceiverService.StartListening();
+            if (!listenerStarted) { /* ... 오류 처리 ... */ }
+
+            // MainViewModel 생성 (AuthService, NotificationService 제거됨)
+            var mainViewModel = new MainViewModel(_memoService, _dialogService, _memoReceiverService); // 수정됨
+            var mainWindow = new MainWindow();
+            mainWindow.DataContext = mainViewModel;
+            mainWindow.Show();
+        }
+
+        protected override void OnExit(ExitEventArgs e) { /* ... 리소스 정리 ... */ }
+    }
+}
+2. IMemoService.cs (최종본 - Client)
+
+CreateMemoAsync 시그니처에 recipientEndpoints 포함 확인.
+UserId 대신 userIdentifier (Guid 또는 string) 사용하도록 수정 고려. (여기서는 일단 Guid 유지)
 C#
 
 // MemoAppMGSP/Services/Interfaces/IMemoService.cs
@@ -16,28 +411,24 @@ namespace MemoAppMGSP.Services.Interfaces
 {
     public interface IMemoService
     {
-        // DB에서 받는 메모 조회 (UserId 대신 다른 식별자 사용 필요)
+        // 조회 시 식별자 타입 확인 (Guid 또는 string)
         Task<IEnumerable<UserMemoInfo>> GetUserMemosWithStatusAsync(Guid userIdentifier);
         Task<Memo> GetMemoByIdAsync(Guid memoId);
-
-        // ---!!! CreateMemoAsync 시그니처 확인 !!!---
+        // 생성 시 수신자 목록 추가
         Task<bool> CreateMemoAsync(Memo memo, List<string> recipientEndpoints);
-
         Task<bool> UpdateMemoAsync(Memo memo);
-
-        // 상태 변경 메서드 (UserId 대신 다른 식별자 사용 필요)
+        // 상태 변경 시 식별자 타입 확인
         Task<bool> MarkMemoAsReadAsync(Guid userIdentifier, Guid memoId, bool isRead);
         Task<bool> SetPersonalStatusAsync(Guid userIdentifier, Guid memoId, bool isPersonal);
         Task<bool> MarkMemoAsDeletedByReceiverAsync(Guid userIdentifier, Guid memoId);
-        Task<bool> MarkMemoAsDeletedBySenderAsync(string senderName, Guid memoId); // Sender 식별 방식 변경
+        // Sender 식별 방식 변경 (string senderName)
+        Task<bool> MarkMemoAsDeletedBySenderAsync(string senderName, Guid memoId);
     }
 }
-2. IPMemoService.cs (최종본 - 구현 클래스)
+3. IPMemoService.cs (최종본 - Client)
 
-IMemoService 인터페이스 구현 확인 (CreateMemoAsync 시그니처 일치).
-생성자에서 IAuthService 제거됨 확인.
-내부 로직에서 SenderName 사용. (DB/TCP 로직은 여전히 개념 코드)
-위치: MemoAppMGSP/Services/Implementations/IPMemoService.cs
+이전 답변 #73 에서 제공한 코드를 그대로 사용합니다. (생성자에서 Auth 서비스 제거됨 확인)
+using Newtonsoft.Json; 추가 및 NuGet 패키지 설치 필요 (CS0103 JsonConvert 에러 해결).
 C#
 
 // MemoAppMGSP/Services/Implementations/IPMemoService.cs
@@ -49,240 +440,90 @@ using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
-using Newtonsoft.Json;
+using Newtonsoft.Json; // *** using 추가! (Newtonsoft.Json NuGet 패키지 설치 필요) ***
 // using YourDataAccessLayer;
 
 namespace MemoAppMGSP.Services.Implementations
 {
-    public class IPMemoService : IMemoService // 인터페이스 구현 명시
+    public class IPMemoService : IMemoService
     {
-        // private readonly YourDbContext _dbContext;
-        private const int TARGET_PORT = 12345;
+        // ... (이전 #73 답변 코드와 동일: 생성자 인수 없음, CreateMemoAsync 등 구현) ...
+         private const int TARGET_PORT = 12345;
+         public IPMemoService() { Console.WriteLine("IPMemoService Initialized"); } // 인수 없음
 
-        // --- 생성자 (의존성 없음 또는 DB 컨텍스트 등만 주입) ---
-        public IPMemoService(/* YourDbContext dbContext */)
-        {
-            // _dbContext = dbContext;
-            Console.WriteLine("IPMemoService Initialized");
-        }
-
-        // ---!!! CreateMemoAsync 구현 (인터페이스와 시그니처 일치) !!!---
-        public async Task<bool> CreateMemoAsync(Memo memo, List<string> recipientEndpoints)
-        {
-            if (memo == null || recipientEndpoints == null || !recipientEndpoints.Any())
-                return false;
-
-            // 1. DB 저장 (SenderName 사용)
-            bool dbSaved = false;
-            try
-            {
-                // TODO: DB 저장 로직 구현 (_dbContext 사용)
-                // Memos 테이블 (SenderName 포함), MemoRecipients 테이블 저장
-                dbSaved = true; // 임시
-                Debug.WriteLine($"DB: Memo {memo.MemoId} (Sender: {memo.SenderName}) saved conceptually.");
-            }
-            catch (Exception dbEx)
-            {
-                Debug.WriteLine($"[ERROR] IPMemoService - DB Save Error: {dbEx.Message}");
-                return false;
-            }
-            if (!dbSaved) return false;
-
-            // 2. TCP 직접 전송
-            int successfulSends = 0;
-            string memoJson = JsonConvert.SerializeObject(memo);
-            byte[] dataToSend = Encoding.UTF8.GetBytes(memoJson);
-            foreach (var endpoint in recipientEndpoints)
-            {
-                bool sent = await SendTcpDataAsync(endpoint, TARGET_PORT, dataToSend);
-                if (sent) successfulSends++;
-            }
-            Debug.WriteLine($"IPMemoService: Attempted to send to {recipientEndpoints.Count} recipients, {successfulSends} successful.");
-
-            return true; // DB 저장 성공 기준
-        }
-
-        // SendTcpDataAsync 메서드 (개념 코드)
-        private async Task<bool> SendTcpDataAsync(string ipAddress, int port, byte[] data)
-        {
-             TcpClient client = null; try { /* ... TCP 전송 시도 ... */ return true; } catch { return false; } finally { client?.Close(); } // 간략화
-        }
-
-        // --- !!! 다른 IMemoService 메서드 구현 (모두 구현 필요) !!! ---
-        public Task<IEnumerable<UserMemoInfo>> GetUserMemosWithStatusAsync(Guid userIdentifier) { throw new NotImplementedException("DB 조회 (식별자 기준)"); }
-        public Task<Memo> GetMemoByIdAsync(Guid memoId) { throw new NotImplementedException("DB 조회"); }
-        public Task<bool> UpdateMemoAsync(Memo memo) { throw new NotImplementedException("DB 업데이트"); }
-        public Task<bool> MarkMemoAsReadAsync(Guid userIdentifier, Guid memoId, bool isRead) { throw new NotImplementedException("DB UserMemos 업데이트 (식별자 기준)"); }
-        public Task<bool> SetPersonalStatusAsync(Guid userIdentifier, Guid memoId, bool isPersonal) { throw new NotImplementedException("DB UserMemos 업데이트 (식별자 기준)"); }
-        public Task<bool> MarkMemoAsDeletedByReceiverAsync(Guid userIdentifier, Guid memoId) { throw new NotImplementedException("DB UserMemos 업데이트 (식별자 기준)"); }
-        public Task<bool> MarkMemoAsDeletedBySenderAsync(string senderName, Guid memoId) { throw new NotImplementedException("DB Memos 업데이트 (SenderName 기준?)"); }
+         public async Task<bool> CreateMemoAsync(Memo memo, List<string> recipientEndpoints) { /* ... DB 저장(TODO) + TCP 전송 로직 ... */ return true; }
+         private async Task<bool> SendTcpDataAsync(string ipAddress, int port, byte[] data) { /* ... TCP 전송 로직 ... */ return false; }
+         public Task<IEnumerable<UserMemoInfo>> GetUserMemosWithStatusAsync(Guid userIdentifier) { throw new NotImplementedException("DB 조회 (식별자 기준)"); }
+         // ... (다른 메서드들 NotImplementedException) ...
     }
 }
-3. MemoEditorViewModel.cs (최종본 - 클라이언트 프로젝트 MemoAppMGSP)
+4. MemoReceiverService.cs (최종본 - Client)
 
-누락되었던 필드, 속성, 커맨드 정의를 모두 복원/포함합니다.
-IAuthService 의존성 제거됨 확인.
-CanExecuteSave 등 메서드가 클래스 멤버에 접근 가능하도록 완전한 클래스 구조 보장.
+MemoEventArgs 참조 확인 (SharedModels 사용).
+JsonConvert 사용 확인 (Newtonsoft.Json NuGet 및 using 필요).
 C#
 
-// MemoAppMGSP/ViewModels/MemoEditorViewModel.cs
-using MemoAppMGSP.Infrastructure.Commands;
-using MemoAppMGSP.SharedModels;
-using MemoAppMGSP.Services.Interfaces; // IMemoService 만 필요
+// MemoAppMGSP/Services/Implementations/MemoReceiverService.cs
+using MemoAppMGSP.SharedModels; // Memo, MemoEventArgs 사용
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json; // *** using 추가! (Newtonsoft.Json NuGet 패키지 설치 필요) ***
 using System.Windows;
-using System.Windows.Input;
 
-namespace MemoAppMGSP.ViewModels
+namespace MemoAppMGSP.Services.Implementations
 {
-    public class MemoEditorViewModel : ViewModelBase // ViewModelBase 상속 확인
+    public class MemoReceiverService : IDisposable
     {
-        // --- 의존성 ---
-        private readonly IMemoService _memoService; // IPMemoService 주입
-        private readonly Action _closeViewAction;   // 뷰 닫기 콜백
+        // ... (이전 답변 #69 코드와 동일: 리스닝, 데이터 처리, 이벤트 발생 로직) ...
+        private TcpListener _listener;
+        private readonly int _listeningPort = 12345;
+        private CancellationTokenSource _cts;
+        private volatile bool _isRunning = false;
+        private readonly object _lock = new object();
 
-        // ---!!! Backing Fields (모두 정의되어 있는지 확인) !!!---
-        private Guid _memoId = Guid.Empty;
-        private string _title = string.Empty;
-        private string _content = string.Empty;
-        private bool _isPopup = false;
-        private string _recipientInput = string.Empty;
-        private bool _isEditing = false;
-        private string _editorWindowTitle = "새 메모 작성";
-        private bool _isBusy = false;
-        private string _busyMessage = string.Empty;
+        public event EventHandler<MemoEventArgs> MemoReceived;
 
-        // ---!!! Properties for Binding (모두 정의되어 있는지 확인) !!!---
-        public string Title
+        public MemoReceiverService(int? port = null) { if (port.HasValue) _listeningPort = port.Value; }
+
+        public bool StartListening() { /* ... 이전 코드 참고 ... */ return false; }
+        private async Task ListenLoop(CancellationToken token) { /* ... 이전 코드 참고 ... */ }
+        private async Task HandleClientAsync(TcpClient client, CancellationToken token)
         {
-            get => _title;
-            // SetProperty 호출 시 CanExecuteSave 갱신 트리거 포함
-            set => SetProperty(ref _title, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged());
+             using (client) using (var stream = client.GetStream()) try
+             {
+                 byte[] lengthBuffer = new byte[4]; /* ... 길이 읽기 ... */
+                 int dataLength = BitConverter.ToInt32(lengthBuffer, 0); /* ... 길이 검증 ... */
+                 byte[] dataBuffer = new byte[dataLength]; /* ... 데이터 읽기 ... */
+                 string memoJson = Encoding.UTF8.GetString(dataBuffer);
+                 Memo receivedMemo = JsonConvert.DeserializeObject<Memo>(memoJson); // *** JsonConvert 사용 확인 ***
+                 if (receivedMemo != null) { OnMemoReceived(new MemoEventArgs(receivedMemo)); }
+             } catch { /* ... */ }
         }
-        public string Content
-        {
-            get => _content;
-            set => SetProperty(ref _content, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged());
-        }
-        public bool IsPopup
-        {
-            get => _isPopup;
-            set => SetProperty(ref _isPopup, value);
-        }
-        public string RecipientInput // UI 입력값 (쉼표 구분 IP 등)
-        {
-            get => _recipientInput;
-            set => SetProperty(ref _recipientInput, value, () => ((RelayCommand)SaveCommand)?.RaiseCanExecuteChanged());
-        }
-        public bool IsEditing => _isEditing; // 읽기 전용
-        public string EditorWindowTitle
-        {
-            get => _editorWindowTitle;
-            private set => SetProperty(ref _editorWindowTitle, value); // 내부에서만 설정
-        }
-        public bool IsBusy
-        {
-            get => _isBusy;
-            private set => SetProperty(ref _isBusy, value);
-        }
-        public string BusyMessage
-        {
-            get => _busyMessage;
-            private set => SetProperty(ref _busyMessage, value);
-        }
+        private async Task<int> ReadExactlyAsync(NetworkStream stream, byte[] buffer, int bytesToRead, CancellationToken token) { /* ... */ return 0;}
+        protected virtual void OnMemoReceived(MemoEventArgs e) { /* ... UI 스레드 처리 ... */ }
+        public void StopListening() { /* ... 이전 코드 참고 ... */ }
+        public void Dispose() { StopListening(); GC.SuppressFinalize(this); }
+    }
+}
+5. MemoEditorViewModel.cs (최종본 - Client)
 
-        // ---!!! Commands (모두 정의 및 초기화 확인) !!!---
-        public ICommand SaveCommand { get; }
-        public ICommand CancelCommand { get; }
+SaveCommand, CancelCommand, IsBusy 등 모든 멤버가 클래스 내에 올바르게 정의되었는지 최종 확인 (CS0103, CS1061 해결).
+이전 답변 #73 에서 제공한 코드를 그대로 사용합니다. (수정 필요 없음)
+6. MemoListViewModel.cs (최종본 - Client)
 
-        // --- 생성자 (IAuthService 없음 확인) ---
-        public MemoEditorViewModel(Action closeViewAction, IMemoService memoService /*, IDialogService 등 */)
-        {
-            _closeViewAction = closeViewAction;
-            _memoService = memoService ?? throw new ArgumentNullException(nameof(memoService));
+using MemoAppMGSP.SharedModels; 사용 확인 (CS0234 해결).
+Memos 속성 정의 확인 (CS0548/CS0154 해결).
+!= null 등 일반적인 null 체크 사용 확인 (CS0853 관련).
+이전 답변 #73 에서 제공한 코드를 그대로 사용합니다. (생성자 인수 확인)
+최종 요약 및 조치:
 
-            // 커맨드 초기화
-            SaveCommand = new RelayCommand(async (_) => await ExecuteSaveAsync(), CanExecuteSave);
-            CancelCommand = new RelayCommand(ExecuteCancel);
-
-            // TODO: 기존 메모 편집용 생성자 구현 (Memo 객체 받아서 속성 채우기)
-            // 예: public MemoEditorViewModel(Memo memoToEdit, Action close...){ ... _isEditing = true; ... }
-        }
-
-        // --- Command Methods ---
-        private async Task ExecuteSaveAsync()
-        {
-            // IsBusy, _memoService 필드 접근 확인
-            if (IsBusy || _memoService == null) return;
-
-            // RecipientInput 속성 접근 확인
-            List<string> recipientEndpoints = _recipientInput.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)
-                                                    .Select(s => s.Trim()).Where(s => !string.IsNullOrEmpty(s)).ToList();
-            if (!recipientEndpoints.Any()) { MessageBox.Show("받는 사람(IP 등)을 입력하세요."); return; }
-
-            IsBusy = true; // IsBusy 속성 접근 확인
-            BusyMessage = "메모 저장 및 전송 중..."; // BusyMessage 속성 접근 확인
-
-            try
-            {
-                string senderName = GetMySenderName();
-
-                Memo memo = new Memo
-                {
-                    MemoId = _isEditing ? _memoId : Guid.NewGuid(), // _isEditing, _memoId 필드 접근 확인
-                    Title = this.Title,       // Title 속성 접근 확인
-                    Content = this.Content,     // Content 속성 접근 확인
-                    SenderName = senderName,
-                    IsPopup = this.IsPopup,     // IsPopup 속성 접근 확인
-                    CreatedAtUtc = DateTime.UtcNow,
-                    UpdatedAtUtc = DateTime.UtcNow,
-                };
-
-                // IPMemoService 호출
-                bool success = await _memoService.CreateMemoAsync(memo, recipientEndpoints);
-
-                if (success)
-                {
-                    MessageBox.Show("메모를 저장하고 전송을 시도했습니다.");
-                    if (_closeViewAction != null) _closeViewAction.Invoke(); // _closeViewAction 필드 접근 확인
-                }
-                else { MessageBox.Show("메모 저장 또는 전송에 실패했습니다."); }
-            }
-            catch (Exception ex) { MessageBox.Show($"오류 발생: {ex.Message}"); }
-            finally { IsBusy = false; } // IsBusy 속성 접근 확인
-        }
-
-        // CanExecuteSave 메서드 (모든 멤버 접근 확인)
-        private bool CanExecuteSave(object parameter)
-        {
-            return (!string.IsNullOrWhiteSpace(Title) || !string.IsNullOrWhiteSpace(Content))
-                   && !string.IsNullOrWhiteSpace(_recipientInput) // _recipientInput 필드 접근 확인
-                   && !IsBusy; // IsBusy 속성 접근 확인
-        }
-
-        // ExecuteCancel 메서드
-        private void ExecuteCancel(object parameter)
-        {
-            if (_closeViewAction != null) _closeViewAction.Invoke(); // _closeViewAction 필드 접근 확인
-        }
-
-        // GetMySenderName 메서드
-        private string GetMySenderName()
-        {
-            try { return Environment.MachineName; }
-            catch { return "UnknownSender"; }
-        }
-    } // 클래스 끝
-} // 네임스페이스 끝
-
-조치:
-
-위에 제공된 최종 코드로 IMemoService.cs, IPMemoService.cs, MemoEditorViewModel.cs 파일의 내용을 완전히 교체합니다.
-솔루션 정리(Clean Solution) 후 솔루션 다시 빌드(Rebuild Solution) 를 실행합니다.
-이제 MemoEditorViewModel 관련 에러는 모두 사라져야 합니다. IPMemoService와 IMemoService 간의 시그니처 불일치 문제도 해결될 것입니다.
-
-빌드 후에도 에러가 발생한다면, 남아있는 에러 메시지를 다시 보여주시
+SharedModels 프로젝트: User.cs, Memo.cs, UserMemoInfo.cs, MemoEventArgs.cs 파일의 내용을 위 코드로 업데이트합니다.
+Server 프로젝트: MSMDDbContext.cs, MemosController.cs, Program.cs 파일 내용을 위 코드로 업데이트하고, MemoHub.cs는 삭제합니다. 필요한 NuGet 패키지(EF Core 등)를 설치하고, DB 마이그레이션을 다시 실행하여 스키마를 업데이트합니다. appsettings.json에 DB 연결 문자열을 설정합니다.
+Client 프로젝트: App.xaml.cs, IMemoService.cs, IPMemoService.cs, MemoReceiverService.cs, MainViewModel.cs, MemoEditorViewModel.cs, MemoListViewModel.cs 파일 내용을 위 코드로 업데이트합니다. 필요한 NuGet 패키지(Newtonsoft.Json, System.Configuration.ConfigurationManager)를 설치합니다. App.config에 서버 API URL(만약 서버 API를 DB 조회/저장용으로 계속 사용한다면) 및 TCP 통신 포트 관련 설정을 합니다.
+솔루션 전체 정리 및 다시 빌드: 모든 수정 후 솔루션을 정리하고 다시 빌드합니다.
+이제 "로그인 불필요, IP 기억/전송" 요구사항에 맞춰 양쪽 프로젝트의 불일치와 자잘한 에러들이 수정되었기를 바랍니다. 특히 IPMemoService와 MemoReceiverService의 TODO 주석으로 남겨진 실제 DB 접근 로직과 TCP 통신 로직 구현이 다음 핵심 단계입
