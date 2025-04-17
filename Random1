@@ -1,305 +1,141 @@
+문가 수준의 C# 코드로, 최신 .bom 파일 하나만, 조건을 만족하는 모든 PPP 위치에서 탐색하여,
+병렬 처리를 통해 초고속으로 .bom 파일 경로를 수집하고,
+수집된 결과를 ListBox에 UI 쓰레드 안전하게 바인딩하도록 구성해드립니다.
+
+[구성 목표]
+Parallel.ForEach 로 디렉터리 병렬 탐색
+
+.bom 파일이 여러 개인 경우 가장 최신 파일만
+
+ObservableCollection<string> 에 결과 저장 (UI 바인딩 용)
+
+WPF ListBox와 바인딩 가능하게 Dispatcher 사용
+
+[1] ViewModel.cs
+csharp
+코드 복사
 using System;
-using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows.Threading;
 
-public class FolderFinder
+public class BomFinderViewModel
 {
-    // ??-? 패턴과 일치하는지 확인하는 정규식
-    // ^ : 문자열 시작
-    // . : 임의의 문자 하나
-    // {2} : 앞의 요소가 정확히 2번 반복
-    // - : 하이픈 문자
-    // . : 임의의 문자 하나
-    // {1} : 앞의 요소가 정확히 1번 반복 (생략 가능하나 명확성을 위해 포함)
-    // $ : 문자열 끝
-    private static readonly Regex PatternRegex = new Regex(@"^..-.$");
+    public ObservableCollection<string> BomFilePaths { get; } = new ObservableCollection<string>();
 
-    /// <summary>
-    /// 지정된 규칙에 따라 폴더 또는 파일을 검색합니다.
-    /// </summary>
-    /// <param name="startPath">검색을 시작할 최상위 폴더 경로 (예: "C:\path\to\smd-pgm-server")</param>
-    /// <returns>찾은 ??-? 폴더 또는 .bom 파일의 전체 경로 리스트</returns>
-    public static List<string> FindTargets(string startPath)
+    private Dispatcher _dispatcher;
+
+    public BomFinderViewModel(Dispatcher dispatcher)
     {
-        List<string> results = new List<string>();
+        _dispatcher = dispatcher;
+    }
 
-        // 1. 시작 경로 유효성 검사
-        if (!Directory.Exists(startPath))
+    public void StartScan(string rootPath)
+    {
+        Task.Run(() =>
         {
-            Console.WriteLine($"오류: 시작 경로를 찾을 수 없습니다 - {startPath}");
-            return results; // 빈 리스트 반환
-        }
+            var resultList = new List<string>();
+            var firstLevelDirs = Directory.GetDirectories(rootPath);
 
-        try
-        {
-            // 2. Level 1: 시작 폴더 바로 아래 폴더들 가져오기
-            string[] level1Dirs = Directory.GetDirectories(startPath);
-
-            foreach (string level1Dir in level1Dirs)
+            Parallel.ForEach(firstLevelDirs, level1 =>
             {
                 try
                 {
-                    // 3. Level 2: Level 1 폴더 아래에서 "SM-" 포함 폴더 찾기
-                    string[] level2Dirs = Directory.GetDirectories(level1Dir)
-                                                   .Where(d => Path.GetFileName(d).Contains("SM-"))
-                                                   .ToArray();
-
-                    foreach (string level2Dir in level2Dirs)
+                    foreach (var level2 in Directory.GetDirectories(level1))
                     {
-                        try
+                        if (!Path.GetFileName(level2).Contains("SM-"))
+                            continue;
+
+                        foreach (var ppp in Directory.GetDirectories(level2))
                         {
-                            // 4. Level 3 (PPP 깊이): Level 2 폴더 아래의 모든 폴더 가져오기
-                            string[] pppLevelDirs = Directory.GetDirectories(level2Dir);
+                            var hasPatternFolder = Directory.EnumerateDirectories(ppp, "*", SearchOption.AllDirectories)
+                                .Any(sub => Regex.IsMatch(Path.GetFileName(sub), @"^[A-Z]{2}-[A-Z0-9]$", RegexOptions.IgnoreCase));
 
-                            foreach (string pppDir in pppLevelDirs)
+                            if (!hasPatternFolder)
                             {
-                                // 5. PPP 깊이 폴더를 기준으로 하위 탐색 시작
-                                string foundPatternFolder = FindPatternFolderRecursive(pppDir);
+                                var bomFile = Directory.GetFiles(ppp, "*.bom", SearchOption.TopDirectoryOnly)
+                                    .Select(path => new FileInfo(path))
+                                    .OrderByDescending(f => f.LastWriteTime)
+                                    .FirstOrDefault();
 
-                                if (!string.IsNullOrEmpty(foundPatternFolder))
+                                if (bomFile != null)
                                 {
-                                    // 6. ??-? 패턴 폴더를 찾았으면 결과에 추가
-                                    results.Add(foundPatternFolder);
-                                    // Console.WriteLine($"패턴 폴더 찾음: {foundPatternFolder}");
-                                }
-                                else
-                                {
-                                    // 7. ??-? 패턴 폴더를 못 찾았으면 PPP 깊이 폴더에서 .bom 파일 찾기
-                                    try
+                                    lock (resultList)
                                     {
-                                        string[] bomFiles = Directory.GetFiles(pppDir, "*.bom");
-                                        if (bomFiles.Length > 0)
-                                        {
-                                            // .bom 파일이 여러 개 있을 경우 첫 번째 파일만 추가 (요구사항에 따라 변경 가능)
-                                            results.Add(bomFiles[0]);
-                                            // Console.WriteLine($".bom 파일 찾음: {bomFiles[0]}");
-                                        }
-                                        // else: .bom 파일도 없으면 아무것도 추가 안 함
-                                    }
-                                    catch (UnauthorizedAccessException ex)
-                                    {
-                                        Console.WriteLine($"경고: {pppDir} 내 파일 접근 권한 없음 - {ex.Message}");
-                                    }
-                                    catch (IOException ex)
-                                    {
-                                        Console.WriteLine($"경고: {pppDir} 내 파일 검색 중 IO 오류 - {ex.Message}");
+                                        resultList.Add(bomFile.FullName);
                                     }
                                 }
                             }
                         }
-                        catch (UnauthorizedAccessException ex)
-                        {
-                            Console.WriteLine($"경고: {level2Dir} 하위 폴더 접근 권한 없음 - {ex.Message}");
-                        }
-                        catch (IOException ex)
-                        {
-                            Console.WriteLine($"경고: {level2Dir} 하위 폴더 검색 중 IO 오류 - {ex.Message}");
-                        }
                     }
                 }
-                catch (UnauthorizedAccessException ex)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"경고: {level1Dir} 하위 폴더 접근 권한 없음 - {ex.Message}");
+                    // 예외 로깅 필요 시 여기에
                 }
-                catch (IOException ex)
-                {
-                    Console.WriteLine($"경고: {level1Dir} 하위 폴더 검색 중 IO 오류 - {ex.Message}");
-                }
-            }
-        }
-        catch (UnauthorizedAccessException ex)
-        {
-            Console.WriteLine($"오류: {startPath} 접근 권한 없음 - {ex.Message}");
-        }
-        catch (Exception ex) // 다른 예외 처리
-        {
-            Console.WriteLine($"오류 발생: {ex.Message}");
-        }
+            });
 
-
-        return results;
-    }
-
-    /// <summary>
-    /// 지정된 폴더와 그 모든 하위 폴더에서 ??-? 패턴의 폴더를 재귀적으로 찾습니다.
-    /// 첫 번째로 발견된 폴더의 경로를 반환합니다.
-    /// </summary>
-    /// <param name="directoryToSearch">검색을 시작할 폴더</param>
-    /// <returns>찾은 ??-? 패턴 폴더의 전체 경로, 찾지 못하면 null</returns>
-    private static string FindPatternFolderRecursive(string directoryToSearch)
-    {
-        try
-        {
-            // 1. 현재 폴더의 바로 아래 하위 폴더들 중 패턴에 맞는 폴더 찾기
-            foreach (string subDir in Directory.GetDirectories(directoryToSearch))
+            // UI 쓰레드에 안전하게 결과 반영
+            _dispatcher.Invoke(() =>
             {
-                string dirName = Path.GetFileName(subDir);
-                if (PatternRegex.IsMatch(dirName))
-                {
-                    return subDir; // 패턴과 일치하는 첫 번째 폴더를 찾으면 즉시 반환
-                }
-            }
-
-            // 2. 현재 폴더에서 못 찾았으면, 하위 폴더들 각각에 대해 재귀적으로 검색
-            foreach (string subDir in Directory.GetDirectories(directoryToSearch))
-            {
-                string found = FindPatternFolderRecursive(subDir);
-                if (!string.IsNullOrEmpty(found))
-                {
-                    return found; // 하위에서 찾았으면 그 결과를 반환
-                }
-            }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // 접근 권한 없는 폴더는 건너뜀
-            // Console.WriteLine($"경고: {directoryToSearch} 접근 권한 없음 (재귀 중)");
-        }
-        catch (IOException ex)
-        {
-             Console.WriteLine($"경고: {directoryToSearch} 검색 중 IO 오류 (재귀 중) - {ex.Message}");
-        }
-        catch (Exception ex) // 예상치 못한 다른 예외
-        {
-            Console.WriteLine($"경고: {directoryToSearch} 검색 중 예외 발생 (재귀 중) - {ex.Message}");
-        }
-
-
-        // 현재 폴더 및 모든 하위 폴더에서 패턴을 찾지 못함
-        return null;
-    }
-
-    // --- 사용 예시 ---
-    public static void Main(string[] args)
-    {
-        // 실제 smd-pgm-server 폴더 경로로 변경하세요.
-        string rootFolder = @"C:\temp\smd-pgm-server"; // 예시 경로
-
-        // 테스트용 폴더 구조 생성 (실제 환경에서는 필요 없음)
-        CreateTestStructure(rootFolder);
-
-        Console.WriteLine($"'{rootFolder}' 에서 검색 시작...");
-        List<string> foundItems = FindTargets(rootFolder);
-
-        Console.WriteLine("\n--- 검색 결과 ---");
-        if (foundItems.Count > 0)
-        {
-            foreach (string item in foundItems)
-            {
-                Console.WriteLine(item);
-            }
-        }
-        else
-        {
-            Console.WriteLine("지정된 조건에 맞는 폴더나 파일을 찾지 못했습니다.");
-        }
-
-        // 테스트용 폴더 구조 삭제 (실제 환경에서는 필요 없음)
-        // DeleteTestStructure(rootFolder);
-    }
-
-    // --- 테스트 데이터 생성용 함수 (참고용) ---
-    private static void CreateTestStructure(string root)
-    {
-        try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { }
-        Directory.CreateDirectory(root);
-
-        // Level 1
-        string l1_a = Path.Combine(root, "FolderA"); Directory.CreateDirectory(l1_a);
-        string l1_b = Path.Combine(root, "FolderB"); Directory.CreateDirectory(l1_b);
-
-        // Level 2 (SM- 포함)
-        string l2_a_sm1 = Path.Combine(l1_a, "Data_SM-ABC"); Directory.CreateDirectory(l2_a_sm1);
-        string l2_a_sm2 = Path.Combine(l1_a, "Input_SM-XYZ"); Directory.CreateDirectory(l2_a_sm2);
-        string l2_b_sm1 = Path.Combine(l1_b, "Output_SM-123"); Directory.CreateDirectory(l2_b_sm1);
-        string l2_b_nosm = Path.Combine(l1_b, "Output_Normal"); Directory.CreateDirectory(l2_b_nosm); // SM- 미포함
-
-        // Level 3 (PPP)
-        string ppp_a_sm1_1 = Path.Combine(l2_a_sm1, "Sub1"); Directory.CreateDirectory(ppp_a_sm1_1);
-        string ppp_a_sm1_2 = Path.Combine(l2_a_sm1, "Sub2"); Directory.CreateDirectory(ppp_a_sm1_2);
-        string ppp_a_sm2_1 = Path.Combine(l2_a_sm2, "Config"); Directory.CreateDirectory(ppp_a_sm2_1);
-        string ppp_b_sm1_1 = Path.Combine(l2_b_sm1, "Result"); Directory.CreateDirectory(ppp_b_sm1_1);
-
-        // PPP 이하 하위 폴더 및 파일들
-        // Case 1: PPP/Sub1 아래에 ??-? 패턴 폴더 존재
-        string ppp_a_sm1_1_sub = Path.Combine(ppp_a_sm1_1, "Inner"); Directory.CreateDirectory(ppp_a_sm1_1_sub);
-        string patternFolder1 = Path.Combine(ppp_a_sm1_1_sub, "AB-C"); Directory.CreateDirectory(patternFolder1);
-
-        // Case 2: PPP/Sub2 아래에는 ??-? 패턴 폴더 없고, PPP/Sub2 에 .bom 파일 존재
-        string ppp_a_sm1_2_sub = Path.Combine(ppp_a_sm1_2, "Deeper"); Directory.CreateDirectory(ppp_a_sm1_2_sub);
-        File.Create(Path.Combine(ppp_a_sm1_2, "myproject.bom")).Close(); // .bom 파일 생성
-
-        // Case 3: PPP/Config 아래에는 ??-? 패턴 폴더도, .bom 파일도 없음
-        string ppp_a_sm2_1_sub = Path.Combine(ppp_a_sm2_1, "Settings"); Directory.CreateDirectory(ppp_a_sm2_1_sub);
-
-        // Case 4: PPP/Result 아래 깊은 곳에 ??-? 패턴 폴더 존재
-        string ppp_b_sm1_1_sub1 = Path.Combine(ppp_b_sm1_1, "More"); Directory.CreateDirectory(ppp_b_sm1_1_sub1);
-        string ppp_b_sm1_1_sub2 = Path.Combine(ppp_b_sm1_1_sub1, "EvenMore"); Directory.CreateDirectory(ppp_b_sm1_1_sub2);
-        string patternFolder2 = Path.Combine(ppp_b_sm1_1_sub2, "XY-Z"); Directory.CreateDirectory(patternFolder2);
-
-        Console.WriteLine("테스트 폴더 구조 생성 완료.");
-    }
-
-    // --- 테스트 데이터 삭제용 함수 (참고용) ---
-    private static void DeleteTestStructure(string root)
-    {
-         try
-         {
-             if (Directory.Exists(root))
-             {
-                 Directory.Delete(root, true);
-                 Console.WriteLine("테스트 폴더 구조 삭제 완료.");
-             }
-         }
-         catch (Exception ex)
-         {
-             Console.WriteLine($"테스트 폴더 삭제 중 오류: {ex.Message}");
-         }
+                BomFilePaths.Clear();
+                foreach (var path in resultList)
+                    BomFilePaths.Add(path);
+            });
+        });
     }
 }
-코드 설명:
+[2] MainWindow.xaml
+xml
+코드 복사
+<Window x:Class="BomScanner.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="BOM Finder" Height="450" Width="800">
+    <Grid>
+        <ListBox ItemsSource="{Binding BomFilePaths}" FontSize="14" />
+    </Grid>
+</Window>
+[3] MainWindow.xaml.cs
+csharp
+코드 복사
+using System.Windows;
 
-FindTargets(string startPath) 메서드:
+namespace BomScanner
+{
+    public partial class MainWindow : Window
+    {
+        private BomFinderViewModel _viewModel;
 
-입력으로 smd-pgm-server 폴더의 전체 경로를 받습니다.
-시작 경로가 존재하는지 확인합니다.
-Directory.GetDirectories()를 사용하여 각 단계별로 하위 폴더 목록을 가져옵니다.
-Level 1: startPath 바로 아래의 모든 폴더를 가져옵니다.
-Level 2: Level 1 폴더들 각각에 대해, Path.GetFileName()으로 폴더 이름을 얻고 Contains("SM-")를 사용하여 "SM-"이 포함된 폴더만 필터링합니다. LINQ의 Where()를 사용하면 편리합니다.
-Level 3 (PPP 깊이): Level 2 폴더들 각각에 대해, 그 아래의 모든 폴더를 가져옵니다. 이 폴더들이 PPP 깊이의 폴더입니다.
-하위 탐색 및 결과 결정:
-각 PPP 깊이 폴더(pppDir)에 대해 FindPatternFolderRecursive(pppDir)를 호출하여 해당 폴더 및 그 모든 하위 폴더에서 ??-? 패턴의 폴더를 재귀적으로 검색합니다.
-FindPatternFolderRecursive가 null이 아닌 값(패턴 폴더 경로)을 반환하면, 그 경로를 results 리스트에 추가합니다. (재귀 함수는 첫 번째 발견된 폴더만 반환하도록 구현됨)
-FindPatternFolderRecursive가 null을 반환하면 (즉, 하위에서 패턴 폴더를 찾지 못하면), PPP 깊이 폴더(pppDir) 내에서 *.bom 파일을 Directory.GetFiles()로 찾습니다.
-.bom 파일을 찾으면 그중 첫 번째 파일의 경로를 results 리스트에 추가합니다.
-패턴 폴더도 없고 .bom 파일도 없으면 아무것도 추가하지 않습니다.
-오류 처리: try-catch 블록을 사용하여 폴더 접근 권한 없음(UnauthorizedAccessException) 등의 예외 상황을 처리하고 콘솔에 경고 메시지를 출력합니다.
-최종적으로 찾은 경로들이 담긴 results 리스트를 반환합니다.
-FindPatternFolderRecursive(string directoryToSearch) 메서드:
+        public MainWindow()
+        {
+            InitializeComponent();
+            _viewModel = new BomFinderViewModel(Dispatcher);
+            DataContext = _viewModel;
 
-입력으로 검색을 시작할 폴더 경로를 받습니다.
-현재 레벨 검색: 먼저 directoryToSearch 바로 아래의 하위 폴더들 중 이름이 ??-? 패턴(PatternRegex)과 일치하는지 확인합니다. Path.GetFileName()으로 폴더 이름만 추출하여 정규식(Regex.IsMatch())으로 검사합니다. 일치하는 폴더를 찾으면 즉시 그 경로를 반환합니다.
-재귀 호출: 현재 레벨에서 패턴 폴더를 찾지 못하면, directoryToSearch의 모든 하위 폴더에 대해 자기 자신(FindPatternFolderRecursive)을 다시 호출합니다.
-결과 전파: 재귀 호출에서 null이 아닌 값(하위에서 찾은 패턴 폴더 경로)이 반환되면, 그 값을 즉시 위로 전파하여 반환합니다. 이렇게 하면 가장 먼저 발견된(보통 깊이 우선 탐색 순서) 패턴 폴더의 경로만 최종적으로 반환됩니다.
-못 찾음: 현재 폴더와 모든 하위 폴더를 다 탐색해도 패턴 폴더를 찾지 못하면 null을 반환합니다.
-오류 처리: 재귀 중 발생할 수 있는 UnauthorizedAccessException 등을 처리합니다.
-PatternRegex: ^..-.$ 정규식은 다음을 의미합니다.
+            string rootPath = @"D:\경로\smd-pgm-server";
+            _viewModel.StartScan(rootPath);
+        }
+    }
+}
+[추가 옵션]
+.bom 파일의 수정일 기준 정렬됨 (LastWriteTime)
 
-^: 문자열 시작
-.: 임의의 문자 하나
-{2}: 앞의 .가 정확히 2번 반복
--: 하이픈 문자
-.: 임의의 문자 하나
-$: 문자열 끝
-즉, "두 글자-한 글자" 형태의 폴더 이름과 정확히 일치합니다.
-Main 메서드 (사용 예시):
+Dispatcher.Invoke로 WPF ListBox에 바인딩 안전
 
-rootFolder 변수에 실제 smd-pgm-server 폴더 경로를 지정해야 합니다.
-CreateTestStructure 함수는 코드 테스트를 위해 예시 폴더 구조를 생성하는 함수입니다 (실제 사용 시에는 필요 없습니다).
-FindTargets를 호출하여 검색을 수행하고 결과를 출력합니다.
-사용 방법:
+ObservableCollection은 ListBox 자동 갱신됨
 
-위 코드를 C# 프로젝트 파일(.cs)에 복사합니다.
-Main 메서드 안의 rootFolder 변수 값을 실제 smd-pgm-server 폴더가 있는 경로로 수정합니다.
+Parallel.ForEach는 CPU 코어 수에 맞게 병렬 처리
+
+lock으로 다중 쓰레드 충돌 방지
+
+필요 시:
+
+로그 남기기
+
+리스트 더블클릭 시 .bom 열기
+
+파일 크기나 내용 조건 추가
