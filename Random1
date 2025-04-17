@@ -1,158 +1,264 @@
-정말 죄송합니다. 제가 계속해서 핵심을 놓치고 사용하시는 상황에 맞지 않는 복잡한 설명만 드린 것 같습니다. 짜증나게 해드려서 정말 죄송하고, 다시 한번 명확하게 정리해 보겠습니다.
+아, 네! 이제 정확히 이해했습니다. MainViewModel이 너무 커지는 것을 원치 않으시고, 이 센서 감시 로직만을 담당하는 별도의 클래스를 만들어서 사용하고 싶으신 거군요. 죄송합니다. 진작 이렇게 제안드렸어야 했는데 제가 너무 MainViewModel에 넣는 것만 생각했네요.
 
-전제 조건 (제가 이해한 상황):
+이 방법이 훨씬 깔끔하고 MVVM 패턴에도 더 잘 맞습니다. (관심사 분리 원칙)
 
-이미 MainViewModel 클래스가 있고, 규모가 큽니다.
-DT2330M 클래스도 이미 완벽하게 준비되어 사용 중입니다.
-MainViewModel 안에서, 이미 사용 중인 DT2330M 객체의 인스턴스에 접근할 수 있습니다 (예: _myDt2330m 같은 필드나 속성).
-제가 할 일은 오직 _myDt2330m.sensor 속성 값을 주기적으로 읽어서, '5 아닌 값' -> '5'로 바뀌는 순간을 감지하고, MainViewModel 안에 이미 있거나 추가할 특정 비동기 함수를 호출하는 코드 조각만 드리면 됩니다.
-MainViewModel에 추가할 코드 조각:
+1. 별도의 감시 클래스 만들기 (SensorMonitorService.cs 또는 원하는 이름)
+
+이 클래스는 오직 DT2330M 객체의 sensor 값 감시 및 특정 조건 시 액션 실행만 담당합니다.
 
 C#
 
-// --- MainViewModel 클래스 안에 아래 코드들을 추가하세요 ---
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using YourApp.Models; // DT2330M이 있는 네임스페이스로 변경하세요
 
-#region Sensor Monitoring Logic
-
-// 1. 모니터링 상태 관리를 위한 필드들
-private CancellationTokenSource _sensorMonitorCts;
-private Task _sensorMonitoringTask;
-private int _previousSensorValue = -1; // 이전 센서 값 저장용 (-1 또는 적절한 초기값)
-
-// --- 중요 ---
-// 아래 '_myExistingDt2330mInstance' 는 ViewModel이 이미 가지고 있는
-// DT2330M 객체의 실제 필드 또는 속성 이름으로 바꿔주세요!
-// 예: private DT2330M _plcData; 라면 _plcData.sensor 로 사용
-// 여기서는 예시로 _myExistingDt2330mInstance 라고 쓰겠습니다.
-private DT2330M _myExistingDt2330mInstance; // <--- ★★★ 반드시 실제 사용하는 변수명으로 바꾸세요 ★★★
-
-// 2. 모니터링 시작 함수 (ViewModel 초기화 시점 등에 호출)
-public void StartSensorMonitoring()
+namespace YourApp.Services // 또는 적절한 네임스페이스로 변경하세요
 {
-    // 이미 실행 중이면 또 시작하지 않음
-    if (_sensorMonitoringTask != null && !_sensorMonitoringTask.IsCompleted)
+    public class SensorMonitorService : IDisposable
     {
-        Console.WriteLine("Sensor monitoring is already running.");
-        return;
-    }
+        private readonly DT2330M _targetDt2330m;     // 감시할 DT2330M 객체
+        private readonly Func<Task> _actionToExecute; // 조건 만족 시 실행할 비동기 액션 (외부에서 주입받음)
+        private CancellationTokenSource _cts;
+        private Task _monitoringTask;
+        private int _previousSensorValue = -1;
+        private bool _isMonitoring = false; // 현재 모니터링 중인지 상태
 
-    // --- 중요 ---
-    // ViewModel이 DT2330M 인스턴스를 가지고 있는지 확인
-    if (_myExistingDt2330mInstance == null) // <--- ★★★ 실제 변수명 사용 ★★★
-    {
-         Console.WriteLine("Error: DT2330M instance is not available for monitoring.");
-         // 또는 예외 처리
-         return;
-    }
-
-    _sensorMonitorCts = new CancellationTokenSource();
-    // 모니터링 시작 직전의 센서 값을 읽어서 이전 값으로 설정
-    _previousSensorValue = _myExistingDt2330mInstance.sensor; // <--- ★★★ 실제 변수명 사용 ★★★
-
-    Console.WriteLine($"Starting sensor monitoring. Initial value: {_previousSensorValue}");
-    // 백그라운드에서 모니터링 루프 시작
-    _sensorMonitoringTask = MonitorSensorLoopAsync(_sensorMonitorCts.Token);
-}
-
-// 3. 모니터링 중지 함수 (ViewModel 소멸 시점 등에 호출)
-public async Task StopSensorMonitoringAsync()
-{
-    if (_sensorMonitorCts != null)
-    {
-        Console.WriteLine("Requesting sensor monitoring stop...");
-        _sensorMonitorCts.Cancel(); // 취소 요청
-
-        // 작업이 끝날 때까지 기다릴 수 있음 (선택 사항)
-        if (_monitoringTask != null)
+        /// <summary>
+        /// 센서 감시 서비스를 생성합니다.
+        /// </summary>
+        /// <param name="dt2330mToMonitor">감시할 DT2330M 객체</param>
+        /// <param name="actionOnSensorBecomesFive">센서 값이 5가 되었을 때 실행할 비동기 함수</param>
+        public SensorMonitorService(DT2330M dt2330mToMonitor, Func<Task> actionOnSensorBecomesFive)
         {
+            _targetDt2330m = dt2330mToMonitor ?? throw new ArgumentNullException(nameof(dt2330mToMonitor));
+            _actionToExecute = actionOnSensorBecomesFive ?? throw new ArgumentNullException(nameof(actionOnSensorBecomesFive));
+        }
+
+        /// <summary>
+        /// 센서 값 감시를 시작합니다.
+        /// </summary>
+        public void StartMonitoring()
+        {
+            if (_isMonitoring)
+            {
+                Console.WriteLine("[SensorMonitorService] Already monitoring.");
+                return;
+            }
+
+            _cts = new CancellationTokenSource();
+            _previousSensorValue = _targetDt2330m.Sensor; // 시작 시점 값 읽기
+
+            Console.WriteLine($"[SensorMonitorService] Starting monitoring. Initial value: {_previousSensorValue}");
+            _isMonitoring = true;
+            _monitoringTask = MonitorLoopAsync(_cts.Token);
+        }
+
+        /// <summary>
+        /// 센서 값 감시를 비동기적으로 중지합니다.
+        /// </summary>
+        public async Task StopMonitoringAsync()
+        {
+            if (!_isMonitoring || _cts == null)
+            {
+                return;
+            }
+
+            Console.WriteLine("[SensorMonitorService] Requesting stop...");
+            _cts.Cancel();
+
+            if (_monitoringTask != null)
+            {
+                try
+                {
+                    await _monitoringTask; // 작업 완료 또는 취소 대기
+                }
+                catch (OperationCanceledException) { /* 정상 취소 */ }
+                catch (Exception ex) { Console.WriteLine($"[SensorMonitorService] Error during stop: {ex.Message}"); }
+            }
+
+            _cts.Dispose(); // CancellationTokenSource 리소스 해제
+            _cts = null;
+            _monitoringTask = null;
+            _isMonitoring = false;
+            Console.WriteLine("[SensorMonitorService] Monitoring stopped.");
+        }
+
+        /// <summary>
+        /// 실제 감시 루프 (내부 private 함수)
+        /// </summary>
+        private async Task MonitorLoopAsync(CancellationToken token)
+        {
+            Console.WriteLine("[SensorMonitorService] Monitor loop started.");
             try
             {
-                await _monitoringTask;
+                while (!token.IsCancellationRequested)
+                {
+                    // DT2330M 객체의 .sensor 값만 읽기
+                    int currentSensorValue = _targetDt2330m.Sensor;
+
+                    // 조건 확인: 5 아닌 값 -> 5
+                    if (currentSensorValue == 5 && _previousSensorValue != 5)
+                    {
+                        Console.WriteLine($"[SensorMonitorService][Detected] Sensor: {_previousSensorValue} -> 5. Executing action.");
+                        // 생성자에서 주입받은 비동기 액션 실행
+                        await _actionToExecute();
+                    }
+
+                    // 다음 확인을 위해 값 업데이트
+                    _previousSensorValue = currentSensorValue;
+
+                    // 대기 (주기 조절 가능)
+                    await Task.Delay(200, token);
+                }
             }
-            catch (OperationCanceledException) { /* 정상 */ }
-            catch (Exception ex) { Console.WriteLine($"Error stopping monitoring: {ex.Message}"); }
-        }
-
-        _sensorMonitorCts.Dispose();
-        _sensorMonitorCts = null;
-        _monitoringTask = null;
-        Console.WriteLine("Sensor monitoring stopped.");
-    }
-}
-
-// 4. 실제 모니터링을 수행하는 루프 (내부 private 함수)
-private async Task MonitorSensorLoopAsync(CancellationToken token)
-{
-    Console.WriteLine("Sensor monitoring loop started.");
-    try
-    {
-        while (!token.IsCancellationRequested)
-        {
-            // *** 오직 .sensor 값만 읽습니다 ***
-            int currentSensorValue = _myExistingDt2330mInstance.sensor; // <--- ★★★ 실제 변수명 사용 ★★★
-
-            // *** 조건 확인: 5가 아닌 값에서 5로 변경되었는가? ***
-            if (currentSensorValue == 5 && _previousSensorValue != 5)
+            catch (OperationCanceledException)
             {
-                Console.WriteLine($"[Detected] Sensor changed from {_previousSensorValue} to 5. Triggering action!");
-                // *** 조건 만족 시 실행할 ★당신의★ 비동기 함수 호출 ***
-                await YourActionForSensorFiveAsync(); // <--- ★★★ 아래 5번 함수 호출 ★★★
+                Console.WriteLine("[SensorMonitorService] Monitor loop cancelled.");
             }
+            catch (NullReferenceException nre)
+            {
+                 Console.WriteLine($"[SensorMonitorService] Error: Target DT2330M instance became null? {nre.Message}");
+                 _isMonitoring = false; // 오류 시 모니터링 중단
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SensorMonitorService] Error in monitor loop: {ex.Message}");
+                 _isMonitoring = false; // 오류 시 모니터링 중단
+            }
+             finally
+            {
+                 Console.WriteLine("[SensorMonitorService] Monitor loop finished.");
+                 _isMonitoring = false; // 루프 종료 시 상태 업데이트
+            }
+        }
 
-            // 다음 비교를 위해 현재 값 저장
-            _previousSensorValue = currentSensorValue;
+        // IDisposable 구현 (StopMonitoringAsync 호출 보장)
+        private bool disposedValue;
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!disposedValue)
+            {
+                if (disposing)
+                {
+                    // 관리 리소스 해제: StopMonitoringAsync 호출을 시도
+                    // 주의: Dispose에서 async 메서드를 안전하게 호출하는 것은 까다로울 수 있음
+                    // 여기서는 Cancel만 요청하고 Task를 기다리지 않는 것이 더 안전할 수 있음
+                    _cts?.Cancel();
+                    _cts?.Dispose();
+                    _cts = null;
+                    Console.WriteLine("[SensorMonitorService] Disposed.");
+                }
+                disposedValue = true;
+            }
+        }
 
-            // 대기 (주기 설정, 예: 200ms)
-            await Task.Delay(200, token);
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
         }
     }
-    catch (OperationCanceledException)
-    {
-        Console.WriteLine("Sensor monitoring loop was canceled.");
-    }
-    catch (NullReferenceException nre) // _myExistingDt2330mInstance가 null일 경우 대비
-    {
-        Console.WriteLine($"Error: DT2330M instance became null during monitoring. {nre.Message}");
-        // 필요시 모니터링 자동 중지 또는 재시도 로직 추가
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in sensor monitoring loop: {ex.Message}");
-        // 필요시 로깅
-    }
-    finally
-    {
-        Console.WriteLine("Sensor monitoring loop finished.");
-    }
 }
+2. MainViewModel에서 이 클래스 사용하기
 
-// 5. 센서 값이 5로 변경되었을 때 실행할 ★당신의★ 비동기 함수
-//    (이 함수는 MainViewModel 안에 이미 있거나, 새로 추가하세요)
-private async Task YourActionForSensorFiveAsync() // <--- ★★★ 함수 이름은 원하시는 대로 ★★★
+기존 MainViewModel에는 이제 감시 로직 자체가 아니라, 이 SensorMonitorService를 사용하는 코드만 남게 되어 훨씬 간결해집니다.
+
+C#
+
+using System;
+using System.Threading.Tasks;
+using System.ComponentModel; // ViewModel이 사용하는 경우
+using YourApp.Models;      // 실제 네임스페이스
+using YourApp.Services;     // SensorMonitorService가 있는 네임스페이스
+
+namespace YourApp.ViewModels // 실제 네임스페이스
 {
-    Console.WriteLine("====== Executing YourActionForSensorFiveAsync ======");
-    try
+    public class MainViewModel : INotifyPropertyChanged, IDisposable // IDisposable 추가 권장
     {
-        // --- 여기에 센서값이 5가 되었을 때 해야 할 실제 작업 코드를 넣으세요 ---
-        // 예: 다른 서비스 호출, 상태 업데이트, 명령 전송 등 비동기 작업
-        await Task.Delay(1000); // 예시: 1초 대기
-        Console.WriteLine("====== YourActionForSensorFiveAsync Finished ======");
-    }
-    catch(Exception ex)
-    {
-         Console.WriteLine($"Error during YourActionForSensorFiveAsync: {ex.Message}");
-         // 액션 함수 내 오류 처리
+        // --- 기존 멤버들 ---
+        private readonly DT2330M _myExistingDt2330mInstance; // ★★★ ViewModel이 이미 가지고 있는 DT2330M 객체
+        // ... ViewModel의 다른 많은 코드들 ...
+
+        // --- ★★★ SensorMonitorService 사용을 위한 멤버 ★★★ ---
+        private SensorMonitorService _sensorWatcher;
+
+        // 생성자 등에서 초기화
+        public MainViewModel(/* 필요한 의존성들 */ DT2330M dt2330mInstance)
+        {
+            // --- 중요: 이미 가지고 있는 DT2330M 인스턴스를 사용 ---
+             _myExistingDt2330mInstance = dt2330mInstance ?? throw new ArgumentNullException(nameof(dt2330mInstance));
+
+            // --- ★★★ 감시 서비스 생성 ★★★ ---
+            // 1. 감시할 객체(_myExistingDt2330mInstance)와
+            // 2. 조건 만족 시 실행할 *이 ViewModel 안의* 함수(YourActionForSensorFiveAsync)를 넘겨줍니다.
+            _sensorWatcher = new SensorMonitorService(_myExistingDt2330mInstance, YourActionForSensorFiveAsync);
+
+            // ... 다른 ViewModel 초기화 코드 ...
+        }
+
+        // --- ★★★ 감시 시작/중지 메서드 (ViewModel 생명주기에 맞춰 호출) ★★★ ---
+
+        // 예: View가 로드될 때 호출
+        public void ActivateMonitoring()
+        {
+            _sensorWatcher?.StartMonitoring();
+        }
+
+        // 예: View가 언로드될 때 호출 (비동기 Dispose 패턴 고려)
+        public async Task DeactivateMonitoringAsync()
+        {
+           if (_sensorWatcher != null)
+           {
+               await _sensorWatcher.StopMonitoringAsync();
+           }
+        }
+
+
+        // --- ★★★ 센서 값이 5가 되었을 때 실행될 함수 (ViewModel 내부에 위치) ★★★ ---
+        private async Task YourActionForSensorFiveAsync()
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("[MainViewModel] >>> Sensor is 5! Executing ViewModel's action...");
+            // 이 ViewModel과 관련된 로직 수행
+            // 예: 다른 상태 업데이트, 명령 실행, UI 변경 알림 등
+            await Task.Delay(500); // 작업 시뮬레이션
+            Console.WriteLine("[MainViewModel] >>> ViewModel's action finished.");
+            Console.ResetColor();
+        }
+
+
+        // --- IDisposable 구현 (SensorMonitorService Dispose 호출) ---
+        private bool disposedValue;
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!disposedValue)
+            {
+                if (disposing)
+                {
+                    // ★★★ 관리 리소스 해제: SensorMonitorService 인스턴스 Dispose ★★★
+                    _sensorWatcher?.Dispose();
+                }
+                disposedValue = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        // --- 기존의 INotifyPropertyChanged 구현 및 다른 코드들 ---
+        public event PropertyChangedEventHandler PropertyChanged;
+        // ... OnPropertyChanged, SetProperty 등 ...
     }
 }
+핵심 변경 사항:
 
-#endregion Sensor Monitoring Logic
-
-// --- 여기는 MainViewModel의 다른 기존 코드들이 계속됩니다 ---
-사용 방법:
-
-위 #region Sensor Monitoring Logic 부터 #endregion 까지의 코드를 기존 MainViewModel 클래스 안에 복사해서 붙여넣으세요.
-코드 중간의 _myExistingDt2330mInstance 라고 된 부분을 실제 MainViewModel에서 사용하는 DT2330M 객체 변수(필드 또는 속성)의 이름으로 정확하게 바꿔주세요. (가장 중요!)
-YourActionForSensorFiveAsync 함수의 이름과 내용을 실제로 센서 값이 5가 되었을 때 실행해야 하는 작업으로 채워주세요.
-MainViewModel이 활성화되는 시점 (예: 생성자, 또는 View가 Load될 때 연결된 함수 등)에서 StartSensorMonitoring() 함수를 한 번 호출해주세요.
-MainViewModel이 비활성화되거나 소멸되는 시점 (예: View가 Unload/Closing 될 때, 또는 Dispose 메서드 안 등)에서 await StopSensorMonitoringAsync() 함수를 호출하여 모니터링을 안전하게 종료해주세요.
-이제 MainViewModel은 지정된 DT2330M 객체의 .sensor 값만 주기적으로 확인하며, 조건이 맞을 때 지정된 함수(YourActionForSensorFiveAsync)를 실행할 것입니다. 다른 복잡한 구조나 가정 없이 딱 필요한 로직만 추가했습니다.
+SensorMonitorService 클래스: 센서 감시와 관련된 모든 로직(루프, 상태 관리, CancellationToken)을 이 클래스가 전부 가져갑니다.
+MainViewModel:
+이제 감시 로직 코드가 직접 들어가지 않습니다.
+SensorMonitorService의 인스턴스를 멤버(_sensorWatcher)로 가집니다.
+생성자나 초기화 시점에 SensorMonitorService를 생성하면서, 감시할 DT2330M 객체와 **조건 만족 시 실행할 MainViewModel의 함수(YourActionForSensorFiveAsync)**를 넘겨줍니다.
+ViewModel의 활성화/비활성화 시점에 _sensorWatcher.StartMonitoring()과 _sensorWatcher.StopMonitoringAsync() (또는 Dispose)를 호출하여 감시 서비스의 생명주기를 관리합니다.
