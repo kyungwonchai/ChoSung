@@ -1,39 +1,198 @@
-네, 맞습니다. 제가 드린 이전 코드(SensorWatcher 클래스)가 바로 그렇게 동작하도록 설계되었습니다.
+네, 알겠습니다. Main ViewModel에서 DT2330M 객체의 sensor 속성을 감시만 하다가, 그 값이 정확히 '다른 값'에서 '5'로 변경되는 순간을 포착하여 특정 비동기 함수를 실행하는 로직을 정리해 드리겠습니다.
 
-SensorWatcher 클래스는 DT2330M 인스턴스의 sensor 값을 절대로 직접 변경하지 않습니다. 오직 읽기만 하면서 값이 변하는 것을 지켜봅니다.
+핵심 로직:
 
-코드의 이 부분을 다시 보시면 명확해집니다:
+ViewModel 내 감시: Main ViewModel 내부에 DT2330M의 sensor 값을 주기적으로 확인하는 비동기 루프를 만듭니다.
+상태 기억: 루프는 센서의 '이전 값'을 기억하고 있어야 합니다.
+조건 검사: 매 확인 시 '현재 값'을 읽어와 '이전 값'과 비교합니다. 현재값 == 5 이고 이전값 != 5 인 조건을 만족하는지 확인합니다.
+액션 실행: 조건이 만족되면, ViewModel 내에 정의된 특정 비동기 메서드(예: OnSensorBecameFiveAsync)를 호출합니다.
+상태 갱신: 확인이 끝나면 '현재 값'을 '이전 값'으로 저장하여 다음 확인을 준비합니다.
+시작/중지 제어: ViewModel이 활성화될 때 감시를 시작하고, 비활성화될 때 안전하게 중지하는 메커니즘이 필요합니다 (예: CancellationTokenSource 사용).
+Main ViewModel 예제 코드 (C#):
 
 C#
 
-// SensorWatcher 클래스 내부의 StartMonitoringAsync 메서드 중...
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+// using System.ComponentModel; // INotifyPropertyChanged 등이 필요하면 추가
 
-while (!token.IsCancellationRequested)
+// --- 외부에서 값이 변경되는 데이터 모델 (예시) ---
+public class DT2330M
 {
-    // 1. 외부에서 변경된 sensor 값을 읽어옵니다 (★ 절대 변경하지 않음)
-    int currentSensorValue = _dt2330mInstance.sensor;
+    // 이 값은 외부(예: 통신 클래스)에서 계속 업데이트된다고 가정합니다.
+    public int sensor { get; set; }
 
-    // 2. 이전에 기억해둔 값(_previousSensorValue)과 비교합니다.
-    if (currentSensorValue == 5 && _previousSensorValue != 5)
+    // 테스트용 메서드 (실제로는 외부에서 변경됨)
+    public void SimulateExternalChange(int newValue)
     {
-        // 3. 조건 (다른 값 -> 5)이 맞으면, 지정된 함수(C())를 호출합니다.
-        Console.WriteLine($"조건 감지: 센서 값이 {_previousSensorValue}에서 {currentSensorValue}(으)로 변경되었습니다. C() 호출.");
-        await _actionHandler.C();
+        Console.WriteLine($"[외부] DT2330M.sensor 값을 {newValue}(으)로 변경");
+        sensor = newValue;
+    }
+}
+
+// --- Main ViewModel ---
+public class MainViewModel // : INotifyPropertyChanged // 필요시 상속
+{
+    // 1. 감시 대상 객체 (생성자 등에서 주입받거나 생성)
+    public DT2330M TargetDT2330M { get; private set; }
+
+    // 2. 감시 작업 관리를 위한 필드
+    private CancellationTokenSource _sensorMonitorCts;
+    private Task _sensorMonitoringTask;
+    private int _previousSensorValue = -1; // 초기값 (실제 센서 초기값과 다르게 설정)
+
+    // 3. 생성자 (예시)
+    public MainViewModel()
+    {
+        // 실제로는 의존성 주입 등을 통해 DT2330M 인스턴스를 얻어옵니다.
+        TargetDT2330M = new DT2330M { sensor = 0 }; // 초기값 0으로 가정
     }
 
-    // 4. 다음 비교를 위해 현재 읽은 값을 기억해둡니다.
-    _previousSensorValue = currentSensorValue;
+    // 4. 감시 시작 메서드
+    public void StartSensorMonitoring()
+    {
+        // 이미 실행 중이면 중복 실행 방지
+        if (_sensorMonitoringTask != null && !_sensorMonitoringTask.IsCompleted)
+        {
+            Console.WriteLine("이미 센서 감시가 실행 중입니다.");
+            return;
+        }
 
-    // 5. 잠시 기다렸다가 다시 1번부터 반복합니다.
-    await Task.Delay(200, token);
+        _sensorMonitorCts = new CancellationTokenSource();
+        _previousSensorValue = TargetDT2330M.sensor; // 시작 시점의 현재 값으로 초기화
+
+        Console.WriteLine($"센서 감시 시작. 초기 값: {_previousSensorValue}");
+        _sensorMonitoringTask = MonitorSensorAsync(_sensorMonitorCts.Token);
+    }
+
+    // 5. 감시 중지 메서드 (ViewModel이 사라질 때 호출 필요)
+    public async Task StopSensorMonitoringAsync()
+    {
+        if (_sensorMonitorCts != null)
+        {
+            Console.WriteLine("센서 감시 중지 요청...");
+            _sensorMonitorCts.Cancel();
+
+            // 작업이 완전히 끝날 때까지 기다릴 수 있음 (선택 사항)
+            if (_sensorMonitoringTask != null)
+            {
+                try
+                {
+                    await _sensorMonitoringTask; // Task가 완료되거나 취소될 때까지 대기
+                }
+                catch (OperationCanceledException)
+                {
+                     Console.WriteLine("감시 작업이 정상적으로 취소되었습니다.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"감시 작업 중지 중 예외 발생: {ex.Message}");
+                }
+            }
+
+            _sensorMonitorCts.Dispose();
+            _sensorMonitorCts = null;
+            _sensorMonitoringTask = null;
+            Console.WriteLine("센서 감시가 중지되었습니다.");
+        }
+    }
+
+    // 6. 실제 감시 로직을 수행하는 비동기 메서드 (private)
+    private async Task MonitorSensorAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                // 현재 센서 값 읽기 (ViewModel은 읽기만 함)
+                int currentSensorValue = TargetDT2330M.sensor;
+
+                // ★★★ 핵심 조건: 현재 값이 5이고, 이전 값은 5가 아니었을 때 ★★★
+                if (currentSensorValue == 5 && _previousSensorValue != 5)
+                {
+                    Console.WriteLine($"[감지!] 센서 값이 {_previousSensorValue}에서 {currentSensorValue}(5)로 변경됨! 액션 실행!");
+
+                    // 조건 만족 시 실행할 비동기 함수 호출
+                    await OnSensorBecameFiveAsync();
+                }
+
+                // 다음 비교를 위해 현재 값을 이전 값으로 저장
+                _previousSensorValue = currentSensorValue;
+
+                // 확인 주기 설정 (예: 200ms 마다)
+                await Task.Delay(200, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 취소 요청 시 발생하는 예외는 정상 종료로 간주
+            // Console.WriteLine("MonitorSensorAsync: 작업 취소됨."); // 필요시 로깅
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"센서 감시 중 오류 발생: {ex.Message}");
+            // TODO: 오류 로깅 또는 사용자 알림 등 처리
+        }
+        // finally { Console.WriteLine("MonitorSensorAsync 루프 종료."); } // 디버깅용
+    }
+
+    // 7. 센서 값이 5가 되었을 때 실행할 비동기 함수 (private)
+    private async Task OnSensorBecameFiveAsync()
+    {
+        Console.WriteLine("===> OnSensorBecameFiveAsync() 실행 시작...");
+        // 여기에 센서 값이 5가 되었을 때 수행해야 할 비동기 작업을 넣습니다.
+        // 예: 다른 장치 제어 명령 전송, 상태 업데이트, 로그 기록 등
+        await Task.Delay(1000); // 예시: 1초 동안 작업하는 척
+        Console.WriteLine("===> OnSensorBecameFiveAsync() 실행 완료.");
+    }
+
+    // ViewModel이 IDisposable을 구현한다면 Dispose 메서드에서 Stop 호출
+    // public void Dispose()
+    // {
+    //     StopSensorMonitoringAsync().Wait(); // 비동기 메서드를 동기적으로 기다려야 할 수도 있음 (상황에 따라 주의)
+    // }
 }
-핵심:
 
-int currentSensorValue = _dt2330mInstance.sensor; 라인은 단순히 현재 sensor 값을 읽어오는 동작입니다.
-SensorWatcher는 DT2330M 객체나 그 안의 sensor 값을 수정하는 코드를 전혀 가지고 있지 않습니다.
-외부(예: _comportPLC 클래스)에서 DT2330M.sensor 값을 계속 업데이트하면, SensorWatcher는 주기적으로 그 변경된 값을 확인하여 '다른 값에서 5로 바뀌는 순간'만 정확히 포착해서 원하는 동작(C() 함수 실행)을 수행합니다.
-결론:
+// --- 사용 예시 ---
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var mainViewModel = new MainViewModel();
 
-이전에 제가 제공한 SensorWatcher 코드는 사용자님께서 원하시는 "나는 바라만 보고 있고, 외부에서 바뀌는 sensor 값이 5가 되는 순간을 캐치해서 내 함수를 실행하는" 요구사항을 정확히 만족하는 구현입니다.
+        // 감시 시작
+        mainViewModel.StartSensorMonitoring();
 
-이전 코드 예제의 Main 함수에 있던 dt2330m.SimulateSensorChange(...) 부분은 단지 SensorWatcher가 잘 동작하는지 테스트하기 위해 외부에서 값이 바뀌는 상황을 흉내 낸 것일 뿐, SensorWatcher 자체의 로직과는 무관합니다. 실제 시스템에서는 그 부분이 _comportPLC 등에 의한 실제 값 업데이트로 대체될 것입니다.
+        Console.WriteLine("--- 외부에서 센서 값 변경 시뮬레이션 시작 ---");
+
+        await Task.Delay(1000);
+        mainViewModel.TargetDT2330M.SimulateExternalChange(1); // 0 -> 1 (변화 O, 액션 X)
+
+        await Task.Delay(1000);
+        mainViewModel.TargetDT2330M.SimulateExternalChange(5); // 1 -> 5 (변화 O, 액션 O) -> OnSensorBecameFiveAsync 실행
+
+        await Task.Delay(2000); // OnSensorBecameFiveAsync 실행 시간 고려
+        mainViewModel.TargetDT2330M.SimulateExternalChange(5); // 5 -> 5 (변화 X, 액션 X)
+
+        await Task.Delay(1000);
+        mainViewModel.TargetDT2330M.SimulateExternalChange(6); // 5 -> 6 (변화 O, 액션 X)
+
+        await Task.Delay(1000);
+        mainViewModel.TargetDT2330M.SimulateExternalChange(5); // 6 -> 5 (변화 O, 액션 O) -> OnSensorBecameFiveAsync 실행
+
+        await Task.Delay(3000); // OnSensorBecameFiveAsync 실행 시간 고려
+
+        // 감시 중지 (애플리케이션 종료 또는 ViewModel 소멸 시점에 호출)
+        await mainViewModel.StopSensorMonitoringAsync();
+
+        Console.WriteLine("--- 프로그램 종료 ---");
+    }
+}
+주요 포인트:
+
+독립성: MainViewModel은 TargetDT2330M.sensor 값을 오직 읽기만 합니다. 값 변경은 외부 요인에 의해 이루어집니다.
+상태 관리: _previousSensorValue 변수를 사용하여 값의 '변화' 여부와 '특정 값(5)으로의 진입' 여부를 동시에 판단합니다.
+비동기 처리: MonitorSensorAsync와 OnSensorBecameFiveAsync 모두 async Task로 선언되어 UI 스레드를 차단하지 않으면서 백그라운드에서 감시 및 액션 처리를 수행합니다.
+생명 주기 관리: StartSensorMonitoring과 StopSensorMonitoringAsync 메서드를 통해 감시 작업의 시작과 종료를 제어할 수 있습니다. ViewModel이 생성되고 활성화될 때 Start를 호출하고, ViewModel이 소멸되거나 비활성화될 때 Stop을 호출하여 리소스를 정리해야 합니다. (WPF/UWP 등에서는 Loaded 이벤트, Dispose 메서드 등을 활용)
+취소: CancellationTokenSource를 사용하여 Stop 요청 시 감시 루프(while)와 Task.Delay를 안전하고 즉각적으로 중단시킵니다.
