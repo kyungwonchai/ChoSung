@@ -1,199 +1,504 @@
-Services/MonitorControlService.cs
+네, 이어서 진행하겠습니다.
+
+먼저, 현재까지의 논의와 앞으로 제공될 Agent 코드를 위해 프로젝트에 설치해야 할 주요 NuGet 패키지는 다음과 같습니다:
+
+Newtonsoft.Json: JSON 데이터를 다루기 위한 필수 라이브러리입니다. 설정 파일(runtime_config.json) 및 통신 메시지(예: InternalTcpMessage)의 직렬화/역직렬화에 사용됩니다.
+
+콘솔에서 설치: Install-Package Newtonsoft.Json
+.NET Framework 4.5와 호환되는 버전을 선택해야 합니다 (예: 12.x 또는 13.x 버전도 대부분 .NET Framework 4.5를 지원합니다).
+Microsoft.AspNet.SignalR.Client: 중앙 서버와 SignalR 프로토콜로 통신하기 위한 클라이언트 라이브러리입니다.
+
+콘솔에서 설치: Install-Package Microsoft.AspNet.SignalR.Client
+.NET Framework 4.5와 호환되는 버전(예: 2.4.3)을 설치해야 합니다.
+WPF 애플리케이션으로 트레이 아이콘 등을 구현한다면 System.Windows.Forms 어셈블리 참조가 필요할 수 있고 (NotifyIcon 사용 시), 또는 WPF 전용 트레이 아이콘 라이브러리(예: Hardcodet.NotifyIcon.Wpf)를 NuGet에서 추가할 수 있습니다. 여기서는 핵심 로직에 집중하며, UI 부분은 App.xaml.cs에서 최소한으로 다룰 예정입니다.
+
+이제 Core 폴더의 클래스들을 작성하겠습니다.
+
+2.10. Core/AgentStatus.cs
 
 C#
 
-// MonitorAgent/Services/MonitorControlService.cs
-using System;
-using System.Runtime.InteropServices;
-
-namespace MonitorAgent.Services
+// MonitorAgent/Core/AgentStatus.cs
+namespace MonitorAgent.Core
 {
-    public interface IMonitorControlService
+    public enum AgentOperationalStatus
     {
-        bool TurnMonitorOn();
-        bool TurnMonitorOff();
-        // string GetMonitorStatus(); // 상태 확인은 복잡하므로 우선 제외
+        Initializing,               // Agent 시작 중, 기본 설정 로드
+        LoadingConfiguration,       // 로컬 설정(ID, 서버 URL, 이전 런타임 설정) 로드 중
+        ConnectingToServer,         // 중앙 서버에 연결 시도 중
+        RegisteringOnServer,        // 중앙 서버에 Agent 정보 등록/업데이트 중
+        WaitingForServerConfig,     // 서버로부터 역할 및 상세 설정 대기 중
+        Running,                    // 주 역할 수행 중 (Direct, Gateway, Proxied)
+        ReconnectingToServer,       // 중앙 서버와 연결 끊김 후 재시도 중
+        ReconnectingToGateway,      // (Proxied 모드) Gateway와 연결 끊김 후 재시도 중
+        Error,                      // 치명적 오류 발생, 기능 정지
+        Stopping                    // Agent 종료 중
     }
+}
+2.11. Core/AgentCoreService.cs
 
-    public class MonitorControlService : IMonitorControlService
+C#
+
+// MonitorAgent/Core/AgentCoreService.cs
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using MonitorAgent.Config;
+using MonitorAgent.Models;
+using MonitorAgent.Network;
+using MonitorAgent.Services;
+using Newtonsoft.Json; // UpdateConfigurationPayload 파싱용
+
+namespace MonitorAgent.Core
+{
+    public class AgentCoreService : IDisposable
     {
         private readonly ILoggingService _logger;
+        private readonly AgentIdentifier _agentIdentifier;
+        private readonly ServerUrlProvider _serverUrlProvider;
+        private RuntimeConfig _runtimeConfig;
 
-        // Windows API 상수
-        private const int WM_SYSCOMMAND = 0x0112;
-        private const int SC_MONITORPOWER = 0xF170;
-        private const int MONITOR_ON = -1;    // 모니터 켜기
-        private const int MONITOR_OFF = 2;    // 모니터 끄기
-        // private const int MONITOR_STANDBY = 1; // 모니터 대기 (필요시 사용)
+        private readonly IMonitorControlService _monitorControl;
+        private CentralServerClient _centralServerClient;
+        private GatewayTcpServer _gatewayTcpServer; // Gateway 역할 시 사용
+        private ProxiedTcpClient _proxiedTcpClient; // Proxied 역할 시 사용
 
-        // HWND_BROADCAST 사용하여 모든 최상위 창에 메시지 전송
-        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
-        // 특정 창 핸들을 사용하려면 FindWindow 등을 사용해야 하나, 일반적으로 Broadcast로 충분
-        // private static readonly IntPtr HWND_DESKTOP = IntPtr.Zero; // 또는 GetDesktopWindow()
+        private AgentOperationalStatus _currentStatus;
+        private CancellationTokenSource _cancellationTokenSource;
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        public event Action<AgentOperationalStatus, string> OnStatusChanged; // UI 업데이트용 이벤트
+        public event Action<string> OnLogRelay; // 로그 UI 전달용
 
-        public MonitorControlService(ILoggingService logger)
+        public AgentCoreService(ILoggingService logger, AgentIdentifier agentIdentifier, ServerUrlProvider serverUrlProvider, IMonitorControlService monitorControl)
         {
             _logger = logger;
+            _agentIdentifier = agentIdentifier;
+            _serverUrlProvider = serverUrlProvider;
+            _monitorControl = monitorControl;
+
+            // 로거의 로그 메시지 이벤트를 받아서 OnLogRelay로 다시 전달
+            if (logger is FileLoggingService fileLogger) // 형변환으로 이벤트 구독
+            {
+                fileLogger.OnLogMessage += (logMsg) => OnLogRelay?.Invoke(logMsg);
+            }
+
+            UpdateStatus(AgentOperationalStatus.Initializing, "Core service created.");
         }
 
-        public bool TurnMonitorOn()
+        public async Task StartAsync()
         {
-            _logger.LogInfo("Attempting to turn monitor ON.");
-            try
+            _cancellationTokenSource = new CancellationTokenSource();
+            UpdateStatus(AgentOperationalStatus.LoadingConfiguration, "Starting agent core service.");
+
+            // 1. 로컬 런타임 설정 로드
+            _runtimeConfig = RuntimeConfig.Load(_logger);
+            if (_runtimeConfig != null && !string.IsNullOrWhiteSpace(_runtimeConfig.AssignedRole.ToString()) && _runtimeConfig.AssignedRole != AgentAssignedRole.Unassigned)
             {
-                // SendMessage의 반환값은 메시지 처리 결과에 따라 다르며, 0이 성공을 의미하지 않을 수 있음.
-                // 여기서는 명령 전송 자체에 집중. 실제 상태 확인은 별도 API 필요.
-                SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER, (IntPtr)MONITOR_ON);
-                _logger.LogInfo("Monitor ON command sent successfully.");
-                return true;
+                 _logger.LogInfo($"Loaded runtime config. Last known role: {_runtimeConfig.AssignedRole}");
+                 // 로그 레벨 설정 (RuntimeConfig에 LogLevel이 있다면 여기서 설정)
+                 // ((FileLoggingService)_logger).SetLogLevel(_runtimeConfig.LogLevelString); 
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogError("Failed to send Monitor ON command.", ex);
-                return false;
+                _logger.LogInfo("No valid prior runtime config found or role is Unassigned. Will fetch from server.");
+                _runtimeConfig = new RuntimeConfig(); // 깨끗한 설정으로 시작
+            }
+
+
+            if (string.IsNullOrEmpty(_serverUrlProvider.Url))
+            {
+                UpdateStatus(AgentOperationalStatus.Error, "Central server URL is not configured. Agent cannot start.");
+                return;
+            }
+
+            // 2. 중앙 서버 클라이언트 초기화 및 시작
+            _centralServerClient = new CentralServerClient(_serverUrlProvider.Url, _agentIdentifier.Id, _logger);
+            SetupCentralServerClientEventHandlers();
+
+            UpdateStatus(AgentOperationalStatus.ConnectingToServer, $"Connecting to SignalR server: {_serverUrlProvider.Url}");
+            bool connected = await _centralServerClient.ConnectAsync();
+
+            if (!connected)
+            {
+                UpdateStatus(AgentOperationalStatus.Error, "Failed to connect to central server on initial attempt.");
+                // 재시도 로직은 CentralServerClient 내부 또는 여기서 추가 관리 가능
+                // 여기서는 일단 실패로 간주하고 추가 진행 안 함. UI에서 재시도 버튼 등을 제공할 수 있음.
+                return;
+            }
+            // 연결 성공 시 CentralServerClient의 OnConnected 핸들러에서 RegisterAgent 호출됨.
+            // RegisterAgent 후 서버에서 OnUpdateConfiguration 호출하여 설정 내려받음.
+        }
+
+        private void SetupCentralServerClientEventHandlers()
+        {
+            if (_centralServerClient == null) return;
+
+            _centralServerClient.OnConnected += async () =>
+            {
+                UpdateStatus(AgentOperationalStatus.RegisteringOnServer, "Connected to server. Registering agent...");
+                var regInfo = new AgentRegistrationInfo
+                {
+                    AgentId = _agentIdentifier.Id,
+                    MachineName = Environment.MachineName,
+                    IpAddresses = CentralServerClient.GetLocalIpAddresses(),
+                    AgentVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(),
+                    CurrentMonitorStatus = "Unknown" // TODO: 실제 모니터 상태 가져오기
+                };
+                await _centralServerClient.RegisterAgentAsync(regInfo);
+                // 등록 후 서버가 설정을 내려주기를 기다림 (OnUpdateConfiguration 호출 예상)
+                // 만약 현재 로컬 _runtimeConfig가 유효하다면, 그것으로 일단 실행 시작하고 서버 업데이트를 기다릴 수도 있음.
+                // 여기서는 서버 설정을 우선시.
+                if(_runtimeConfig.AssignedRole != AgentAssignedRole.Unassigned)
+                {
+                    _logger.LogInfo($"Agent already has a role: {_runtimeConfig.AssignedRole}. Attempting to start with this role while waiting for server confirmation/update.");
+                    await ApplyCurrentRoleConfigurationAsync(_runtimeConfig); // 로컬 캐시된 설정으로 우선 실행 시도
+                }
+                else
+                {
+                     UpdateStatus(AgentOperationalStatus.WaitingForServerConfig, "Waiting for server to assign role and configuration.");
+                }
+            };
+
+            _centralServerClient.OnDisconnected += () =>
+            {
+                UpdateStatus(AgentOperationalStatus.ReconnectingToServer, "Disconnected from server. Attempting to reconnect...");
+                // 역할 수행 중지 또는 일시 중지
+                StopRoleSpecificServices();
+            };
+
+            _centralServerClient.OnExecuteCommandReceived += HandleServerCommandAsync;
+            _centralServerClient.OnUpdateConfigurationReceived += async (newConfig) =>
+            {
+                _logger.LogInfo($"Received new configuration from server. New Role: {newConfig.AssignedRole}");
+                _runtimeConfig = newConfig;
+                _runtimeConfig.Save(_logger); // 받은 설정을 로컬에 저장
+
+                // 로그 레벨 업데이트 (runtimeConfig에 로그레벨 설정이 있다면)
+                // if (!string.IsNullOrEmpty(_runtimeConfig.LogLevel))
+                //    ((FileLoggingService)_logger).SetLogLevel(_runtimeConfig.LogLevel);
+
+                await ApplyCurrentRoleConfigurationAsync(_runtimeConfig);
+            };
+        }
+
+        private async Task ApplyCurrentRoleConfigurationAsync(RuntimeConfig config)
+        {
+            StopRoleSpecificServices(); // 기존 역할 서비스 중지
+
+            UpdateStatus(AgentOperationalStatus.Running, $"Applying new role: {config.AssignedRole}");
+
+            switch (config.AssignedRole)
+            {
+                case AgentAssignedRole.Direct:
+                    _logger.LogInfo("Configured as Direct Agent.");
+                    // Direct는 SignalR로만 동작하므로 별도 TCP 서비스 없음.
+                    break;
+                case AgentAssignedRole.Gateway:
+                    _logger.LogInfo($"Configured as Gateway Agent. Listen Port: {config.GatewayListenPort}");
+                    if (config.GatewayListenPort.HasValue)
+                    {
+                        _gatewayTcpServer = new GatewayTcpServer(config.GatewayListenPort.Value, _logger, _agentIdentifier.Id);
+                        _gatewayTcpServer.OnProxiedMessageReceived += HandleProxiedAgentMessageAsync;
+                        _gatewayTcpServer.Start();
+                    }
+                    else
+                    {
+                        _logger.LogError("GatewayListenPort not configured for Gateway role.");
+                        UpdateStatus(AgentOperationalStatus.Error, "Gateway configuration error.");
+                    }
+                    break;
+                case AgentAssignedRole.Proxied:
+                    _logger.LogInfo($"Configured as Proxied Agent. Target Gateway: {config.TargetGatewayAgentId} ({config.TargetGatewayIpToConnect}:{config.TargetGatewayPortToConnect})");
+                    if (!string.IsNullOrEmpty(config.TargetGatewayIpToConnect) && config.TargetGatewayPortToConnect.HasValue)
+                    {
+                        _proxiedTcpClient = new ProxiedTcpClient(config.TargetGatewayIpToConnect, config.TargetGatewayPortToConnect.Value, _agentIdentifier.Id, _logger);
+                        _proxiedTcpClient.OnGatewayMessageReceived += HandleGatewayMessageAsync;
+                        _proxiedTcpClient.OnDisconnectedFromGateway += () => {
+                            UpdateStatus(AgentOperationalStatus.ReconnectingToGateway, "Disconnected from Gateway. Attempting to reconnect...");
+                            // 여기서 Gateway 재연결 로직을 ProxiedTcpClient 내부에서 처리하도록 하거나, 여기서 명시적으로 재시도 호출
+                        };
+                        await _proxiedTcpClient.ConnectAsync(); // 연결 시도
+                        if (_proxiedTcpClient.IsConnected)
+                        {
+                             _logger.LogInfo("Successfully connected to Gateway.");
+                             // 연결 성공 시 Hello 메시지 전송
+                            var helloMsg = new InternalTcpMessage
+                            {
+                                MessageType = InternalMessageType.ProxiedAgentHello,
+                                SourceAgentId = _agentIdentifier.Id
+                            };
+                            await _proxiedTcpClient.SendMessageAsync(helloMsg);
+                        }
+                        else
+                        {
+                            _logger.LogError("Failed to connect to Gateway server on initial attempt for Proxied role.");
+                            UpdateStatus(AgentOperationalStatus.Error, "Proxied configuration error or Gateway unavailable.");
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError("TargetGateway IP/Port not configured for Proxied role.");
+                        UpdateStatus(AgentOperationalStatus.Error, "Proxied configuration error.");
+                    }
+                    break;
+                case AgentAssignedRole.Unassigned:
+                default:
+                    _logger.LogInfo("Agent role is Unassigned. Waiting for server configuration.");
+                    UpdateStatus(AgentOperationalStatus.WaitingForServerConfig, "Role is Unassigned.");
+                    break;
+            }
+            // 전체 상태가 Running으로 변경되었으므로, 하트비트 등 정상 동작 시작을 알릴 수 있음
+            await _centralServerClient.ReportAgentStatusAsync(_runtimeConfig.AssignedRole.ToString(), "Running normally", GetCurrentMonitorStatus());
+        }
+
+        private async void HandleServerCommandAsync(ServerCommand command)
+        {
+            _logger.LogInfo($"Received command from server: {command.Action}, Target: {command.TargetAgentId}, CmdId: {command.CommandId}");
+            bool result = false;
+            string message = "Command not processed.";
+            string currentMonitorStatus = GetCurrentMonitorStatus(); // 명령 처리 전 상태
+
+            // 이 Agent가 최종 대상인지 확인
+            if (command.TargetAgentId == _agentIdentifier.Id)
+            {
+                switch (command.Action)
+                {
+                    case CommandAction.TurnMonitorOn:
+                        result = _monitorControl.TurnMonitorOn();
+                        message = result ? "Monitor turned ON." : "Failed to turn monitor ON.";
+                        currentMonitorStatus = result ? "On" : currentMonitorStatus;
+                        break;
+                    case CommandAction.TurnMonitorOff:
+                        result = _monitorControl.TurnMonitorOff();
+                        message = result ? "Monitor turned OFF." : "Failed to turn monitor OFF.";
+                        currentMonitorStatus = result ? "Off" : currentMonitorStatus;
+                        break;
+                    case CommandAction.RequestStatusUpdate:
+                        result = true; // 상태 보고는 항상 성공으로 간주
+                        message = "Status update requested by server.";
+                        // 현재 상태 정보는 ReportCommandResult에서 함께 보냄.
+                        break;
+                    case CommandAction.Ping:
+                        result = true;
+                        message = "Pong";
+                        break;
+                    // UpdateConfiguration은 OnUpdateConfigurationReceived에서 별도 처리됨.
+                    default:
+                        message = $"Unknown command action: {command.Action}";
+                        _logger.LogWarning(message);
+                        break;
+                }
+                // 중앙 서버로 결과 보고
+                await _centralServerClient.ReportCommandResultAsync(command.CommandId, command.TargetAgentId, result, message, currentMonitorStatus);
+            }
+            // 이 Agent가 Gateway이고, 명령이 Proxied Agent를 향한 것이라면 중계
+            else if (_runtimeConfig.AssignedRole == AgentAssignedRole.Gateway && _gatewayTcpServer != null)
+            {
+                _logger.LogInfo($"Relaying command to Proxied Agent: {command.TargetAgentId}");
+                var relayedCmdPayload = new ExecuteRelayedCommandPayload
+                {
+                    ActionToExecute = command.Action, // TurnMonitorOn, TurnMonitorOff 등
+                    ActionPayload = command.Payload   // 원본 명령의 페이로드 (필요시)
+                };
+                
+                var internalMsg = new InternalTcpMessage
+                {
+                    MessageType = InternalMessageType.ExecuteRelayedCommand,
+                    SourceAgentId = _agentIdentifier.Id, // Gateway가 보냄
+                    TargetAgentId = command.TargetAgentId,
+                    OriginalCommandId = command.CommandId,
+                    Payload = JsonConvert.SerializeObject(relayedCmdPayload)
+                };
+                bool relayed = await _gatewayTcpServer.SendMessageToProxiedAsync(command.TargetAgentId, internalMsg);
+                
+                if(relayed) {
+                    // 중계 성공 시, 서버에는 우선 "SentToProxied" 상태 보고. 최종 결과는 Proxied Agent로부터 받아서 다시 보고.
+                    // 여기서는 일단 중계 시도 결과만 간단히 로깅. 실제 서버 보고는 복잡해짐.
+                    // 또는 서버에 "Relayed" 상태를 보고하고, Proxied의 응답을 기다렸다가 최종 결과를 다시 보고할 수 있음.
+                     _logger.LogInfo($"Command relayed to Proxied Agent {command.TargetAgentId}. Waiting for response from Proxied Agent.");
+                     // 서버에 즉시 응답해야 한다면, "ForwardedToProxied" 같은 상태를 보내고, 
+                     // 나중에 Proxied Agent로부터 실제 결과가 오면 그 때 다시 서버에 최종 결과를 보고해야 함.
+                     // 여기서는 단순화를 위해, Gateway가 Proxied Agent에게 보낸 후의 즉각적인 서버 응답은 생략.
+                     // Proxied Agent의 응답이 HandleProxiedAgentMessageAsync 를 통해 서버로 전달될 것임.
+                } else {
+                     _logger.LogError($"Failed to relay command to Proxied Agent: {command.TargetAgentId}. Agent might be offline.");
+                     await _centralServerClient.ReportCommandResultAsync(command.CommandId, command.TargetAgentId, false, $"Failed to relay: Proxied agent {command.TargetAgentId} not connected to this gateway.", currentMonitorStatus);
+                }
+            }
+            else
+            {
+                _logger.LogWarning($"Command target mismatch or invalid state. Command Target: {command.TargetAgentId}, My ID: {_agentIdentifier.Id}, My Role: {_runtimeConfig.AssignedRole}");
             }
         }
 
-        public bool TurnMonitorOff()
+        // Proxied Agent로부터 메시지 수신 (Gateway 역할 시)
+        private async void HandleProxiedAgentMessageAsync(string proxiedAgentId, InternalTcpMessage message)
         {
-            _logger.LogInfo("Attempting to turn monitor OFF.");
-            try
+            _logger.LogInfo($"Message received from Proxied Agent {proxiedAgentId}: {message.MessageType}");
+            switch (message.MessageType)
             {
-                SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER, (IntPtr)MONITOR_OFF);
-                _logger.LogInfo("Monitor OFF command sent successfully.");
-                return true;
+                case InternalMessageType.ProxiedAgentHello:
+                    // 연결된 Proxied Agent 정보 관리 (예: 리스트에 추가)
+                    _logger.LogInfo($"Proxied Agent {proxiedAgentId} said Hello.");
+                    // 서버에 이 Proxied Agent가 이 Gateway에 연결되었음을 알릴 수 있음 (선택적)
+                    // await _centralServerClient.ReportProxiedAgentConnectionAsync(proxiedAgentId, true, _agentIdentifier.Id);
+                    break;
+                case InternalMessageType.CommandResult:
+                    if (!string.IsNullOrEmpty(message.OriginalCommandId) && !string.IsNullOrEmpty(message.TargetAgentId)) // TargetAgentId는 원본 명령의 최종 타겟
+                    {
+                        var resultPayload = JsonConvert.DeserializeObject<CommandResultPayload>(message.Payload);
+                        _logger.LogInfo($"Relayed command result from {proxiedAgentId} for OriginalCmdId {message.OriginalCommandId}: Success={resultPayload.Success}, Msg='{resultPayload.Message}'");
+                        // 중앙 서버로 최종 결과 보고
+                        await _centralServerClient.ReportCommandResultAsync(message.OriginalCommandId, message.TargetAgentId, resultPayload.Success, resultPayload.Message, resultPayload.CurrentMonitorStatusAfterCommand);
+                    }
+                    break;
+                case InternalMessageType.ProxiedHeartbeat:
+                    _logger.LogDebug($"Heartbeat from Proxied Agent: {proxiedAgentId}");
+                    // 하트비트 시간 업데이트 등
+                    break;
             }
-            catch (Exception ex)
+        }
+
+        // Gateway로부터 메시지 수신 (Proxied 역할 시)
+        private async void HandleGatewayMessageAsync(InternalTcpMessage message)
+        {
+             _logger.LogInfo($"Message received from Gateway: {message.MessageType}, OriginalCmdId: {message.OriginalCommandId}");
+            switch (message.MessageType)
             {
-                _logger.LogError("Failed to send Monitor OFF command.", ex);
-                return false;
+                case InternalMessageType.ExecuteRelayedCommand:
+                    var commandPayload = JsonConvert.DeserializeObject<ExecuteRelayedCommandPayload>(message.Payload);
+                    bool cmdResult = false;
+                    string cmdMessage = "Execution failed.";
+                    string monitorStatusAfterCmd = GetCurrentMonitorStatus();
+
+                    _logger.LogInfo($"Executing relayed command: {commandPayload.ActionToExecute}");
+
+                    switch (commandPayload.ActionToExecute)
+                    {
+                        case CommandAction.TurnMonitorOn:
+                            cmdResult = _monitorControl.TurnMonitorOn();
+                            cmdMessage = cmdResult ? "Monitor turned ON by Proxied." : "Failed to turn monitor ON by Proxied.";
+                            monitorStatusAfterCmd = cmdResult ? "On" : monitorStatusAfterCmd;
+                            break;
+                        case CommandAction.TurnMonitorOff:
+                            cmdResult = _monitorControl.TurnMonitorOff();
+                            cmdMessage = cmdResult ? "Monitor turned OFF by Proxied." : "Failed to turn monitor OFF by Proxied.";
+                            monitorStatusAfterCmd = cmdResult ? "Off" : monitorStatusAfterCmd;
+                            break;
+                        // Ping이나 RequestStatusUpdate는 Gateway가 직접 처리하거나, 필요시 Proxied에게 전달 가능.
+                        // 여기서는 모니터 제어만 중계한다고 가정.
+                        default:
+                            cmdMessage = $"Unsupported relayed action: {commandPayload.ActionToExecute}";
+                            _logger.LogWarning(cmdMessage);
+                            break;
+                    }
+
+                    // 결과 페이로드 생성
+                    var resultPayloadForGateway = new CommandResultPayload
+                    {
+                        Success = cmdResult,
+                        Message = cmdMessage,
+                        CurrentMonitorStatusAfterCommand = monitorStatusAfterCmd
+                    };
+
+                    // Gateway로 결과 전송
+                    var responseMsg = new InternalTcpMessage
+                    {
+                        MessageType = InternalMessageType.CommandResult,
+                        SourceAgentId = _agentIdentifier.Id,
+                        TargetAgentId = message.TargetAgentId, // 원본 명령의 최종 타겟 AgentID
+                        OriginalCommandId = message.OriginalCommandId,
+                        Payload = JsonConvert.SerializeObject(resultPayloadForGateway)
+                    };
+                    await _proxiedTcpClient.SendMessageAsync(responseMsg);
+                    _logger.LogInfo($"Sent command result to Gateway for OriginalCmdId: {message.OriginalCommandId}");
+                    break;
+                case InternalMessageType.GatewayPing:
+                    _logger.LogDebug("Ping received from Gateway. Responding with ProxiedHeartbeat (implicitly or explicitly).");
+                    // Pong 대신 하트비트 개념으로 대체하거나, 명시적인 Pong 메시지 타입 추가 가능
+                    // 여기서는 별도 응답 없이, 주기적인 ProxiedHeartbeat으로 대체 가능
+                    break;
             }
+        }
+
+
+        private string GetCurrentMonitorStatus()
+        {
+            // 실제 모니터 상태를 가져오는 로직 필요.
+            // Windows API를 사용하여 현재 모니터 전원 상태를 읽는 것은 간단하지 않음.
+            // SendMessage로 켜고 끄는 것은 명령일 뿐, 실제 상태를 반환하지 않음.
+            // 여기서는 마지막으로 실행한 명령을 기반으로 추정하거나 'Unknown' 반환.
+            // 또는 DisplayConfigGetDeviceInfo 같은 복잡한 API 사용 필요.
+            // 우선은 마지막 명령 상태를 캐시하거나, "Unknown"으로.
+            // _lastKnownMonitorState 변수 사용 가능.
+            return "Unknown"; // 단순화를 위해 임시값
+        }
+
+        private void StopRoleSpecificServices()
+        {
+            _logger.LogInfo("Stopping role-specific services (if any)...");
+            if (_gatewayTcpServer != null)
+            {
+                _gatewayTcpServer.Stop();
+                _gatewayTcpServer.OnProxiedMessageReceived -= HandleProxiedAgentMessageAsync;
+                _gatewayTcpServer = null;
+                _logger.LogInfo("Gateway TCP server stopped.");
+            }
+            if (_proxiedTcpClient != null)
+            {
+                // _proxiedTcpClient.DisconnectAsync(); // 비동기 종료가 있다면
+                _proxiedTcpClient.Disconnect();
+                _proxiedTcpClient.OnGatewayMessageReceived -= HandleGatewayMessageAsync;
+                 _proxiedTcpClient.OnDisconnectedFromGateway -= null; // 이벤트 핸들러 정리
+                _proxiedTcpClient = null;
+                _logger.LogInfo("Proxied TCP client disconnected and stopped.");
+            }
+        }
+
+        private void UpdateStatus(AgentOperationalStatus newStatus, string message)
+        {
+            _currentStatus = newStatus;
+            string logMessage = $"Status changed to {_currentStatus}: {message}";
+            _logger.LogInfo(logMessage); // 내부 로깅
+            OnStatusChanged?.Invoke(_currentStatus, message); // UI 알림
+        }
+
+        public async Task StopAsync()
+        {
+            UpdateStatus(AgentOperationalStatus.Stopping, "Agent core service stopping...");
+            _cancellationTokenSource?.Cancel();
+            StopRoleSpecificServices();
+
+            if (_centralServerClient != null)
+            {
+                await _centralServerClient.DisconnectAsync();
+                _centralServerClient.Dispose(); // 추가적인 리소스 정리
+                _centralServerClient = null;
+            }
+            _logger.LogInfo("Agent core service stopped.");
+        }
+
+        public void Dispose()
+        {
+            _logger.LogInfo("Disposing AgentCoreService.");
+            StopAsync().Wait(); // 동기적으로 Stop 호출 (Dispose 패턴에 따라)
+            _cancellationTokenSource?.Dispose();
         }
     }
 }
-다음은 통신에 사용될 Models 폴더의 클래스들과, Agent의 핵심 로직이 담길 Core 폴더, 그리고 네트워크 통신을 담당할 Network 폴더의 코드들을 순차적으로 제공하겠습니다.
+AgentCoreService.cs 핵심 로직:
 
-먼저 Models 폴더의 클래스들입니다.
-
-2.7. Models/AgentRegistrationInfo.cs (서버 등록 시 전송할 정보)
-
-C#
-
-// MonitorAgent/Models/AgentRegistrationInfo.cs
-using System.Collections.Generic;
-
-namespace MonitorAgent.Models
-{
-    public class AgentRegistrationInfo
-    {
-        public string AgentId { get; set; }
-        public string MachineName { get; set; }
-        public List<string> IpAddresses { get; set; }
-        public string AgentVersion { get; set; } // Agent 프로그램 버전
-        public string CurrentMonitorStatus { get; set; } // 초기 모니터 상태
-        // 필요시 OS 버전, .NET 버전 등 추가 정보 포함 가능
-    }
-}
-2.8. Models/ServerCommand.cs (서버에서 Agent로 내려오는 명령)
-
-C#
-
-// MonitorAgent/Models/ServerCommand.cs
-using MonitorAgent.Config; // RuntimeConfig 사용
-
-namespace MonitorAgent.Models
-{
-    public enum CommandAction
-    {
-        TurnMonitorOn,
-        TurnMonitorOff,
-        RequestStatusUpdate,
-        UpdateConfiguration, // 서버가 Agent의 설정을 변경하라고 보낼 때
-        Ping                 // Agent 생존 확인
-    }
-
-    public class ServerCommand
-    {
-        public CommandAction Action { get; set; }
-        public string CommandId { get; set; } // 요청 추적을 위한 ID (서버에서 생성)
-        public string TargetAgentId { get; set; } // 이 명령이 최종적으로 도달해야 할 Agent의 ID (중계 시 사용)
-        public string Payload { get; set; } // JSON 직렬화된 추가 데이터
-                                            // 예: UpdateConfiguration 시 RuntimeConfig 객체를 JSON으로 전달
-    }
-
-    // ServerCommand의 Payload로 사용될 UpdateConfiguration 명령의 상세 내용
-    public class UpdateConfigurationPayload
-    {
-        public RuntimeConfig NewConfig { get; set; }
-    }
-}
-
-2.9. Models/InternalTcpMessage.cs (Gateway와 Proxied Agent 간 TCP 통신 메시지)
-
-C#
-
-// MonitorAgent/Models/InternalTcpMessage.cs
-using Newtonsoft.Json; // Newtonsoft.Json NuGet 패키지 필요
-
-namespace MonitorAgent.Models
-{
-    public enum InternalMessageType
-    {
-        // Proxied -> Gateway
-        ProxiedAgentHello,      // Proxied Agent가 Gateway에 처음 연결 시 자신의 ID 알림
-        CommandResult,          // Proxied Agent가 명령 실행 결과를 Gateway로 보고
-        ProxiedHeartbeat,       // Proxied Agent가 Gateway로 보내는 하트비트
-
-        // Gateway -> Proxied
-        ExecuteRelayedCommand,  // Gateway가 Proxied Agent에게 중앙 서버로부터 받은 명령을 중계
-        GatewayPing             // Gateway가 Proxied Agent 생존 확인
-    }
-
-    public class InternalTcpMessage
-    {
-        public InternalMessageType MessageType { get; set; }
-        public string SourceAgentId { get; set; }   // 메시지를 보낸 Agent의 ID (Proxied 또는 Gateway)
-        public string TargetAgentId { get; set; }   // 메시지를 받아야 할 Agent의 ID (중계 시 원본 명령의 TargetAgentId)
-        public string OriginalCommandId { get; set; } // 서버에서 내려온 원본 명령의 CommandId (추적용)
-        public string Payload { get; set; }         // JSON 직렬화된 추가 데이터
-
-        public string ToJson()
-        {
-            return JsonConvert.SerializeObject(this);
-        }
-
-        public static InternalTcpMessage FromJson(string json)
-        {
-            try
-            {
-                return JsonConvert.DeserializeObject<InternalTcpMessage>(json);
-            }
-            catch
-            {
-                return null; // 파싱 실패 시 null 반환
-            }
-        }
-    }
-
-    // InternalTcpMessage의 Payload 예시들
-    public class ProxiedAgentHelloPayload
-    {
-        // SourceAgentId가 Proxied Agent의 ID 이므로 별도 페이로드 불필요할 수 있음.
-        // 필요시 버전 정보 등 추가 가능.
-    }
-
-    public class CommandResultPayload
-    {
-        public bool Success { get; set; }
-        public string Message { get; set; }
-        public string CurrentMonitorStatusAfterCommand { get; set; } // 명령 수행 후 모니터 상태
-    }
-
-    public class ExecuteRelayedCommandPayload // ServerCommand와 유사하게 구성
-    {
-        public CommandAction ActionToExecute { get; set; } // 실제 수행할 액션 (예: TurnMonitorOn)
-        public string ActionPayload { get; set; } // 해당 액션에 필요한 추가 데이터 (예: ServerCommand의 Payload)
-    }
+초기화 (StartAsync): 로컬 설정(ID, 서버 URL, 이전 실행 설정)을 로드하고 중앙 서버에 연결을 시도합니다.
+SignalR 이벤트 핸들링: 서버 연결/끊김, 명령 수신, 설정 업데이트 수신 시 적절히 대응합니다.
+OnConnected: 서버에 연결되면 Agent 정보를 등록합니다.
+OnUpdateConfigurationReceived: 서버로부터 새로운 설정을 받으면 로컬에 저장하고, 해당 역할에 맞게 Agent를 재구성합니다 (ApplyCurrentRoleConfigurationAsync).
+OnExecuteCommandReceived: 서버로부터 명령을 받으면 처리합니다.
+명령의 TargetAgentId가 자신이면 직접 실행 (모니터 제어).
+자신이 Gateway이고 TargetAgentId가 다른 Agent이면, 해당 Proxied Agent에게 TCP로 명령 중계.
+역할별 서비스 관리 (ApplyCurrentRoleConfigurationAsync):
+Direct: 별도 TCP 서비스 없음. SignalR로만 동작.
+Gateway: GatewayTcpServer를 시작하여 Proxied Agent들의 연결을 수신 대기. Proxied Agent로부터 메시지를 받으면(HandleProxiedAgentMessageAsync) 중앙 서버로 결과를 보고.
+Proxied: ProxiedTcpClient를 시작하여 지정된 Gateway Agent에 TCP 연결. Gateway로부터 명령을 받으면(HandleGatewayMessageAsync) 실행하고 결과를 Gateway로 다시 전송.
+상태 관리 (UpdateStatus): Agent의 현재 운영 상태를 변경하고 로그를 남기며, UI 업데이트를 위한 이벤트를 발생시킵니다.
+종료 (StopAsync, Dispose): 모든 네트워크 연결과 내부 서비스를 정리합니다.
+이제 남은 Network 폴더의 CentralServerClient.cs, GatewayTcpServer.cs, ProxiedTcpClient.cs와 WPF 애플리케이션의 진입점인 App.xaml.cs (트레이 아이콘 관리 포함) 코드를 제공하겠습니다.
