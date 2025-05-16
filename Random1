@@ -1,396 +1,469 @@
-네, 명확하게 이해했습니다. UI(제어 프로그램)와 Agent(제어 대상 PC에 설치되는 프로그램)는 완전히 분리되며, Agent는 단일 실행 파일로 다양한 네트워크 환경(10.x.x.x 또는 192.x.x.x 등)의 PC에 설치되어 AgentConfig.json 파일의 설정에 따라 Direct, Gateway, 또는 Proxied 역할로 동작해야 합니다. 제어 UI는 이 설정을 참조하여 서버를 통해 명령을 직접 또는 중계 방식으로 전달합니다.
+네, 알겠습니다. "실행만 하면 자동 설정 완료"라는 목표에 맞춰 Agent 설정을 극도로 단순화하고, 중앙 서버와의 통신을 통해 역할 및 상세 설정을 동적으로 받아오도록 하는 방향으로 다시 설계하겠습니다.
 
-이제 다시 DB 스키마와 Agent 프로그램의 전체 완성 코드를 중심으로 제공하겠습니다. Agent 프로그램은 트레이 아이콘을 가지며, 최소한의 로컬 상태 확인 및 종료 기능을 포함할 수 있습니다 (사용자 요청에 따라 이 부분은 제외하거나 최소화 가능합니다. 여기서는 트레이 아이콘 및 종료 기능은 포함하겠습니다).
+핵심 변경 사항 및 설계 원칙:
 
-1. 데이터베이스 스키마 (MS SQL Server)
-
-이전에 제안드린 스키마에서 Agent의 역할과 제어 UI의 관점을 좀 더 반영하여 다듬었습니다.
+Agent의 유일한 "사전 설정": 중앙 서버 주소.
+Agent는 server_address.txt (또는 유사한 이름) 파일에 적힌 중앙 SignalR 서버 URL 하나만 알고 시작합니다. 이 파일은 Agent 실행 파일과 함께 배포되어야 합니다.
+Agent ID 자동 생성 및 로컬 저장:
+최초 실행 시, Agent는 자신의 고유 ID(예: MAC 주소 기반 또는 GUID)를 생성하여 로컬 파일(agent_id.txt)에 저장해두고 사용합니다.
+동적 설정 수신:
+Agent는 중앙 서버에 접속하여 자신의 Agent ID와 기본 시스템 정보(머신 이름, IP 등)를 알립니다.
+중앙 서버(및 관리자 UI)에서 해당 Agent에게 역할(Direct, Gateway, Proxied) 및 필요한 설정(Gateway 리슨 포트, 연결할 Gateway의 IP/Port 등)을 할당합니다.
+Agent는 이 설정을 받아 로컬 runtime_config.json 파일에 저장하고, 이후 실행 시 이 설정을 우선적으로 사용합니다. (서버에서 설정 변경 시 업데이트)
+역할 기반 동작:
+수신한 설정에 따라 Direct, Gateway(TCP 서버 동작), 또는 Proxied(TCP 클라이언트 동작) 모드로 작동합니다.
+DB 스키마 간소화: Agent가 직접 관리하는 설정이 줄어들고, 서버가 할당/관리하는 정보 위주로 구성됩니다.
+소켓 통신 집중: Gateway-Proxied 간 통신은 TCP 소켓을 사용합니다.
+1. 수정된 데이터베이스 스키마 (MS SQL Server - 자동 설정 지원 및 극단적 간결화)
 
 SQL
 
--- 데이터베이스 사용 설정 (예: MonitorControlDB)
--- USE MonitorControlDB;
+-- 데이터베이스 사용 설정
+-- USE YourMonitorControlDB;
 -- GO
 
--- 1. Settings 테이블 (제어 UI용 전역 설정 - 예: 관리자 암호 해시 등)
-IF OBJECT_ID('dbo.Settings', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.Settings (
-        SettingKey NVARCHAR(100) PRIMARY KEY,
-        SettingValue NVARCHAR(MAX) NOT NULL
-    );
-    -- 예시: 제어 UI 관리자 계정 암호 (실제로는 해시된 값 저장)
-    -- INSERT INTO dbo.Settings (SettingKey, SettingValue) VALUES ('ControlUI_AdminPasswordHash', 'your_strong_password_hash_here');
-END
-GO
-
--- 2. Agents 테이블 (각 제어 대상 PC에 설치된 Agent 정보)
+-- 1. Agents 테이블 (Agent 정보 및 서버가 할당한 설정)
 IF OBJECT_ID('dbo.Agents', 'U') IS NOT NULL
     DROP TABLE dbo.Agents;
 GO
 CREATE TABLE dbo.Agents (
-    AgentId NVARCHAR(100) PRIMARY KEY,      -- Agent 설정 파일(AgentConfig.json)의 AgentId와 동일. 절대 불변.
-    AgentName NVARCHAR(255) NOT NULL,       -- 제어 UI에 표시될 사용자가 정의하는 Agent 이름.
-    Description NVARCHAR(500) NULL,         -- Agent에 대한 추가 설명.
+    -- Agent가 자동 생성하고 서버에 등록하는 고유 ID
+    AgentId NVARCHAR(128) PRIMARY KEY,
     
-    AgentRole NVARCHAR(20) NOT NULL CHECK (AgentRole IN ('Direct', 'Gateway', 'Proxied')), -- Agent의 역할.
-    
-    -- 네트워크 정보 (제어 UI에서 참조 및 서버에서 Agent 식별/검증용)
-    MachineName NVARCHAR(100) NULL,         -- Agent가 설치된 PC의 호스트 이름 (Agent가 보고).
-    ReportedIpAddress VARCHAR(45) NULL,     -- Agent가 보고한 주 IP 주소 (내부/외부망 IP일 수 있음).
-    ConfiguredGatewayListenIp VARCHAR(45) NULL, -- Gateway 역할 시 설정된 리슨 IP (AgentConfig.json 값).
-    ConfiguredGatewayListenPort INT NULL,       -- Gateway 역할 시 설정된 리슨 포트 (AgentConfig.json 값).
-    ConfiguredTargetGatewayIp VARCHAR(45) NULL, -- Proxied 역할 시 설정된 대상 Gateway IP (AgentConfig.json 값).
-    ConfiguredTargetGatewayPort INT NULL,       -- Proxied 역할 시 설정된 대상 Gateway 포트 (AgentConfig.json 값).
-    
-    -- Proxied Agent가 어떤 Gateway Agent를 통해야 하는지 명시 (제어 UI가 명령 라우팅 시 참고).
-    DesignatedGatewayAgentId NVARCHAR(100) NULL, 
-    CONSTRAINT FK_Agents_DesignatedGateway FOREIGN KEY (DesignatedGatewayAgentId) REFERENCES dbo.Agents(AgentId) ON DELETE SET NULL,
+    -- 관리자가 제어 UI에서 설정하는 정보
+    FriendlyName NVARCHAR(255) NULL,       -- UI 표시용 이름 (초기에는 AgentId와 동일하거나 비어있을 수 있음)
+    Description NVARCHAR(500) NULL,
+    IsEnabled BIT DEFAULT 0 NOT NULL,       -- 관리자가 이 Agent를 제어 대상으로 사용할지 (최초 등록 시 false, 관리자 승인 후 true)
 
-    -- Agent 상태 및 관리 정보
-    IsEnabled BIT DEFAULT 1 NOT NULL,         -- 제어 UI에서 이 Agent를 활성화/비활성화 할지 여부.
-    RegisteredDate DATETIME2(7) DEFAULT GETUTCDATE(), -- Agent 정보가 DB에 처음 등록된 시간.
-    LastModifiedDate DATETIME2(7) DEFAULT GETUTCDATE(), -- 제어 UI에서 Agent 정보가 마지막으로 수정된 시간.
+    -- Agent가 서버에 보고하는 정보
+    MachineNameReported NVARCHAR(100) NULL,
+    IpAddressesReported NVARCHAR(MAX) NULL, -- Agent의 IP 주소 목록 (JSON 배열 또는 쉼표 구분)
+    AgentVersion NVARCHAR(50) NULL,        -- Agent 프로그램 버전
+
+    -- 서버(관리자)가 Agent에게 할당하는 역할 및 상세 설정
+    AssignedRole NVARCHAR(20) DEFAULT 'Unassigned' NOT NULL, -- 'Unassigned', 'Direct', 'Gateway', 'Proxied'
     
-    -- 중앙 서버(SignalR) 통신 상태 (Direct/Gateway Agent가 중앙 서버와 통신하며 업데이트)
-    CentralServerUrlConfigured NVARCHAR(500) NULL, -- Agent 설정 파일의 중앙 서버 URL (참고용).
-    LastSignalRConnectionId NVARCHAR(100) NULL,   -- 현재 중앙 서버와의 SignalR 연결 ID (서버가 관리).
-    LastHeartbeatToCentral DATETIME2(7) NULL,      -- Agent가 중앙 서버로 마지막 하트비트를 보낸 시간 (또는 서버가 Agent를 Ping한 시간).
-    IsConnectedToCentral BIT DEFAULT 0 NOT NULL,  -- 중앙 서버 연결 상태 (서버 또는 Agent가 업데이트).
+    -- Gateway 역할 시 서버가 할당하는 리슨 포트
+    GatewayListenPort INT NULL,
 
-    -- 내부망(Gateway/Proxied) 통신 상태
-    -- Gateway Agent: 자신이 리슨 중인 상태, 연결된 Proxied Agent 수 등 (Agent가 로컬로 관리, 필요시 서버 보고).
-    -- Proxied Agent: 자신이 Gateway에 연결된 상태 (Agent가 로컬로 관리, 필요시 서버 보고).
-    InternalCommunicationStatus NVARCHAR(255) NULL, -- 예: "Listening on 0.0.0.0:7890. Clients: 2" 또는 "Connected to 192.168.1.100:7890"
+    -- Proxied 역할 시 서버가 할당하는 정보
+    TargetGatewayAgentIdForProxy NVARCHAR(128) NULL, -- 연결해야 할 Gateway의 AgentId (서버가 이 ID로 Gateway IP/Port 조회)
+    -- 참고: TargetGatewayAgentIdForProxy에 해당하는 Gateway의 실제 IP/Port는 서버가 조회해서 Proxied Agent에게 알려줌.
 
-    CurrentMonitorStatus NVARCHAR(20) DEFAULT 'Unknown', -- 'Unknown', 'On', 'Off', 'Standby' (Agent가 주기적으로 또는 명령 수행 후 보고).
-    OverallAgentStatus NVARCHAR(50) DEFAULT 'Offline' -- 'Initializing', 'Online', 'Offline', 'Error', 'DegradedConnection' (종합적인 상태).
+    -- 상태 정보 (Agent와 서버 간 통신으로 업데이트)
+    LastHeartbeatUtc DATETIME2(7) NULL,
+    IsOnline BIT DEFAULT 0 NOT NULL,
+    CurrentMonitorStatus NVARCHAR(20) DEFAULT 'Unknown', -- 'Unknown', 'On', 'Off'
+    
+    FirstSeenUtc DATETIME2(7) DEFAULT GETUTCDATE() NOT NULL, -- Agent가 서버에 처음 등록된 시간
+    LastConfigUpdateFromServerUtc DATETIME2(7) NULL      -- 서버로부터 마지막으로 설정을 받은 시간
 );
 GO
 
--- 인덱스
-CREATE INDEX IX_Agents_AgentRole ON dbo.Agents(AgentRole);
-CREATE INDEX IX_Agents_DesignatedGatewayAgentId ON dbo.Agents(DesignatedGatewayAgentId);
-CREATE INDEX IX_Agents_IsEnabled_OverallStatus ON dbo.Agents(IsEnabled, OverallAgentStatus);
-CREATE INDEX IX_Agents_AgentName ON dbo.Agents(AgentName);
+CREATE INDEX IX_Agents_AssignedRole ON dbo.Agents(AssignedRole);
+CREATE INDEX IX_Agents_IsOnline ON dbo.Agents(IsOnline);
+CREATE INDEX IX_Agents_IsEnabled ON dbo.Agents(IsEnabled);
+CREATE INDEX IX_Agents_FriendlyName ON dbo.Agents(FriendlyName);
 GO
 
--- 3. ControlLogs 테이블 (제어 명령 및 실행 이력)
+-- 2. ControlLogs 테이블 (제어 명령 이력 - FK 제약 없이 단순화)
 IF OBJECT_ID('dbo.ControlLogs', 'U') IS NOT NULL
     DROP TABLE dbo.ControlLogs;
 GO
 CREATE TABLE dbo.ControlLogs (
     LogId BIGINT PRIMARY KEY IDENTITY(1,1),
-    CorrelationId UNIQUEIDENTIFIER DEFAULT NEWID(), -- UI에서 시작된 단일 명령 요청을 여러 단계(UI-서버-게이트웨이-Agent)에 걸쳐 추적하기 위한 ID.
-    
-    TargetAgentId NVARCHAR(100) NOT NULL, -- 명령의 최종 대상 Agent의 AgentId.
-    CONSTRAINT FK_ControlLogs_TargetAgent FOREIGN KEY (TargetAgentId) REFERENCES dbo.Agents(AgentId),
-    
-    CommandType NVARCHAR(50) NOT NULL,    -- 예: 'TurnMonitorOn', 'TurnMonitorOff', 'PingAgent', 'RequestStatusUpdate'.
-    CommandPayload NVARCHAR(MAX) NULL,     -- 명령에 필요한 추가 데이터 (JSON 형식 권장).
-    
-    RequesterType NVARCHAR(50) NOT NULL,  -- 'ControlUIUser', 'SystemScheduledTask', 'ApiCall'.
-    RequesterIdentifier NVARCHAR(100) NULL, -- 제어 UI 사용자 ID, 스케줄된 작업 이름, API 클라이언트 ID 등.
-    RequesterIpAddress VARCHAR(45) NULL,  -- 제어 UI 인스턴스 또는 API 호출 클라이언트의 IP 주소.
-    
-    TimestampUiRequest DATETIME2(7) DEFAULT GETUTCDATE(), -- 제어 UI에서 명령이 시작된 시간.
-    TimestampServerReceived DATETIME2(7) NULL,            -- 중앙 서버가 명령을 수신한 시간.
-    TimestampGatewayRelayAttempt DATETIME2(7) NULL,       -- Gateway Agent가 Proxied Agent로 명령 중계를 시도한 시간 (중계 시).
-    TimestampAgentExecuted DATETIME2(7) NULL,             -- 최종 대상 Agent에서 명령이 실행 완료된 시간.
-    TimestampAgentResponseReceived DATETIME2(7) NULL,     -- 최종 대상 Agent의 응답이 (Gateway 또는 서버를 거쳐) 수신된 시간.
-    TimestampServerCompleted DATETIME2(7) NULL,           -- 중앙 서버가 해당 명령 처리를 완료한 시간.
-    
-    FinalResultStatus NVARCHAR(50) NOT NULL, -- 'Pending', 'SentToAgent', 'SentToGateway', 'ProcessingByAgent', 'Success', 'FailureAtAgent', 'FailureAtGateway', 'FailureAtServer', 'Timeout'.
-    ResultMessage NVARCHAR(MAX) NULL,        -- 상세 결과 메시지 또는 오류 정보.
-    
-    ExecutionPath NVARCHAR(500) NULL       -- 명령이 전달된 경로 (예: "UI -> Server -> AgentX" 또는 "UI -> Server -> GatewayY -> AgentZ").
+    CorrelationId UNIQUEIDENTIFIER DEFAULT NEWID(), -- 요청 추적 ID
+    TargetAgentId NVARCHAR(128) NOT NULL,      -- 명령 대상 Agent ID
+    CommandType NVARCHAR(50) NOT NULL,         -- 예: 'TurnMonitorOn', 'Ping'
+    CommandPayload NVARCHAR(MAX) NULL,          -- 명령 관련 추가 데이터 (JSON)
+    RequesterInfo NVARCHAR(255) NULL,          -- 요청자 정보 (예: 'User:admin from 10.0.0.1')
+    TimestampRequestUtc DATETIME2(7) DEFAULT GETUTCDATE(), -- 명령 요청 시간
+    TimestampExecutedUtc DATETIME2(7) NULL,     -- 명령 실행 완료 시간 (Agent 보고)
+    ResultStatus NVARCHAR(50) NOT NULL,        -- 'Pending', 'Success', 'Failure', 'Timeout'
+    ResultMessage NVARCHAR(MAX) NULL,           -- 실행 결과 또는 오류 메시지
+    ExecutionPath NVARCHAR(500) NULL           -- 명령 전달 경로 (예: 'UI->Server->Agent' or 'UI->Server->GatewayX->AgentY')
 );
 GO
 
--- 인덱스
-CREATE INDEX IX_ControlLogs_TargetAgentId_TimestampUiRequest ON dbo.ControlLogs(TargetAgentId, TimestampUiRequest DESC);
+CREATE INDEX IX_ControlLogs_TargetAgentId_TimestampRequestUtc ON dbo.ControlLogs(TargetAgentId, TimestampRequestUtc DESC);
 CREATE INDEX IX_ControlLogs_CorrelationId ON dbo.ControlLogs(CorrelationId);
-CREATE INDEX IX_ControlLogs_TimestampUiRequest ON dbo.ControlLogs(TimestampUiRequest DESC);
-CREATE INDEX IX_ControlLogs_FinalResultStatus ON dbo.ControlLogs(FinalResultStatus);
 GO
+DB 스키마 핵심:
 
--- 최근 로그 조회용 뷰 (제어 UI 대시보드 등에서 활용)
-IF OBJECT_ID('dbo.RecentControlLogsView', 'V') IS NOT NULL
-    DROP VIEW dbo.RecentControlLogsView;
-GO
-CREATE VIEW dbo.RecentControlLogsView
-AS
-SELECT TOP 500 -- 최근 500개 로그 (필요에 따라 개수 조정)
-    cl.LogId,
-    cl.CorrelationId,
-    cl.TargetAgentId,
-    a.AgentName AS TargetAgentName, -- Agents 테이블과 조인하여 Agent 이름 표시
-    cl.CommandType,
-    cl.RequesterIdentifier,
-    cl.TimestampUiRequest,
-    cl.TimestampAgentExecuted,
-    cl.FinalResultStatus,
-    cl.ResultMessage,
-    cl.ExecutionPath
-FROM 
-    dbo.ControlLogs cl
-LEFT JOIN 
-    dbo.Agents a ON cl.TargetAgentId = a.AgentId
-ORDER BY 
-    cl.TimestampUiRequest DESC;
-GO
-DB 스키마 설명:
-
-Agents 테이블:
-AgentId: 각 Agent의 고유 식별자. AgentConfig.json 파일에 명시되며, 변경되지 않아야 합니다.
-AgentName: 사용자가 제어 UI에서 쉽게 식별할 수 있도록 지정하는 이름입니다.
-AgentRole: "Direct", "Gateway", "Proxied" 중 하나. 제어 UI와 서버는 이 정보를 바탕으로 명령을 어떻게 라우팅할지 결정합니다.
-Configured...Ip/Port: AgentConfig.json에 설정된 네트워크 값들을 DB에도 저장하여 제어 UI에서 참조하거나 문제를 진단하는 데 도움을 줄 수 있습니다. (Agent가 직접 이 값을 DB에 쓰는 것이 아니라, 제어 UI를 통해 Agent 정보를 등록/수정할 때 입력받거나 Agent가 보고한 정보를 저장)
-DesignatedGatewayAgentId: Proxied Agent가 통신해야 할 Gateway Agent의 AgentId입니다.
-상태 관련 필드 (IsConnectedToCentral, CurrentMonitorStatus, OverallAgentStatus 등)는 Agent와 중앙 서버 간의 통신을 통해 주기적으로 또는 이벤트 발생 시 업데이트됩니다.
-ControlLogs 테이블:
-CorrelationId: 제어 UI에서 시작된 하나의 명령이 여러 시스템(서버, 게이트웨이, 최종 에이전트)을 거쳐 처리될 때, 이 모든 과정을 하나의 ID로 묶어 추적합니다.
-다양한 타임스탬프 필드: 명령 처리의 각 단계별 시간을 기록하여 성능 분석 및 문제 해결에 도움을 줍니다.
-ExecutionPath: 명령이 어떤 경로를 통해 전달되었는지 기록합니다. (예: "UI → Server → AgentDirectly" 또는 "UI → Server → GatewayX → AgentY")
-RecentControlLogsView: 제어 UI의 대시보드 등에서 최근 로그를 쉽게 조회할 수 있도록 제공하는 뷰입니다.
+Agents.AgentId: Agent가 스스로 생성 (예: Environment.MachineName + - + 첫 번째 사용 가능한 MAC 주소).
+Agents.AssignedRole, Agents.GatewayListenPort, Agents.TargetGatewayAgentIdForProxy: 모두 중앙 서버(관리자 UI를 통해)가 설정하고 Agent에게 전달해주는 값들입니다. Agent는 이 값을 받아 로컬에 캐시(runtime_config.json)합니다.
+FK 제약은 유연성을 위해 명시적으로 걸지 않았습니다. 애플리케이션 레벨에서 관계를 관리하거나, 필요시 추가할 수 있습니다.
 2. Agent 프로그램 코드 (C#, .NET Framework 4.5)
 
-이제 Agent 프로그램의 전체 코드를 구성 요소별로 나누어 제공하겠습니다. Agent는 WPF 애플리케이션으로 만들지만, 주 목적은 백그라운드 실행이므로 트레이 아이콘을 사용하고 창은 최소화되거나 숨겨집니다.
+Agent가 실행될 때 필요한 외부 파일 (실행 파일과 같은 폴더에 위치):
 
-필수 NuGet 패키지:
-
-Newtonsoft.Json: 설정 파일(JSON) 처리 및 통신 메시지 직렬화/역직렬화.
-Microsoft.AspNet.SignalR.Client: 중앙 서버(SignalR Hub)와 통신하기 위한 클라이언트 라이브러리. (.NET Framework 4.5 호환 버전 확인 필요)
-2.1. 프로젝트 파일 구조 (예시)
+MonitorAgent.exe (빌드된 실행 파일)
+(필수 배포) server_address.txt: 이 파일에는 중앙 SignalR 서버의 URL 한 줄만 적혀 있어야 합니다.
+예시 server_address.txt 내용:
+http://your-central-server.com/monitorControlHub
+(자동 생성) agent_id.txt: Agent의 고유 ID가 저장됩니다. 없으면 Agent가 자동 생성.
+(자동 생성/업데이트) runtime_config.json: 서버로부터 받은 현재 실행 설정(역할, 포트 등)이 JSON 형태로 저장됩니다.
+(자동 생성) agent_log.txt: 로그 파일.
+프로젝트 구조 (간소화 제안):
 
 MonitorAgent/
-├── App.xaml
-├── App.xaml.cs
-│
-├── AgentConfig.json                // Agent 설정 파일 (실행 파일과 동일 위치)
+├── App.xaml, App.xaml.cs             // WPF 애플리케이션 진입점 및 트레이 아이콘 관리
 │
 ├── Config/
-│   ├── AgentConfig.cs              // AgentConfig.json 매핑 클래스
-│   └── AgentConfigLoader.cs        // 설정 파일 로드 유틸리티
+│   ├── AppConstants.cs             // 경로 등 상수 정의
+│   ├── AgentIdentifier.cs          // agent_id.txt 관리
+│   ├── ServerUrlProvider.cs        // server_address.txt 관리
+│   └── RuntimeConfig.cs            // runtime_config.json 매핑 클래스 및 관리
 │
 ├── Core/
-│   ├── AgentCoreService.cs         // Agent 핵심 로직 (상태 관리, 역할별 동작 제어)
-│   ├── IAgentRoleHandler.cs        // 역할별 처리기 인터페이스
-│   ├── DirectRoleHandler.cs        // 'Direct' 역할 처리기
-│   ├── GatewayRoleHandler.cs       // 'Gateway' 역할 처리기
-│   └── ProxiedRoleHandler.cs       // 'Proxied' 역할 처리기
+│   ├── AgentCoreService.cs         // 핵심 로직, 상태 관리, 역할별 핸들러 호출
+│   └── AgentStatus.cs              // Agent 현재 상태 Enum
 │
-├── Models/
-│   ├── AgentStatusInfo.cs          // Agent 상태 정보 모델 (서버 보고용)
-│   └── InternalTcpCommand.cs       // Gateway-Proxied 간 TCP 통신 명령 모델
+├── Models/                           // 통신용 데이터 모델
+│   ├── AgentRegistrationInfo.cs    // 서버 등록 시 보낼 정보
+│   ├── ServerCommand.cs            // 서버 -> Agent 명령
+│   └── InternalTcpMessage.cs       // Gateway <-> Proxied 간 TCP 메시지
 │
 ├── Network/
-│   ├── CentralServerClient.cs      // 중앙 SignalR 서버 통신 클라이언트
-│   ├── GatewayTcpServer.cs         // Gateway 역할 시 내부망 TCP 서버
-│   └── ProxiedTcpClient.cs         // Proxied 역할 시 Gateway 연결 TCP 클라이언트
+│   ├── CentralServerClient.cs      // SignalR 클라이언트 (서버와 통신)
+│   ├── GatewayTcpServer.cs         // Gateway 역할 시 TCP 서버
+│   └── ProxiedTcpClient.cs         // Proxied 역할 시 TCP 클라이언트
 │
-├── Services/ (또는 Utils/)
-│   ├── MonitorControlService.cs    // 모니터 제어 로직 (SendMessage API 사용)
-│   ├── LoggingService.cs           // 로깅 인터페이스 및 간단한 파일 로거 구현
-│   └── StartupRegistryService.cs   // 시작 프로그램 등록 유틸리티
+├── Services/
+│   ├── LoggingService.cs
+│   └── MonitorControlService.cs
 │
-└── UI/
-    ├── TrayIconManager.cs          // 트레이 아이콘 관리 (NotifyIcon 사용)
-    ├── AgentStatusViewModel.cs     // (선택적) Agent 상태 표시창 ViewModel
-    └── AgentStatusWindow.xaml      // (선택적) Agent 상태 표시창 View
-2.1.1. AgentConfig.json (중요! 실행 파일과 같은 폴더에 위치)
-
-JSON
-
-{
-  "AgentId": "PLEASE_CONFIGURE_UNIQUE_AGENT_ID",
-  "AgentName": "Default Agent Name (Please Configure)",
-  "AgentRole": "Direct", // "Direct", "Gateway", "Proxied"
-  "CentralServerUrl": "http://your-central-server-hostname-or-ip:port/monitorControlHub",
-
-  "GatewayListenIp": "0.0.0.0",
-  "GatewayListenPort": 7890,
-
-  "DesignatedGatewayAgentIdForConfig": "CONFIGURED_GATEWAY_AGENT_ID_IF_PROXIED", // For Proxied role, informational
-  "TargetGatewayIp": "192.168.1.100", // For Proxied role
-  "TargetGatewayPort": 7890,       // For Proxied role
-
-  "LogLevel": "Info", // "Debug", "Info", "Warning", "Error"
-  "AutoRegisterInStartup": true
-}
-사용자는 Agent 설치 후 이 AgentConfig.json 파일의 AgentId, AgentName, AgentRole 및 관련 네트워크 설정을 해당 PC 환경에 맞게 수정해야 합니다. AgentId는 DB의 Agents.AgentId와 일치해야 합니다.
-
-2.1.2. Config/AgentConfig.cs
+└── (선택적 UI) MainWindow.xaml, MainWindow.xaml.cs // 간단한 상태 표시용 창
+2.1. Config/AppConstants.cs
 
 C#
 
-// MonitorAgent/Config/AgentConfig.cs
-// Newtonsoft.Json NuGet 패키지 필요
-using Newtonsoft.Json;
-using Newtonsoft.Json.Converters; // StringEnumConverter 사용
-
+// MonitorAgent/Config/AppConstants.cs
 namespace MonitorAgent.Config
 {
-    public enum AgentRoleType { Direct, Gateway, Proxied }
-
-    public class AgentConfig
+    public static class AppConstants
     {
-        [JsonProperty("AgentId", Required = Required.Always)]
-        public string AgentId { get; set; }
-
-        [JsonProperty("AgentName", Required = Required.Always)]
-        public string AgentName { get; set; }
-
-        [JsonProperty("AgentRole", Required = Required.Always)]
-        [JsonConverter(typeof(StringEnumConverter))] // JSON에서 문자열로 역할 저장/로드
-        public AgentRoleType AgentRole { get; set; }
-
-        [JsonProperty("CentralServerUrl", Required = Required.Always)]
-        public string CentralServerUrl { get; set; }
-
-        // Gateway 역할 시 사용
-        public string GatewayListenIp { get; set; } = "0.0.0.0";
-        public int GatewayListenPort { get; set; } = 7890;
-
-        // Proxied 역할 시 사용 (정보용 ID 및 실제 접속 IP/Port)
-        public string DesignatedGatewayAgentIdForConfig { get; set; } // 서버에서 매핑 참조용
-        public string TargetGatewayIp { get; set; }
-        public int TargetGatewayPort { get; set; } = 7890;
-
-        [JsonConverter(typeof(StringEnumConverter))]
-        public LogLevelSetting LogLevel { get; set; } = LogLevelSetting.Info;
-        public bool AutoRegisterInStartup { get; set; } = true;
-
-        // 기본값 설정용 생성자 (Config 파일 없을 때 사용될 수 있음)
-        public AgentConfig() { }
-
-        // 설정 유효성 검사 메서드 (필요시 추가)
-        public bool IsValid(out string errorMessage)
-        {
-            errorMessage = string.Empty;
-            if (string.IsNullOrWhiteSpace(AgentId) || AgentId == "PLEASE_CONFIGURE_UNIQUE_AGENT_ID")
-            {
-                errorMessage = "AgentId is not configured or has default placeholder.";
-                return false;
-            }
-            if (string.IsNullOrWhiteSpace(AgentName) || AgentName == "Default Agent Name (Please Configure)")
-            {
-                errorMessage = "AgentName is not configured or has default placeholder.";
-                return false;
-            }
-            if (string.IsNullOrWhiteSpace(CentralServerUrl) || !Uri.IsWellFormedUriString(CentralServerUrl, UriKind.Absolute))
-            {
-                errorMessage = "CentralServerUrl is not configured or invalid.";
-                return false;
-            }
-
-            if (AgentRole == AgentRoleType.Proxied)
-            {
-                if (string.IsNullOrWhiteSpace(TargetGatewayIp))
-                {
-                    errorMessage = "TargetGatewayIp must be configured for Proxied role.";
-                    return false;
-                }
-            }
-            return true;
-        }
+        public const string AgentIdFileName = "agent_id.txt";
+        public const string ServerUrlFileName = "server_address.txt"; // 이 파일은 배포 시 제공되어야 함
+        public const string RuntimeConfigFileName = "runtime_config.json";
+        public const string LogFileName = "agent_log.txt";
     }
-
-    public enum LogLevelSetting { Debug, Info, Warning, Error }
 }
-2.1.3. Config/AgentConfigLoader.cs
+2.2. Config/AgentIdentifier.cs
 
 C#
 
-// MonitorAgent/Config/AgentConfigLoader.cs
-using Newtonsoft.Json;
+// MonitorAgent/Config/AgentIdentifier.cs
 using System;
 using System.IO;
-using MonitorAgent.Services; // Logger 사용
+using System.Linq;
+using System.Net.NetworkInformation;
+using MonitorAgent.Services; // ILoggingService
 
 namespace MonitorAgent.Config
 {
-    public static class AgentConfigLoader
+    public class AgentIdentifier
     {
-        private const string ConfigFileName = "AgentConfig.json";
-        // 실행 파일과 동일한 경로에 있는 설정 파일을 찾음
-        private static readonly string ConfigFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ConfigFileName);
+        private readonly ILoggingService _logger;
+        private readonly string _filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.AgentIdFileName);
+        public string Id { get; private set; }
 
-        public static AgentConfig Load(ILoggingService logger)
+        public AgentIdentifier(ILoggingService logger)
         {
-            logger.LogInfo($"Attempting to load configuration from: {ConfigFilePath}");
-            if (!File.Exists(ConfigFilePath))
-            {
-                logger.LogError($"{ConfigFileName} not found at {ConfigFilePath}. Agent cannot start without configuration.");
-                // 기본 설정을 생성하고 프로그램을 종료하거나, 사용자에게 알림
-                CreateDefaultConfigFile(logger);
-                // 이 경우 null을 반환하거나 예외를 발생시켜 AgentCoreService에서 처리하도록 함
-                return null;
-            }
-
-            try
-            {
-                string jsonContent = File.ReadAllText(ConfigFilePath);
-                var config = JsonConvert.DeserializeObject<AgentConfig>(jsonContent);
-
-                if (config == null) {
-                    logger.LogError($"Failed to deserialize {ConfigFileName}. Content might be corrupted.");
-                    return null;
-                }
-
-                string validationError;
-                if (!config.IsValid(out validationError))
-                {
-                    logger.LogError($"Configuration validation failed: {validationError}");
-                    // 특정 필수 값이 없으면 Agent 실행 불가
-                    if (validationError.Contains("AgentId") || validationError.Contains("CentralServerUrl")) {
-                         logger.LogError("Critical configuration missing. Agent cannot proceed.");
-                         return null;
-                    }
-                }
-                
-                logger.LogInfo($"Configuration loaded successfully for AgentId: {config.AgentId}, Role: {config.AgentRole}");
-                return config;
-            }
-            catch (JsonException jsonEx)
-            {
-                logger.LogError($"Error deserializing {ConfigFileName}: {jsonEx.Message}", jsonEx);
-                return null;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError($"An unexpected error occurred while loading {ConfigFileName}: {ex.Message}", ex);
-                return null;
-            }
+            _logger = logger;
+            LoadOrGenerateId();
         }
 
-        private static void CreateDefaultConfigFile(ILoggingService logger)
+        private void LoadOrGenerateId()
         {
-            logger.LogInfo($"Creating a default {ConfigFileName} as a template. Please configure it and restart the agent.");
-            var defaultConfig = new AgentConfig
+            if (File.Exists(_filePath))
             {
-                AgentId = "PLEASE_CONFIGURE_UNIQUE_AGENT_ID",
-                AgentName = "Default Agent Name (Please Configure)",
-                AgentRole = AgentRoleType.Direct,
-                CentralServerUrl = "http://your-central-server-hostname-or-ip:port/monitorControlHub",
-                GatewayListenIp = "0.0.0.0",
-                GatewayListenPort = 7890,
-                DesignatedGatewayAgentIdForConfig = "CONFIGURED_GATEWAY_AGENT_ID_IF_PROXIED",
-                TargetGatewayIp = "192.168.0.1", // 예시 IP
-                TargetGatewayPort = 7890,
-                LogLevel = LogLevelSetting.Info,
-                AutoRegisterInStartup = true
-            };
-
+                try
+                {
+                    Id = File.ReadAllText(_filePath).Trim();
+                    if (!string.IsNullOrWhiteSpace(Id))
+                    {
+                        _logger.LogInfo($"Agent ID loaded from file: {Id}");
+                        return;
+                    }
+                    _logger.LogWarning("Agent ID file was empty. A new ID will be generated.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Failed to read Agent ID file. A new ID will be generated. Error: {ex.Message}");
+                }
+            }
+            
+            // Generate new ID
             try
             {
-                string jsonContent = JsonConvert.SerializeObject(defaultConfig, Formatting.Indented);
-                File.WriteAllText(ConfigFilePath, jsonContent);
-                logger.LogInfo($"Default configuration file created at {ConfigFilePath}.");
+                string macAddress = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(nic => nic.OperationalStatus == OperationalStatus.Up && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                    .Select(nic => nic.GetPhysicalAddress().ToString())
+                    .FirstOrDefault();
+
+                if (string.IsNullOrEmpty(macAddress))
+                {
+                    // Fallback to GUID if MAC is not available
+                    macAddress = Guid.NewGuid().ToString("N").Substring(0, 12).ToUpper();
+                    _logger.LogWarning("Could not retrieve MAC address. Using GUID fragment for Agent ID.");
+                }
+                // 머신 이름을 추가하여 조금 더 식별 용이하게 (서버에서는 중복 체크 필요)
+                Id = $"{Environment.MachineName}-{macAddress}"; 
+
+                File.WriteAllText(_filePath, Id);
+                _logger.LogInfo($"New Agent ID generated and saved: {Id}");
             }
             catch (Exception ex)
             {
-                logger.LogError($"Failed to create default configuration file: {ex.Message}", ex);
+                // 최종 폴백: 순수 GUID
+                Id = Guid.NewGuid().ToString();
+                _logger.LogError($"Failed to generate MAC/MachineName based Agent ID. Using GUID: {Id}. Error: {ex.Message}");
+                // 이 경우 파일 저장 시도도 실패할 수 있음.
             }
         }
     }
+}
+2.3. Config/ServerUrlProvider.cs
+
+C#
+
+// MonitorAgent/Config/ServerUrlProvider.cs
+using System;
+using System.IO;
+using MonitorAgent.Services;
+
+namespace MonitorAgent.Config
+{
+    public class ServerUrlProvider
+    {
+        private readonly ILoggingService _logger;
+        private readonly string _filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.ServerUrlFileName);
+        public string Url { get; private set; }
+
+        public ServerUrlProvider(ILoggingService logger)
+        {
+            _logger = logger;
+            LoadUrl();
+        }
+
+        private void LoadUrl()
+        {
+            if (!File.Exists(_filePath))
+            {
+                _logger.LogError($"Server URL file not found: {_filePath}. Agent cannot connect to the server. Please create this file with the server URL.");
+                Url = null; // 또는 예외 발생
+                return;
+            }
+
+            try
+            {
+                Url = File.ReadAllText(_filePath).Trim();
+                if (string.IsNullOrWhiteSpace(Url) || !Uri.IsWellFormedUriString(Url, UriKind.Absolute))
+                {
+                    _logger.LogError($"Server URL in {_filePath} is empty or invalid: '{Url}'.");
+                    Url = null;
+                }
+                else
+                {
+                    _logger.LogInfo($"Central Server URL loaded: {Url}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Failed to read Server URL file. Error: {ex.Message}");
+                Url = null;
+            }
+        }
+    }
+}
+2.4. Config/RuntimeConfig.cs (서버에서 받은 설정 저장/로드)
+
+C#
+
+// MonitorAgent/Config/RuntimeConfig.cs
+using Newtonsoft.Json; // Newtonsoft.Json NuGet 패키지 필요
+using Newtonsoft.Json.Converters;
+using System;
+using System.IO;
+using MonitorAgent.Services;
+
+namespace MonitorAgent.Config
+{
+    public enum AgentAssignedRole { Unassigned, Direct, Gateway, Proxied }
+
+    public class RuntimeConfig
+    {
+        [JsonConverter(typeof(StringEnumConverter))]
+        public AgentAssignedRole AssignedRole { get; set; } = AgentAssignedRole.Unassigned;
+        
+        // Gateway 역할 시
+        public int? GatewayListenPort { get; set; }
+
+        // Proxied 역할 시
+        public string TargetGatewayAgentId { get; set; } // 이 ID를 가진 게이트웨이에 연결해야 함 (정보용)
+        public string TargetGatewayIpToConnect { get; set; } // 실제 연결할 게이트웨이 IP (서버가 알려줌)
+        public int? TargetGatewayPortToConnect { get; set; } // 실제 연결할 게이트웨이 포트 (서버가 알려줌)
+
+        public DateTime LastUpdatedFromServerUtc { get; set; }
+
+        // 기본 생성자
+        public RuntimeConfig() { }
+
+
+        private static readonly string FilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.RuntimeConfigFileName);
+
+        public static RuntimeConfig Load(ILoggingService logger)
+        {
+            if (!File.Exists(FilePath))
+            {
+                logger.LogInfo($"{AppConstants.RuntimeConfigFileName} not found. Will request config from server.");
+                return new RuntimeConfig(); // 기본값으로 빈 설정 반환
+            }
+            try
+            {
+                string json = File.ReadAllText(FilePath);
+                var config = JsonConvert.DeserializeObject<RuntimeConfig>(json);
+                if (config != null)
+                {
+                    logger.LogInfo($"Runtime config loaded from file. Role: {config.AssignedRole}, Last Update: {config.LastUpdatedFromServerUtc}");
+                    return config;
+                }
+                logger.LogWarning($"Failed to deserialize {AppConstants.RuntimeConfigFileName}. File might be empty or corrupted.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Error loading runtime config: {ex.Message}", ex);
+            }
+            return new RuntimeConfig(); // 오류 시 기본값 반환
+        }
+
+        public void Save(ILoggingService logger)
+        {
+            try
+            {
+                LastUpdatedFromServerUtc = DateTime.UtcNow; // 저장 시각 기록
+                string json = JsonConvert.SerializeObject(this, Formatting.Indented);
+                File.WriteAllText(FilePath, json);
+                logger.LogInfo($"Runtime config saved. Role: {AssignedRole}");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Error saving runtime config: {ex.Message}", ex);
+            }
+        }
+    }
+}
+다음으로 Services (로깅, 모니터제어), Models (통신 DTO), 그리고 핵심인 Network 및 Core 클래스들을 제공하겠습니다. 이어서 진행할까요?
+
+
+소스
+
+잠시만요 저거 닷넷프레임워크 4.5문법으로하는거맞져 닷넷코어로 첨에시작하는거 아니지? 아니라면 4.5기준으로 다시 맞다면 다음코드줘
+
+
+
+
+생각하는 과정 표시
+네, 맞습니다. 제공되는 모든 코드는 .NET Framework 4.5를 기준으로 작성되고 있습니다. C# 5.0 문법을 사용하며, async/await와 같은 비동기 패턴도 .NET Framework 4.5에서 지원되므로 적극적으로 활용될 예정입니다. .NET Core 전용의 최신 C# 기능은 사용하지 않습니다.
+
+이전까지 드린 Config 폴더 내의 코드들도 .NET Framework 4.5 환경에서 동작하도록 작성되었습니다.
+
+다음 코드를 이어서 드리겠습니다. Services 폴더의 LoggingService.cs와 MonitorControlService.cs 부터 시작하겠습니다.
+
+2.5. Services/LoggingService.cs
+
+C#
+
+// MonitorAgent/Services/LoggingService.cs
+using System;
+using System.IO;
+using System.Text;
+using MonitorAgent.Config; // AppConstants 사용
+
+namespace MonitorAgent.Services
+{
+    public enum LogLevel
+    {
+        Debug,
+        Info,
+        Warning,
+        Error
+    }
+
+    public interface ILoggingService
+    {
+        void LogDebug(string message);
+        void LogInfo(string message);
+        void LogWarning(string message);
+        void LogError(string message, Exception ex = null);
+        LogLevel CurrentLogLevel { get; set; } // 로그 레벨 동적 변경 가능 (여기서는 고정 또는 단순화)
+        event Action<string> OnLogMessage; // UI 등으로 로그 메시지 전달용 이벤트
+    }
+
+    public class FileLoggingService : ILoggingService
+    {
+        private readonly string _logFilePath;
+        private static readonly object _lock = new object();
+        public LogLevel CurrentLogLevel { get; set; } = LogLevel.Info; // 기본 로그 레벨, 추후 설정에서 읽어오도록 변경 가능
+
+        public event Action<string> OnLogMessage;
+
+        public FileLoggingService()
+        {
+            // AppDomain.CurrentDomain.BaseDirectory는 실행 파일이 있는 디렉터리
+            _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.LogFileName);
+            LogInfo($"Logging service initialized. Log file: {_logFilePath}");
+        }
+        
+        // 외부에서 로그 레벨 설정 (예: runtime_config.json 로드 후)
+        public void SetLogLevel(string logLevelString)
+        {
+            if (Enum.TryParse(logLevelString, true, out LogLevel level))
+            {
+                CurrentLogLevel = level;
+                LogInfo($"Log level set to: {CurrentLogLevel}");
+            }
+            else
+            {
+                LogWarning($"Invalid log level string: {logLevelString}. Using default: {CurrentLogLevel}");
+            }
+        }
+
+
+        private void Log(LogLevel level, string message, Exception ex = null)
+        {
+            if (level < CurrentLogLevel) return;
+
+            string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level.ToString().ToUpper()}] {message}";
+            if (ex != null)
+            {
+                logEntry += $"{Environment.NewLine}   Exception: {ex.ToString()}";
+            }
+
+            lock (_lock)
+            {
+                try
+                {
+                    File.AppendAllText(_logFilePath, logEntry + Environment.NewLine);
+                }
+                catch (Exception fileEx)
+                {
+                    // 파일 로깅 실패 시 콘솔에라도 출력 (백그라운드 서비스에서는 효과 없을 수 있음)
+                    Console.WriteLine($"!!! FAILED TO WRITE TO LOG FILE: {fileEx.Message} !!!");
+                    Console.WriteLine($"Original log: {logEntry}");
+                }
+            }
+            // UI 등 다른 곳으로 로그 메시지 전달
+            OnLogMessage?.Invoke(logEntry);
+        }
+
+        public void LogDebug(string message) => Log(LogLevel.Debug, message);
+        public void LogInfo(string message) => Log(LogLevel.Info, message);
+        public void LogWarning(string message) => Log(LogLevel.Warning, message);
+        public void LogError(string message, Exception ex = null) => Log(LogLevel.Error, message, ex);
+    }
+}
+2.6. Services/MonitorControlService.cs
+
+C#
