@@ -1,155 +1,339 @@
-// MGSPMonitorControl/App.xaml.cs
+// MGSPMonitorControl/ViewModels/MainViewModel.cs
 using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Security;
+using System.Threading.Tasks;
 using System.Windows;
-using MGSPMonitorControl.Services;  // BrokerClientService, DatabaseService 등 (실제 초기화는 주석 유지)
-using MGSPMonitorControl.ViewModels; 
-using MGSPMonitorControl.Views;      // MainWindow가 루트면 new MainWindow()
-using System.Threading.Tasks;     
-using System.Configuration; // App.config 사용을 위해
+using System.Windows.Controls; // PasswordBox
+using System.Windows.Input;
+using MGSPMonitorControl.Models;
+using MGSPMonitorControl.Services;
+using MGSPMonitorControl.Views; // AgentConfigWindow 등
+using MonitorControl.SharedModels; // 공용 네임스페이스
+using Newtonsoft.Json;
 
-namespace MGSPMonitorControl
+namespace MGSPMonitorControl.ViewModels
 {
-    public partial class App : Application
+    public enum ApplicationMode { Basic, User, Admin }
+
+    public class MainViewModel : ObservableObject, IDisposable
     {
-        // 서비스 필드들은 선언만 해두고, 초기화는 단계적으로 진행
-        private IDatabaseService _databaseService;
-        private IBrokerClientService _brokerClientService;
+        // --- 하드코딩된 암호 (보안에 매우 취약! 실제 운영 환경에서는 절대 사용 금지) ---
+        private const string UserModePassword = "user123";
+        private const string AdminModePassword = "admin123";
+        // --- ---
 
-        protected override void OnStartup(StartupEventArgs e)
+        private readonly IDatabaseService _databaseService;
+        private readonly IBrokerClientService _brokerClientService;
+
+        public ObservableCollection<ManagedAgentDisplay> Agents { get; }
+        public ObservableCollection<string> UiActionLogs { get; }
+        public BrokerStatusDisplay BrokerStatus { get; private set; }
+
+        private ManagedAgentDisplay _selectedAgent;
+        public ManagedAgentDisplay SelectedAgent
         {
-            base.OnStartup(e);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Application OnStartup - Step 1: ViewModel Test.");
+            get => _selectedAgent;
+            set { if (SetProperty(ref _selectedAgent, value)) RefreshAllCommandStates(); }
+        }
 
-            SetupGlobalExceptionHandling(); 
+        private string _brokerConnectionStatus = "Broker Service Not Initialized";
+        public string BrokerConnectionStatus
+        {
+            get => _brokerConnectionStatus;
+            set { if (SetProperty(ref _brokerConnectionStatus, value)) RefreshAllCommandStates(); }
+        }
 
+        private ApplicationMode _currentMode = ApplicationMode.Basic;
+        public ApplicationMode CurrentMode
+        {
+            get => _currentMode;
+            private set
+            {
+                if (SetProperty(ref _currentMode, value))
+                {
+                    OnPropertyChanged(nameof(CanManageAgents));
+                    OnPropertyChanged(nameof(CanControlPower));
+                    OnPropertyChanged(nameof(CurrentModeDisplay));
+                    RefreshAllCommandStates();
+                    SafeAddUiLog($"Application mode changed to: {CurrentMode}");
+                }
+            }
+        }
+
+        public string CurrentModeDisplay => $"Current Mode: {CurrentMode}";
+        public bool CanManageAgents => CurrentMode == ApplicationMode.Admin;
+        public bool CanControlPower => CurrentMode == ApplicationMode.Admin || CurrentMode == ApplicationMode.User;
+        public string UiUserIdentifier => $"{Environment.UserName}@{Environment.MachineName}";
+
+        private bool IsBrokerConnectedAndReady() => _brokerClientService != null && _brokerClientService.IsConnected;
+
+        // Commands
+        public ICommand LoadAgentsCommand { get; }
+        public RelayCommand<PasswordBox> ApplyModeCommand { get; }
+        public ICommand LogoutCommand { get; }
+        public ICommand AddAgentCommand { get; }
+        public ICommand EditAgentCommand { get; }
+        public ICommand DeleteAgentCommand { get; }
+        public ICommand MonitorOnCommand { get; }
+        public ICommand MonitorOffCommand { get; }
+        public ICommand PingAgentCommand { get; }
+        public ICommand RequestBrokerStatusCommand { get; }
+        public ICommand ConnectToBrokerCommand { get; }
+        public ICommand DisconnectFromBrokerCommand { get; }
+        public ICommand ClearUiLogsCommand { get; }
+
+        private bool _isCleanupDone = false; // 중복 Cleanup 방지
+
+        public MainViewModel(IDatabaseService databaseService, IBrokerClientService brokerClientService)
+        {
+            _databaseService = databaseService; 
+            _brokerClientService = brokerClientService;
+
+            Agents = new ObservableCollection<ManagedAgentDisplay>();
+            UiActionLogs = new ObservableCollection<string>();
+            BrokerStatus = new BrokerStatusDisplay(); 
+
+            SafeAddUiLog($"Application MainViewModel initialized. Initial mode: {CurrentMode}.");
+            if (_databaseService == null) SafeAddUiLog("[CRITICAL_WARNING] DatabaseService IS NULL. DB functions will be unavailable.");
+            if (_brokerClientService == null) SafeAddUiLog("[CRITICAL_WARNING] BrokerClientService IS NULL. Broker communication will be unavailable.");
+            else
+            {
+                _brokerClientService.Connected += OnBrokerConnected;
+                _brokerClientService.Disconnected += OnBrokerDisconnected;
+                _brokerClientService.MessageReceived += OnBrokerMessageReceived;
+                BrokerConnectionStatus = _brokerClientService.IsConnected ? "Connected" : "Disconnected (UI Init)";
+            }
+
+            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync(), () => _databaseService != null);
+            ApplyModeCommand = new RelayCommand<PasswordBox>(ExecuteApplyMode, (pBox) => pBox != null );
+            LogoutCommand = new RelayCommand(ExecuteLogout, () => CurrentMode != ApplicationMode.Basic);
+            AddAgentCommand = new RelayCommand(ExecuteAddAgent, () => CanManageAgents && _databaseService != null);
+            EditAgentCommand = new RelayCommand(ExecuteEditAgent, () => SelectedAgent != null && CanManageAgents && _databaseService != null);
+            DeleteAgentCommand = new RelayCommand(async () => await ExecuteDeleteAgentAsync(), () => SelectedAgent != null && CanManageAgents && _databaseService != null);
+            MonitorOnCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOn"), () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
+            MonitorOffCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOff"), () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
+            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(), () => SelectedAgent != null && SelectedAgent.IsOnline && IsBrokerConnectedAndReady());
+            RequestBrokerStatusCommand = new RelayCommand(async () => await ExecuteRequestBrokerStatusAsync(), () => IsBrokerConnectedAndReady());
+            ConnectToBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.ConnectAsync(); }, () => _brokerClientService != null && !_brokerClientService.IsConnected);
+            DisconnectFromBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.DisconnectAsync(); }, () => IsBrokerConnectedAndReady());
+            ClearUiLogsCommand = new RelayCommand(() => UiActionLogs.Clear());
+
+            // ViewModel 생성자에서는 UI 스레드를 직접 블로킹하는 DB/네트워크 호출 자제.
+            // App.xaml.cs에서 MainWindow.Show() 이후에 초기 데이터 로드 및 연결 시도 권장.
+            // 여기서는 생성자에서 Task.Run으로 호출하여 UI 스레드 블로킹 최소화.
+            if (_databaseService != null) Task.Run(async () => await ExecuteLoadAgentsAsync());
+            if (_brokerClientService != null && !_brokerClientService.IsConnected) Task.Run(async () => await _brokerClientService.ConnectAsync());
+            
+            RefreshAllCommandStates();
+        }
+
+        private void SafeRefreshAllCommandStates() // Dispatcher.Invoke 대신 사용
+        {
+            if (Application.Current != null && Application.Current.Dispatcher != null && !Application.Current.Dispatcher.HasShutdownStarted && !Application.Current.Dispatcher.HasShutdownFinished)
+            {
+                Application.Current.Dispatcher.Invoke(RefreshAllCommandStates);
+            }
+            else
+            {
+                 Console.WriteLine("[VM LOG - NO DISPATCHER] Attempted to refresh command states during shutdown or no dispatcher.");
+            }
+        }
+        
+        private void RefreshAllCommandStates() // 이 메서드는 UI 스레드에서 호출되어야 함
+        {
+            (LoadAgentsCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (ApplyModeCommand as RelayCommand<PasswordBox>)?.RaiseCanExecuteChanged();
+            (LogoutCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (AddAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (EditAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (DeleteAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (MonitorOnCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (MonitorOffCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (PingAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (RequestBrokerStatusCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (ConnectToBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (DisconnectFromBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
+        private void SafeAddUiLog(string message) // Dispatcher.Invoke 대신 사용
+        {
+            if (Application.Current != null && Application.Current.Dispatcher != null && !Application.Current.Dispatcher.HasShutdownStarted && !Application.Current.Dispatcher.HasShutdownFinished)
+            {
+                Application.Current.Dispatcher.Invoke(() => AddUiLogInternal(message));
+            }
+            else
+            {
+                Console.WriteLine($"[UI LOG - NO DISPATCHER OR SHUTDOWN] {message}");
+            }
+        }
+
+        private void AddUiLogInternal(string message) // UI 스레드에서만 호출됨
+        {
+            string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+            UiActionLogs.Insert(0, logEntry);
+            if (UiActionLogs.Count > 200) UiActionLogs.RemoveAt(UiActionLogs.Count - 1);
+        }
+        
+        private void ExecuteApplyMode(PasswordBox passwordBox) { /* ... 이전과 동일 ... */ }
+        private void ExecuteLogout() { CurrentMode = ApplicationMode.Basic; }
+
+        private async Task ExecuteLoadAgentsAsync()
+        {
+            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for loading agents."); return; }
+            SafeAddUiLog("Loading managed agent configurations from database...");
             try
             {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Attempting to create MainViewModel and MainWindow...");
-
-                // --- MainViewModel 생성 (서비스는 일단 null로 전달하여 ViewModel 자체 로딩 테스트) ---
-                // 실제 서비스 초기화는 다음 단계에서 하나씩 활성화합니다.
-                // 이렇게 하면 MainViewModel 생성자에서 서비스가 null일 때를 대비한 방어 코드가 중요해집니다.
-                // (이전 답변의 MainViewModel은 이를 고려하여 수정되었습니다.)
-                
-                // 실제 서비스 초기화 시도 (이 부분에서 오류나면 App.config 문제일 가능성 높음)
-                // 만약 이 부분에서 오류나면, 이전처럼 null을 전달하고 해당 서비스 사용 로직을 ViewModel에서 막아야 함.
-                try
+                var dbAgents = await _databaseService.GetManagedAgentsAsync();
+                if (Application.Current != null && Application.Current.Dispatcher != null && !Application.Current.Dispatcher.HasShutdownStarted)
                 {
-                    _databaseService = new DatabaseService(); // App.config의 연결 문자열 사용
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] DatabaseService potentially initialized (check App.config if issues).");
-                }
-                catch (ConfigurationErrorsException cex)
-                {
-                    ShowCriticalErrorAndShutdown($"CRITICAL: App.config error for Database: {cex.Message}\nConnection string 'MonitorControlDBConnection' must be valid.");
-                    return;
-                }
-                catch (Exception exDb)
-                {
-                    ShowCriticalErrorAndShutdown($"CRITICAL: Error initializing DatabaseService: {exDb.ToString()}");
-                    return;
-                }
-
-                try
-                {
-                     _brokerClientService = new BrokerClientService(); // App.config의 BrokerAddress 사용
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService potentially initialized (check App.config if issues).");
-                }
-                catch (ConfigurationErrorsException cex)
-                {
-                    ShowCriticalErrorAndShutdown($"CRITICAL: App.config error for Broker: {cex.Message}\nAppSetting 'BrokerAddress' must be valid (IP:Port).");
-                    return;
-                }
-                catch (Exception exBroker)
-                {
-                    ShowCriticalErrorAndShutdown($"CRITICAL: Error initializing BrokerClientService: {exBroker.ToString()}");
-                    return;
-                }
-
-
-                MainViewModel mainViewModel = null;
-                try
-                {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Creating MainViewModel with actual services (or null if init failed)...");
-                    mainViewModel = new MainViewModel(_databaseService, _brokerClientService);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel instance created.");
-                }
-                catch (Exception exVm)
-                {
-                    ShowCriticalErrorAndShutdown($"Error CREATING MainViewModel instance: {exVm.ToString()}");
-                    return;
-                }
-
-                MainWindow mainWindow = null;
-                try
-                {
-                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Creating new MainWindow(mainViewModel) instance...");
-                    // MainWindow가 루트에 있다면 new MainWindow(), Views 폴더면 new Views.MainWindow()
-                    mainWindow = new MainWindow(mainViewModel); // MainWindow 생성자에 MainViewModel 전달
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainWindow instance created.");
-                }
-                catch (Exception exCreate)
-                {
-                    ShowCriticalErrorAndShutdown($"Error CREATING MainWindow instance with ViewModel: {exCreate.ToString()}");
-                    return;
-                }
-                
-                this.MainWindow = mainWindow;
-                
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Attempting to SHOW MainWindow...");
-                mainWindow.Show();
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainWindow.Show() called. Window should be visible or loading.");
-            }
-            catch (Exception ex) // 최상위 포괄적 예외 처리
-            {
-                 ShowCriticalErrorAndShutdown($"An UNEXPECTED critical error occurred during application startup: {ex.ToString()}\nThe application will now exit.");
-            }
-        }
-        
-        private void SetupGlobalExceptionHandling()
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Setting up global exception handlers.");
-            this.DispatcherUnhandledException += (s, e) =>
-            {
-                string errorMessage = $"[UI THREAD CRASH] {e.Exception.ToString()}";
-                Console.WriteLine(errorMessage);
-                try { MessageBox.Show(errorMessage, "Unhandled UI Exception - App Unstable", MessageBoxButton.OK, MessageBoxImage.Error); } catch {}
-                e.Handled = true; 
-            };
-
-            TaskScheduler.UnobservedTaskException += (s, e) =>
-            {
-                string errorMessage = $"[BACKGROUND THREAD CRASH] {e.Exception.ToString()}";
-                Console.WriteLine(errorMessage);
-                e.SetObserved(); 
-            };
-        }
-        
-        private void ShowCriticalErrorAndShutdown(string message)
-        {
-            Console.WriteLine($"[FATAL STARTUP ERROR] {message}"); 
-            try { MessageBox.Show(message, "Application Startup Error", MessageBoxButton.OK, MessageBoxImage.Error); } catch {}
-            
-            if (Application.Current != null) 
-            {
-                if (Application.Current.Dispatcher.CheckAccess()) {
-                    try { Application.Current.Shutdown(-1); } catch { try { Environment.Exit(-1); } catch {}}
-                }
-                else {
-                    Application.Current.Dispatcher.Invoke(() => {
-                        try { Application.Current.Shutdown(-1); } catch { try { Environment.Exit(-1); } catch {}}
+                    Application.Current.Dispatcher.Invoke(() =>
+                    {
+                        Agents.Clear();
+                        if (dbAgents != null)
+                        {
+                            foreach (var agent in dbAgents.OrderBy(a => a.AgentName))
+                            { agent.IsOnline = false; agent.CurrentMonitorStatus = "Unknown (Offline)"; Agents.Add(agent); }
+                        }
+                        SelectedAgent = null;
                     });
                 }
+                SafeAddUiLog($"Loaded {dbAgents?.Count ?? 0} agent configurations from DB.");
+                if (IsBrokerConnectedAndReady()) { await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = UiUserIdentifier }); }
             }
-            else { try { Environment.Exit(-1); } catch {} }
+            catch (Exception ex) { SafeAddUiLog($"[ERROR] Loading agents from DB: {ex.ToString()}"); MessageBox.Show($"Error loading agents: {ex.Message}", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); }
+            finally { SafeRefreshAllCommandStates(); }
         }
 
-        protected override void OnExit(ExitEventArgs e)
+        private async void ExecuteAddAgent()
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Application OnExit called. ExitCode: {e.ApplicationExitCode}");
-            // MainViewModel의 Cleanup은 MainWindow_Closing에서 호출
-            // BrokerClientService의 Dispose는 MainViewModel.Cleanup에서 호출될 수 있도록 설계 또는 여기서 명시적 호출
-            (_brokerClientService as IDisposable)?.Dispose(); // 안전하게 Dispose
-            base.OnExit(e);
+            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for Add Agent."); return; }
+            SafeAddUiLog("Opening 'Add New Agent' window...");
+            var agentConfigVm = new AgentConfigViewModel(_databaseService, CurrentMode.ToString() + "Mode");
+            var agentConfigWindow = new AgentConfigWindow(agentConfigVm);
+            if (agentConfigWindow.ShowDialog() == true) { SafeAddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' config saved. Refreshing."); await ExecuteLoadAgentsAsync(); }
+            else { SafeAddUiLog("'Add New Agent' cancelled."); }
+        }
+
+        private async void ExecuteEditAgent()
+        {
+            if (SelectedAgent == null || _databaseService == null) { SafeAddUiLog(SelectedAgent == null ? "[WARN] No agent selected for edit." : "[ERROR] DatabaseService unavailable for Edit Agent."); return; }
+            // ... (DB에서 최신 정보 로드 및 창 띄우는 로직은 이전과 동일, SafeAddUiLog 사용) ...
+        }
+
+        private async Task ExecuteDeleteAgentAsync()
+        {
+            if (SelectedAgent == null || _databaseService == null) { /* ... */ return; }
+            // ... (이전 로직과 동일, SafeAddUiLog 사용) ...
+        }
+
+        private async Task ExecuteMonitorControlAsync(string actionType)
+        {
+            if (SelectedAgent == null || _databaseService == null || !IsBrokerConnectedAndReady()) { SafeAddUiLog("[WARN] Cannot send monitor control: Invalid state."); return; }
+            // ... (이전 로직과 동일, SafeAddUiLog 사용) ...
+        }
+        
+        private async Task ExecutePingAgentAsync() 
+        {
+            if (SelectedAgent == null || !IsBrokerConnectedAndReady() || _databaseService == null) { SafeAddUiLog("[WARN] Cannot Ping: Invalid state."); return; }
+            // ... (이전 로직과 동일, SafeAddUiLog 사용) ...
+        }
+
+        private async Task ExecuteRequestBrokerStatusAsync() 
+        {
+            if (!IsBrokerConnectedAndReady()) { SafeAddUiLog("[WARN] Cannot request broker status: Not connected."); return; }
+            // ... (이전 로직과 동일, SafeAddUiLog 사용) ...
+        }
+
+        #region Broker Event Handlers
+        private void OnBrokerConnected()
+        {
+            SafeRunOnUi(() => {
+                BrokerConnectionStatus = "Connected"; SafeAddUiLog("Successfully connected to Broker Service."); SafeRefreshAllCommandStates();
+            });
+            if (_brokerClientService == null) return;
+            Task.Run(async () => { /* ... 메시지 전송 로직 이전과 동일 ... */ });
+        }
+
+        private void OnBrokerDisconnected()
+        {
+             SafeRunOnUi(() => {
+                BrokerConnectionStatus = "Disconnected"; SafeAddUiLog("Disconnected from Broker Service.");
+                foreach(var agent in Agents) { agent.IsOnline = false; agent.CurrentMonitorStatus = "Offline (Broker D/C)"; }
+                SafeRefreshAllCommandStates();
+             });
+        }
+
+        private void OnBrokerMessageReceived(BrokerMessage message) 
+        {
+            SafeRunOnUi(() =>
+            {
+                try
+                {
+                    // ... (switch-case 로직은 이전과 동일, SafeAddUiLog 사용, UpdateControlActionLogAsync 호출 시 null 체크된 _databaseService 사용) ...
+                    // 예시: case MessageType.BrokerToUi_ForwardAgentCommandResult:
+                    //   ...
+                    //   if (Guid.TryParse(message.CorrelationId, out Guid correlationGuid)) { UpdateControlActionLogAsync(correlationGuid, ...).ConfigureAwait(false); }
+                    //   ...
+                    // 모든 SafeAddUiLog 호출 및 MessageBox.Show는 이미 UI 스레드에서 실행 중이므로 그대로 사용
+                }
+                catch (Exception ex) { SafeAddUiLog($"[ERROR] Processing Broker Message Type {message.Type}: {ex.ToString()}");}
+            });
+        }
+        
+        // UpdateControlActionLogAsync, UpdateAgentListFromBroker, UpdateSingleAgentStatus 메서드는
+        // 내부에서 _databaseService 사용 전에 null 체크 추가 또는 호출 전에 체크.
+        // 그리고 UI 업데이트는 SafeRunOnUi 또는 SafeAddUiLog 사용.
+        private async Task UpdateControlActionLogAsync(Guid correlationId, string agentIdProvidedByApp, 
+                                                    bool success, string resultMessage, string finalMonitorStatus, 
+                                                    DateTime completedTimestamp, string finalStatusOverride = null)
+        {
+            if (_databaseService == null) { SafeAddUiLog("[DB LOG ERROR] DatabaseService not available."); return; }
+            // ... (이전 로직과 동일, SafeAddUiLog 사용) ...
+        }
+        
+        private void UpdateAgentListFromBroker(List<LiveAgentInfoForUi> liveAgents, bool isInitialLoad) 
+        { SafeRunOnUi(() => { /* 이전 로직과 동일, SafeAddUiLog, SafeRefreshAllCommandStates 사용 */ }); }
+        private void UpdateSingleAgentStatus(LiveAgentInfoForUi liveInfo) 
+        { SafeRunOnUi(() => { /* 이전 로직과 동일, SafeAddUiLog, SafeRefreshAllCommandStates 사용 */ }); }
+
+        #endregion
+
+        // UI 스레드에서 안전하게 액션 실행을 위한 헬퍼 메서드
+        private void SafeRunOnUi(Action action)
+        {
+            if (Application.Current != null && Application.Current.Dispatcher != null && !Application.Current.Dispatcher.HasShutdownStarted && !Application.Current.Dispatcher.HasShutdownFinished)
+            {
+                Application.Current.Dispatcher.Invoke(action);
+            }
+            else
+            {
+                Console.WriteLine($"[VM LOG - NO DISPATCHER OR SHUTDOWN] Action was not executed on UI thread.");
+            }
+        }
+
+        public void Cleanup() 
+        {
+            if (_isCleanupDone) return;
+            _isCleanupDone = true;
+
+            SafeAddUiLog("MainViewModel is cleaning up resources...");
+            if (_brokerClientService != null)
+            {
+                _brokerClientService.Connected -= OnBrokerConnected;
+                _brokerClientService.Disconnected -= OnBrokerDisconnected;
+                _brokerClientService.MessageReceived -= OnBrokerMessageReceived;
+                try { Task.Run(async () => await _brokerClientService.DisconnectAsync()).Wait(TimeSpan.FromMilliseconds(500));  } catch { /* ignore */ }
+                (_brokerClientService as IDisposable)?.Dispose();
+            }
+            SafeAddUiLog("MainViewModel cleanup finished.");
+        }
+
+        public void Dispose() // IDisposable 구현 시
+        {
+            Cleanup();
         }
     }
 }
