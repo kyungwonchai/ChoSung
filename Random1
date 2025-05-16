@@ -1,197 +1,269 @@
-알겠습니다! DB 이름은 MonitorControlDB로 확정되었군요. 이 정보는 나중에 제어 UI 프로그램에서 DB에 연결할 때 사용됩니다. 중계 프로그램은 DB에 직접 접근하지 않으므로 DB명 자체는 중계 프로그램 코드에 직접적인 영향을 주지는 않습니다.
+네, 알겠습니다. 이제 Agent 프로그램 (MonitorAgent)의 전체 코드를 제공해 드리겠습니다.
 
-이제 중계 프로그램 (MGSPBrokerService)의 전체 코드를 제공해 드리겠습니다. 이 프로그램은 순수 TCP 소켓 통신을 기반으로 하며, 제어 UI와 Agent들 사이의 메시지를 중계하는 역할을 합니다.
+이 Agent 프로그램은 다음 주요 기능을 수행합니다:
 
+지정된 중계 프로그램(MGSPBrokerService)으로 TCP 소켓 연결을 시도하고 유지합니다.
+연결 성공 시 자신의 고유 ID와 시스템 정보를 중계 프로그램에 알립니다 (AgentHello).
+자신의 현재 모니터 상태를 주기적으로 또는 변경 시 중계 프로그램에 보고합니다.
+중계 프로그램으로부터 모니터 제어 명령 등을 수신하여 로컬에서 실행하고, 그 결과를 보고합니다.
+게이트웨이 역할 수행: 중계 프로그램으로부터 "다른 최종 Agent에게 명령을 전달하라"는 요청을 받으면, 해당 최종 Agent와 직접 TCP 소켓 통신을 하여 명령을 전달하고 결과를 다시 중계 프로그램에 보고합니다.
 프로젝트 생성:
 
 Visual Studio에서 새 프로젝트를 만듭니다.
-템플릿: "콘솔 앱(.NET Framework)"
-프로젝트 이름: MGSPBrokerService
+템플릿: "WPF 앱(.NET Framework)" (트레이 아이콘 등을 위해 WPF 기반 유지)
+프로젝트 이름: MonitorAgent
 프레임워크: ".NET Framework 4.5"
 필요한 NuGet 패키지 설치:
 
-솔루션 탐색기에서 MGSPBrokerService 프로젝트 마우스 우클릭 -> "NuGet 패키지 관리..." -> "찾아보기" 탭에서 다음 패키지를 검색하여 설치합니다.
+Newtonsoft.Json: 메시지 직렬화/역직렬화.
+패키지 관리자 콘솔: Install-Package Newtonsoft.Json
+필요한 외부 파일 (Agent 실행 파일과 같은 폴더에 위치):
 
-Newtonsoft.Json: Agent, UI와 주고받을 메시지를 JSON 형식으로 직렬화/역직렬화하기 위해 사용합니다.
-패키지 관리자 콘솔 명령어: Install-Package Newtonsoft.Json
-중계 프로그램 (MGSPBrokerService) 코드 구성:
+MonitorAgent.exe (빌드된 실행 파일)
+(필수 배포) broker_address.txt: 중계 프로그램의 주소와 Agent 연결용 포트. 한 줄에 IP주소:포트 형식.
+예시 broker_address.txt 내용:
+127.0.0.1:9002
+(자동 생성) agent_id.txt: Agent의 고유 ID가 저장됩니다.
+(자동 생성) agent_log.txt: 로그 파일.
+Agent 프로그램 (MonitorAgent) 코드 구성:
 
-1. Models/MessageContract.cs (통신 메시지 규약 정의)
-
-이 파일은 UI, 중계기, Agent 간에 주고받을 메시지의 종류와 데이터 구조를 정의합니다. 사실상 통신 프로토콜의 일부입니다.
+1. Config/AppConstants.cs
 
 C#
 
-// MGSPBrokerService/Models/MessageContract.cs
-using System.Collections.Generic;
-
-namespace MGSPBrokerService.Models
+// MonitorAgent/Config/AppConstants.cs
+namespace MonitorAgent.Config
 {
-    // 메시지 타입 구분용 Enum
-    public enum MessageType
+    public static class AppConstants
     {
-        // UI -> Broker -> Agent (명령 관련)
-        UiRequest_ControlAgent,     // UI가 Agent 제어 명령을 Broker에게 요청
-        BrokerToAgent_ExecuteControl, // Broker가 Agent에게 실제 제어 명령 전달
-
-        // Agent -> Broker -> UI (명령 결과 및 상태 보고 관련)
-        AgentToBroker_CommandResult,  // Agent가 Broker에게 명령 실행 결과 보고
-        BrokerToUi_ForwardAgentResult, // Broker가 UI에게 Agent의 명령 실행 결과 전달
-        AgentToBroker_StatusUpdate,   // Agent가 Broker에게 자신의 현재 상태 보고
-        BrokerToUi_BroadcastAgentStatus, // Broker가 UI에게 Agent의 현재 상태 브로드캐스트
-
-        // Broker <-> UI (Broker 자체 상태 및 로그 관련)
-        UiRequest_GetBrokerStatus,    // UI가 Broker에게 상태 및 로그 요청
-        BrokerToUi_SendBrokerStatus,  // Broker가 UI에게 자신의 상태 및 로그 전달
-
-        // Broker <-> Agent (연결 관리 등)
-        AgentHello,                 // Agent가 Broker에 처음 연결 시 자신을 알림
-        BrokerAck_AgentHello,       // Broker가 AgentHello에 대한 응답
-        Ping,                       // 생존 확인용
-        Pong                        // Ping에 대한 응답
-    }
-
-    // 기본 메시지 구조체 (모든 메시지의 기본 형태)
-    public class BrokerMessage
-    {
-        public MessageType Type { get; set; }
-        public string SourceId { get; set; } // 메시지를 보낸 주체 (AgentId 또는 UI의 고유 식별자)
-        public string TargetId { get; set; } // 메시지를 받을 대상 (AgentId 또는 "ALL_UIS", "BROKER")
-        public string CorrelationId { get; set; } // 요청과 응답을 매칭하기 위한 ID
-        public string Payload { get; set; } // 실제 데이터 (JSON 문자열)
-    }
-
-    // 페이로드 예시들
-
-    // AgentHello 메시지의 페이로드 (Agent -> Broker)
-    public class AgentHelloPayload
-    {
-        public string AgentIdProvidedByApp { get; set; } // Agent가 자체적으로 가진 고유 ID
-        public string MachineName { get; set; }
-        public List<string> IpAddresses { get; set; }
-        public string AgentVersion { get; set; }
-    }
-
-    // UiRequest_ControlAgent 메시지의 페이로드 (UI -> Broker)
-    // 이 정보는 UI가 DB에서 가져와서 Broker에게 전달함
-    public class UiControlAgentPayload
-    {
-        public string TargetAgentIdProvidedByApp { get; set; } // 제어할 Agent의 고유 ID
-        public string ControlAction { get; set; } // 예: "TurnMonitorOn", "TurnMonitorOff"
-        // Agent 제어 경로 정보 (UI가 DB에서 읽어옴)
-        public string ControlType { get; set; } // "Direct" 또는 "Gatewayed"
-        public string PrimaryIpAddress { get; set; }
-        public int PrimaryPort { get; set; }
-        public string GatewayAgentIpAddress { get; set; } // ControlType이 Gatewayed일 경우
-        public int? GatewayAgentPort { get; set; }      // ControlType이 Gatewayed일 경우
-        public string OriginalParameters { get; set; } // 명령에 필요한 추가 파라미터 (JSON)
-    }
-
-    // BrokerToAgent_ExecuteControl 메시지의 페이로드 (Broker -> Agent 또는 Broker -> GatewayAgent)
-    public class BrokerExecuteControlPayload
-    {
-        public string ActionToPerform { get; set; } // 예: "TurnMonitorOn"
-        public string Parameters { get; set; } // 명령 파라미터
-
-        // 만약 이 명령이 GatewayAgent를 통해 최종 Agent로 가야 한다면, 최종 Agent 정보 포함
-        public bool IsGatewayRelay { get; set; } = false;
-        public string FinalTargetAgentIp { get; set; } // Gateway가 이 IP로 최종 전달
-        public int? FinalTargetAgentPort { get; set; }
-    }
-
-    // AgentToBroker_CommandResult 메시지의 페이로드 (Agent -> Broker)
-    public class AgentCommandResultPayload
-    {
-        public bool Success { get; set; }
-        public string Message { get; set; }
-        public string CurrentMonitorStatus { get; set; } // 명령 실행 후 모니터 상태
-    }
-    
-    // AgentToBroker_StatusUpdate 메시지의 페이로드 (Agent -> Broker)
-    public class AgentStatusUpdatePayload
-    {
-        public string CurrentMonitorStatus { get; set; }
-        // 추가적인 상태 정보 (CPU, Memory 등) 포함 가능
-    }
-
-    // BrokerToUi_SendBrokerStatus 메시지의 페이로드 (Broker -> UI)
-    public class BrokerStatusPayload
-    {
-        public DateTime ServerStartTime { get; set; }
-        public string UptimeString { get; set; }
-        public int ConnectedUiCount { get; set; }
-        public int ConnectedAgentCount { get; set; }
-        public List<string> RecentLogs { get; set; } // 서버 내부 로그
-        public string BrokerVersion { get; set; }
+        public const string AgentIdFileName = "agent_id.txt";
+        public const string BrokerAddressFileName = "broker_address.txt"; // 중계 서버 주소:포트
+        public const string LogFileName = "agent_log.txt";
+        public const string AppName = "MonitorAgent"; // 시작프로그램 등록 등에 사용
     }
 }
-2. Services/LoggingService.cs (간단 로깅 서비스)
-
-이전 Agent의 로깅 서비스와 유사하지만, Broker용으로 맞춤.
+2. Config/AgentIdentifier.cs (이전과 유사, Broker 프로젝트의 것과 거의 동일하게 사용 가능)
 
 C#
 
-// MGSPBrokerService/Services/LoggingService.cs
+// MonitorAgent/Config/AgentIdentifier.cs
 using System;
-using System.Collections.Concurrent;
+using System.IO;
+using System.Linq;
+using System.Net.NetworkInformation;
+using MonitorAgent.Services; // ILoggingService
+
+namespace MonitorAgent.Config
+{
+    public class AgentIdentifier
+    {
+        private readonly ILoggingService _logger;
+        private readonly string _filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.AgentIdFileName);
+        public string Id { get; private set; }
+
+        public AgentIdentifier(ILoggingService logger)
+        {
+            _logger = logger;
+            LoadOrGenerateId();
+        }
+
+        private void LoadOrGenerateId()
+        {
+            if (File.Exists(_filePath))
+            {
+                try
+                {
+                    Id = File.ReadAllText(_filePath).Trim();
+                    if (!string.IsNullOrWhiteSpace(Id))
+                    {
+                        _logger.LogInfo($"Agent ID loaded from file: {Id}");
+                        return;
+                    }
+                    _logger.LogWarning("Agent ID file was empty. A new ID will be generated.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Failed to read Agent ID file. A new ID will be generated. Error: {ex.Message}");
+                }
+            }
+            
+            try
+            {
+                string macAddress = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(nic => nic.OperationalStatus == OperationalStatus.Up && 
+                                  nic.NetworkInterfaceType != NetworkInterfaceType.Loopback && 
+                                  nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                    .Select(nic => nic.GetPhysicalAddress().ToString())
+                    .FirstOrDefault(mac => !string.IsNullOrEmpty(mac) && mac.Length >= 12); // 유효한 MAC 주소
+
+                if (string.IsNullOrEmpty(macAddress))
+                {
+                    macAddress = Guid.NewGuid().ToString("N").Substring(0, 12).ToUpper();
+                    _logger.LogWarning("Could not retrieve a valid MAC address. Using GUID fragment for Agent ID.");
+                }
+                Id = $"{Environment.MachineName.Replace(" ", "_")}-{macAddress}"; // 공백 제거 및 조합
+
+                File.WriteAllText(_filePath, Id);
+                _logger.LogInfo($"New Agent ID generated and saved: {Id}");
+            }
+            catch (Exception ex)
+            {
+                Id = Guid.NewGuid().ToString(); // 최종 폴백
+                _logger.LogError($"Failed to generate MAC/MachineName based Agent ID. Using GUID: {Id}. Error: {ex.Message}", ex);
+            }
+        }
+    }
+}
+3. Config/BrokerAddressProvider.cs
+
+C#
+
+// MonitorAgent/Config/BrokerAddressProvider.cs
+using System;
+using System.IO;
+using System.Net;
+using MonitorAgent.Services;
+
+namespace MonitorAgent.Config
+{
+    public class BrokerAddressProvider
+    {
+        private readonly ILoggingService _logger;
+        private readonly string _filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.BrokerAddressFileName);
+        
+        public IPAddress BrokerIpAddress { get; private set; }
+        public int BrokerPort { get; private set; }
+        public bool IsValid { get; private set; } = false;
+
+        public BrokerAddressProvider(ILoggingService logger)
+        {
+            _logger = logger;
+            LoadAddress();
+        }
+
+        private void LoadAddress()
+        {
+            if (!File.Exists(_filePath))
+            {
+                _logger.LogError($"Broker address file not found: {_filePath}. Agent cannot connect. Please create this file with 'IP_ADDRESS:PORT'.");
+                CreateSampleBrokerAddressFile();
+                return;
+            }
+
+            try
+            {
+                string addressString = File.ReadAllText(_filePath).Trim();
+                if (string.IsNullOrWhiteSpace(addressString))
+                {
+                    _logger.LogError($"Broker address in {_filePath} is empty.");
+                    return;
+                }
+
+                string[] parts = addressString.Split(':');
+                if (parts.Length != 2)
+                {
+                    _logger.LogError($"Invalid broker address format in {_filePath}. Expected 'IP_ADDRESS:PORT'. Found: '{addressString}'.");
+                    return;
+                }
+
+                if (!IPAddress.TryParse(parts[0], out IPAddress ip))
+                {
+                    _logger.LogError($"Invalid IP address part in broker address: '{parts[0]}'.");
+                    return;
+                }
+                BrokerIpAddress = ip;
+
+                if (!int.TryParse(parts[1], out int port) || port <= 0 || port > 65535)
+                {
+                    _logger.LogError($"Invalid port number part in broker address: '{parts[1]}'. Port must be 1-65535.");
+                    return;
+                }
+                BrokerPort = port;
+                IsValid = true;
+                _logger.LogInfo($"Broker address loaded: {BrokerIpAddress}:{BrokerPort}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Failed to read or parse Broker address file. Error: {ex.Message}", ex);
+            }
+        }
+
+        private void CreateSampleBrokerAddressFile()
+        {
+            try
+            {
+                File.WriteAllText(_filePath, "127.0.0.1:9002" + Environment.NewLine + "# Replace with your actual MGSPBrokerService IP address and Agent port.");
+                _logger.LogInfo($"Sample broker_address.txt created. Please configure it.");
+            }
+            catch(Exception ex)
+            {
+                _logger.LogError("Failed to create sample broker_address.txt.", ex);
+            }
+        }
+    }
+}
+4. Services/LoggingService.cs (이전 Broker의 것과 유사하게 사용 가능, AppConstants 참조 수정)
+
+C#
+
+// MonitorAgent/Services/LoggingService.cs
+using System;
 using System.IO;
 using System.Text;
+using MonitorAgent.Config; // AppConstants
 
-namespace MGSPBrokerService.Services
+namespace MonitorAgent.Services
 {
-    public enum LogLevel
-    {
-        Debug, Info, Warning, Error, Fatal
-    }
+    public enum LogLevel { Debug, Info, Warning, Error, Fatal } // Broker와 동일하게
 
     public interface ILoggingService
     {
-        void Debug(string message);
-        void Info(string message);
-        void Warn(string message);
-        void Error(string message, Exception ex = null);
-        void Fatal(string message, Exception ex = null);
-        List<string> GetRecentLogs(int count);
+        void LogDebug(string message);
+        void LogInfo(string message);
+        void LogWarning(string message);
+        void LogError(string message, Exception ex = null);
+        void LogFatal(string message, Exception ex = null);
+        // UI 전송용 로그는 Agent에선 필요 없을 수 있음
     }
 
-    public class BrokerLoggingService : ILoggingService
+    public class AgentLoggingService : ILoggingService
     {
-        private const string LogFileName = "broker_service_log.txt";
-        private const int MaxInMemoryLogs = 100; // UI 전송용 메모리 내 로그 수
         private readonly string _logFilePath;
         private static readonly object _fileLock = new object();
-        private readonly ConcurrentQueue<string> _recentLogs = new ConcurrentQueue<string>();
+        private LogLevel _currentLogLevel = LogLevel.Info; // 기본, 설정 파일에서 읽어올 수 있음
 
-        public BrokerLoggingService()
+        public AgentLoggingService(string logLevelFromConfig = "Info") // 설정 로드 후 주입 가능
         {
-            _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, LogFileName);
-            Info("Broker Logging Service initialized.");
+            _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, AppConstants.LogFileName);
+            SetLogLevel(logLevelFromConfig); // 생성 시 로그 레벨 설정
+            LogInfo($"Agent Logging Service initialized. Log file: {_logFilePath}");
+        }
+        
+        public void SetLogLevel(string logLevelString)
+        {
+            if (Enum.TryParse(logLevelString, true, out LogLevel level))
+            {
+                _currentLogLevel = level;
+                // LogInfo($"Log level set to: {_currentLogLevel}"); // 로그 레벨 변경 시 너무 많은 로그 방지
+            }
+            else
+            {
+                LogWarning($"Invalid log level string: {logLevelString}. Using default: {_currentLogLevel}");
+            }
         }
 
         private void WriteLog(LogLevel level, string message, Exception ex = null)
         {
+            if (level < _currentLogLevel) return;
+
             string logEntry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level.ToString().ToUpper()}] {message}";
             if (ex != null)
             {
                 logEntry += $"{Environment.NewLine}   Exception: {ex.ToString()}";
             }
 
-            // 콘솔에 출력
-            if (level >= LogLevel.Info) // 정보 레벨 이상만 콘솔에 출력 (조정 가능)
-            {
-                ConsoleColor originalColor = Console.ForegroundColor;
-                switch (level)
-                {
-                    case LogLevel.Warning: Console.ForegroundColor = ConsoleColor.Yellow; break;
-                    case LogLevel.Error:   Console.ForegroundColor = ConsoleColor.Red; break;
-                    case LogLevel.Fatal:   Console.ForegroundColor = ConsoleColor.DarkRed; break;
-                    default: Console.ForegroundColor = ConsoleColor.Gray; break;
-                }
-                Console.WriteLine(logEntry);
-                Console.ForegroundColor = originalColor;
-            }
+            Console.WriteLine(logEntry); // Agent도 콘솔 출력 (디버깅용)
 
-            // 파일에 기록
             lock (_fileLock)
             {
                 try
@@ -200,112 +272,293 @@ namespace MGSPBrokerService.Services
                 }
                 catch { /* 파일 쓰기 실패는 일단 무시 */ }
             }
-            
-            // 메모리 내 로그 큐에 추가
-            _recentLogs.Enqueue(logEntry);
-            while (_recentLogs.Count > MaxInMemoryLogs && _recentLogs.TryDequeue(out _)) { }
         }
 
-        public void Debug(string message) => WriteLog(LogLevel.Debug, message);
-        public void Info(string message) => WriteLog(LogLevel.Info, message);
-        public void Warn(string message) => WriteLog(LogLevel.Warning, message);
-        public void Error(string message, Exception ex = null) => WriteLog(LogLevel.Error, message, ex);
-        public void Fatal(string message, Exception ex = null) => WriteLog(LogLevel.Fatal, message, ex);
-
-        public List<string> GetRecentLogs(int count)
-        {
-            return _recentLogs.TakeLast(count).ToList(); // ConcurrentQueue는 TakeLast 직접 지원 안함. ToArray 후 Linq 사용.
-                                                         // 또는 _recentLogs.ToList().TakeLast() 도 가능.
-                                                         // 더 효율적인 방법은 Dequeue/Enqueue 시 별도 List 관리 또는 Circular Buffer.
-                                                         // 여기서는 단순하게.
-            return _recentLogs.ToArray().Reverse().Take(count).Reverse().ToList(); // 최신 순으로 정렬된 것처럼
-        }
+        public void LogDebug(string message) => WriteLog(LogLevel.Debug, message);
+        public void LogInfo(string message) => WriteLog(LogLevel.Info, message);
+        public void LogWarning(string message) => WriteLog(LogLevel.Warning, message);
+        public void LogError(string message, Exception ex = null) => WriteLog(LogLevel.Error, message, ex);
+        public void LogFatal(string message, Exception ex = null) => WriteLog(LogLevel.Fatal, message, ex);
     }
 }
-3. ClientManagement/ClientState.cs (연결된 클라이언트 정보 관리)
+5. Services/MonitorControlService.cs (이전과 동일)
 
 C#
 
-// MGSPBrokerService/ClientManagement/ClientState.cs
+// MonitorAgent/Services/MonitorControlService.cs
 using System;
-using System.Net.Sockets;
+using System.Runtime.InteropServices;
+
+namespace MonitorAgent.Services
+{
+    public interface IMonitorControlService
+    {
+        bool TurnMonitorOn();
+        bool TurnMonitorOff();
+        string GetCurrentMonitorStateApproximation(); // 현재 상태 추정 (마지막 명령 기반)
+    }
+
+    public class MonitorControlService : IMonitorControlService
+    {
+        private readonly ILoggingService _logger;
+        private const int WM_SYSCOMMAND = 0x0112;
+        private const int SC_MONITORPOWER = 0xF170;
+        private const int MONITOR_ON = -1;
+        private const int MONITOR_OFF = 2;
+        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private string _lastKnownMonitorState = "Unknown"; // 마지막으로 실행한 명령 기반 상태
+
+        public MonitorControlService(ILoggingService logger)
+        {
+            _logger = logger;
+        }
+
+        public bool TurnMonitorOn()
+        {
+            _logger.LogInfo("Attempting to turn monitor ON.");
+            try
+            {
+                SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER, (IntPtr)MONITOR_ON);
+                _logger.LogInfo("Monitor ON command sent successfully.");
+                _lastKnownMonitorState = "On";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Failed to send Monitor ON command.", ex);
+                return false;
+            }
+        }
+
+        public bool TurnMonitorOff()
+        {
+            _logger.LogInfo("Attempting to turn monitor OFF.");
+            try
+            {
+                SendMessage(HWND_BROADCAST, WM_SYSCOMMAND, (IntPtr)SC_MONITORPOWER, (IntPtr)MONITOR_OFF);
+                _logger.LogInfo("Monitor OFF command sent successfully.");
+                _lastKnownMonitorState = "Off";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Failed to send Monitor OFF command.", ex);
+                return false;
+            }
+        }
+        
+        public string GetCurrentMonitorStateApproximation()
+        {
+            // 실제 API로 상태를 읽는 것은 매우 복잡. 마지막 명령으로 추정.
+            return _lastKnownMonitorState;
+        }
+    }
+}
+6. Models/MessageContract.cs (Broker와 동일한 파일 사용 또는 복사)
+
+이 파일은 MGSPBrokerService 프로젝트의 Models/MessageContract.cs 와 완전히 동일한 내용이어야 합니다. 메시지 규약이 일치해야 통신이 가능합니다. 이전 답변에서 제공된 MGSPBrokerService의 MessageContract.cs 코드를 그대로 가져와서 이 프로젝트에 추가합니다.
+
+7. Network/BrokerTcpClient.cs (중계 프로그램 연결 클라이언트)
+
+C#
+
+// MonitorAgent/Network/BrokerTcpClient.cs
+using System;
 using System.IO;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using MGSPBrokerService.Models; // BrokerMessage
-using MGSPBrokerService.Services; // ILoggingService
+using MonitorAgent.Config; // BrokerAddressProvider
+using MonitorAgent.Models; // BrokerMessage
+using MonitorAgent.Services; // ILoggingService
 using Newtonsoft.Json;
 
-namespace MGSPBrokerService.ClientManagement
+namespace MonitorAgent.Network
 {
-    public enum ClientType { Unknown, UiClient, AgentClient }
-
-    public class ClientState : IDisposable
+    public class BrokerTcpClient : IDisposable
     {
-        public TcpClient TcpClient { get; }
-        public string ClientId { get; private set; } // UI의 경우 ConnectionId, Agent의 경우 AgentIdProvidedByApp
-        public ClientType Type { get; private set; } = ClientType.Unknown;
-        public NetworkStream Stream { get; }
-        private readonly StreamReader _reader;
-        private readonly StreamWriter _writer;
+        private readonly BrokerAddressProvider _addressProvider;
+        private readonly string _agentId;
         private readonly ILoggingService _logger;
-        private readonly Action<ClientState, BrokerMessage> _onMessageReceived; // 메시지 수신 시 호출될 콜백
-        private readonly Action<ClientState> _onDisconnected; // 연결 종료 시 호출될 콜백
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+        private StreamReader _streamReader;
+        private StreamWriter _streamWriter;
         private CancellationTokenSource _cts;
         private Task _receiveLoopTask;
-        private readonly object _writeLock = new object();
+        private readonly TimeSpan _retryConnectDelay = TimeSpan.FromSeconds(10);
+        private readonly TimeSpan _statusReportInterval = TimeSpan.FromSeconds(30); // 상태 보고 주기
+        private Timer _statusReportTimer;
+        private readonly Func<string> _getCurrentMonitorStatusFunc; // 현재 모니터 상태를 가져오는 함수 참조
+        private readonly object _sendLock = new object();
+        private bool _isDisposed = false;
 
-        public DateTime ConnectedTime { get; }
-        public DateTime LastActivityTime { get; private set; }
+        public bool IsConnected => _tcpClient != null && _tcpClient.Connected && _networkStream != null;
 
-        public ClientState(TcpClient tcpClient, ILoggingService logger, Action<ClientState, BrokerMessage> onMessageReceived, Action<ClientState> onDisconnected)
+        public event Action<BrokerMessage> OnBrokerMessageReceived; // Broker로부터 받은 메시지 처리용
+        public event Action OnDisconnectedFromBroker;
+
+        public BrokerTcpClient(BrokerAddressProvider addressProvider, string agentId, ILoggingService logger, Func<string> getCurrentMonitorStatusFunc)
         {
-            TcpClient = tcpClient;
+            _addressProvider = addressProvider;
+            _agentId = agentId;
             _logger = logger;
-            _onMessageReceived = onMessageReceived;
-            _onDisconnected = onDisconnected;
-            
-            Stream = tcpClient.GetStream();
-            _reader = new StreamReader(Stream, Encoding.UTF8);
-            _writer = new StreamWriter(Stream, Encoding.UTF8) { AutoFlush = true };
-            
-            ConnectedTime = DateTime.UtcNow;
-            LastActivityTime = DateTime.UtcNow;
-
-            // 임시 ID (AgentHello 또는 UI 등록 전까지 사용)
-            ClientId = $"Temp_{Guid.NewGuid().ToString("N").Substring(0, 8)}"; 
+            _getCurrentMonitorStatusFunc = getCurrentMonitorStatusFunc;
         }
 
-        public void StartReceiving(CancellationTokenSource parentCts)
+        public async Task StartAsync(CancellationTokenSource parentCts)
         {
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(parentCts.Token);
-            _receiveLoopTask = Task.Run(ReceiveLoopAsync, _cts.Token);
-        }
-
-        // 이 메서드는 AgentHello 또는 UI 등록 후 호출되어 실제 ID와 타입 설정
-        public void IdentifyClient(string id, ClientType type)
-        {
-            ClientId = id;
-            Type = type;
-            _logger.Info($"Client identified: ID='{ClientId}', Type='{Type}', RemoteEndPoint='{TcpClient.Client.RemoteEndPoint}'");
-        }
-
-        private async Task ReceiveLoopAsync()
-        {
-            _logger.Info($"Receive loop started for client: {ClientId} ({TcpClient.Client.RemoteEndPoint})");
-            try
+            if (!_addressProvider.IsValid)
             {
-                while (!_cts.Token.IsCancellationRequested && TcpClient.Connected)
+                _logger.LogError("Broker address is invalid. Cannot start BrokerTcpClient.");
+                return;
+            }
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(parentCts.Token);
+            
+            // 연결 및 메시지 수신 루프를 백그라운드에서 실행
+            // ConnectAndReceiveLoopAsync는 내부적으로 연결이 끊기면 재연결을 시도함
+            _ = Task.Run(ConnectAndReceiveLoopAsync, _cts.Token);
+        }
+        
+        private async Task ConnectAndReceiveLoopAsync()
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                if (!IsConnected) // 연결되어 있지 않다면 연결 시도
                 {
-                    string messageJson = await _reader.ReadLineAsync(); // 라인 단위로 JSON 메시지 수신
-                    if (messageJson == null) // 클라이언트 연결 종료
+                    try
                     {
-                        _logger.Info($"Client {ClientId} disconnected (stream closed).");
+                        _logger.LogInfo($"Attempting to connect to Broker: {_addressProvider.BrokerIpAddress}:{_addressProvider.BrokerPort}");
+                        _tcpClient = new TcpClient();
+                        var connectTask = _tcpClient.ConnectAsync(_addressProvider.BrokerIpAddress, _addressProvider.BrokerPort);
+                        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), _cts.Token);
+
+                        if (await Task.WhenAny(connectTask, timeoutTask).ConfigureAwait(false) == connectTask && connectTask.Status == TaskStatus.RanToCompletion && _tcpClient.Connected)
+                        {
+                            _networkStream = _tcpClient.GetStream();
+                            _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
+                            _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
+                            _logger.LogInfo("Successfully connected to Broker.");
+
+                            // 연결 성공 시 AgentHello 전송
+                            await SendAgentHelloAsync();
+
+                            // 상태 보고 타이머 시작
+                            _statusReportTimer?.Dispose();
+                            _statusReportTimer = new Timer(ReportStatusTimerCallback, null, TimeSpan.Zero, _statusReportInterval);
+
+                            // 메시지 수신 시작
+                            await ReceiveMessagesAsync(); // 이 메서드는 연결이 끊기면 종료됨
+                        }
+                        else
+                        {
+                            _tcpClient.Close(); // 연결 실패 또는 타임아웃 시 정리
+                            if (_cts.IsCancellationRequested) break;
+                            _logger.LogWarning($"Failed to connect to Broker. Retrying in {_retryConnectDelay.TotalSeconds}s...");
+                        }
+                    }
+                    catch (OperationCanceledException) when (_cts.IsCancellationRequested) {
+                        _logger.LogInfo("Connection/Receive loop cancelled.");
                         break;
                     }
-                    LastActivityTime = DateTime.UtcNow;
+                    catch (Exception ex)
+                    {
+                        _logger.LogError($"Error during connection attempt to Broker: {ex.Message}. Retrying in {_retryConnectDelay.TotalSeconds}s...");
+                         _tcpClient?.Close(); // 연결 실패 시 정리
+                    }
+                }
+                
+                // 재연결 시도 전 대기 (연결이 끊겼거나, 위에서 연결 실패한 경우)
+                if (!_cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(_retryConnectDelay, _cts.Token);
+                    }
+                    catch (OperationCanceledException) { break; } // Delay 중 취소
+                }
+            }
+            _logger.LogInfo("BrokerTcpClient ConnectAndReceiveLoopAsync ended.");
+            CleanupConnectionResources(); // 루프 종료 시 항상 정리
+            OnDisconnectedFromBroker?.Invoke();
+        }
 
+
+        private async Task SendAgentHelloAsync()
+        {
+            var helloPayload = new AgentHelloPayload
+            {
+                AgentIdProvidedByApp = _agentId,
+                MachineName = Environment.MachineName,
+                IpAddresses = GetLocalIpAddresses(),
+                AgentVersion = Assembly.GetExecutingAssembly().GetName().Version.ToString()
+            };
+            var helloMessage = new BrokerMessage
+            {
+                Type = MessageType.AgentHello,
+                SourceId = _agentId,
+                Payload = JsonConvert.SerializeObject(helloPayload)
+            };
+            await SendMessageAsync(helloMessage);
+            _logger.LogInfo("AgentHello message sent to Broker.");
+        }
+
+        private async void ReportStatusTimerCallback(object state)
+        {
+            await ReportCurrentStatusAsync();
+        }
+
+        public async Task ReportCurrentStatusAsync()
+        {
+            if (!IsConnected) return;
+            string monitorStatus = _getCurrentMonitorStatusFunc?.Invoke() ?? "Unknown";
+            var statusPayload = new AgentStatusUpdatePayload { CurrentMonitorStatus = monitorStatus };
+            var statusMessage = new BrokerMessage
+            {
+                Type = MessageType.AgentToBroker_StatusUpdate,
+                SourceId = _agentId,
+                Payload = JsonConvert.SerializeObject(statusPayload)
+            };
+            await SendMessageAsync(statusMessage);
+            // _logger.LogDebug($"Sent status update to Broker: Monitor={monitorStatus}"); // 너무 잦을 수 있음
+        }
+
+        public async Task ReportCommandResultAsync(string correlationId, bool success, string message, string currentMonitorStatus)
+        {
+             if (!IsConnected) {
+                _logger.LogWarning("Cannot report command result, not connected to Broker.");
+                return;
+             }
+            var resultPayload = new AgentCommandResultPayload { Success = success, Message = message, CurrentMonitorStatus = currentMonitorStatus };
+            var resultMessage = new BrokerMessage
+            {
+                Type = MessageType.AgentToBroker_CommandResult,
+                SourceId = _agentId,
+                CorrelationId = correlationId,
+                Payload = JsonConvert.SerializeObject(resultPayload)
+            };
+            await SendMessageAsync(resultMessage);
+            _logger.LogInfo($"Command result (CorrId: {correlationId}, Success: {success}) sent to Broker.");
+        }
+
+
+        private async Task ReceiveMessagesAsync()
+        {
+            _logger.LogInfo($"Starting to receive messages from Broker for {_agentId}");
+            try
+            {
+                while (!_cts.Token.IsCancellationRequested && IsConnected)
+                {
+                    string messageJson = await _streamReader.ReadLineAsync();
+                    if (messageJson == null) {
+                        _logger.LogInfo($"Broker disconnected or stream closed for {_agentId}.");
+                        break; 
+                    }
                     if (string.IsNullOrWhiteSpace(messageJson)) continue;
 
                     try
@@ -313,528 +566,559 @@ namespace MGSPBrokerService.ClientManagement
                         var message = JsonConvert.DeserializeObject<BrokerMessage>(messageJson);
                         if (message != null)
                         {
-                            _onMessageReceived?.Invoke(this, message);
+                            OnBrokerMessageReceived?.Invoke(message);
                         }
                         else
                         {
-                            _logger.Warn($"Failed to deserialize message from {ClientId}: {messageJson}");
+                            _logger.LogWarning($"Failed to deserialize message from Broker: {messageJson}");
                         }
                     }
                     catch (JsonException jsonEx)
                     {
-                        _logger.Error($"JSON deserialization error from {ClientId}: {jsonEx.Message}. Received: {messageJson}", jsonEx);
+                        _logger.LogError($"JSON deserialization error from Broker: {jsonEx.Message}. Received: {messageJson}", jsonEx);
                     }
                 }
             }
             catch (IOException ioEx)
             {
-                _logger.Info($"IOException in receive loop for {ClientId} (likely connection forcibly closed): {ioEx.Message}");
+                _logger.LogInfo($"IOException in receive loop from Broker for {_agentId} (likely connection forcibly closed): {ioEx.Message}");
             }
             catch (ObjectDisposedException)
             {
-                _logger.Info($"Receive loop for {ClientId} terminated due to object disposal (likely during shutdown).");
+                _logger.LogInfo($"Receive loop for {_agentId} from Broker terminated due to object disposal.");
             }
             catch (OperationCanceledException)
             {
-                 _logger.Info($"Receive loop for {ClientId} cancelled.");
+                 _logger.LogInfo($"Receive loop for {_agentId} from Broker cancelled.");
             }
             catch (Exception ex)
             {
-                _logger.Error($"Unexpected error in receive loop for {ClientId}: {ex.Message}", ex);
+                _logger.LogError($"Unexpected error in receive loop from Broker for {_agentId}: {ex.Message}", ex);
             }
             finally
             {
-                _logger.Info($"Receive loop ended for client: {ClientId}");
-                _onDisconnected?.Invoke(this); // 연결 종료 알림
-                Dispose(); // 루프 종료 시 리소스 정리
-            }
-        }
-
-        public async Task SendMessageAsync(BrokerMessage message)
-        {
-            if (!TcpClient.Connected || _cts.IsCancellationRequested)
-            {
-                _logger.Warn($"Cannot send message to {ClientId}. Client not connected or sending cancelled.");
-                return;
-            }
-            try
-            {
-                string messageJson = JsonConvert.SerializeObject(message);
-                // 동시 쓰기 방지를 위해 lock 사용 (StreamWriter는 스레드 안전하지 않을 수 있음)
-                lock(_writeLock) 
-                {
-                    if (!_cts.IsCancellationRequested && TcpClient.Connected)
-                    {
-                        _writer.WriteLine(messageJson);
-                        // _writer.Flush(); // AutoFlush = true 이므로 생략 가능
-                    }
-                }
-                LastActivityTime = DateTime.UtcNow;
-                // _logger.Debug($"Message sent to {ClientId}: {message.Type}"); // 너무 잦은 로그일 수 있음
-            }
-            catch (ObjectDisposedException)
-            {
-                _logger.Warn($"Attempted to send message to {ClientId} on a disposed stream/writer.");
-            }
-            catch (IOException ioEx)
-            {
-                _logger.Error($"IOException sending message to {ClientId} (connection may be lost): {ioEx.Message}", ioEx);
-                _onDisconnected?.Invoke(this); // 연결 문제 시 알림
-                Dispose();
-            }
-            catch (Exception ex)
-            {
-                _logger.Error($"Error sending message to {ClientId}: {ex.Message}", ex);
-            }
-        }
-
-        public void Dispose()
-        {
-            if (_cts != null && !_cts.IsCancellationRequested)
-            {
-                _cts.Cancel(); // 수신 루프 종료 요청
-            }
-            
-            _reader?.Dispose();
-            _writer?.Dispose(); // StreamWriter가 Stream을 닫을 수 있으므로 먼저 Dispose
-            Stream?.Dispose();  // NetworkStream Dispose
-            TcpClient?.Close(); // TcpClient Close (Dispose 호출)
-            _cts?.Dispose();
-            // _logger.Info($"ClientState for {ClientId} disposed."); // 너무 잦을 수 있음
-        }
-    }
-}
-4. BrokerCore.cs (핵심 로직 - 서버 운영 및 메시지 처리)
-
-C#
-
-// MGSPBrokerService/BrokerCore.cs
-using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
-using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
-using MGSPBrokerService.ClientManagement;
-using MGSPBrokerService.Models;
-using MGSPBrokerService.Services;
-using Newtonsoft.Json;
-
-namespace MGSPBrokerService
-{
-    public class BrokerCore : IDisposable
-    {
-        private readonly ILoggingService _logger;
-        private readonly int _uiListenPort;
-        private readonly int _agentListenPort;
-
-        private TcpListener _uiListener;
-        private TcpListener _agentListener;
-        private CancellationTokenSource _serverCts;
-
-        // Key: ConnectionId (ClientState.ClientId와 다름, UI는 임시 ID 후 등록하면 그 ID 사용)
-        private readonly ConcurrentDictionary<string, ClientState> _uiClients = new ConcurrentDictionary<string, ClientState>();
-        // Key: AgentIdProvidedByApp
-        private readonly ConcurrentDictionary<string, ClientState> _agentClients = new ConcurrentDictionary<string, ClientState>();
-        
-        public static DateTime ServerStartTime { get; private set; }
-        public static string BrokerVersion { get; set; } = "1.0.0-Broker";
-
-
-        public BrokerCore(ILoggingService logger, int uiPort, int agentPort)
-        {
-            _logger = logger;
-            _uiListenPort = uiPort;
-            _agentListenPort = agentPort;
-            ServerStartTime = DateTime.UtcNow;
-            // 버전 정보는 Program.cs 등에서 설정 가능
-        }
-
-        public void Start()
-        {
-            _serverCts = new CancellationTokenSource();
-            _logger.Info($"MGSP Broker Service v{BrokerVersion} starting...");
-
-            try
-            {
-                // UI 리스너 시작
-                _uiListener = new TcpListener(IPAddress.Any, _uiListenPort);
-                _uiListener.Start();
-                _logger.Info($"UI Listener started on port {_uiListenPort}. Waiting for UI connections...");
-                Task.Run(() => AcceptLoopAsync(_uiListener, ClientType.UiClient, _serverCts.Token), _serverCts.Token);
-
-                // Agent 리스너 시작
-                _agentListener = new TcpListener(IPAddress.Any, _agentListenPort);
-                _agentListener.Start();
-                _logger.Info($"Agent Listener started on port {_agentListenPort}. Waiting for Agent connections...");
-                Task.Run(() => AcceptLoopAsync(_agentListener, ClientType.AgentClient, _serverCts.Token), _serverCts.Token);
-
-                _logger.Info("Broker Core Service running.");
-            }
-            catch (SocketException sockEx)
-            {
-                 _logger.Fatal($"Failed to start TCP listener(s). Port in use or permission issue? UI Port: {_uiListenPort}, Agent Port: {_agentListenPort}. Error: {sockEx.Message}", sockEx);
-                 throw; // 상위에서 처리하도록 예외 다시 던짐
-            }
-            catch (Exception ex)
-            {
-                _logger.Fatal($"Critical error during BrokerCore Start: {ex.Message}", ex);
-                throw;
-            }
-        }
-
-        private async Task AcceptLoopAsync(TcpListener listener, ClientType clientTypeForNewConnections, CancellationToken token)
-        {
-            _logger.Info($"Accept loop started for {clientTypeForNewConnections} on {((IPEndPoint)listener.LocalEndpoint).Port}");
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    TcpClient connectedTcpClient = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    _logger.Info($"New {(clientTypeForNewConnections == ClientType.UiClient ? "UI" : "Agent (pending hello)")} connection from {connectedTcpClient.Client.RemoteEndPoint}");
-                    
-                    var clientState = new ClientState(connectedTcpClient, _logger, HandleClientMessage, HandleClientDisconnect);
-                    // 여기서 바로 딕셔너리에 추가하지 않고, 첫 메시지(AgentHello 등)를 통해 ID 확정 후 추가
-                    clientState.StartReceiving(_serverCts); // 메시지 수신 루프 시작
-                }
-                catch (ObjectDisposedException) when (token.IsCancellationRequested)
-                {
-                    _logger.Info($"Listener for {clientTypeForNewConnections} stopped as requested.");
-                    break;
-                }
-                catch (SocketException sockEx) when (token.IsCancellationRequested || !listener.Server.IsBound)
-                {
-                     _logger.Info($"Listener socket for {clientTypeForNewConnections} closed during shutdown: {sockEx.Message}");
-                     break;
-                }
-                catch (Exception ex)
-                {
-                    if (!token.IsCancellationRequested)
-                    {
-                        _logger.Error($"Error in {clientTypeForNewConnections} accept loop: {ex.Message}", ex);
-                        await Task.Delay(1000, token); // 오류 발생 시 잠시 대기
-                    }
-                }
-            }
-            _logger.Info($"Accept loop for {clientTypeForNewConnections} stopped.");
-        }
-
-        private void HandleClientMessage(ClientState sender, BrokerMessage message)
-        {
-            _logger.Debug($"Message received from {sender.ClientId} ({sender.Type}): {message.Type}");
-            switch (message.Type)
-            {
-                // Agent -> Broker 메시지 처리
-                case MessageType.AgentHello:
-                    HandleAgentHello(sender, message);
-                    break;
-                case MessageType.AgentToBroker_CommandResult:
-                    ForwardAgentResultToUi(sender, message);
-                    break;
-                case MessageType.AgentToBroker_StatusUpdate:
-                    BroadcastAgentStatusToUis(sender, message);
-                    break;
-                
-                // UI -> Broker 메시지 처리
-                case MessageType.UiRequest_ControlAgent:
-                    RelayControlCommandToAgent(sender, message);
-                    break;
-                case MessageType.UiRequest_GetBrokerStatus:
-                    SendBrokerStatusToUi(sender);
-                    break;
-
-                // 공통 메시지 (Ping/Pong 등)
-                case MessageType.Ping:
-                    HandlePing(sender, message);
-                    break;
-                // 다른 메시지 타입 처리...
-                default:
-                    _logger.Warn($"Unhandled message type '{message.Type}' from {sender.ClientId}");
-                    break;
+                _logger.LogInfo($"Receive loop from Broker for {_agentId} ended.");
+                // 연결이 여기서 끊겼음을 인지하고, ConnectAndReceiveLoopAsync가 재연결 시도하도록 함
+                // CleanupConnectionResources(); // 여기서 호출하면 ConnectAndReceiveLoopAsync의 재연결 로직과 충돌 가능
+                // OnDisconnectedFromBroker?.Invoke(); // ConnectAndReceiveLoopAsync에서 처리
             }
         }
         
-        private void HandleAgentHello(ClientState sender, BrokerMessage helloMessage)
+        public Task SendMessageAsync(BrokerMessage message)
         {
-            try
+            if (!IsConnected || _streamWriter == null)
             {
-                var helloPayload = JsonConvert.DeserializeObject<AgentHelloPayload>(helloMessage.Payload);
-                if (helloPayload == null || string.IsNullOrWhiteSpace(helloPayload.AgentIdProvidedByApp))
+                _logger.LogWarning($"Cannot send message to Broker. Not connected or writer is null. MessageType: {message.Type}");
+                return Task.FromResult(false); // 또는 Task.CompletedTask in .NET 4.6+
+            }
+            if (_isDisposed) return Task.FromResult(false);
+
+            // lock을 사용하여 _streamWriter에 대한 동시 접근을 막음
+            // WriteLineAsync는 스레드 안전하지 않을 수 있음
+            Task task = Task.FromResult(true);
+            lock(_sendLock)
+            {
+                if (IsConnected && _streamWriter != null && !_isDisposed)
                 {
-                    _logger.Warn($"Invalid AgentHello payload from {sender.ClientId}. Closing connection.");
-                    sender.Dispose(); // 연결 종료
-                    return;
-                }
-
-                string agentId = helloPayload.AgentIdProvidedByApp;
-                sender.IdentifyClient(agentId, ClientType.AgentClient); // ClientState에 실제 ID와 타입 설정
-
-                // 기존 연결이 있다면 정리 (예: 이전 세션이 비정상 종료된 경우)
-                if (_agentClients.TryGetValue(agentId, out var existingClientState) && existingClientState != sender)
-                {
-                    _logger.Warn($"Agent {agentId} reconnected with a new session. Closing old session {existingClientState.ClientId}.");
-                    existingClientState.Dispose(); 
-                    _agentClients.TryRemove(agentId, out _); // 이전 것 제거 시도
-                }
-                
-                _agentClients.AddOrUpdate(agentId, sender, (key, oldClient) => {
-                     if(oldClient != sender) oldClient.Dispose(); // 만약 같은 ID로 다른 세션이 있었다면 닫음
-                     return sender; 
-                });
-
-                _logger.Info($"Agent {agentId} successfully identified and added/updated in list. Machine: {helloPayload.MachineName}");
-
-                // Agent에게 Hello에 대한 Ack 전송
-                var ackMessage = new BrokerMessage { Type = MessageType.BrokerAck_AgentHello, TargetId = agentId, CorrelationId = helloMessage.CorrelationId };
-                sender.SendMessageAsync(ackMessage).ConfigureAwait(false);
-
-                // 모든 UI 클라이언트에게 새로운 Agent 연결(또는 상태 업데이트) 알림
-                var statusPayload = new AgentStatusUpdatePayload { CurrentMonitorStatus = "Unknown" }; // 초기 상태
-                BroadcastAgentStatusToUis(sender, new BrokerMessage { Type = MessageType.AgentToBroker_StatusUpdate, SourceId = agentId, Payload = JsonConvert.SerializeObject(statusPayload) });
-
-            }
-            catch (JsonException jsonEx)
-            {
-                _logger.Error($"Failed to parse AgentHello payload from {sender.ClientId}: {jsonEx.Message}", jsonEx);
-                sender.Dispose();
-            }
-            catch (Exception ex)
-            {
-                 _logger.Error($"Error handling AgentHello from {sender.ClientId}: {ex.Message}", ex);
-                 sender.Dispose();
-            }
-        }
-
-
-        private void ForwardAgentResultToUi(ClientState agentClient, BrokerMessage agentResultMessage)
-        {
-            // 이 결과는 특정 UI의 요청에 대한 응답일 수 있으므로, CorrelationId 등을 활용
-            // 여기서는 간단히 모든 UI 또는 특정 UI에 브로드캐스트
-            // agentResultMessage.SourceId 는 AgentId임.
-            // agentResultMessage.TargetId 는 Broker가 설정한 원래 UI의 client ID (ClientState.ClientId)가 될 수 있음
-            // 또는 CorrelationId로 매칭
-            
-            // UI가 보낸 명령의 CorrelationId를 Agent가 결과에 포함시켜 보냈다고 가정.
-            // 그 CorrelationId를 사용하여 특정 UI에게만 전달하거나, 모든 UI에 브로드캐스트.
-            // 여기서는 모든 UI에 브로드캐스트 하는 예시 (메시지 타입을 BrokerToUi_ForwardAgentResult 로 변경)
-            var uiMessage = new BrokerMessage
-            {
-                Type = MessageType.BrokerToUi_ForwardAgentResult,
-                SourceId = agentResultMessage.SourceId, // 결과를 보낸 Agent
-                CorrelationId = agentResultMessage.CorrelationId,
-                Payload = agentResultMessage.Payload // Agent가 보낸 결과 페이로드 그대로 전달
-            };
-
-            foreach (var uiClient in _uiClients.Values)
-            {
-                uiClient.SendMessageAsync(uiMessage).ConfigureAwait(false);
-            }
-             _logger.Info($"Forwarded command result from Agent {agentClient.ClientId} to UIs. CorrId: {uiMessage.CorrelationId}");
-        }
-
-        private void BroadcastAgentStatusToUis(ClientState agentClient, BrokerMessage agentStatusMessage)
-        {
-            // 모든 UI 클라이언트에게 Agent의 현재 상태 브로드캐스트
-            var uiMessage = new BrokerMessage
-            {
-                Type = MessageType.BrokerToUi_BroadcastAgentStatus,
-                SourceId = agentClient.ClientId, // 상태를 보고한 Agent
-                Payload = agentStatusMessage.Payload // AgentStatusUpdatePayload JSON
-            };
-            foreach (var uiClientState in _uiClients.Values)
-            {
-                uiClientState.SendMessageAsync(uiMessage).ConfigureAwait(false);
-            }
-            _logger.Debug($"Broadcasted status from Agent {agentClient.ClientId} to {_uiClients.Count} UIs.");
-        }
-
-        private void RelayControlCommandToAgent(ClientState uiClient, BrokerMessage uiCommandMessage)
-        {
-            try
-            {
-                var controlPayload = JsonConvert.DeserializeObject<UiControlAgentPayload>(uiCommandMessage.Payload);
-                if (controlPayload == null || string.IsNullOrWhiteSpace(controlPayload.TargetAgentIdProvidedByApp))
-                {
-                    _logger.Warn($"Invalid UiRequest_ControlAgent payload from UI {uiClient.ClientId}.");
-                    // UI에게 오류 응답 보낼 수 있음
-                    return;
-                }
-
-                string targetAgentAppId = controlPayload.TargetAgentIdProvidedByApp;
-                BrokerMessage agentCommand = null;
-
-                if (controlPayload.ControlType == "Direct")
-                {
-                    if (_agentClients.TryGetValue(targetAgentAppId, out var directAgentClientState))
+                    try
                     {
-                        var execPayload = new BrokerExecuteControlPayload
-                        {
-                            ActionToPerform = controlPayload.ControlAction,
-                            Parameters = controlPayload.OriginalParameters,
-                            IsGatewayRelay = false
-                        };
-                        agentCommand = new BrokerMessage
-                        {
-                            Type = MessageType.BrokerToAgent_ExecuteControl,
-                            TargetId = targetAgentAppId, // 최종 타겟 Agent
-                            SourceId = _logger.GetType().Name, // Broker가 보냄
-                            CorrelationId = uiCommandMessage.CorrelationId,
-                            Payload = JsonConvert.SerializeObject(execPayload)
-                        };
-                        directAgentClientState.SendMessageAsync(agentCommand).ConfigureAwait(false);
-                        _logger.Info($"Relayed command '{controlPayload.ControlAction}' directly to Agent {targetAgentAppId} for UI {uiClient.ClientId}. CorrId: {uiCommandMessage.CorrelationId}");
+                        string messageJson = JsonConvert.SerializeObject(message);
+                        // WriteLineAsync를 호출하고 반환된 Task를 즉시 await하지 않고 반환하여 호출자가 await하도록 함
+                        // 하지만 이 메서드 시그니처가 Task이므로, 실제 비동기 작업을 수행해야 함.
+                        // 일반적인 패턴은 StreamWriter.WriteLineAsync()를 사용하거나,
+                        // Write를 별도 스레드/태스크에서 처리하는 것임.
+                        // 여기서는 단순화를 위해 동기적으로 쓰고 Task.FromResult로 감쌈 (고성능에는 부적합)
+                        // 또는 진짜 비동기로 만들려면:
+                        // task = _streamWriter.WriteLineAsync(messageJson);
+                        
+                        _streamWriter.WriteLine(messageJson); // 동기적 쓰기
+                        // _logger.LogDebug($"Message sent to Broker: {message.Type}"); // 너무 잦은 로그
+
                     }
-                    else
+                    catch (ObjectDisposedException)
                     {
-                        _logger.Warn($"Target Agent {targetAgentAppId} for direct control not found or not connected. UI: {uiClient.ClientId}");
-                        // UI에게 실패 알림
-                        var failMsg = new BrokerMessage { Type = MessageType.BrokerToUi_ForwardAgentResult, CorrelationId = uiCommandMessage.CorrelationId, SourceId=targetAgentAppId, Payload = JsonConvert.SerializeObject(new AgentCommandResultPayload { Success = false, Message = $"Agent {targetAgentAppId} not connected."}) };
-                        uiClient.SendMessageAsync(failMsg).ConfigureAwait(false);
+                        _logger.LogWarning($"Attempted to send message to Broker on a disposed stream/writer (Type: {message.Type}).");
+                        CleanupConnectionResources();
+                        OnDisconnectedFromBroker?.Invoke();
+                        return Task.FromResult(false);
                     }
-                }
-                else if (controlPayload.ControlType == "Gatewayed")
-                {
-                    if (string.IsNullOrWhiteSpace(controlPayload.GatewayAgentIpAddress) || !controlPayload.GatewayAgentPort.HasValue)
+                    catch (IOException ioEx)
                     {
-                        _logger.Error($"Gateway IP/Port not specified for Gatewayed control to {targetAgentAppId}. UI: {uiClient.ClientId}");
-                        return;
+                        _logger.LogError($"IOException sending message to Broker (Type: {message.Type}, connection may be lost): {ioEx.Message}", ioEx);
+                        CleanupConnectionResources();
+                        OnDisconnectedFromBroker?.Invoke();
+                        return Task.FromResult(false);
                     }
-                    
-                    // Gateway Agent ID 찾기 (DB 설정에 따라 GatewayAgentIpAddress로 찾아야 할 수도 있으나, 여기서는 Gateway도 AgentIdProvidedByApp 으로 식별한다고 가정)
-                    // UI가 Gateway의 AgentIdProvidedByApp도 함께 보내줘야 함. 여기서는 일단 IP로 찾지는 않음.
-                    // 임시로, Gateway Agent도 _agentClients에 등록되어 있다고 가정하고, UI가 Gateway의 AgentIdProvidedByApp를 알아서 보내준다고 가정.
-                    // 실제로는 UI가 DB에서 GatewayAgent의 AgentIdProvidedByApp를 조회해서 UiControlAgentPayload에 포함시켜야 함.
-                    // 여기서는 controlPayload.GatewayAgentIpAddress가 사실상 GatewayAgent의 AgentIdProvidedByApp라고 가정. (단순화)
-
-                    string gatewayAgentAppId = controlPayload.GatewayAgentIpAddress; // 이 부분이 UI에서 Gateway의 AgentIdProvidedByApp를 보내줘야 함.
-
-                    if (_agentClients.TryGetValue(gatewayAgentAppId, out var gatewayAgentClientState))
+                    catch (Exception ex)
                     {
-                        var execPayloadForGateway = new BrokerExecuteControlPayload
-                        {
-                            ActionToPerform = controlPayload.ControlAction,
-                            Parameters = controlPayload.OriginalParameters,
-                            IsGatewayRelay = true,
-                            FinalTargetAgentIp = controlPayload.PrimaryIpAddress, // 최종 Agent의 IP
-                            FinalTargetAgentPort = controlPayload.PrimaryPort       // 최종 Agent의 포트
-                        };
-                        agentCommand = new BrokerMessage
-                        {
-                            Type = MessageType.BrokerToAgent_ExecuteControl,
-                            TargetId = gatewayAgentAppId, // Gateway Agent에게 보냄
-                            SourceId = _logger.GetType().Name, // Broker가 보냄
-                            CorrelationId = uiCommandMessage.CorrelationId,
-                            Payload = JsonConvert.SerializeObject(execPayloadForGateway)
-                        };
-                        gatewayAgentClientState.SendMessageAsync(agentCommand).ConfigureAwait(false);
-                         _logger.Info($"Relayed command '{controlPayload.ControlAction}' to Gateway Agent {gatewayAgentAppId} (for final target {targetAgentAppId}) for UI {uiClient.ClientId}. CorrId: {uiCommandMessage.CorrelationId}");
-                    }
-                    else
-                    {
-                        _logger.Warn($"Gateway Agent {gatewayAgentAppId} for relay not found or not connected. UI: {uiClient.ClientId}");
-                        // UI에게 실패 알림
-                         var failMsg = new BrokerMessage { Type = MessageType.BrokerToUi_ForwardAgentResult, CorrelationId = uiCommandMessage.CorrelationId, SourceId=targetAgentAppId, Payload = JsonConvert.SerializeObject(new AgentCommandResultPayload { Success = false, Message = $"Gateway Agent {gatewayAgentAppId} not connected."}) };
-                        uiClient.SendMessageAsync(failMsg).ConfigureAwait(false);
+                        _logger.LogError($"Error sending message to Broker (Type: {message.Type}): {ex.Message}", ex);
+                        // 이 경우에도 연결이 끊어졌을 가능성 높음
+                        CleanupConnectionResources();
+                        OnDisconnectedFromBroker?.Invoke();
+                        return Task.FromResult(false);
                     }
                 }
                 else
                 {
-                     _logger.Warn($"Unknown ControlType '{controlPayload.ControlType}' from UI {uiClient.ClientId}");
+                    return Task.FromResult(false);
                 }
             }
-            catch (JsonException jsonEx)
+            return task; // 이 Task는 실제로는 거의 즉시 완료될 것임 (동기 쓰기 후)
+                         // 진정한 비동기 쓰기를 원하면 _streamWriter.WriteLineAsync 사용
+        }
+
+        private void CleanupConnectionResources()
+        {
+            _logger.LogInfo($"Cleaning up connection resources for BrokerTcpClient (AgentId: {_agentId}).");
+            _statusReportTimer?.Dispose();
+            _statusReportTimer = null;
+
+            try { _streamWriter?.Dispose(); } catch { /* ignore */ }
+            _streamWriter = null;
+            try { _streamReader?.Dispose(); } catch { /* ignore */ }
+            _streamReader = null;
+            try { _networkStream?.Dispose(); } catch { /* ignore */ }
+            _networkStream = null;
+            try { _tcpClient?.Close(); } catch { /* ignore */ } // Close는 Dispose 호출
+            _tcpClient = null;
+        }
+        
+        public static List<string> GetLocalIpAddresses() // AgentCoreService에서 사용할 수 있도록 public static
+        {
+            var ipAddresses = new List<string>();
+            try
             {
-                _logger.Error($"Failed to parse UiRequest_ControlAgent payload from UI {uiClient.ClientId}: {jsonEx.Message}", jsonEx);
+                foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (item.OperationalStatus == OperationalStatus.Up && 
+                        (item.NetworkInterfaceType == NetworkInterfaceType.Ethernet || item.NetworkInterfaceType == NetworkInterfaceType.Wireless80211))
+                    {
+                        foreach (UnicastIPAddressInformation ip in item.GetIPProperties().UnicastAddresses)
+                        {
+                            if (ip.Address.AddressFamily == AddressFamily.InterNetwork) // IPv4
+                            {
+                                ipAddresses.Add(ip.Address.ToString());
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception) { /* 로거가 없을 수 있음 */ }
+            return ipAddresses.Distinct().ToList();
+        }
+
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+
+            _logger.LogInfo($"Disposing BrokerTcpClient for AgentId: {_agentId}.");
+            _cts?.Cancel(); // 모든 비동기 작업 취소
+            _cts?.Dispose();
+            _cts = null;
+
+            CleanupConnectionResources(); // 연결 관련 리소스 정리
+            _logger.LogInfo($"BrokerTcpClient for AgentId: {_agentId} disposed.");
+        }
+    }
+}
+8. Network/DownstreamAgentClient.cs (게이트웨이 역할 시 최종 Agent 연결 클라이언트)
+
+이 클래스는 게이트웨이 Agent가 최종 대상 Agent에게 명령을 전달할 때 사용합니다. BrokerTcpClient와 유사하지만, 대상이 Broker가 아닌 다른 Agent입니다.
+
+C#
+
+// MonitorAgent/Network/DownstreamAgentClient.cs
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using MonitorAgent.Models;
+using MonitorAgent.Services;
+using Newtonsoft.Json;
+
+namespace MonitorAgent.Network
+{
+    // 이 클래스는 게이트웨이 Agent가 최종 대상 Agent에게 명령을 전달하고 응답을 받을 때 사용.
+    // 단발성 연결 및 요청/응답 처리에 더 적합하게 만들 수 있음.
+    public class DownstreamAgentClient : IDisposable
+    {
+        private readonly ILoggingService _logger;
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+        private StreamReader _streamReader;
+        private StreamWriter _streamWriter;
+        private readonly object _sendLock = new object();
+        private bool _isDisposed = false;
+
+        public bool IsConnected => _tcpClient != null && _tcpClient.Connected;
+
+        public DownstreamAgentClient(ILoggingService logger)
+        {
+            _logger = logger;
+        }
+
+        public async Task<bool> ConnectAsync(string targetIp, int targetPort, CancellationToken token = default(CancellationToken))
+        {
+            if (IsConnected) Disconnect(); // 기존 연결이 있다면 정리
+            if (_isDisposed) throw new ObjectDisposedException(nameof(DownstreamAgentClient));
+
+            _logger.LogInfo($"Downstream: Attempting to connect to final target Agent: {targetIp}:{targetPort}");
+            _tcpClient = new TcpClient();
+            try
+            {
+                var connectTask = _tcpClient.ConnectAsync(targetIp, targetPort);
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), token); // 연결 타임아웃 5초
+
+                if (await Task.WhenAny(connectTask, timeoutTask).ConfigureAwait(false) == connectTask && connectTask.Status == TaskStatus.RanToCompletion && _tcpClient.Connected)
+                {
+                    _networkStream = _tcpClient.GetStream();
+                    _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
+                    _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
+                    _logger.LogInfo($"Downstream: Successfully connected to final target Agent {targetIp}:{targetPort}.");
+                    return true;
+                }
+                else
+                {
+                    _tcpClient.Close();
+                    if (token.IsCancellationRequested)
+                        _logger.LogInfo("Downstream: Connection attempt to final target Agent cancelled.");
+                    else
+                        _logger.LogWarning($"Downstream: Timeout or error connecting to final target Agent {targetIp}:{targetPort}.");
+                    return false;
+                }
             }
             catch (Exception ex)
             {
-                 _logger.Error($"Error relaying control command from UI {uiClient.ClientId}: {ex.Message}", ex);
+                _logger.LogError($"Downstream: Error connecting to final target Agent {targetIp}:{targetPort}: {ex.Message}", ex);
+                _tcpClient?.Close();
+                return false;
             }
         }
 
-        private void SendBrokerStatusToUi(ClientState uiClient)
+        public async Task<AgentCommandResultPayload> SendCommandAndGetResponseAsync(BrokerExecuteControlPayload commandToRelay, string originalCorrelationId, CancellationToken token = default(CancellationToken))
         {
-            var statusPayload = new BrokerStatusPayload
+            if (!IsConnected)
             {
-                ServerStartTime = BrokerCore.ServerStartTime,
-                UptimeString = (DateTime.UtcNow - BrokerCore.ServerStartTime).ToString(@"d\.hh\:mm\:ss"),
-                ConnectedUiCount = _uiClients.Count,
-                ConnectedAgentCount = _agentClients.Count(ac => ac.Value.Type == ClientType.AgentClient && ac.Value.TcpClient.Connected),
-                RecentLogs = _logger.GetRecentLogs(50), // 최근 50개 로그
-                BrokerVersion = BrokerCore.BrokerVersion
-            };
-            var statusMessage = new BrokerMessage
-            {
-                Type = MessageType.BrokerToUi_SendBrokerStatus,
-                Payload = JsonConvert.SerializeObject(statusPayload)
-            };
-            uiClient.SendMessageAsync(statusMessage).ConfigureAwait(false);
-            _logger.Info($"Sent broker status to UI {uiClient.ClientId}");
-        }
-
-        private void HandlePing(ClientState sender, BrokerMessage pingMessage)
-        {
-            var pongMessage = new BrokerMessage { Type = MessageType.Pong, CorrelationId = pingMessage.CorrelationId, TargetId = sender.ClientId };
-            sender.SendMessageAsync(pongMessage).ConfigureAwait(false);
-            _logger.Debug($"Sent Pong to {sender.Type} {sender.ClientId}");
-        }
-
-
-        private void HandleClientDisconnect(ClientState clientState)
-        {
-            _logger.Info($"Handling disconnect for client: {clientState.ClientId} ({clientState.Type})");
-            if (clientState.Type == ClientType.UiClient)
-            {
-                _uiClients.TryRemove(clientState.ClientId, out _);
-                _logger.Info($"UI Client {clientState.ClientId} removed. Total UIs: {_uiClients.Count}");
+                _logger.LogError("Downstream: Not connected. Cannot send command.");
+                return new AgentCommandResultPayload { Success = false, Message = "Gateway not connected to final agent." };
             }
-            else if (clientState.Type == ClientType.AgentClient)
+             if (_isDisposed) throw new ObjectDisposedException(nameof(DownstreamAgentClient));
+
+            try
             {
-                _agentClients.TryRemove(clientState.ClientId, out _); // AgentIdProvidedByApp를 키로 사용
-                _logger.Info($"Agent Client {clientState.ClientId} removed. Total Agents: {_agentClients.Count}");
-                
-                // 모든 UI에게 해당 Agent 연결 끊김 알림
-                var disconnectNotification = new BrokerMessage
+                // 최종 Agent에게 보낼 메시지는 BrokerToAgent_ExecuteControl과 동일한 구조로.
+                // 다만, SourceId, TargetId는 이 통신에서는 덜 중요할 수 있음. CorrelationId는 유지.
+                var messageToFinalAgent = new BrokerMessage
                 {
-                    Type = MessageType.BrokerToUi_BroadcastAgentStatus, // 상태 업데이트 메시지 재활용 가능
-                    SourceId = clientState.ClientId,
-                    Payload = JsonConvert.SerializeObject(new AgentStatusUpdatePayload { CurrentMonitorStatus = "Offline (Disconnected)"}) // 예시
+                    Type = MessageType.BrokerToAgent_ExecuteControl, // 이 타입을 최종 Agent도 이해해야 함.
+                    CorrelationId = originalCorrelationId,
+                    // SourceId는 이 GatewayAgent의 ID가 될 수 있음 (선택적)
+                    // TargetId는 최종 Agent의 ID (여기서는 IP로 식별)
+                    Payload = JsonConvert.SerializeObject(new BrokerExecuteControlPayload // commandToRelay를 그대로 보내면 IsGatewayRelay 등이 혼동될 수 있으므로, 필요한 부분만 다시 구성
+                    {
+                        ActionToPerform = commandToRelay.ActionToPerform,
+                        Parameters = commandToRelay.Parameters,
+                        IsGatewayRelay = false // 최종 Agent에게는 이것이 직접 명령임
+                    })
                 };
-                foreach (var ui in _uiClients.Values)
+
+                string requestJson = JsonConvert.SerializeObject(messageToFinalAgent);
+                _logger.LogDebug($"Downstream: Sending to final agent: {requestJson}");
+                
+                lock (_sendLock) // StreamWriter 동시 접근 방지
                 {
-                    ui.SendMessageAsync(disconnectNotification).ConfigureAwait(false);
+                    if (IsConnected) _writer.WriteLine(requestJson); else throw new IOException("Connection lost before send.");
+                }
+
+                // 응답 수신 (타임아웃 필요)
+                // 최종 Agent도 명령 처리 후 AgentToBroker_CommandResult 형식으로 응답한다고 가정
+                var readTask = _streamReader.ReadLineAsync();
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(30), token); // 응답 대기 타임아웃 30초
+
+                if (await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false) == readTask && readTask.Result != null)
+                {
+                    string responseJson = readTask.Result;
+                    _logger.LogDebug($"Downstream: Received from final agent: {responseJson}");
+                    var responseMessage = JsonConvert.DeserializeObject<BrokerMessage>(responseJson);
+                    if (responseMessage != null && responseMessage.Type == MessageType.AgentToBroker_CommandResult)
+                    {
+                        return JsonConvert.DeserializeObject<AgentCommandResultPayload>(responseMessage.Payload);
+                    }
+                    else
+                    {
+                        _logger.LogWarning($"Downstream: Unexpected or invalid response from final agent: {responseJson}");
+                        return new AgentCommandResultPayload { Success = false, Message = "Invalid response from final agent." };
+                    }
+                }
+                else
+                {
+                    if (token.IsCancellationRequested)
+                        _logger.LogWarning("Downstream: Response wait cancelled for final agent.");
+                    else
+                        _logger.LogWarning("Downstream: Timeout waiting for response from final agent.");
+                    return new AgentCommandResultPayload { Success = false, Message = "Timeout or cancelled waiting for final agent response." };
                 }
             }
-            // ClientState.Dispose()는 ClientState 내부의 ReceiveLoopAsync finally에서 호출됨
+            catch (Exception ex)
+            {
+                _logger.LogError($"Downstream: Error during command relay to final agent: {ex.Message}", ex);
+                return new AgentCommandResultPayload { Success = false, Message = $"Error relaying to final agent: {ex.Message}" };
+            }
+            finally
+            {
+                Disconnect(); // 각 명령 후 연결 종료 (단발성으로 사용 시) 또는 유지할 수도 있음
+            }
+        }
+
+        public void Disconnect()
+        {
+            if (_isDisposed) return;
+            _logger.LogInfo("Downstream: Disconnecting from final target Agent.");
+            try { _streamWriter?.Dispose(); } catch { }
+            _streamWriter = null;
+            try { _streamReader?.Dispose(); } catch { }
+            _streamReader = null;
+            try { _networkStream?.Dispose(); } catch { }
+            _networkStream = null;
+            try { _tcpClient?.Close(); } catch { }
+            _tcpClient = null;
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+            Disconnect();
+            GC.SuppressFinalize(this);
+        }
+    }
+}
+9. Core/AgentCore.cs (Agent 핵심 로직)
+
+C#
+
+// MonitorAgent/Core/AgentCore.cs
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using MonitorAgent.Config;
+using MonitorAgent.Models;
+using MonitorAgent.Network;
+using MonitorAgent.Services;
+using Newtonsoft.Json;
+using System.Net.Sockets; // TcpClient 사용을 위해
+using System.Reflection; // Assembly Version
+
+namespace MonitorAgent.Core
+{
+    public enum AgentOperationalStatus // Agent의 로컬 상태
+    {
+        Initializing,
+        ConnectingToBroker,
+        ConnectedToBroker, // Broker와 연결됨 (아직 Hello 전일 수 있음)
+        IdentifiedToBroker, // Broker에게 Hello 보내고 인식됨
+        Running,            // 정상 작동 중
+        RelayingCommand,    // 게이트웨이로서 명령 중계 중
+        Disconnected,
+        Error,
+        Stopping
+    }
+
+    public class AgentCore : IDisposable
+    {
+        private readonly ILoggingService _logger;
+        private readonly AgentIdentifier _agentIdentifier;
+        private readonly BrokerAddressProvider _brokerAddressProvider;
+        private readonly IMonitorControlService _monitorControl;
+        
+        private BrokerTcpClient _brokerClient;
+        private CancellationTokenSource _mainCts;
+        private AgentOperationalStatus _currentStatus;
+
+        public event Action<AgentOperationalStatus, string> OnStatusChanged;
+
+        public AgentCore(ILoggingService logger, AgentIdentifier agentIdentifier, BrokerAddressProvider brokerAddressProvider, IMonitorControlService monitorControl)
+        {
+            _logger = logger;
+            _agentIdentifier = agentIdentifier;
+            _brokerAddressProvider = brokerAddressProvider;
+            _monitorControl = monitorControl;
+            UpdateStatus(AgentOperationalStatus.Initializing, "Agent core created.");
+        }
+
+        public async Task StartAsync()
+        {
+            if (_mainCts != null && !_mainCts.IsCancellationRequested)
+            {
+                _logger.LogWarning("AgentCore is already running or starting.");
+                return;
+            }
+            _mainCts = new CancellationTokenSource();
+            UpdateStatus(AgentOperationalStatus.Initializing, "Agent core starting...");
+
+            if (!_brokerAddressProvider.IsValid)
+            {
+                UpdateStatus(AgentOperationalStatus.Error, "Broker address configuration is invalid. Cannot connect.");
+                return;
+            }
+
+            _brokerClient = new BrokerTcpClient(_brokerAddressProvider, _agentIdentifier.Id, _logger, _monitorControl.GetCurrentMonitorStateApproximation);
+            _brokerClient.OnBrokerMessageReceived += HandleBrokerMessage;
+            _brokerClient.OnDisconnectedFromBroker += HandleBrokerDisconnection;
+
+            // BrokerTcpClient의 StartAsync는 내부적으로 연결 및 재연결 루프를 돌림
+            _ = _brokerClient.StartAsync(_mainCts); // 백그라운드에서 실행, 반환된 Task를 기다리지 않음
+
+            UpdateStatus(AgentOperationalStatus.ConnectingToBroker, $"Attempting to connect to Broker at {_brokerAddressProvider.BrokerIpAddress}:{_brokerAddressProvider.BrokerPort}");
+            // 실제 연결 상태는 BrokerTcpClient 내부 이벤트나 IsConnected 속성으로 확인
+        }
+
+        private void HandleBrokerMessage(BrokerMessage message)
+        {
+            _logger.LogInfo($"Message received from Broker: {message.Type}, CorrId: {message.CorrelationId}");
+            switch (message.Type)
+            {
+                case MessageType.BrokerToAgent_ExecuteControl:
+                    HandleExecuteControlCommand(message);
+                    break;
+                case MessageType.BrokerAck_AgentHello:
+                    UpdateStatus(AgentOperationalStatus.IdentifiedToBroker, "Successfully identified to Broker.");
+                    // Broker가 Hello Ack를 보내면 여기서 Running 상태로 변경해도 됨
+                    UpdateStatus(AgentOperationalStatus.Running, "Agent is running and connected to Broker.");
+                    break;
+                case MessageType.Ping:
+                    HandlePingFromBroker(message);
+                    break;
+                // 다른 메시지 타입 처리 ...
+                default:
+                    _logger.LogWarning($"Unhandled message type '{message.Type}' from Broker.");
+                    break;
+            }
+        }
+
+        private async void HandleExecuteControlCommand(BrokerMessage commandMessage)
+        {
+            BrokerExecuteControlPayload controlPayload = null;
+            try
+            {
+                controlPayload = JsonConvert.DeserializeObject<BrokerExecuteControlPayload>(commandMessage.Payload);
+            }
+            catch (JsonException jsonEx)
+            {
+                _logger.LogError($"Failed to parse BrokerExecuteControlPayload: {jsonEx.Message}. Payload: {commandMessage.Payload}", jsonEx);
+                await _brokerClient.ReportCommandResultAsync(commandMessage.CorrelationId, false, "Invalid command payload.", _monitorControl.GetCurrentMonitorStateApproximation());
+                return;
+            }
+
+            if (controlPayload == null)
+            {
+                _logger.LogError("BrokerExecuteControlPayload is null after deserialization.");
+                await _brokerClient.ReportCommandResultAsync(commandMessage.CorrelationId, false, "Null command payload.", _monitorControl.GetCurrentMonitorStateApproximation());
+                return;
+            }
+
+            bool result = false;
+            string resultMessage = "Execution failed.";
+            string monitorStatusAfterCommand = _monitorControl.GetCurrentMonitorStateApproximation();
+
+            if (!controlPayload.IsGatewayRelay) // 이 Agent가 최종 실행 대상
+            {
+                _logger.LogInfo($"Executing direct command: {controlPayload.ActionToPerform}");
+                switch (controlPayload.ActionToPerform)
+                {
+                    case "TurnMonitorOn":
+                        result = _monitorControl.TurnMonitorOn();
+                        resultMessage = result ? "Monitor turned ON." : "Failed to turn monitor ON.";
+                        break;
+                    case "TurnMonitorOff":
+                        result = _monitorControl.TurnMonitorOff();
+                        resultMessage = result ? "Monitor turned OFF." : "Failed to turn monitor OFF.";
+                        break;
+                    default:
+                        resultMessage = $"Unknown direct action: {controlPayload.ActionToPerform}";
+                        _logger.LogWarning(resultMessage);
+                        break;
+                }
+                monitorStatusAfterCommand = _monitorControl.GetCurrentMonitorStateApproximation();
+                // 결과를 Broker로 보고
+                await _brokerClient.ReportCommandResultAsync(commandMessage.CorrelationId, result, resultMessage, monitorStatusAfterCommand);
+            }
+            else // 이 Agent가 Gateway로서 다른 최종 Agent에게 전달해야 함
+            {
+                UpdateStatus(AgentOperationalStatus.RelayingCommand, $"Relaying command '{controlPayload.ActionToPerform}' to {controlPayload.FinalTargetAgentIp}:{controlPayload.FinalTargetAgentPort}");
+                _logger.LogInfo($"Acting as Gateway: Relaying command '{controlPayload.ActionToPerform}' to final target {controlPayload.FinalTargetAgentIp}:{controlPayload.FinalTargetAgentPort}");
+
+                AgentCommandResultPayload finalAgentResult = null;
+                using (var downstreamClient = new DownstreamAgentClient(_logger))
+                {
+                    if (await downstreamClient.ConnectAsync(controlPayload.FinalTargetAgentIp, controlPayload.FinalTargetAgentPort.Value, _mainCts.Token))
+                    {
+                        // downstreamClient는 BrokerExecuteControlPayload를 받아 최종 Agent에게 전달할 적절한 메시지로 변환해야 함
+                        // BrokerExecuteControlPayload 내의 IsGatewayRelay는 이제 false여야 함.
+                        var payloadForFinalAgent = new BrokerExecuteControlPayload
+                        {
+                            ActionToPerform = controlPayload.ActionToPerform,
+                            Parameters = controlPayload.Parameters, // 원본 파라미터 그대로 전달
+                            IsGatewayRelay = false // 최종 대상에게는 이것이 직접 명령임
+                        };
+                        finalAgentResult = await downstreamClient.SendCommandAndGetResponseAsync(payloadForFinalAgent, commandMessage.CorrelationId, _mainCts.Token);
+                    }
+                    else
+                    {
+                        finalAgentResult = new AgentCommandResultPayload { Success = false, Message = $"Gateway failed to connect to final agent {controlPayload.FinalTargetAgentIp}:{controlPayload.FinalTargetAgentPort}." };
+                    }
+                } // using 블록 종료 시 downstreamClient.Dispose() 자동 호출
+
+                result = finalAgentResult.Success;
+                resultMessage = $"Gateway: {finalAgentResult.Message}"; // 게이트웨이를 통해 전달되었음을 명시
+                monitorStatusAfterCommand = finalAgentResult.CurrentMonitorStatus; // 최종 에이전트의 상태
+
+                // 최종 결과를 Broker로 보고 (원본 CorrelationId 사용)
+                await _brokerClient.ReportCommandResultAsync(commandMessage.CorrelationId, result, resultMessage, monitorStatusAfterCommand);
+                UpdateStatus(AgentOperationalStatus.Running, "Command relay finished."); // 중계 후 원래 상태로
+            }
         }
         
+        private void HandlePingFromBroker(BrokerMessage pingMessage)
+        {
+            _logger.LogDebug("Ping received from Broker. Sending Pong.");
+            var pongMessage = new BrokerMessage { Type = MessageType.Pong, SourceId = _agentIdentifier.Id, CorrelationId = pingMessage.CorrelationId };
+            _brokerClient.SendMessageAsync(pongMessage).ConfigureAwait(false); // 응답은 기다리지 않음
+        }
+
+
+        private void HandleBrokerDisconnection()
+        {
+            UpdateStatus(AgentOperationalStatus.Disconnected, "Disconnected from Broker. Will attempt to reconnect.");
+            // BrokerTcpClient 내부에서 재연결 로직이 이미 동작 중임
+        }
+
+        private void UpdateStatus(AgentOperationalStatus newStatus, string message)
+        {
+            if (_currentStatus == newStatus && newStatus != AgentOperationalStatus.RelayingCommand) return; // 중복 상태 변경 방지 (릴레이는 예외)
+
+            _currentStatus = newStatus;
+            string logMessage = $"Agent Status: {_currentStatus} - {message}";
+             if (newStatus == AgentOperationalStatus.Error) _logger.LogError(logMessage);
+             else _logger.LogInfo(logMessage);
+            OnStatusChanged?.Invoke(_currentStatus, message);
+        }
+
         public void Stop()
         {
-            _logger.Info("Broker Core Service stopping...");
-            _serverCts?.Cancel(); // 모든 AcceptLoop 및 ClientState의 ReceiveLoop 종료 요청
-
-            _uiListener?.Stop();
-            _agentListener?.Stop();
-
-            // 모든 클라이언트 연결 종료
-            _logger.Info("Closing all UI client connections...");
-            foreach (var uiClient in _uiClients.Values)
-            {
-                uiClient.Dispose();
-            }
-            _uiClients.Clear();
-
-            _logger.Info("Closing all Agent client connections...");
-            foreach (var agentClient in _agentClients.Values)
-            {
-                agentClient.Dispose();
-            }
-            _agentClients.Clear();
+            UpdateStatus(AgentOperationalStatus.Stopping, "Agent core stopping...");
+            _mainCts?.Cancel(); // 모든 내부 작업 취소 요청
             
-            _serverCts?.Dispose();
-            _logger.Info("Broker Core Service stopped.");
+            _brokerClient?.Dispose(); // BrokerTcpClient 정리
+            _brokerClient = null;
+            
+            _mainCts?.Dispose();
+            _mainCts = null;
+            _logger.LogInfo("Agent core stopped.");
         }
 
         public void Dispose()
@@ -843,94 +1127,244 @@ namespace MGSPBrokerService
         }
     }
 }
-5. Program.cs (메인 진입점)
+10. UI/TrayIconManager.cs
 
 C#
 
-// MGSPBrokerService/Program.cs
+// MonitorAgent/UI/TrayIconManager.cs
 using System;
-using System.Reflection;
-using System.Threading;
-using MGSPBrokerService.Services;
+using System.Windows.Forms; // System.Windows.Forms.dll 참조
+using System.Drawing;       // System.Drawing.dll 참조
+using MonitorAgent.Core;    // AgentOperationalStatus
 
-namespace MGSPBrokerService
+namespace MonitorAgent.UI
 {
-    class Program
+    public class TrayIconManager : IDisposable
     {
-        private static BrokerCore _brokerCore;
-        private static ManualResetEvent _shutdownEvent = new ManualResetEvent(false);
-        private static ILoggingService _logger;
+        private NotifyIcon _notifyIcon;
+        private readonly string _agentId;
+        private readonly Action _onExitRequested; // 종료 요청 시 호출될 콜백
+        // private readonly Action _onShowStatusClicked; // 상태창 표시 요청 시 호출될 콜백 (필요시)
 
-        static void Main(string[] args)
+        public TrayIconManager(string agentId, Action onExitRequested)
         {
-            _logger = new BrokerLoggingService(); // 로거 인스턴스 생성
+            _agentId = agentId;
+            _onExitRequested = onExitRequested;
+            // _onShowStatusClicked = onShowStatusClicked;
 
-            // 버전 정보 설정
-            try
-            {
-                var version = Assembly.GetExecutingAssembly().GetName().Version;
-                BrokerCore.BrokerVersion = $"{version.Major}.{version.Minor}.{version.Build}.{version.Revision}";
-            }
-            catch { BrokerCore.BrokerVersion = "N/A (Version Error)"; }
-
-            Console.Title = $"MGSP Broker Service - v{BrokerCore.BrokerVersion}";
-            _logger.Info($"MGSP Broker Service v{BrokerCore.BrokerVersion} starting up...");
-
-            // 종료 이벤트 핸들러 등록
-            Console.CancelKeyPress += (sender, e) => { e.Cancel = true; _logger.Info("Ctrl+C detected. Shutting down..."); InitiateShutdown(); };
-            AppDomain.CurrentDomain.ProcessExit += (sender, e) => { _logger.Info("ProcessExit detected. Ensuring shutdown..."); InitiateShutdown(); };
-
-            try
-            {
-                // 설정 파일에서 포트 번호 등을 읽어올 수 있으나, 여기서는 하드코딩
-                int uiPort = 9001;
-                int agentPort = 9002;
-                
-                _logger.Info($"Configuring Broker to listen for UIs on port {uiPort} and Agents on port {agentPort}.");
-                _brokerCore = new BrokerCore(_logger, uiPort, agentPort);
-                _brokerCore.Start();
-
-                _logger.Info("Broker Service is now running. Press Ctrl+C to stop.");
-                _shutdownEvent.WaitOne(); // 종료 시그널 대기
-            }
-            catch (Exception ex)
-            {
-                _logger.Fatal("A critical error occurred during Broker startup or operation.", ex);
-                Console.WriteLine("A fatal error occurred. Check logs. Press any key to exit.");
-                Console.ReadKey();
-            }
-            finally
-            {
-                _logger.Info("Broker Service Main finally block. Cleaning up...");
-                Cleanup();
-            }
-            _logger.Info("Broker Service has shut down. Press any key to close window.");
-            Console.ReadKey();
+            SetupTrayIcon();
         }
 
-        private static void InitiateShutdown()
+        private void SetupTrayIcon()
         {
-            // 이미 종료 중이면 아무것도 안 함
-            if (_shutdownEvent.WaitOne(0)) return; 
+            _notifyIcon = new NotifyIcon
+            {
+                Icon = SystemIcons.Application, // 적절한 아이콘으로 변경 필요
+                Visible = true,
+                Text = $"MonitorAgent ({_agentId}) - Initializing..."
+            };
 
-            _logger.Info("Shutdown initiated...");
-            _brokerCore?.Stop(); // BrokerCore의 Stop 메서드 호출
-            _shutdownEvent.Set(); // Main 스레드 종료 허용
+            var contextMenu = new ContextMenuStrip();
+            // contextMenu.Items.Add("Show Status", null, (s, e) => _onShowStatusClicked?.Invoke());
+            contextMenu.Items.Add("Exit Agent", null, (s, e) => _onExitRequested?.Invoke());
+            
+            _notifyIcon.ContextMenuStrip = contextMenu;
+            // _notifyIcon.DoubleClick += (s, e) => _onShowStatusClicked?.Invoke();
         }
 
-        private static void Cleanup()
+        public void UpdateStatus(AgentOperationalStatus status, string message)
         {
-             _brokerCore?.Dispose(); // BrokerCore의 Dispose 메서드 (Stop 호출 포함)
-            _logger.Info("Cleanup finished.");
-            // 필요시 다른 리소스 정리
+            if (_notifyIcon != null)
+            {
+                string trayText = $"Agent ({_agentId.Substring(0, Math.Min(_agentId.Length,10))}...) - {status}";
+                if (!string.IsNullOrWhiteSpace(message))
+                {
+                    trayText += $": {message.Substring(0, Math.Min(message.Length, 20))}{(message.Length > 20 ? "..." : "")}";
+                }
+                _notifyIcon.Text = trayText.Length > 63 ? trayText.Substring(0, 60) + "..." : trayText;
+            }
+        }
+
+        public void Dispose()
+        {
+            _notifyIcon?.Dispose();
+            _notifyIcon = null;
         }
     }
 }
-MGSPBrokerService 실행 방법:
+11. App.xaml.cs (WPF 애플리케이션 진입점)
 
-위 코드들을 사용하여 MGSPBrokerService 프로젝트를 빌드합니다.
-Newtonsoft.Json NuGet 패키지가 설치되어 있는지 확인합니다.
-빌드된 MGSPBrokerService.exe를 실행합니다.
-콘솔 창에 로그가 출력되며, UI 연결 포트(기본 9001)와 Agent 연결 포트(기본 9002)에서 연결을 기다립니다.
-방화벽에서 이 포트들이 열려 있는지 확인해야 다른 PC의 UI나 Agent가 접속할 수 있습니다.
-이것으로 중계 프로그램(MGSPBrokerService)의 기본 골격이 완성되었습니다. 이 프로그램은 UI로부터 Agent 제어 명령을 받아 라우팅하고, Agent로부터 상태를 받아 UI로 브로드캐스트하며, 자체적인 간단한 로그를 콘솔과 내부 메모리에 기록합니다.
+C#
+
+// MonitorAgent/App.xaml.cs
+using System;
+using System.Windows;
+using MonitorAgent.Config;
+using MonitorAgent.Core;
+using MonitorAgent.Services;
+using MonitorAgent.UI; // TrayIconManager
+using Microsoft.Win32; // StartupRegistryService에서 사용 (여기서는 직접 사용 안함)
+using System.Diagnostics; // Process
+
+namespace MonitorAgent
+{
+    public partial class App : Application
+    {
+        private AgentCore _agentCore;
+        private AgentLoggingService _loggingService;
+        private TrayIconManager _trayIconManager;
+        private AgentIdentifier _agentIdentifier;
+        private BrokerAddressProvider _brokerAddressProvider;
+        private MonitorControlService _monitorControlService;
+        private StartupRegistryService _startupRegistryService;
+
+
+        protected override async void OnStartup(StartupEventArgs e)
+        {
+            base.OnStartup(e);
+            // MainWindow 자동 생성 방지 (App.xaml에서 StartupUri 제거)
+
+            _loggingService = new AgentLoggingService(); // 로그 레벨은 나중에 설정 파일에서 읽어와서 세팅 가능
+
+            // 중복 실행 방지 (선택적)
+            // Mutex mutex = new Mutex(true, "Global\\MonitorAgentInstance", out bool createdNew);
+            // if (!createdNew)
+            // {
+            //    _loggingService.LogWarning("MonitorAgent is already running. Shutting down new instance.");
+            //    Shutdown();
+            //    return;
+            // }
+
+            _agentIdentifier = new AgentIdentifier(_loggingService);
+            _brokerAddressProvider = new BrokerAddressProvider(_loggingService);
+            _monitorControlService = new MonitorControlService(_loggingService);
+            _startupRegistryService = new StartupRegistryService(Config.AppConstants.AppName, _loggingService);
+
+
+            _agentCore = new AgentCore(_loggingService, _agentIdentifier, _brokerAddressProvider, _monitorControlService);
+            _agentCore.OnStatusChanged += AgentCore_OnStatusChanged;
+
+            _trayIconManager = new TrayIconManager(_agentIdentifier.Id, HandleExitRequest);
+            _trayIconManager.UpdateStatus(AgentOperationalStatus.Initializing, "Starting up..."); // 초기 상태
+
+            // 시작 프로그램 등록 시도 (설정에 따라)
+            // 간단하게, 항상 등록 시도. 설정 파일에서 읽어오는 로직은 AgentConfig에 추가 필요.
+            // bool autoStartEnabled = true; // 예시, 실제로는 설정에서 읽어옴
+            // if (autoStartEnabled) _startupRegistryService.RegisterInStartup(true);
+             _startupRegistryService.EnsureRegistered(); // 현재 실행 파일 경로로 시작 프로그램 등록/업데이트
+
+
+            await _agentCore.StartAsync();
+        }
+
+        private void AgentCore_OnStatusChanged(AgentOperationalStatus status, string message)
+        {
+            // UI 스레드에서 트레이 아이콘 업데이트
+            Dispatcher.Invoke(() =>
+            {
+                _trayIconManager?.UpdateStatus(status, message);
+            });
+        }
+
+        private void HandleExitRequest()
+        {
+            _loggingService.LogInfo("Exit requested from tray icon.");
+            ShutdownAgentCoreAndExit();
+        }
+
+        private async void ShutdownAgentCoreAndExit()
+        {
+            if (_agentCore != null)
+            {
+                _agentCore.Stop(); // 비동기 Stop이 아니므로, 여기서 await 할 필요 없음. Stop 내부에서 정리.
+                _agentCore.Dispose(); // 명시적 Dispose
+                _agentCore = null;
+            }
+            _trayIconManager?.Dispose(); // 트레이 아이콘 정리
+            _loggingService.LogInfo("Agent shutdown complete. Exiting application.");
+            Shutdown(); // WPF 애플리케이션 종료
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            // 애플리케이션 종료 시 최종 정리 (이미 HandleExitRequest에서 처리되었을 수 있음)
+            ShutdownAgentCoreAndExit(); // 중복 호출되어도 내부에서 처리되도록 AgentCore.Stop/Dispose 설계
+            base.OnExit(e);
+        }
+    }
+    
+    // 시작 프로그램 등록 유틸리티 (간단 버전)
+    public class StartupRegistryService
+    {
+        private readonly string _appName;
+        private readonly ILoggingService _logger;
+        private readonly string _appPath;
+
+        public StartupRegistryService(string appName, ILoggingService logger)
+        {
+            _appName = appName;
+            _logger = logger;
+            _appPath = Process.GetCurrentProcess().MainModule.FileName;
+        }
+
+        public void EnsureRegistered()
+        {
+            try
+            {
+                RegistryKey rkApp = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+                if (rkApp.GetValue(_appName) == null || rkApp.GetValue(_appName).ToString() != _appPath)
+                {
+                    rkApp.SetValue(_appName, _appPath);
+                    _logger.LogInfo($"Application registered to run at startup: {_appPath}");
+                }
+                // else { _logger.LogDebug("Application already registered for startup."); }
+                rkApp.Close();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Error accessing registry for startup registration.", ex);
+            }
+        }
+        public void Unregister()
+        {
+             try
+            {
+                RegistryKey rkApp = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+                if (rkApp.GetValue(_appName) != null)
+                {
+                    rkApp.DeleteValue(_appName, false);
+                     _logger.LogInfo("Application unregistered from startup.");
+                }
+                rkApp.Close();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Error unregistering application from startup.", ex);
+            }
+        }
+    }
+}
+12. App.xaml (수정 - StartupUri 제거)
+
+XML
+
+<Application x:Class="MonitorAgent.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:MonitorAgent">
+    <Application.Resources>
+         
+    </Application.Resources>
+</Application>
+참고: 만약 MainWindow.xaml 과 MainWindow.xaml.cs 파일이 프로젝트에 남아있다면, 이 Agent 프로그램에서는 사용하지 않으므로 삭제해도 됩니다.
+
+Agent 프로그램 실행 방법:
+
+위 코드들을 사용하여 MonitorAgent 프로젝트를 빌드합니다.
+Newtonsoft.Json NuGet 패키지가 설치되었는지 확인합니다.
+빌드된 MonitorAgent.exe 파일과 함께, 실행 파일과 같은 폴더에 broker_address.txt 파일을 생성하고 중계 프로그램의 IP 주소와 Agent 연결용 포트를 적어줍니다 (예: 127.0.0.1:9002).
+MonitorAgent.exe를 실행합니다.
+트레이 아이콘이 나타나고, 중계 프로그램으로 연결을 시도합니다.
+로그는 agent_log.txt 파일에 기록됩니다.
+agent_id.txt 파일이 자동으로 생성되어 이 Agent의 고유 ID를 저장합니다.
+이제 이 Agent 프로그램은 이전에 제공한 중계 프로그램(MGSPBrokerService)과 통신할 준비가 되었습니다.
