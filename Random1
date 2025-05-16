@@ -1,174 +1,408 @@
-네, 알겠습니다. 사용자님의 요구사항이 이전과 크게 변경되어, 로그인 창 없이 메인 창이 바로 실행되고, 메인 창 내에 있는 암호 입력 칸에 하드코딩된 특정 암호를 입력하여 "유저 모드" 또는 "관리자 모드"를 활성화하는 방식으로 변경하겠습니다. DB를 이용한 사용자 인증이나 암호화는 필요 없습니다.
+네, 알겠습니다. Users 테이블 및 관련 로그인 로직이 제거됨에 따라 MGSPMonitorControl UI 프로그램의 여러 파일들이 수정됩니다.
 
-이 변경은 MGSPMonitorControl UI 프로그램에 큰 영향을 미치며, DB 스키마도 일부 간소화됩니다.
+가장 먼저 Services/DatabaseService.cs 파일의 수정된 전체 코드를 드리겠습니다. 이 파일에서는 Users 테이블 관련 메서드들이 모두 삭제되고, ManagedAgents 및 ControlActionLogs 테이블의 메서드들에서 userId 관련 파라미터가 제거되거나 단순화됩니다.
 
-변경 방향 요약:
+1. Services/DatabaseService.cs (수정된 전체 코드)
 
-DB 스크립트 수정:
-Users 테이블 삭제.
-ManagedAgents 테이블의 LastModifiedByUserId 컬럼 및 관련 FK 제약 조건 삭제 (또는 LastModifiedByMode 같은 문자열 컬럼으로 대체).
-ControlActionLogs 테이블의 RequestedByUserId 컬럼 및 관련 FK 제약 조건 삭제 (또는 RequestedByMode 같은 문자열 컬럼으로 대체).
-MGSPMonitorControl UI 프로그램 코드 대폭 수정:
-로그인 관련 모든 파일 (LoginWindow.xaml, LoginWindow.xaml.cs, LoginViewModel.cs, Models/UserSession.cs, Services/PasswordService.cs) 삭제.
-Services/DatabaseService.cs: Users 테이블 관련 메서드 모두 삭제. 다른 테이블의 CRUD 메서드에서 userId 파라미터 제거 또는 단순화.
-ViewModels/MainViewModel.cs: UserSession 대신 내부적으로 "현재 모드(기본, 유저, 관리자)" 상태를 관리. 암호 입력 및 모드 변경 로직 추가. 권한 관련 bool 속성들이 이 내부 모드 상태에 따라 변경.
-Views/MainWindow.xaml: 암호 입력용 PasswordBox와 "모드 적용" 또는 "로그인" 버튼 추가. 기존 기능 버튼들의 활성화 조건 변경.
-App.xaml.cs: 로그인 창 로직 제거. MainViewModel 생성 방식 변경.
-1. 수정된 데이터베이스 (DB) 스크립트 (MonitorControlDB)
+C#
 
-Users 테이블을 삭제하고, ManagedAgents와 ControlActionLogs 테이블에서 사용자 ID 관련 컬럼을 제거하거나 단순화합니다.
+// MGSPMonitorControl/Services/DatabaseService.cs
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Threading.Tasks;
+using MGSPMonitorControl.Models; // ManagedAgentDisplay, ControlActionLogEntry
+using System.Configuration;     // App.config 사용
 
-SQL
+namespace MGSPMonitorControl.Services
+{
+    public interface IDatabaseService
+    {
+        // User 관련 메서드 모두 제거됨
 
--- 사용할 데이터베이스 선택
-USE MonitorControlDB;
-GO
+        Task<List<ManagedAgentDisplay>> GetManagedAgentsAsync();
+        Task<ManagedAgentDisplay> GetManagedAgentByGuidAsync(Guid agentGuid);
+        Task<ManagedAgentDisplay> GetManagedAgentByProvidedIdAsync(string agentIdProvidedByApp);
+        // Add/Update 시 modifierInfo (예: "AdminMode", "UserMode") 전달 받도록 변경
+        Task<bool> AddManagedAgentAsync(ManagedAgentDisplay agent, string modifierInfo);
+        Task<bool> UpdateManagedAgentAsync(ManagedAgentDisplay agent, string modifierInfo);
+        Task<bool> DeleteManagedAgentAsync(Guid agentGuid);
 
---------------------------------------------------------------------------------
--- 1. Users 테이블 삭제 (더 이상 사용 안 함)
---------------------------------------------------------------------------------
-IF OBJECT_ID('dbo.Users', 'U') IS NOT NULL
-BEGIN
-    -- Users 테이블을 참조하는 FK 제약 조건 먼저 삭제 (필요한 경우)
-    IF OBJECT_ID('FK_ManagedAgents_LastModifiedBy', 'F') IS NOT NULL
-        ALTER TABLE dbo.ManagedAgents DROP CONSTRAINT FK_ManagedAgents_LastModifiedBy;
-    
-    IF OBJECT_ID('FK_ControlActionLogs_User', 'F') IS NOT NULL
-        ALTER TABLE dbo.ControlActionLogs DROP CONSTRAINT FK_ControlActionLogs_User;
+        Task<bool> LogControlActionAsync(ControlActionLogEntry logEntry);
+        Task<List<ControlActionLogEntry>> GetRecentControlLogsAsync(int count = 100);
+        Task<List<ControlActionLogEntry>> GetControlLogsForAgentAsync(Guid agentGuid, int count = 100);
+    }
 
-    DROP TABLE dbo.Users;
-    PRINT 'Table Users dropped.';
-END
-GO
+    public class DatabaseService : IDatabaseService
+    {
+        private readonly string _connectionString;
 
---------------------------------------------------------------------------------
--- 2. ManagedAgents 테이블 수정: LastModifiedByUserId 제거 (또는 변경)
---------------------------------------------------------------------------------
-IF OBJECT_ID('dbo.ManagedAgents', 'U') IS NOT NULL
-BEGIN
-    -- 기존 FK 제약 조건이 있다면 먼저 제거
-    IF OBJECT_ID('FK_ManagedAgents_LastModifiedBy', 'F') IS NOT NULL
-        ALTER TABLE dbo.ManagedAgents DROP CONSTRAINT FK_ManagedAgents_LastModifiedBy;
+        public DatabaseService()
+        {
+            try
+            {
+                _connectionString = ConfigurationManager.ConnectionStrings["MonitorControlDBConnection"]?.ConnectionString;
+                if (string.IsNullOrEmpty(_connectionString))
+                {
+                    Console.WriteLine("[ERROR] DB Connection string 'MonitorControlDBConnection' not found in App.config or is empty. Using fallback or will fail.");
+                    // 개발용 폴백 연결 문자열 (실제로는 App.config를 통해 설정하는 것이 최선)
+                    // _connectionString = "Server=(localdb)\\MSSQLLocalDB;Database=MonitorControlDB;Integrated Security=True;";
+                     if (string.IsNullOrEmpty(_connectionString))
+                        throw new ConfigurationErrorsException("Database connection string 'MonitorControlDBConnection' is not configured in App.config and no fallback is available.");
+                }
+            }
+            catch (ConfigurationErrorsException configEx)
+            {
+                 Console.WriteLine($"[ERROR] Configuration error reading DB connection string: {configEx.Message}");
+                 throw; 
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Unexpected error initializing DatabaseService: {ex.Message}");
+                throw;
+            }
+        }
+        
+        // 테스트 또는 외부 주입용 생성자
+        public DatabaseService(string connectionString)
+        {
+            _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+        }
 
-    -- 기존 LastModifiedByUserId 컬럼이 있다면 제거
-    IF EXISTS (SELECT * FROM sys.columns WHERE Name = N'LastModifiedByUserId' AND Object_ID = Object_ID(N'dbo.ManagedAgents'))
-    BEGIN
-        ALTER TABLE dbo.ManagedAgents DROP COLUMN LastModifiedByUserId;
-        PRINT 'Column LastModifiedByUserId dropped from ManagedAgents.';
-    END
+        // User Management 관련 메서드들 (AuthenticateUserAsync, UpdateLastLoginAsync, CreateUserAsync) 모두 삭제됨
 
-    -- (선택적) 누가 수정했는지 간단히 기록하고 싶다면 문자열 컬럼 추가 가능
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'LastModifiedByInfo' AND Object_ID = Object_ID(N'dbo.ManagedAgents'))
-    BEGIN
-        ALTER TABLE dbo.ManagedAgents ADD LastModifiedByInfo NVARCHAR(50) NULL;
-        PRINT 'Column LastModifiedByInfo added to ManagedAgents.';
-    END
-    PRINT 'Table ManagedAgents schema adjusted.';
-END
-ELSE
-BEGIN
-    -- 테이블이 아예 없다면 새로 생성 (Users 테이블 참조 없이)
-    CREATE TABLE dbo.ManagedAgents
-    (
-        AgentGuid UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
-        AgentIdProvidedByApp NVARCHAR(100) NOT NULL UNIQUE,
-        AgentName NVARCHAR(100) NOT NULL,
-        Description NVARCHAR(255) NULL,
-        ControlType NVARCHAR(20) NOT NULL CHECK (ControlType IN ('Direct', 'Gatewayed')),
-        PrimaryIpAddress VARCHAR(45) NOT NULL,
-        PrimaryPort INT NOT NULL,
-        GatewayAgentIpAddress VARCHAR(45) NULL,
-        GatewayAgentPort INT NULL,
-        IsEnabled BIT NOT NULL DEFAULT 1,
-        CreatedDate DATETIME2(7) DEFAULT GETUTCDATE(),
-        LastModifiedDate DATETIME2(7) DEFAULT GETUTCDATE(),
-        LastModifiedByInfo NVARCHAR(50) NULL -- 예: "AdminMode", "UserMode", 또는 비워둠
-    );
-    PRINT 'Table ManagedAgents created (no user FK).';
-    CREATE UNIQUE INDEX IX_ManagedAgents_AgentIdProvidedByApp ON dbo.ManagedAgents(AgentIdProvidedByApp); -- 고유 ID에 대한 인덱스
-    CREATE INDEX IX_ManagedAgents_AgentName ON dbo.ManagedAgents(AgentName);
-END
-GO
+        #region ManagedAgents CRUD
 
+        public async Task<List<ManagedAgentDisplay>> GetManagedAgentsAsync()
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            var agents = new List<ManagedAgentDisplay>();
+            // LastModifiedByInfo 컬럼 추가된 것 반영 (DB 스크립트에서 추가했다면)
+            string query = @"SELECT AgentGuid, AgentIdProvidedByApp, AgentName, Description, ControlType, 
+                                    PrimaryIpAddress, PrimaryPort, GatewayAgentIpAddress, GatewayAgentPort, IsEnabled, LastModifiedByInfo
+                             FROM ManagedAgents ORDER BY AgentName;";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                await connection.OpenAsync();
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        agents.Add(new ManagedAgentDisplay
+                        {
+                            AgentGuid = reader.GetGuid(reader.GetOrdinal("AgentGuid")),
+                            AgentIdProvidedByApp = reader.GetString(reader.GetOrdinal("AgentIdProvidedByApp")),
+                            AgentName = reader.GetString(reader.GetOrdinal("AgentName")),
+                            Description = reader.IsDBNull(reader.GetOrdinal("Description")) ? null : reader.GetString(reader.GetOrdinal("Description")),
+                            ControlType = reader.GetString(reader.GetOrdinal("ControlType")),
+                            PrimaryIpAddress = reader.GetString(reader.GetOrdinal("PrimaryIpAddress")),
+                            PrimaryPort = reader.GetInt32(reader.GetOrdinal("PrimaryPort")),
+                            GatewayAgentIpAddress = reader.IsDBNull(reader.GetOrdinal("GatewayAgentIpAddress")) ? null : reader.GetString(reader.GetOrdinal("GatewayAgentIpAddress")),
+                            GatewayAgentPort = reader.IsDBNull(reader.GetOrdinal("GatewayAgentPort")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("GatewayAgentPort")),
+                            IsEnabled = reader.GetBoolean(reader.GetOrdinal("IsEnabled")),
+                            // LastModifiedByInfo = reader.IsDBNull(reader.GetOrdinal("LastModifiedByInfo")) ? null : reader.GetString(reader.GetOrdinal("LastModifiedByInfo")), // 필요시 추가
+                            IsOnline = false, 
+                            CurrentMonitorStatus = "Unknown" 
+                        });
+                    }
+                }
+            }
+            return agents;
+        }
 
---------------------------------------------------------------------------------
--- 3. ControlActionLogs 테이블 수정: RequestedByUserId 제거 (또는 변경)
---------------------------------------------------------------------------------
-IF OBJECT_ID('dbo.ControlActionLogs', 'U') IS NOT NULL
-BEGIN
-    -- 기존 FK 제약 조건이 있다면 먼저 제거
-    IF OBJECT_ID('FK_ControlActionLogs_User', 'F') IS NOT NULL
-        ALTER TABLE dbo.ControlActionLogs DROP CONSTRAINT FK_ControlActionLogs_User;
+        public async Task<ManagedAgentDisplay> GetManagedAgentByGuidAsync(Guid agentGuid)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            ManagedAgentDisplay agent = null;
+            string query = @"SELECT AgentGuid, AgentIdProvidedByApp, AgentName, Description, ControlType, 
+                                    PrimaryIpAddress, PrimaryPort, GatewayAgentIpAddress, GatewayAgentPort, IsEnabled, LastModifiedByInfo
+                             FROM ManagedAgents WHERE AgentGuid = @AgentGuid;";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentGuid", agentGuid);
+                await connection.OpenAsync();
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    if (await reader.ReadAsync())
+                    {
+                        agent = new ManagedAgentDisplay
+                        {
+                            AgentGuid = reader.GetGuid(reader.GetOrdinal("AgentGuid")),
+                            AgentIdProvidedByApp = reader.GetString(reader.GetOrdinal("AgentIdProvidedByApp")),
+                            AgentName = reader.GetString(reader.GetOrdinal("AgentName")),
+                            Description = reader.IsDBNull(reader.GetOrdinal("Description")) ? null : reader.GetString(reader.GetOrdinal("Description")),
+                            ControlType = reader.GetString(reader.GetOrdinal("ControlType")),
+                            PrimaryIpAddress = reader.GetString(reader.GetOrdinal("PrimaryIpAddress")),
+                            PrimaryPort = reader.GetInt32(reader.GetOrdinal("PrimaryPort")),
+                            GatewayAgentIpAddress = reader.IsDBNull(reader.GetOrdinal("GatewayAgentIpAddress")) ? null : reader.GetString(reader.GetOrdinal("GatewayAgentIpAddress")),
+                            GatewayAgentPort = reader.IsDBNull(reader.GetOrdinal("GatewayAgentPort")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("GatewayAgentPort")),
+                            IsEnabled = reader.GetBoolean(reader.GetOrdinal("IsEnabled"))
+                            // LastModifiedByInfo = reader.IsDBNull(reader.GetOrdinal("LastModifiedByInfo")) ? null : reader.GetString(reader.GetOrdinal("LastModifiedByInfo")), // 필요시 추가
+                        };
+                    }
+                }
+            }
+            return agent;
+        }
 
-    -- 기존 RequestedByUserId 컬럼이 있다면 제거
-    IF EXISTS (SELECT * FROM sys.columns WHERE Name = N'RequestedByUserId' AND Object_ID = Object_ID(N'dbo.ControlActionLogs'))
-    BEGIN
-        ALTER TABLE dbo.ControlActionLogs DROP COLUMN RequestedByUserId;
-        PRINT 'Column RequestedByUserId dropped from ControlActionLogs.';
-    END
+        public async Task<ManagedAgentDisplay> GetManagedAgentByProvidedIdAsync(string agentIdProvidedByApp)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            ManagedAgentDisplay agent = null;
+            string query = @"SELECT AgentGuid, AgentIdProvidedByApp, AgentName, Description, ControlType, 
+                                    PrimaryIpAddress, PrimaryPort, GatewayAgentIpAddress, GatewayAgentPort, IsEnabled, LastModifiedByInfo 
+                             FROM ManagedAgents WHERE AgentIdProvidedByApp = @AgentIdProvidedByApp;";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentIdProvidedByApp", agentIdProvidedByApp);
+                await connection.OpenAsync();
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    if (await reader.ReadAsync())
+                    {
+                         agent = new ManagedAgentDisplay
+                        {
+                            AgentGuid = reader.GetGuid(reader.GetOrdinal("AgentGuid")),
+                            AgentIdProvidedByApp = reader.GetString(reader.GetOrdinal("AgentIdProvidedByApp")),
+                            AgentName = reader.GetString(reader.GetOrdinal("AgentName")),
+                            Description = reader.IsDBNull(reader.GetOrdinal("Description")) ? null : reader.GetString(reader.GetOrdinal("Description")),
+                            ControlType = reader.GetString(reader.GetOrdinal("ControlType")),
+                            PrimaryIpAddress = reader.GetString(reader.GetOrdinal("PrimaryIpAddress")),
+                            PrimaryPort = reader.GetInt32(reader.GetOrdinal("PrimaryPort")),
+                            GatewayAgentIpAddress = reader.IsDBNull(reader.GetOrdinal("GatewayAgentIpAddress")) ? null : reader.GetString(reader.GetOrdinal("GatewayAgentIpAddress")),
+                            GatewayAgentPort = reader.IsDBNull(reader.GetOrdinal("GatewayAgentPort")) ? (int?)null : reader.GetInt32(reader.GetOrdinal("GatewayAgentPort")),
+                            IsEnabled = reader.GetBoolean(reader.GetOrdinal("IsEnabled"))
+                            // LastModifiedByInfo = reader.IsDBNull(reader.GetOrdinal("LastModifiedByInfo")) ? null : reader.GetString(reader.GetOrdinal("LastModifiedByInfo")), // 필요시 추가
+                        };
+                    }
+                }
+            }
+            return agent;
+        }
 
-    -- (선택적) 누가 요청했는지 간단히 기록하고 싶다면 문자열 컬럼 추가 또는 기존 컬럼 타입 변경
-    IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'RequesterInfo' AND Object_ID = Object_ID(N'dbo.ControlActionLogs'))
-    BEGIN
-        -- 이전 스키마에 이미 RequesterInfo NVARCHAR(255) NULL 이 있었으므로, 그대로 사용하거나 용도 변경
-        -- 만약 없다면 추가: ALTER TABLE dbo.ControlActionLogs ADD RequesterInfo NVARCHAR(255) NULL;
-        PRINT 'Column RequesterInfo in ControlActionLogs will be used for mode/user info.';
-    END
-    ELSE -- 이미 있다면 해당 컬럼을 활용
-    BEGIN
-        PRINT 'Column RequesterInfo in ControlActionLogs will be used for mode/user info.';
-    END
-    PRINT 'Table ControlActionLogs schema adjusted.';
-END
-ELSE
-BEGIN
-    -- 테이블이 아예 없다면 새로 생성 (Users 테이블 참조 없이)
-    CREATE TABLE dbo.ControlActionLogs
-    (
-        LogId BIGINT PRIMARY KEY IDENTITY(1,1),
-        CorrelationId UNIQUEIDENTIFIER DEFAULT NEWID(),
-        AgentGuid UNIQUEIDENTIFIER NOT NULL,
-        CONSTRAINT FK_ControlActionLogs_Agent FOREIGN KEY (AgentGuid) REFERENCES ManagedAgents(AgentGuid) ON DELETE CASCADE,
-        ActionType NVARCHAR(50) NOT NULL,
-        ActionParameters NVARCHAR(MAX) NULL,
-        RequesterInfo NVARCHAR(255) NULL, -- 예: "AdminMode", "UserMode", 또는 실행한 PC 정보 등
-        RequestTimestamp DATETIME2(7) DEFAULT GETUTCDATE(),
-        RelayReceivedTimestamp DATETIME2(7) NULL,
-        AgentReceivedTimestamp DATETIME2(7) NULL,
-        ExecutionCompletedTimestamp DATETIME2(7) NULL,
-        FinalStatus NVARCHAR(50) NOT NULL,
-        ResultMessage NVARCHAR(MAX) NULL,
-        ExecutionPath NVARCHAR(500) NULL,
-        ExecutedViaGatewayAgentId NVARCHAR(100) NULL -- DB 스키마 수정: 이 컬럼은 ControlActionLogs에 있는게 맞음
-    );
-    PRINT 'Table ControlActionLogs created (no user FK).';
-    CREATE INDEX IX_ControlActionLogs_AgentGuid_RequestTimestamp ON dbo.ControlActionLogs(AgentGuid, RequestTimestamp DESC);
-    CREATE INDEX IX_ControlActionLogs_CorrelationId ON dbo.ControlActionLogs(CorrelationId);
-END
-GO
+        // modifierInfo 파라미터 추가 (예: "AdminMode", "UserMode", 또는 현재 활성화된 모드)
+        public async Task<bool> AddManagedAgentAsync(ManagedAgentDisplay agent, string modifierInfo)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            if(agent.AgentGuid == Guid.Empty) agent.AgentGuid = Guid.NewGuid();
 
---------------------------------------------------------------------------------
-PRINT 'Database schema adjustment for simplified login complete.';
---------------------------------------------------------------------------------
-DB 스크립트 주요 변경점:
+            string query = @"INSERT INTO ManagedAgents 
+                                (AgentGuid, AgentIdProvidedByApp, AgentName, Description, ControlType, PrimaryIpAddress, PrimaryPort, 
+                                 GatewayAgentIpAddress, GatewayAgentPort, IsEnabled, CreatedDate, LastModifiedDate, LastModifiedByInfo)
+                             VALUES 
+                                (@AgentGuid, @AgentIdProvidedByApp, @AgentName, @Description, @ControlType, @PrimaryIpAddress, @PrimaryPort,
+                                 @GatewayAgentIpAddress, @GatewayAgentPort, @IsEnabled, GETUTCDATE(), GETUTCDATE(), @ModifierInfo);";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentGuid", agent.AgentGuid);
+                command.Parameters.AddWithValue("@AgentIdProvidedByApp", agent.AgentIdProvidedByApp);
+                command.Parameters.AddWithValue("@AgentName", agent.AgentName);
+                command.Parameters.AddWithValue("@Description", (object)agent.Description ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ControlType", agent.ControlType);
+                command.Parameters.AddWithValue("@PrimaryIpAddress", agent.PrimaryIpAddress);
+                command.Parameters.AddWithValue("@PrimaryPort", agent.PrimaryPort);
+                command.Parameters.AddWithValue("@GatewayAgentIpAddress", (object)agent.GatewayAgentIpAddress ?? DBNull.Value);
+                command.Parameters.AddWithValue("@GatewayAgentPort", (object)agent.GatewayAgentPort ?? DBNull.Value);
+                command.Parameters.AddWithValue("@IsEnabled", agent.IsEnabled);
+                command.Parameters.AddWithValue("@ModifierInfo", (object)modifierInfo ?? DBNull.Value); // 수정자 정보
 
-Users 테이블 삭제: 더 이상 DB를 통한 사용자 인증을 하지 않으므로 이 테이블은 필요 없습니다.
-ManagedAgents 테이블:
-LastModifiedByUserId 컬럼과 FK_ManagedAgents_LastModifiedBy FK 제약 조건이 삭제되었습니다.
-대신 LastModifiedByInfo NVARCHAR(50) NULL 컬럼을 추가하여 (또는 기존 컬럼 활용), 어떤 모드("AdminMode", "UserMode")에서 수정되었는지 간단히 기록할 수 있도록 했습니다 (선택 사항).
-ControlActionLogs 테이블:
-RequestedByUserId 컬럼과 FK_ControlActionLogs_User FK 제약 조건이 삭제되었습니다.
-기존의 RequesterInfo NVARCHAR(255) NULL 컬럼을 활용하여 어떤 모드에서 명령이 실행되었는지, 또는 실행한 PC의 정보 등을 기록할 수 있습니다.
-ExecutedViaGatewayAgentId 컬럼 추가 (이전 스키마에서 이 컬럼이 ManagedAgents에 잘못 추가되었을 수 있어, 로그 테이블로 옮김).
-이제 이 수정된 DB 스키마를 기준으로 MGSPMonitorControl UI 프로그램의 파일들을 수정하여 전체 코드를 드리겠습니다.
+                await connection.OpenAsync();
+                return await command.ExecuteNonQueryAsync() > 0;
+            }
+        }
 
-먼저 삭제될 파일들을 안내하고, 그 다음 수정될 파일들의 코드를 순서대로 제공하겠습니다.
+        public async Task<bool> UpdateManagedAgentAsync(ManagedAgentDisplay agent, string modifierInfo)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            string query = @"UPDATE ManagedAgents SET 
+                                AgentIdProvidedByApp = @AgentIdProvidedByApp, AgentName = @AgentName, Description = @Description, 
+                                ControlType = @ControlType, PrimaryIpAddress = @PrimaryIpAddress, PrimaryPort = @PrimaryPort,
+                                GatewayAgentIpAddress = @GatewayAgentIpAddress, GatewayAgentPort = @GatewayAgentPort, 
+                                IsEnabled = @IsEnabled, LastModifiedDate = GETUTCDATE(), LastModifiedByInfo = @ModifierInfo
+                             WHERE AgentGuid = @AgentGuid;";
 
-삭제할 파일 목록 (MGSPMonitorControl 프로젝트에서):
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentIdProvidedByApp", agent.AgentIdProvidedByApp);
+                command.Parameters.AddWithValue("@AgentName", agent.AgentName);
+                command.Parameters.AddWithValue("@Description", (object)agent.Description ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ControlType", agent.ControlType);
+                command.Parameters.AddWithValue("@PrimaryIpAddress", agent.PrimaryIpAddress);
+                command.Parameters.AddWithValue("@PrimaryPort", agent.PrimaryPort);
+                command.Parameters.AddWithValue("@GatewayAgentIpAddress", (object)agent.GatewayAgentIpAddress ?? DBNull.Value);
+                command.Parameters.AddWithValue("@GatewayAgentPort", (object)agent.GatewayAgentPort ?? DBNull.Value);
+                command.Parameters.AddWithValue("@IsEnabled", agent.IsEnabled);
+                command.Parameters.AddWithValue("@ModifierInfo", (object)modifierInfo ?? DBNull.Value); // 수정자 정보
+                command.Parameters.AddWithValue("@AgentGuid", agent.AgentGuid);
 
-Models/UserSession.cs
-Services/PasswordService.cs
-ViewModels/LoginViewModel.cs
-Views/LoginWindow.xaml
-Views/LoginWindow.xaml.cs
-위 파일들은 새로운 방식에서는 필요하지 않으므로 프로젝트에서 삭제해주십시오.
+                await connection.OpenAsync();
+                return await command.ExecuteNonQueryAsync() > 0;
+            }
+        }
+
+        public async Task<bool> DeleteManagedAgentAsync(Guid agentGuid)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            string query = "DELETE FROM ManagedAgents WHERE AgentGuid = @AgentGuid;";
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentGuid", agentGuid);
+                await connection.OpenAsync();
+                return await command.ExecuteNonQueryAsync() > 0;
+            }
+        }
+
+        #endregion
+
+        #region ControlActionLogs
+
+        // requesterInfo 파라미터 추가 (예: "AdminMode", "UserMode", 또는 현재 활성화된 모드)
+        public async Task<bool> LogControlActionAsync(ControlActionLogEntry logEntry)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            // DB 스키마에서 RequestedByUserId가 RequesterInfo (NVARCHAR)로 변경되었다고 가정
+            string query = @"INSERT INTO ControlActionLogs 
+                                (AgentGuid, ActionType, ActionParameters, RequesterInfo, RequestTimestamp, 
+                                 RelayReceivedTimestamp, AgentReceivedTimestamp, ExecutionCompletedTimestamp, 
+                                 FinalStatus, ResultMessage, ExecutedViaGatewayAgentId)
+                             VALUES 
+                                (@AgentGuid, @ActionType, @ActionParameters, @RequesterInfo, @RequestTimestamp,
+                                 @RelayReceivedTimestamp, @AgentReceivedTimestamp, @ExecutionCompletedTimestamp,
+                                 @FinalStatus, @ResultMessage, @ExecutedViaGatewayAgentId); SELECT SCOPE_IDENTITY();";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@AgentGuid", logEntry.AgentGuid);
+                command.Parameters.AddWithValue("@ActionType", logEntry.ActionType);
+                command.Parameters.AddWithValue("@ActionParameters", (object)logEntry.ActionParameters ?? DBNull.Value);
+                command.Parameters.AddWithValue("@RequesterInfo", (object)logEntry.RequestedByUsername ?? (object)logEntry.RequestedByUserId.ToString() ?? DBNull.Value); // RequestedByUsername 사용 (또는 mode)
+                command.Parameters.AddWithValue("@RequestTimestamp", logEntry.RequestTimestamp);
+                command.Parameters.AddWithValue("@RelayReceivedTimestamp", (object)logEntry.RelayReceivedTimestamp ?? DBNull.Value);
+                command.Parameters.AddWithValue("@AgentReceivedTimestamp", (object)logEntry.AgentReceivedTimestamp ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ExecutionCompletedTimestamp", (object)logEntry.ExecutionCompletedTimestamp ?? DBNull.Value);
+                command.Parameters.AddWithValue("@FinalStatus", logEntry.FinalStatus);
+                command.Parameters.AddWithValue("@ResultMessage", (object)logEntry.ResultMessage ?? DBNull.Value);
+                command.Parameters.AddWithValue("@ExecutedViaGatewayAgentId", (object)logEntry.ExecutedViaGatewayAgentId ?? DBNull.Value);
+
+                await connection.OpenAsync();
+                var result = await command.ExecuteScalarAsync();
+                return result != null && Convert.ToInt64(result) > 0;
+            }
+        }
+        
+        public async Task<List<ControlActionLogEntry>> GetRecentControlLogsAsync(int count = 100)
+        {
+            if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            var logs = new List<ControlActionLogEntry>();
+            // DB 스키마에서 RequestedByUserId가 RequesterInfo로 변경되었다고 가정하고 쿼리 수정
+            string query = $@"
+                SELECT TOP (@Count) 
+                    cl.LogId, cl.AgentGuid, 
+                    ma.AgentName AS AgentNameForLog, 
+                    cl.ActionType, cl.ActionParameters, 
+                    cl.RequesterInfo, -- Users 테이블 조인 대신 RequesterInfo 직접 사용
+                    cl.RequestTimestamp, 
+                    cl.RelayReceivedTimestamp, cl.AgentReceivedTimestamp, cl.ExecutionCompletedTimestamp, 
+                    cl.FinalStatus, cl.ResultMessage, cl.ExecutedViaGatewayAgentId 
+                FROM ControlActionLogs cl
+                LEFT JOIN dbo.ManagedAgents ma ON cl.AgentGuid = ma.AgentGuid
+                ORDER BY cl.RequestTimestamp DESC;";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@Count", count);
+                await connection.OpenAsync();
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        logs.Add(new ControlActionLogEntry {
+                            LogId = reader.GetInt64(reader.GetOrdinal("LogId")),
+                            AgentGuid = reader.GetGuid(reader.GetOrdinal("AgentGuid")),
+                            ActionType = reader.GetString(reader.GetOrdinal("ActionType")),
+                            ActionParameters = reader.IsDBNull(reader.GetOrdinal("ActionParameters")) ? null : reader.GetString(reader.GetOrdinal("ActionParameters")),
+                            RequestedByUsername = reader.IsDBNull(reader.GetOrdinal("RequesterInfo")) ? "N/A" : reader.GetString(reader.GetOrdinal("RequesterInfo")),
+                            RequestTimestamp = reader.GetDateTime(reader.GetOrdinal("RequestTimestamp")),
+                            RelayReceivedTimestamp = reader.IsDBNull(reader.GetOrdinal("RelayReceivedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("RelayReceivedTimestamp")),
+                            AgentReceivedTimestamp = reader.IsDBNull(reader.GetOrdinal("AgentReceivedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("AgentReceivedTimestamp")),
+                            ExecutionCompletedTimestamp = reader.IsDBNull(reader.GetOrdinal("ExecutionCompletedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("ExecutionCompletedTimestamp")),
+                            FinalStatus = reader.GetString(reader.GetOrdinal("FinalStatus")),
+                            ResultMessage = reader.IsDBNull(reader.GetOrdinal("ResultMessage")) ? null : reader.GetString(reader.GetOrdinal("ResultMessage")),
+                            ExecutedViaGatewayAgentId = reader.IsDBNull(reader.GetOrdinal("ExecutedViaGatewayAgentId")) ? null : reader.GetString(reader.GetOrdinal("ExecutedViaGatewayAgentId"))
+                        });
+                    }
+                }
+            }
+            return logs;
+        }
+
+        public async Task<List<ControlActionLogEntry>> GetControlLogsForAgentAsync(Guid agentGuid, int count = 100)
+        {
+             if (string.IsNullOrEmpty(_connectionString)) throw new InvalidOperationException("Database connection string is not configured.");
+            var logs = new List<ControlActionLogEntry>();
+            string query = $@"
+                SELECT TOP (@Count) 
+                    cl.LogId, cl.AgentGuid, 
+                    ma.AgentName AS AgentNameForLog,
+                    cl.ActionType, cl.ActionParameters, 
+                    cl.RequesterInfo, 
+                    cl.RequestTimestamp, 
+                    cl.RelayReceivedTimestamp, cl.AgentReceivedTimestamp, cl.ExecutionCompletedTimestamp, 
+                    cl.FinalStatus, cl.ResultMessage, cl.ExecutedViaGatewayAgentId 
+                FROM ControlActionLogs cl
+                LEFT JOIN dbo.ManagedAgents ma ON cl.AgentGuid = ma.AgentGuid
+                WHERE cl.AgentGuid = @AgentGuid
+                ORDER BY cl.RequestTimestamp DESC;";
+            
+            using (var connection = new SqlConnection(_connectionString))
+            using (var command = new SqlCommand(query, connection))
+            {
+                command.Parameters.AddWithValue("@Count", count);
+                command.Parameters.AddWithValue("@AgentGuid", agentGuid);
+                await connection.OpenAsync();
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                     while (await reader.ReadAsync())
+                    {
+                        logs.Add(new ControlActionLogEntry {
+                            LogId = reader.GetInt64(reader.GetOrdinal("LogId")),
+                            AgentGuid = reader.GetGuid(reader.GetOrdinal("AgentGuid")),
+                            ActionType = reader.GetString(reader.GetOrdinal("ActionType")),
+                            ActionParameters = reader.IsDBNull(reader.GetOrdinal("ActionParameters")) ? null : reader.GetString(reader.GetOrdinal("ActionParameters")),
+                            RequestedByUsername = reader.IsDBNull(reader.GetOrdinal("RequesterInfo")) ? "N/A" : reader.GetString(reader.GetOrdinal("RequesterInfo")),
+                            RequestTimestamp = reader.GetDateTime(reader.GetOrdinal("RequestTimestamp")),
+                            RelayReceivedTimestamp = reader.IsDBNull(reader.GetOrdinal("RelayReceivedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("RelayReceivedTimestamp")),
+                            AgentReceivedTimestamp = reader.IsDBNull(reader.GetOrdinal("AgentReceivedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("AgentReceivedTimestamp")),
+                            ExecutionCompletedTimestamp = reader.IsDBNull(reader.GetOrdinal("ExecutionCompletedTimestamp")) ? (DateTime?)null : reader.GetDateTime(reader.GetOrdinal("ExecutionCompletedTimestamp")),
+                            FinalStatus = reader.GetString(reader.GetOrdinal("FinalStatus")),
+                            ResultMessage = reader.IsDBNull(reader.GetOrdinal("ResultMessage")) ? null : reader.GetString(reader.GetOrdinal("ResultMessage")),
+                            ExecutedViaGatewayAgentId = reader.IsDBNull(reader.GetOrdinal("ExecutedViaGatewayAgentId")) ? null : reader.GetString(reader.GetOrdinal("ExecutedViaGatewayAgentId"))
+                        });
+                    }
+                }
+            }
+            return logs;
+        }
+        #endregion
+    }
+}
+DatabaseService.cs 주요 변경점:
+
+사용자 관련 메서드 전체 삭제: AuthenticateUserAsync, UpdateLastLoginAsync, CreateUserAsync 등 Users 테이블을 사용하던 모든 메서드를 삭제했습니다.
+AddManagedAgentAsync, UpdateManagedAgentAsync 수정: modifierUserId 파라미터 대신 modifierInfo (string 타입) 파라미터를 받도록 변경하고, DB 쿼리에서 LastModifiedByInfo 컬럼에 이 값을 저장하도록 수정했습니다. (DB 스크립트에서 해당 컬럼이 추가되었다고 가정)
+LogControlActionAsync 수정: RequestedByUserId 파라미터 대신 logEntry.RequestedByUsername (또는 다른 모드 정보)을 RequesterInfo 컬럼에 저장하도록 수정했습니다. (DB 스크립트에서 해당 컬럼이 RequesterInfo로 변경되었다고 가정)
+GetRecentControlLogsAsync, GetControlLogsForAgentAsync 수정: Users 테이블과의 JOIN을 제거하고, RequesterInfo 컬럼을 직접 읽어 RequestedByUsername (또는 유사한 속성)에 채우도록 수정했습니다.
+다음 파일:
