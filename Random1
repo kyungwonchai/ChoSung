@@ -1,445 +1,351 @@
-// MGSPMonitorControl/ViewModels/MainViewModel.cs
+// MGSPMonitorControl/Services/BrokerClientService.cs
 using System;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
-using System.Linq;
-using System.Runtime.CompilerServices;
+using System.IO;
+using System.Net; // IPAddress 사용
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Controls; // PasswordBox
-using System.Windows.Input;
-using MGSPMonitorControl.Models;
-using MGSPMonitorControl.Services;
-using MGSPMonitorControl.Views;
-using MonitorControl.SharedModels; // 공용 네임스페이스
+using MGSPMonitorControl.Models;    // 로컬 모델 (여기서는 직접 사용 안 함)
+using MonitorControl.SharedModels; // BrokerMessage 등 공용 모델
 using Newtonsoft.Json;
+using System.Configuration;     // App.config 사용
 
-namespace MGSPMonitorControl.ViewModels
+namespace MGSPMonitorControl.Services
 {
-    public enum ApplicationMode { Basic, User, Admin }
-
-    public class MainViewModel : ObservableObject, IDisposable
+    public interface IBrokerClientService
     {
-        private const string UserModePassword = "user123";
-        private const string AdminModePassword = "admin123";
+        bool IsConnected { get; }
+        Task<bool> ConnectAsync(); // 연결 성공 여부 반환
+        Task DisconnectAsync();
+        Task SendMessageAsync(BrokerMessage message);
 
-        private readonly IDatabaseService _databaseService;
-        private readonly IBrokerClientService _brokerClientService;
+        event Action<BrokerMessage> MessageReceived;
+        event Action Connected;
+        event Action Disconnected;
+    }
 
-        public ObservableCollection<ManagedAgentDisplay> Agents { get; }
-        public ObservableCollection<string> UiActionLogs { get; }
-        public BrokerStatusDisplay BrokerStatus { get; private set; }
+    public class BrokerClientService : IBrokerClientService, IDisposable
+    {
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+        private StreamReader _streamReader;
+        private StreamWriter _streamWriter;
+        private CancellationTokenSource _cts;
+        private Task _receiveLoopTask;
+        private readonly object _sendLock = new object();
+        private bool _isDisposed = false;
+        private volatile bool _isConnecting = false; // 동시 연결 시도 방지 (volatile 추가)
+        private volatile bool _explicitlyDisconnected = false; // 사용자가 명시적으로 연결 끊었는지
 
-        private ManagedAgentDisplay _selectedAgent;
-        public ManagedAgentDisplay SelectedAgent
+        private readonly string _brokerIp = "127.0.0.1"; // 설정 실패 시 기본값
+        private readonly int _brokerPort = 9001;      // 설정 실패 시 기본값
+        private bool _configValid = false;          // 설정이 유효하게 로드되었는지
+
+        public bool IsConnected => !_isDisposed && _tcpClient != null && _tcpClient.Connected &&
+                                  _networkStream != null && _streamReader != null && _streamWriter != null;
+
+        public event Action<BrokerMessage> MessageReceived;
+        public event Action Connected;
+        public event Action Disconnected;
+
+        public BrokerClientService()
         {
-            get => _selectedAgent;
-            set { if (SetProperty(ref _selectedAgent, value)) RefreshAllCommandStates(); }
-        }
-
-        private string _brokerConnectionStatus = "Broker Not Initialized";
-        public string BrokerConnectionStatus
-        {
-            get => _brokerConnectionStatus;
-            set { if (SetProperty(ref _brokerConnectionStatus, value)) RefreshAllCommandStates(); }
-        }
-
-        private ApplicationMode _currentMode = ApplicationMode.Basic;
-        public ApplicationMode CurrentMode
-        {
-            get => _currentMode;
-            private set
-            {
-                if (SetProperty(ref _currentMode, value))
-                {
-                    OnPropertyChanged(nameof(CanManageAgents));
-                    OnPropertyChanged(nameof(CanControlPower));
-                    OnPropertyChanged(nameof(CurrentModeDisplay));
-                    RefreshAllCommandStates();
-                    SafeAddUiLog($"Application mode changed to: {CurrentMode}");
-                }
-            }
-        }
-
-        public string CurrentModeDisplay => $"Current Mode: {CurrentMode}";
-        public bool CanManageAgents => CurrentMode == ApplicationMode.Admin;
-        public bool CanControlPower => CurrentMode == ApplicationMode.Admin || CurrentMode == ApplicationMode.User;
-        public string UiUserIdentifier => $"{Environment.UserName}@{Environment.MachineName}";
-
-        private bool IsBrokerConnectedAndReady() => _brokerClientService != null && _brokerClientService.IsConnected;
-
-        public ICommand LoadAgentsCommand { get; }
-        public RelayCommand<PasswordBox> ApplyModeCommand { get; }
-        public ICommand LogoutCommand { get; }
-        public ICommand AddAgentCommand { get; }
-        public ICommand EditAgentCommand { get; }
-        public ICommand DeleteAgentCommand { get; }
-        public ICommand MonitorOnCommand { get; }
-        public ICommand MonitorOffCommand { get; }
-        public ICommand PingAgentCommand { get; }
-        public ICommand RequestBrokerStatusCommand { get; }
-        public ICommand ConnectToBrokerCommand { get; }
-        public ICommand DisconnectFromBrokerCommand { get; }
-        public ICommand ClearUiLogsCommand { get; }
-
-        private bool _isCleanupDone = false;
-
-        public MainViewModel(IDatabaseService databaseService, IBrokerClientService brokerClientService)
-        {
-            _databaseService = databaseService;
-            _brokerClientService = brokerClientService;
-
-            Agents = new ObservableCollection<ManagedAgentDisplay>();
-            UiActionLogs = new ObservableCollection<string>();
-            BrokerStatus = new BrokerStatusDisplay();
-
-            SafeAddUiLog($"MainViewModel initialized. Mode: {CurrentMode}.");
-            if (_databaseService == null) SafeAddUiLog("[CRITICAL] DatabaseService is NULL.");
-            if (_brokerClientService == null) SafeAddUiLog("[CRITICAL] BrokerClientService is NULL.");
-            else
-            {
-                _brokerClientService.Connected += OnBrokerConnected;
-                _brokerClientService.Disconnected += OnBrokerDisconnected;
-                _brokerClientService.MessageReceived += OnBrokerMessageReceived;
-                BrokerConnectionStatus = _brokerClientService.IsConnected ? "Connected" : "Disconnected (Initial)";
-            }
-
-            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync(), () => _databaseService != null);
-            ApplyModeCommand = new RelayCommand<PasswordBox>(ExecuteApplyMode, (pBox) => pBox != null);
-            LogoutCommand = new RelayCommand(ExecuteLogout, () => CurrentMode != ApplicationMode.Basic);
-            AddAgentCommand = new RelayCommand(ExecuteAddAgent, () => CanManageAgents && _databaseService != null);
-            EditAgentCommand = new RelayCommand(ExecuteEditAgent, () => SelectedAgent != null && CanManageAgents && _databaseService != null);
-            DeleteAgentCommand = new RelayCommand(async () => await ExecuteDeleteAgentAsync(), () => SelectedAgent != null && CanManageAgents && _databaseService != null);
-            MonitorOnCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOn"), () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
-            MonitorOffCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOff"), () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
-            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(), () => SelectedAgent != null && SelectedAgent.IsOnline && IsBrokerConnectedAndReady());
-            RequestBrokerStatusCommand = new RelayCommand(async () => await ExecuteRequestBrokerStatusAsync(), IsBrokerConnectedAndReady);
-            ConnectToBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.ConnectAsync(); }, () => _brokerClientService != null && !_brokerClientService.IsConnected);
-            DisconnectFromBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.DisconnectAsync(); }, IsBrokerConnectedAndReady);
-            ClearUiLogsCommand = new RelayCommand(() => UiActionLogs.Clear());
-
-            // 초기 데이터 로드 및 연결 시도
-            if (_databaseService != null) Task.Run(async () => await ExecuteLoadAgentsAsync());
-            if (_brokerClientService != null && !_brokerClientService.IsConnected) Task.Run(async () => await _brokerClientService.ConnectAsync());
-            RefreshAllCommandStates();
-        }
-
-        // UI 스레드에서 안전하게 커맨드 상태 갱신
-        private void RefreshAllCommandStates()
-        {
-            SafeRunOnUi(() =>
-            {
-                (LoadAgentsCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (ApplyModeCommand as RelayCommand<PasswordBox>)?.RaiseCanExecuteChanged();
-                (LogoutCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (AddAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (EditAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (DeleteAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (MonitorOnCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (MonitorOffCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (PingAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (RequestBrokerStatusCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (ConnectToBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
-                (DisconnectFromBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            });
-        }
-
-        // UI 스레드에서 안전하게 로그 추가
-        private void SafeAddUiLog(string message)
-        {
-            SafeRunOnUi(() => AddUiLogInternal(message));
-        }
-
-        private void AddUiLogInternal(string message) // 반드시 UI 스레드에서 호출
-        {
-            string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
-            UiActionLogs.Insert(0, logEntry);
-            if (UiActionLogs.Count > 200) UiActionLogs.RemoveAt(UiActionLogs.Count - 1);
-        }
-
-        private void ExecuteApplyMode(PasswordBox passwordBox)
-        {
-            if (passwordBox == null) { SafeAddUiLog("[ERROR] PasswordBox is null in ExecuteApplyMode."); return; }
-            string enteredPassword = passwordBox.Password;
-            passwordBox.Clear();
-            if (string.IsNullOrEmpty(enteredPassword)) { SafeAddUiLog("[WARNING] Empty password entered for mode change."); return; }
-
-            if (enteredPassword == AdminModePassword) CurrentMode = ApplicationMode.Admin;
-            else if (enteredPassword == UserModePassword) CurrentMode = ApplicationMode.User;
-            else
-            {
-                SafeAddUiLog($"[WARNING] Invalid password ('{enteredPassword}') entered. Mode remains {CurrentMode}.");
-                MessageBox.Show("Invalid password.", "Access Denied", MessageBoxButton.OK, MessageBoxImage.Warning);
-            }
-        }
-
-        private void ExecuteLogout() => CurrentMode = ApplicationMode.Basic;
-
-        private async Task ExecuteLoadAgentsAsync()
-        {
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for ExecuteLoadAgentsAsync."); return; }
-            SafeAddUiLog("Loading agent configurations from database...");
+            SafeConsoleLog("BrokerClientService: Constructor - Initializing...");
+            string brokerAddressSetting = null;
             try
             {
-                var dbAgents = await _databaseService.GetManagedAgentsAsync();
-                SafeRunOnUi(() =>
+                brokerAddressSetting = ConfigurationManager.AppSettings["BrokerAddress"];
+                if (string.IsNullOrWhiteSpace(brokerAddressSetting))
                 {
-                    Agents.Clear();
-                    if (dbAgents != null)
+                    SafeConsoleLog($"[CONFIG_WARN] 'BrokerAddress' not found or empty in App.config. Using default: {_brokerIp}:{_brokerPort}");
+                    // 기본값을 사용하므로 _configValid는 true로 설정될 수 있음 (만약 기본값이 유효하다면)
+                }
+            }
+            catch (ConfigurationErrorsException confEx)
+            {
+                SafeConsoleLog($"[CRITICAL_CONFIG_ERROR] Failed to load App.config or AppSettings section: {confEx.Message}. Using default: {_brokerIp}:{_brokerPort}");
+                // 이 경우에도 기본값을 사용하므로 _configValid는 기본값에 따라 결정
+            }
+            catch (Exception ex)
+            {
+                SafeConsoleLog($"[ERROR] Unexpected error reading BrokerAddress from App.config. Using default: {_brokerIp}:{_brokerPort}. Error: {ex.Message}");
+            }
+
+            string addressToParse = string.IsNullOrWhiteSpace(brokerAddressSetting) ? $"{_brokerIp}:{_brokerPort}" : brokerAddressSetting;
+            var parts = addressToParse.Split(':');
+
+            if (parts.Length == 2 &&
+                IPAddress.TryParse(parts[0], out IPAddress ip) &&
+                int.TryParse(parts[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int port) &&
+                port > 0 && port <= 65535)
+            {
+                _brokerIp = ip.ToString();
+                _brokerPort = port;
+                _configValid = true; // 설정이 유효하게 파싱됨
+                SafeConsoleLog($"BrokerClientService: Target Broker configured to {_brokerIp}:{_brokerPort}");
+            }
+            else
+            {
+                SafeConsoleLog($"[CONFIG_ERROR] Invalid 'BrokerAddress' format: '{addressToParse}'. Using default: {_brokerIp}:{_brokerPort}. This service might not connect.");
+                // 기본값(_brokerIp, _brokerPort)이 설정되어 있으므로, _configValid는 true로 둘 수 있음.
+                // 만약 기본값도 유효하지 않다면 false로 설정해야 함. 여기서는 기본값이 유효하다고 가정.
+                _configValid = true; // 기본값으로라도 시도 가능하도록
+            }
+        }
+
+        public async Task<bool> ConnectAsync()
+        {
+            if (!_configValid)
+            {
+                SafeConsoleLog("BrokerClientService: Broker configuration is invalid. Cannot attempt connection.");
+                Disconnected?.Invoke();
+                return false;
+            }
+            if (IsConnected)
+            {
+                SafeConsoleLog("BrokerClientService: Already connected.");
+                return true;
+            }
+            if (_isDisposed)
+            {
+                SafeConsoleLog("BrokerClientService: Object is disposed. Cannot connect.");
+                return false;
+            }
+            if (_isConnecting)
+            {
+                SafeConsoleLog("BrokerClientService: Connection attempt already in progress.");
+                return false;
+            }
+
+            _isConnecting = true;
+            _explicitlyDisconnected = false; // 새로운 연결 시도 시 명시적 끊김 플래그 리셋
+            _cts?.Cancel();
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
+
+            try
+            {
+                SafeConsoleLog($"BrokerClientService: Attempting to connect to Broker: {_brokerIp}:{_brokerPort}");
+                _tcpClient = new TcpClient();
+
+                var connectTask = _tcpClient.ConnectAsync(_brokerIp, _brokerPort);
+                var timeoutDelayTask = Task.Delay(TimeSpan.FromSeconds(7), token);
+
+                Task completedTask = await Task.WhenAny(connectTask, timeoutDelayTask).ConfigureAwait(false);
+
+                if (token.IsCancellationRequested)
+                {
+                    SafeConsoleLog("BrokerClientService: Connection attempt cancelled by token during WhenAny.");
+                    _tcpClient?.Close();
+                    throw new OperationCanceledException("Connection cancelled by token.");
+                }
+
+                if (completedTask == timeoutDelayTask || !connectTask.IsCompleted)
+                {
+                    _tcpClient?.Close();
+                    SafeConsoleLog($"BrokerClientService: Timeout or connect task did not complete connecting to Broker {_brokerIp}:{_brokerPort}.");
+                    throw new TimeoutException("Connection attempt timed out.");
+                }
+
+                if (connectTask.IsFaulted) // 연결 중 예외 발생 (예: 서버 거부, 네트워크 경로 없음)
+                {
+                    _tcpClient?.Close();
+                    SafeConsoleLog($"[ERROR] BrokerClientService: Connection task faulted: {connectTask.Exception?.GetBaseException().Message}");
+                    throw connectTask.Exception?.GetBaseException() ?? new SocketException((int)SocketError.SocketError);
+                }
+                
+                // 이 시점에서 connectTask.Status == TaskStatus.RanToCompletion 가정
+                if (_tcpClient.Connected)
+                {
+                    _networkStream = _tcpClient.GetStream();
+                    if (_networkStream == null) throw new NullReferenceException("NetworkStream is null after TcpClient connection.");
+                    
+                    _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
+                    _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
+                    
+                    SafeConsoleLog("BrokerClientService: Successfully connected to Broker. Streams initialized.");
+                    _isConnecting = false;
+                    Connected?.Invoke();
+
+                    _receiveLoopTask = Task.Run(() => ReceiveMessagesAsync(token), token);
+                    return true;
+                }
+                else // RanToCompletion이지만 Connected가 false인 드문 경우
+                {
+                    _tcpClient?.Close();
+                    SafeConsoleLog("[ERROR] BrokerClientService: Connection task RanToCompletion but TcpClient is not connected.");
+                    throw new SocketException((int)SocketError.NotConnected);
+                }
+            }
+            catch (OperationCanceledException opCancelledEx) // Task.Delay에서 발생 가능
+            {
+                SafeConsoleLog($"BrokerClientService: Connection operation cancelled: {opCancelledEx.Message}");
+            }
+            catch (SocketException sockEx)
+            {
+                SafeConsoleLog($"[ERROR] BrokerClientService: SocketException during ConnectAsync: {sockEx.Message} (ErrorCode: {sockEx.SocketErrorCode})");
+            }
+            catch (Exception ex)
+            {
+                SafeConsoleLog($"[ERROR] BrokerClientService: General error during ConnectAsync: {ex.ToString()}");
+            }
+            finally
+            {
+                _isConnecting = false; // 어떤 경우든 isConnecting은 해제
+            }
+
+            // 여기까지 왔다면 연결 실패
+            CleanupConnectionResourcesInternal(false); // 예외 발생 시 리소스 정리
+            Disconnected?.Invoke();
+            return false;
+        }
+
+        private async Task ReceiveMessagesAsync(CancellationToken token)
+        {
+            SafeConsoleLog("BrokerClientService: ReceiveMessagesAsync loop started.");
+            try
+            {
+                while (!token.IsCancellationRequested && IsConnected)
+                {
+                    string messageJson = null;
+                    try
                     {
-                        foreach (var agent in dbAgents.OrderBy(a => a.AgentName))
-                        { agent.IsOnline = false; agent.CurrentMonitorStatus = "Unknown (Offline)"; Agents.Add(agent); }
+                        // ReadLineAsync가 null을 반환하면 연결이 정상적으로 닫힌 것
+                        // IOException은 비정상적 종료 가능성
+                        messageJson = await _streamReader.ReadLineAsync().ConfigureAwait(false);
                     }
-                    SelectedAgent = null;
-                });
-                SafeAddUiLog($"Loaded {dbAgents?.Count ?? 0} agent configurations from DB.");
-                if (IsBrokerConnectedAndReady() && _brokerClientService != null) { await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = UiUserIdentifier }); }
-            }
-            catch (Exception ex) { SafeAddUiLog($"[ERROR] Loading agents from DB: {ex.ToString()}"); MessageBox.Show($"Error loading agents: {ex.Message}", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); }
-            finally { SafeRefreshAllCommandStates(); }
-        }
+                    catch (ObjectDisposedException) when (token.IsCancellationRequested || _isDisposed) { SafeConsoleLog("BrokerClientService: StreamReader disposed in ReceiveMessagesAsync."); break; }
+                    catch (IOException) when (token.IsCancellationRequested || !IsConnected) { SafeConsoleLog("BrokerClientService: IOException in ReceiveMessagesAsync (connection likely lost or cancelled)."); break; }
 
-        private async void ExecuteAddAgent()
-        {
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for ExecuteAddAgent."); return; }
-            SafeAddUiLog("Opening 'Add New Agent' window...");
-            var agentConfigVm = new AgentConfigViewModel(_databaseService, CurrentMode.ToString() + "Mode");
-            var agentConfigWindow = new AgentConfigWindow(agentConfigVm);
-            if (agentConfigWindow.ShowDialog() == true) { SafeAddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' config saved. Refreshing."); await ExecuteLoadAgentsAsync(); }
-            else { SafeAddUiLog("'Add New Agent' window cancelled."); }
-        }
+                    if (messageJson == null) { SafeConsoleLog("BrokerClientService: Broker disconnected (ReadLineAsync returned null)."); break; }
+                    if (string.IsNullOrWhiteSpace(messageJson)) continue;
 
-        private async void ExecuteEditAgent()
-        {
-            if (SelectedAgent == null) { SafeAddUiLog("[WARN] No agent selected for edit."); return; }
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for ExecuteEditAgent."); return; }
-            SafeAddUiLog($"Opening 'Edit Agent' window for: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
-            ManagedAgentDisplay agentToEditInDb = null;
-            try { agentToEditInDb = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid); }
-            catch (Exception ex) { SafeAddUiLog($"[ERROR] Fetching agent for editing: {ex.GetBaseException().Message}"); MessageBox.Show($"Error: {ex.GetBaseException().Message}", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); return; }
-            if (agentToEditInDb == null) { SafeAddUiLog($"Agent {SelectedAgent.AgentName} not found in DB. Refreshing."); MessageBox.Show("Selected agent not found. Refresh list.", "Error", MessageBoxButton.OK, MessageBoxImage.Error); await ExecuteLoadAgentsAsync(); return; }
-            var agentConfigVm = new AgentConfigViewModel(_databaseService, CurrentMode.ToString() + "Mode", agentToEditInDb);
-            var agentConfigWindow = new AgentConfigWindow(agentConfigVm);
-            if (agentConfigWindow.ShowDialog() == true) { SafeAddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' config updated. Refreshing."); await ExecuteLoadAgentsAsync(); }
-            else { SafeAddUiLog("'Edit Agent' window cancelled."); }
-        }
-
-        private async Task ExecuteDeleteAgentAsync()
-        {
-            if (SelectedAgent == null) { SafeAddUiLog("[WARN] No agent selected for delete."); return; }
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for ExecuteDeleteAgentAsync."); return; }
-            if (MessageBox.Show($"Delete config for '{SelectedAgent.AgentName}' (AppID: {SelectedAgent.AgentIdProvidedByApp})?", "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
-            {
-                SafeAddUiLog($"Deleting agent config: {SelectedAgent.AgentName}");
-                try
-                {
-                    bool success = await _databaseService.DeleteManagedAgentAsync(SelectedAgent.AgentGuid);
-                    if (success) { SafeAddUiLog($"Agent '{SelectedAgent.AgentName}' deleted. Refreshing."); await ExecuteLoadAgentsAsync(); }
-                    else { SafeAddUiLog($"[ERROR] Failed to delete '{SelectedAgent.AgentName}'."); MessageBox.Show("Failed to delete.", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); }
-                }
-                catch (Exception ex) { SafeAddUiLog($"[ERROR] Deleting '{SelectedAgent.AgentName}': {ex.Message}"); MessageBox.Show($"Error: {ex.Message}", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); }
-            }
-        }
-
-        private async Task ExecuteMonitorControlAsync(string actionType)
-        {
-            if (SelectedAgent == null) { SafeAddUiLog("[WARN] No agent selected for monitor control."); return; }
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for monitor control."); return; }
-            if (!IsBrokerConnectedAndReady()) { SafeAddUiLog("[WARN] Broker not connected. Cannot send monitor control."); return; }
-
-            string correlationIdString = Guid.NewGuid().ToString(); Guid correlationIdGuid = Guid.Parse(correlationIdString);
-            SafeAddUiLog($"Sending '{actionType}' (CorrID: {correlationIdString}) to: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
-            ManagedAgentDisplay currentAgentConfig = null;
-            try { currentAgentConfig = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid); }
-            catch (Exception ex) { SafeAddUiLog($"[DB ERROR] Get agent config for '{actionType}': {ex.Message}"); MessageBox.Show($"DB error: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error); return; }
-            if (currentAgentConfig == null) { SafeAddUiLog($"[ERROR] Agent config for '{SelectedAgent.AgentName}' not found. Cannot send '{actionType}'."); MessageBox.Show("Agent config not found. Refresh list.", "Error", MessageBoxButton.OK, MessageBoxImage.Error); return; }
-            
-            var payload = new UiControlAgentPayload { TargetAgentIdProvidedByApp = currentAgentConfig.AgentIdProvidedByApp, ControlAction = actionType, ControlType = currentAgentConfig.ControlType, PrimaryIpAddress = currentAgentConfig.PrimaryIpAddress, PrimaryPort = currentAgentConfig.PrimaryPort, GatewayAgentIdToUse = currentAgentConfig.ControlType == "Gatewayed" ? currentAgentConfig.GatewayAgentIpAddress : null, };
-            var message = new BrokerMessage { Type = MessageType.UiRequest_ControlAgent, CorrelationId = correlationIdString, Payload = JsonConvert.SerializeObject(payload), SourceId = UiUserIdentifier };
-            var logEntry = new ControlActionLogEntry { AgentGuid = currentAgentConfig.AgentGuid, CorrelationId = correlationIdGuid, ActionType = actionType, RequesterInfo = $"{CurrentMode} Mode ({UiUserIdentifier})", RequestTimestamp = DateTime.UtcNow, FinalStatus = "SentToBroker", ResultMessage = $"Command (CorrID: {correlationIdString}) sent to broker." };
-            
-            try { await _databaseService.LogControlActionAsync(logEntry); SafeAddUiLog($"Initial log for CorrID {correlationIdString} saved."); }
-            catch (Exception ex) { SafeAddUiLog($"[DB ERROR] Log initial cmd send for CorrID {correlationIdString}: {ex.Message}"); }
-            
-            if (_brokerClientService != null) await _brokerClientService.SendMessageAsync(message); 
-            else SafeAddUiLog("[ERROR] Broker client not available to send command.");
-        }
-
-        private async Task ExecutePingAgentAsync()
-        {
-            if (SelectedAgent == null) { SafeAddUiLog("[WARN] No agent selected for ping."); return; }
-            if (_databaseService == null) { SafeAddUiLog("[ERROR] DatabaseService not available for ping."); return; }
-            if (!IsBrokerConnectedAndReady()) { SafeAddUiLog("[WARN] Broker not connected. Cannot send ping."); return; }
-            
-            string correlationIdString = Guid.NewGuid().ToString(); Guid correlationIdGuid = Guid.Parse(correlationIdString);
-            SafeAddUiLog($"Sending 'PingAgent' (CorrID: {correlationIdString}) to: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
-            var currentAgentConfig = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid);
-            if (currentAgentConfig == null) { SafeAddUiLog($"[ERROR] Agent config for '{SelectedAgent.AgentName}' not found for Ping."); return; }
-            var payload = new UiControlAgentPayload { TargetAgentIdProvidedByApp = currentAgentConfig.AgentIdProvidedByApp, ControlAction = "PingAgent", ControlType = currentAgentConfig.ControlType, PrimaryIpAddress = currentAgentConfig.PrimaryIpAddress, PrimaryPort = currentAgentConfig.PrimaryPort, GatewayAgentIdToUse = currentAgentConfig.ControlType == "Gatewayed" ? currentAgentConfig.GatewayAgentIpAddress : null };
-            var message = new BrokerMessage { Type = MessageType.UiRequest_ControlAgent, CorrelationId = correlationIdString, Payload = JsonConvert.SerializeObject(payload), SourceId = UiUserIdentifier };
-            var logEntry = new ControlActionLogEntry { AgentGuid = currentAgentConfig.AgentGuid, CorrelationId = correlationIdGuid, ActionType = "PingAgent", RequesterInfo = $"{CurrentMode} Mode ({UiUserIdentifier})", RequestTimestamp = DateTime.UtcNow, FinalStatus = "PingSentToBroker" };
-            try { await _databaseService.LogControlActionAsync(logEntry); } catch (Exception ex) { SafeAddUiLog($"[DB ERROR] Log Ping send: {ex.Message}");}
-            if (_brokerClientService != null) await _brokerClientService.SendMessageAsync(message); else SafeAddUiLog("[ERROR] Broker client not available to send ping.");
-        }
-
-        private async Task ExecuteRequestBrokerStatusAsync()
-        {
-            if (!IsBrokerConnectedAndReady()) { SafeAddUiLog("[WARN] Cannot request broker status: Not connected."); return; }
-            SafeAddUiLog("Requesting broker status and logs...");
-            var message = new BrokerMessage { Type = MessageType.UiRequest_GetBrokerStatus, SourceId = UiUserIdentifier };
-            if (_brokerClientService != null) await _brokerClientService.SendMessageAsync(message); else SafeAddUiLog("[ERROR] Broker client not available to request status.");
-        }
-
-        #region Broker Event Handlers
-        private void OnBrokerConnected()
-        {
-            SafeRunOnUi(() => { BrokerConnectionStatus = "Connected"; SafeAddUiLog("Successfully connected to Broker Service."); SafeRefreshAllCommandStates(); });
-            if (_brokerClientService == null) return;
-            Task.Run(async () => {
-                string uiIdentifier = UiUserIdentifier;
-                if (_brokerClientService != null) // 중첩 null 체크
-                {
-                    await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiClientHello, SourceId = uiIdentifier });
-                    await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = uiIdentifier });
-                    await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetBrokerStatus, SourceId = uiIdentifier });
-                }
-            });
-        }
-
-        private void OnBrokerDisconnected()
-        {
-             SafeRunOnUi(() => {
-                BrokerConnectionStatus = "Disconnected"; SafeAddUiLog("Disconnected from Broker Service. Check Broker. Auto-retry may be active.");
-                foreach(var agent in Agents) { agent.IsOnline = false; agent.CurrentMonitorStatus = "Offline (Broker D/C)"; }
-                SafeRefreshAllCommandStates();
-             });
-        }
-
-        private void OnBrokerMessageReceived(BrokerMessage message) 
-        {
-            SafeRunOnUi(() =>
-            {
-                try
-                {
-                    switch (message.Type)
+                    try
                     {
-                        case MessageType.BrokerToUi_InitialAgentList:
-                            var agentListPayload = JsonConvert.DeserializeObject<List<LiveAgentInfoForUi>>(message.Payload);
-                            if (agentListPayload != null) { UpdateAgentListFromBroker(agentListPayload, true); SafeAddUiLog($"Rcvd initial list of {agentListPayload.Count} live agents."); }
-                            break;
-                        case MessageType.BrokerToUi_BroadcastAgentRegisteredOrUpdated:
-                        case MessageType.BrokerToUi_BroadcastAgentStatus:
-                            var liveAgentInfo = JsonConvert.DeserializeObject<LiveAgentInfoForUi>(message.Payload);
-                            if (liveAgentInfo != null) { UpdateSingleAgentStatus(liveAgentInfo); if(message.Type == MessageType.BrokerToUi_BroadcastAgentRegisteredOrUpdated) SafeAddUiLog($"Agent '{liveAgentInfo.AgentIdProvidedByApp}' connection status updated."); }
-                            break;
-                        case MessageType.BrokerToUi_BroadcastAgentDisconnected:
-                            string disconnectedAgentId = message.SourceId; 
-                            var agentToMarkOffline = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == disconnectedAgentId);
-                            if (agentToMarkOffline != null) { agentToMarkOffline.IsOnline = false; agentToMarkOffline.CurrentMonitorStatus = "Offline (Disconnected)"; agentToMarkOffline.LastStatusMessageFromAgent = "Disconnected from Broker"; SafeAddUiLog($"Agent disconnected from Broker: {disconnectedAgentId}"); SafeRefreshAllCommandStates(); }
-                            break;
-                        case MessageType.BrokerToUi_ForwardAgentCommandResult:
-                            var cmdResultPayload = JsonConvert.DeserializeObject<AgentCommandResultPayload>(message.Payload);
-                            if (cmdResultPayload != null && !string.IsNullOrEmpty(message.SourceId))
-                            {
-                                SafeAddUiLog($"Result for CmdID [{message.CorrelationId}] from Agent [{message.SourceId}]: {(cmdResultPayload.Success ? "OK" : "NG")} - {cmdResultPayload.Message}");
-                                var agentForResult = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == message.SourceId);
-                                if(agentForResult != null) { agentForResult.CurrentMonitorStatus = cmdResultPayload.CurrentMonitorStatus; agentForResult.LastStatusMessageFromAgent = $"CmdRes: {cmdResultPayload.Message.Substring(0, Math.Min(cmdResultPayload.Message.Length,100))}"; agentForResult.IsOnline = true; SafeRefreshAllCommandStates(); }
-                                if (Guid.TryParse(message.CorrelationId, out Guid correlationGuid)) { UpdateControlActionLogAsync(correlationGuid, message.SourceId, cmdResultPayload.Success, cmdResultPayload.Message, cmdResultPayload.CurrentMonitorStatus, DateTime.UtcNow).ConfigureAwait(false); } // ConfigureAwait(false) for non-UI thread
-                                else { SafeAddUiLog($"[WARN] Invalid CorrelationId format for DB log: {message.CorrelationId}"); }
-                            }
-                            break;
-                        case MessageType.BrokerToUi_CommandDispatchFailed:
-                             var dispatchFailPayload = JsonConvert.DeserializeObject<dynamic>(message.Payload); // dynamic은 최소한으로 사용
-                             string reason = dispatchFailPayload?.Message?.ToString() ?? "Unknown dispatch error";
-                             string failedTargetAgentId = message.TargetId ?? message.SourceId; 
-                             SafeAddUiLog($"[ERROR] Broker failed to dispatch command [{message.CorrelationId}] for Agent [{failedTargetAgentId}]: {reason}");
-                             if (Guid.TryParse(message.CorrelationId, out Guid correlationGuidFail)) { UpdateControlActionLogAsync(correlationGuidFail, failedTargetAgentId, false, $"Broker Dispatch Failed: {reason}", null, DateTime.UtcNow, "FailureAtBroker").ConfigureAwait(false); }
-                             else { SafeAddUiLog($"[WARN] Invalid CorrelationId format for DB log (DispatchFail): {message.CorrelationId}"); }
-                            break;
-                        case MessageType.BrokerToUi_SendBrokerStatus:
-                            var brokerStatusPayload = JsonConvert.DeserializeObject<BrokerStatusInfoPayload>(message.Payload);
-                            if (brokerStatusPayload != null) { BrokerStatus.UpdateFromServerPayload(brokerStatusPayload); SafeAddUiLog("Broker status and logs updated."); }
-                            break;
-                        default: SafeAddUiLog($"Rcvd unhandled msg type '{message.Type}' from Broker. Src: {message.SourceId}"); break;
+                        var message = JsonConvert.DeserializeObject<BrokerMessage>(messageJson);
+                        if (message != null) { SafeConsoleLog($"BrokerClientService: Message received: Type={message.Type}, CorrId={message.CorrelationId}"); MessageReceived?.Invoke(message); }
+                        else { SafeConsoleLog($"[WARNING] BrokerClientService: Failed to deserialize message: {messageJson}"); }
+                    }
+                    catch (JsonException jsonEx) { SafeConsoleLog($"[ERROR] BrokerClientService: JSON deserialization error: {jsonEx.Message}. Received: {messageJson}"); }
+                }
+            }
+            catch (OperationCanceledException) { SafeConsoleLog("BrokerClientService: ReceiveMessagesAsync cancelled."); }
+            catch (Exception ex) { if(!token.IsCancellationRequested && !_isDisposed) SafeConsoleLog($"[ERROR] BrokerClientService: Unexpected error in ReceiveMessagesAsync: {ex.ToString()}"); }
+            finally
+            {
+                SafeConsoleLog("BrokerClientService: ReceiveMessagesAsync loop ended.");
+                if (!_isDisposed && !token.IsCancellationRequested && !_explicitlyDisconnected)
+                {
+                    CleanupConnectionResourcesInternal(false);
+                    Disconnected?.Invoke();
+                }
+            }
+        }
+
+        public async Task SendMessageAsync(BrokerMessage message)
+        {
+            if (!IsConnected || _streamWriter == null || _isDisposed || (_cts != null && _cts.IsCancellationRequested))
+            { SafeConsoleLog($"BrokerClientService: Cannot send message. Invalid state. Type: {message.Type}"); return; }
+
+            string messageJson = "";
+            try
+            {
+                messageJson = JsonConvert.SerializeObject(message);
+                // SendMessageAsync는 UI 스레드에서도 호출될 수 있으므로, WriteLineAsync 사용 권장.
+                // 하지만 StreamWriter.WriteLineAsync는 .NET 4.5에 없음. Write + FlushAsync.
+                // 여기서는 동기 Write 후 Flush를 가정 (이전 코드 유지)
+                bool sent = false;
+                lock (_sendLock)
+                {
+                    if (IsConnected && _streamWriter != null && !_isDisposed && (_cts == null || !_cts.IsCancellationRequested))
+                    {
+                        _streamWriter.WriteLine(messageJson); // AutoFlush = true
+                        sent = true;
                     }
                 }
-                catch (JsonException jsonEx) { SafeAddUiLog($"[ERROR] Parse payload error {message.Type}: {jsonEx.Message}. Payload: {message.Payload}"); }
-                catch (Exception ex) { SafeAddUiLog($"[ERROR] Processing message {message.Type}: {ex.Message}. Details: {ex.ToString()}"); }
-            });
-        }
-        
-        private void UpdateAgentListFromBroker(List<LiveAgentInfoForUi> liveAgents, bool isInitialLoad) 
-        { 
-            // 이 메서드는 이미 UI 스레드에서 호출됨 (SafeRunOnUi 내부)
-            foreach (var liveAgent in liveAgents) UpdateSingleAgentStatus(liveAgent);
-            if(isInitialLoad) { foreach(var dbAgentConfig in Agents.ToList()) { if(!liveAgents.Any(la => la.AgentIdProvidedByApp == dbAgentConfig.AgentIdProvidedByApp && la.IsOnline)) { dbAgentConfig.IsOnline = false; dbAgentConfig.CurrentMonitorStatus = "Offline (Not on Broker)"; } } }
-            RefreshAllCommandStates(); // UI 스레드에서 직접 호출
-        }
-
-        private void UpdateSingleAgentStatus(LiveAgentInfoForUi liveInfo) 
-        { 
-            // 이 메서드는 이미 UI 스레드에서 호출됨
-            var agentInUiList = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == liveInfo.AgentIdProvidedByApp);
-            if (agentInUiList != null) agentInUiList.UpdateLiveStatus(liveInfo); 
-            else SafeAddUiLog($"Live agent '{liveInfo.AgentIdProvidedByApp}' (IP: {liveInfo.PrimaryReportedIpAddress}) from Broker is not in local DB config list.");
-            if (SelectedAgent != null && SelectedAgent.AgentIdProvidedByApp == liveInfo.AgentIdProvidedByApp) RefreshAllCommandStates(); // UI 스레드에서 직접 호출
-        }
-        
-        private async Task UpdateControlActionLogAsync(Guid correlationId, string agentIdProvidedByApp, 
-                                                    bool success, string resultMessage, string finalMonitorStatus, 
-                                                    DateTime completedTimestamp, string finalStatusOverride = null)
-        {
-            if (_databaseService == null) { SafeAddUiLog("[DB LOG ERROR] DatabaseService not available."); return; }
-            var agentConfig = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == agentIdProvidedByApp);
-            if (agentConfig == null) { SafeAddUiLog($"[DB LOG ERROR] Cannot log: Agent config {agentIdProvidedByApp} not found for CorrId {correlationId}."); return; }
-            string originalActionType = "ControlAction_Result"; // TODO: 실제 ActionType 로깅 필요
-            var logEntry = new ControlActionLogEntry
-            {
-                AgentGuid = agentConfig.AgentGuid, CorrelationId = correlationId, ActionType = originalActionType, 
-                RequestTimestamp = DateTime.UtcNow.AddSeconds(-30), // TODO: 올바른 원래 요청 시간 필요
-                ExecutionCompletedTimestamp = completedTimestamp,
-                FinalStatus = finalStatusOverride ?? (success ? "Success" : "FailureAtAgent"),
-                ResultMessage = resultMessage, RequesterInfo = $"{CurrentMode} Mode ({UiUserIdentifier})"
-            };
-            SafeAddUiLog($"Logging final status for {agentConfig.AgentName} (CorrId: {correlationId}) to DB. Status: {logEntry.FinalStatus}");
-            try { await _databaseService.LogControlActionAsync(logEntry); }
-            catch (Exception ex) { SafeAddUiLog($"[DB ERROR] Failed to log final command status for {agentConfig.AgentName} to DB: {ex.Message}"); }
-        }
-        
-        #endregion
-
-        // UI 스레드에서 안전하게 액션 실행을 위한 헬퍼 메서드
-        private void SafeRunOnUi(Action action)
-        {
-            if (Application.Current != null && Application.Current.Dispatcher != null && 
-                !Application.Current.Dispatcher.HasShutdownStarted && !Application.Current.Dispatcher.HasShutdownFinished)
-            {
-                Application.Current.Dispatcher.Invoke(action);
+                if (sent) { SafeConsoleLog($"BrokerClientService: Message sent: {message.Type}, CorrId: {message.CorrelationId}"); }
+                else { SafeConsoleLog($"[WARNING] BrokerClientService: Send cancelled or not possible for {message.Type} inside lock."); }
             }
-            else { Console.WriteLine($"[VM LOG - NO DISPATCHER/SHUTDOWN] Action not executed on UI thread: {action?.Method.Name}"); }
+            catch (ObjectDisposedException) { SafeConsoleLog($"[WARNING] BrokerClientService: Attempted to send {message.Type} on a disposed object."); HandleSendErrorInternal(); }
+            catch (IOException ioEx) { SafeConsoleLog($"[ERROR] BrokerClientService: IOException sending {message.Type}: {ioEx.Message}"); HandleSendErrorInternal(); }
+            catch (JsonException jsonEx) { SafeConsoleLog($"[ERROR] BrokerClientService: Error serializing {message.Type}: {jsonEx.Message}. Payload: {message.Payload}"); }
+            catch (Exception ex) { SafeConsoleLog($"[ERROR] BrokerClientService: Error sending {message.Type}: {ex.ToString()}"); HandleSendErrorInternal(); }
+        }
+        
+        private void HandleSendErrorInternal()
+        {
+            if (!_isDisposed) { CleanupConnectionResourcesInternal(false); Disconnected?.Invoke(); }
         }
 
-        public void Cleanup() 
+        public Task DisconnectAsync()
         {
-            if (_isCleanupDone) return;
-            _isCleanupDone = true;
-            SafeAddUiLog("MainViewModel is cleaning up resources...");
-            if (_brokerClientService != null)
+            SafeConsoleLog("BrokerClientService: DisconnectAsync called by user.");
+            if (_isDisposed) return Task.FromResult(false);
+            _explicitlyDisconnected = true; // 사용자가 명시적으로 연결 끊음
+            _cts?.Cancel(); // 연결 시도 또는 수신 루프 취소
+            CleanupConnectionResourcesInternal(false); // 즉시 리소스 정리
+            Disconnected?.Invoke(); // 즉시 이벤트 발생
+            return Task.FromResult(true);
+        }
+
+        // calledFromDispose 플래그는 이 메서드가 Dispose()에 의해 호출되었는지, 아니면 일반적인 연결 끊김으로 호출되었는지 구분
+        private void CleanupConnectionResourcesInternal(bool calledFromDispose)
+        {
+            if (!calledFromDispose && _isDisposed) return;
+            // Dispose 중이고 이미 리소스가 null이면 중복 정리 방지
+            if (calledFromDispose && _isDisposed && _tcpClient == null && _networkStream == null) return;
+
+            SafeConsoleLog($"BrokerClientService: Cleaning up connection resources. Called from Dispose: {calledFromDispose}");
+            _isConnecting = false;
+
+            lock(_sendLock)
             {
-                _brokerClientService.Connected -= OnBrokerConnected;
-                _brokerClientService.Disconnected -= OnBrokerDisconnected;
-                _brokerClientService.MessageReceived -= OnBrokerMessageReceived;
-                try { Task.Run(async () => await _brokerClientService.DisconnectAsync()).Wait(TimeSpan.FromMilliseconds(500));  } catch (Exception ex) { SafeAddUiLog($"Error during broker disconnect on cleanup: {ex.Message}");}
-                (_brokerClientService as IDisposable)?.Dispose();
+                try { _streamWriter?.Dispose(); } catch (Exception ex){ SafeConsoleLog($"Error disposing StreamWriter: {ex.Message}"); }
+                _streamWriter = null;
             }
-            SafeAddUiLog("MainViewModel cleanup finished.");
+            try { _streamReader?.Dispose(); } catch (Exception ex){ SafeConsoleLog($"Error disposing StreamReader: {ex.Message}"); }
+            _streamReader = null;
+            try { _networkStream?.Dispose(); } catch (Exception ex){ SafeConsoleLog($"Error disposing NetworkStream: {ex.Message}"); }
+            _networkStream = null;
+            try { _tcpClient?.Close(); } catch (Exception ex){ SafeConsoleLog($"Error closing TcpClient: {ex.Message}"); }
+            _tcpClient = null;
+            
+            if (!calledFromDispose) SafeConsoleLog("BrokerClientService: Connection resources released (not from Dispose).");
         }
 
-        public void Dispose() 
+        public void Dispose()
         {
-            Cleanup();
+            if (_isDisposed) return;
+            _isDisposed = true;
+            SafeConsoleLog("BrokerClientService: Disposing...");
+            _explicitlyDisconnected = true; // Dispose는 명시적 종료로 간주
+
+            _cts?.Cancel(); // 모든 진행 중인 비동기 작업 취소
+            
+            if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted && !_receiveLoopTask.IsCanceled && !_receiveLoopTask.IsFaulted)
+            {
+               SafeConsoleLog("BrokerClientService: Waiting briefly for receive loop to complete disposal...");
+               try { _receiveLoopTask.Wait(TimeSpan.FromMilliseconds(200)); } // 짧게 대기
+               catch { /* 무시 */ }
+            }
+
+            CleanupConnectionResourcesInternal(true); // Dispose 중임을 알림
+
+            _cts?.Dispose();
+            _cts = null;
+            
+            SafeConsoleLog("BrokerClientService: Disposed.");
             GC.SuppressFinalize(this);
+        }
+
+        // 콘솔 출력을 위한 안전한 메서드 (로거가 없을 경우 대비)
+        private void SafeConsoleLog(string message)
+        {
+            // if (_logger != null) _logger.LogInfo(message); // 로거가 있다면 로거 사용
+            // else Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+            Console.WriteLine(message); // 여기서는 항상 콘솔 출력
         }
     }
 }
