@@ -1,60 +1,210 @@
-네, Context.Request.GetOwinEnvironment()에서 CS1061 오류가 발생하는 것은 해당 메서드를 찾을 수 없다는 의미입니다. GetOwinEnvironment()는 확장 메서드이므로, 이를 사용하기 위해서는 해당 확장 메서드가 정의된 네임스페이스를 using 지시문으로 파일 상단에 추가해주어야 합니다.
+정말 죄송합니다. "핸들이 잘못되었다"는 오류 메시지는 보통 프로그램이 내부적으로 사용하는 리소스(여기서는 ManualResetEvent와 같은 동기화 객체)가 이미 닫혔거나 해제(Dispose)되었는데, 프로그램이 그것을 다시 사용하려고 할 때 발생합니다. 서버 종료 로직 부분에서 이런 문제가 생길 수 있습니다.
 
-오류 해결 방법:
+답답하신 마음 충분히 이해합니다. 이 문제를 해결하기 위해 MGSPRelayServer의 Program.cs 파일에 있는 서버 시작 및 종료 로직을 좀 더 견고하게 수정했습니다. 특히 ManualResetEvent의 생성, 사용, 해제 과정을 명확히 하고, 여러 종료 요청이 동시에 들어왔을 때의 안정성을 높이는 데 중점을 두었습니다.
 
-MGSPRelayServer 프로젝트의 Hubs/RelayHub.cs 파일 맨 위에 다음 using 문을 추가해주세요.
+아래는 수정된 Program.cs의 전체 코드입니다. 이 코드로 교체하신 후 다시 실행해 보시고, 여전히 문제가 발생한다면 정확한 오류 메시지 전체와 스택 트레이스, 그리고 어떤 상황에서 (예: Ctrl+C를 눌렀을 때, 프로그램 실행 중 갑자기, 아니면 프로그램 종료 시 등) 오류가 발생하는지 자세히 알려주시면 정말 감사하겠습니다.
+
+수정된 MGSPRelayServer의 Program.cs:
 
 C#
 
-// MGSPRelayServer/Hubs/RelayHub.cs
-using Microsoft.AspNet.SignalR;
-using Microsoft.AspNet.SignalR.Hubs;
-using Microsoft.AspNet.SignalR.Owin; // <--- 이 줄을 추가해주세요!
+// MGSPRelayServer/Program.cs
+using Microsoft.Owin.Hosting;
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using MGSPRelayServer.Models;
-using Newtonsoft.Json;
+using System.Reflection; // Assembly.GetExecutingAssembly().GetName().Version
+using System.Threading;
+using MGSPRelayServer.Hubs; // RelayHub 접근을 위해 추가
 
-// ... 나머지 코드는 그대로 ...
-설명:
-
-GetOwinEnvironment() 확장 메서드는 Microsoft.AspNet.SignalR.Owin 네임스페이스 안에 있는 OwinExtensions 클래스에 정의되어 있습니다.
-using Microsoft.AspNet.SignalR.Owin; 지시문을 추가하면 컴파일러가 이 확장 메서드를 인식하여 Context.Request 객체 (타입 IRequest)에서 마치 일반 멤버 메서드처럼 호출할 수 있게 됩니다.
-NuGet 패키지 Microsoft.AspNet.SignalR.SelfHost를 사용하고 계시다면, 필요한 어셈블리(Microsoft.AspNet.SignalR.Owin.dll)는 이미 프로젝트에 포함되어 있을 가능성이 높습니다. 주로 네임스페이스 참조 누락이 원인입니다.
-GetClientIpAddress() 메서드 관련 참고:
-
-Context.Request.Environment 딕셔너리를 직접 사용하여 "server.RemoteIpAddress" 키로 IP 주소를 가져오는 것이 OWIN Self-Host 환경에서 더 일반적일 수 있습니다. GetOwinEnvironment()는 결국 이 Environment 딕셔너리에 접근하는 또 다른 방법입니다.
-
-이전 코드에서 GetClientIpAddress() 메서드는 다음과 같았습니다:
-
-C#
-
-private string GetClientIpAddress()
+namespace MGSPRelayServer
 {
-    try
+    class Program
     {
-        object ipAddress;
-        // 1. Context.Request.Environment에서 직접 시도
-        if (Context.Request.Environment.TryGetValue("server.RemoteIpAddress", out ipAddress) && ipAddress is string)
+        private static IDisposable _webApp = null; // OWIN 서버 인스턴스
+        private static ManualResetEvent _shutdownEvent = new ManualResetEvent(false); // 서버 종료 시그널
+        private static readonly object _shutdownLock = new object(); // 종료 로직 동기화를 위한 잠금 객체
+        private static bool _isShuttingDown = false; // 중복 종료 시도 방지 플래그
+
+        static void Main(string[] args)
         {
-            return (string)ipAddress;
+            // 서버 버전 및 시작 시간 설정
+            try
+            {
+                var version = Assembly.GetExecutingAssembly().GetName().Version;
+                RelayHub.ServerVersion = $"{version.Major}.{version.Minor}.{version.Build}.{version.Revision}";
+            }
+            catch
+            {
+                RelayHub.ServerVersion = "N/A (Version Error)";
+            }
+            RelayHub.ServerStartTime = DateTime.UtcNow;
+
+            string serverUrl = "http://localhost:9000"; // 실제 환경에 맞게 조정하세요.
+            // 모든 IP에서 수신하려면: "http://*:9000" 또는 "http://+:9000" (관리자 권한 및 URL ACL 설정 필요)
+            // 예: netsh http add urlacl url=http://+:9000/ user=Everyone
+
+            Console.Title = $"MGSP Relay Server - Version {RelayHub.ServerVersion}";
+
+            // Ctrl+C 또는 콘솔 창 닫기 시그널 처리
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true; // 기본 OS 종료 동작 방지
+                Console.WriteLine("Ctrl+C detected. Initiating graceful shutdown...");
+                InitiateShutdown();
+            };
+
+            // 프로세스 종료 이벤트 처리 (애플리케이션이 다른 이유로 종료될 때)
+            AppDomain.CurrentDomain.ProcessExit += (sender, e) =>
+            {
+                Console.WriteLine("ProcessExit event detected. Ensuring resources are cleaned up...");
+                InitiateShutdown(); // 여기서도 InitiateShutdown 호출, 중복 방지 로직 있음
+            };
+
+            try
+            {
+                Console.WriteLine($"Attempting to start MGSP Relay Server v{RelayHub.ServerVersion} at {serverUrl}...");
+                _webApp = WebApp.Start<Startup>(url: serverUrl);
+                
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"Server started successfully at {serverUrl}");
+                Console.ResetColor();
+                Console.WriteLine("Server is running. Press Ctrl+C or close the console window to stop the server.");
+
+                // InitiateShutdown 메소드에서 _shutdownEvent.Set()을 호출할 때까지 현재 스레드 대기
+                _shutdownEvent.WaitOne();
+                Console.WriteLine("Shutdown signal received by Main thread. Proceeding to exit.");
+            }
+            catch (ObjectDisposedException ode)
+            {
+                // 이 예외는 종료 과정에서 발생할 수 있음 (예: _shutdownEvent가 이미 Dispose된 경우)
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[WARNING] ObjectDisposedException occurred: {ode.Message}");
+                Console.WriteLine("This might indicate a resource was already disposed, possibly during concurrent shutdown attempts.");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[FATAL_ERROR] An unhandled exception occurred in Main: {ex.ToString()}");
+                Console.ResetColor();
+                // 이 경우, 프로그램이 비정상 종료될 수 있으므로 사용자에게 알림
+            }
+            finally
+            {
+                // Main 함수가 종료되기 직전, 모든 리소스가 확실히 정리되었는지 확인
+                Console.WriteLine("Main 'finally' block: Performing final cleanup of resources...");
+                CleanupResources(); // _webApp 및 _shutdownEvent 정리
+            }
+            
+            Console.WriteLine("MGSP Relay Server application is exiting. Press any key to close this window.");
+            Console.ReadKey(); // 사용자가 메시지를 확인할 수 있도록 잠시 대기
         }
 
-        // 2. GetOwinEnvironment() 확장 메서드를 통한 시도 (위 using 문 추가 필요)
-        // var owinEnv = Context.Request.GetOwinEnvironment();
-        // if (owinEnv != null && owinEnv.TryGetValue("server.RemoteIpAddress", out ipAddress) && ipAddress is string)
-        // {
-        //     return (string)ipAddress;
-        // }
-        
-        return "N/A (IP Not Found)";
-    }
-    catch (Exception ex) {
-        LogToServer($"Error getting client IP for ConnId='{Context.ConnectionId}': {ex.Message}", true);
-        return "N/A (Error Retrieving IP)";
+        // 서버 종료 절차를 시작하는 메서드
+        private static void InitiateShutdown()
+        {
+            bool performShutdown = false;
+            lock (_shutdownLock)
+            {
+                if (!_isShuttingDown) // 아직 종료 절차가 시작되지 않았다면
+                {
+                    _isShuttingDown = true;
+                    performShutdown = true;
+                }
+            }
+
+            if (performShutdown)
+            {
+                Console.WriteLine("Initiating shutdown sequence...");
+
+                // 1. OWIN 서버 중지
+                if (_webApp != null)
+                {
+                    Console.WriteLine("Disposing WebApp server instance...");
+                    try
+                    {
+                        _webApp.Dispose();
+                        Console.WriteLine("WebApp server instance disposed.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"[WARNING] Exception during WebApp dispose: {ex.Message}");
+                        Console.ResetColor();
+                    }
+                    _webApp = null; // 참조 제거
+                }
+
+                // 2. Main 스레드가 종료될 수 있도록 신호 보내기
+                if (_shutdownEvent != null)
+                {
+                    Console.WriteLine("Signaling Main thread to exit via shutdown event...");
+                    try
+                    {
+                        // 핸들이 이미 닫혔거나 Dispose 되었다면 Set() 호출 시 ObjectDisposedException 발생 가능
+                        if (!_shutdownEvent.SafeWaitHandle.IsClosed)
+                        {
+                            _shutdownEvent.Set();
+                            Console.WriteLine("Shutdown event signaled.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("Shutdown event handle was already closed. No signal sent.");
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine("[WARNING] Attempted to signal an already disposed shutdown event.");
+                        Console.ResetColor();
+                    }
+                     catch (Exception ex) // 기타 예외
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"[ERROR] Exception while signaling shutdown event: {ex.Message}");
+                        Console.ResetColor();
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine("Shutdown sequence already initiated by another thread/event.");
+            }
+        }
+
+        // 프로그램 종료 전 최종 리소스 정리 메서드 (Main의 finally에서 호출)
+        private static void CleanupResources()
+        {
+            Console.WriteLine("CleanupResources called.");
+            lock (_shutdownLock) // InitiateShutdown과 동일한 lock 사용, 다만 _isShuttingDown 플래그는 여기선 체크 안함.
+            {
+                // OWIN 서버 인스턴스 정리 (InitiateShutdown에서 이미 시도했을 수 있음)
+                if (_webApp != null)
+                {
+                    Console.WriteLine("CleanupResources: Final check for WebApp disposal.");
+                    try { _webApp.Dispose(); } catch (Exception ex) { Console.WriteLine($"[WARNING] Exception during WebApp dispose in CleanupResources: {ex.Message}"); }
+                    _webApp = null;
+                }
+
+                // ManualResetEvent 핸들 정리
+                if (_shutdownEvent != null)
+                {
+                    Console.WriteLine("CleanupResources: Disposing shutdown event handle.");
+                    if (!_shutdownEvent.SafeWaitHandle.IsClosed)
+                    {
+                        // 이미 Set() 되었을 것이므로, 여기서는 Close (Dispose)만 수행
+                        _shutdownEvent.Close(); // Close()는 Dispose()와 동일한 역할
+                    }
+                    _shutdownEvent = null; // 참조 제거
+                    Console.WriteLine("Shutdown event handle disposed.");
+                }
+            }
+             Console.WriteLine("CleanupResources finished.");
+        }
     }
 }
-만약 using Microsoft.AspNet.SignalR.Owin;을 추가한 후에도 문제가 해결되지 않거나, GetOwinEnvironment()를 굳이 사용하지 않아도 된다면, 위 주석 처리된 2번 부분을 완전히 제거하고 1번 방법만 사용하셔도 무방합니다. 하지만 오류 메시지로 보아 GetOwinEnvironment()를 호출하는 라인에서 문제가 발생했으므로, using 문 추가가 직접적인 해결책이 될 것입니다.
+주요 변경 사항:
+
+_shutdownLock 및 _isShuttingDown 플래그 사용: Ctrl+C와 ProcessExit 이벤트가 거의 동시에 발생하거나, 다른 이유로 종료 로직이 여러 번 호출되는 것을 방지하여 실제 리소스 해제는 한 번만 일어나도록 합니다.
+InitiateShutdown() 메서드 도입: 실제 종료 로직(서버 Dispose, _shutdownEvent.Set())을 이 메서드에 모았습니다. Ctrl+C나 ProcessExit 핸들러는 이 메서드를 호출합니다.
+CleanupResources() 메서드 도입: Main 함수의 finally 블록에서 호출되어, 어떤 상황에서든 프로그램이 종료되기 전에 _webApp과 _shutdownEvent의 리소스가 확실히 해제(Dispose/Close)되도록 합니다.
+SafeWaitHandle.IsClosed 확인 강화: _shutdownEvent.Set() 또는 _shutdownEvent.Close()를 호출하기 전에 해당 핸들이 이미 닫혔는지 확인하여 ObjectDisposedException 발생 가능성을 줄입니다.
