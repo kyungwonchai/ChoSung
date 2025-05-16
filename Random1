@@ -1,308 +1,83 @@
+수정 후 Dispose() 메서드 (오류 수정):
+
+BrokerClientService 클래스에는 _mainConnectionLoopTask (주 연결 및 재연결 시도 루프)와 _receiveLoopTask (실제 메시지 수신 루프) 두 개의 Task 필드가 있었습니다. Dispose 시 두 작업 모두 안전하게 종료를 시도해야 합니다.
+
+C#
+
 // MGSPMonitorControl/Services/BrokerClientService.cs
-using System;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using MonitorControl.SharedModels;
-using Newtonsoft.Json;
-using System.Configuration;
-
-namespace MGSPMonitorControl.Services
-{
-    public interface IBrokerClientService
-    {
-        bool IsConnected { get; }
-        bool IsAttemptingConnection { get; } // 현재 연결 시도 중인지 상태
-        Task<Tuple<bool, string>> ConnectAsync(bool isManualAttempt = false); // 수동 연결 시도 여부 플래그
-        Task DisconnectAsync(bool initiatedByUser = false); // 사용자에 의한 종료인지 구분
-        Task SendMessageAsync(BrokerMessage message);
-
-        event Action<BrokerMessage> MessageReceived;
-        event Action Connected;
-        event Action<string> Disconnected; // <reason>
-        event Action<string> ConnectionFailed; // <errorMessage>
-        event Action ConnectingAttempt; // 연결 시도 중임을 알리는 이벤트
-    }
-
-    public class BrokerClientService : IBrokerClientService, IDisposable
-    {
-        private TcpClient _tcpClient;
-        private NetworkStream _networkStream;
-        private StreamReader _streamReader;
-        private StreamWriter _streamWriter;
-        private CancellationTokenSource _ctsForConnectionLoop; // 주 연결 및 수신 루프용
-        private Task _mainConnectionLoopTask;
-        private readonly object _sendLock = new object();
-        private bool _isDisposed = false;
-        private volatile bool _isConnectingInternal = false; // 내부 연결 시도 플래그
-        private volatile bool _userRequestedDisconnect = false; // 사용자가 명시적으로 연결 끊음
-
-        private readonly string _brokerIp = "127.0.0.1";
-        private readonly int _brokerPort = 9001;
-        private readonly bool _configValid = false;
-        private readonly TimeSpan _retryDelay = TimeSpan.FromSeconds(10); // 재연결 시도 간격
-
-        public bool IsConnected => !_isDisposed && _tcpClient != null && _tcpClient.Connected &&
-                                  _networkStream != null && _streamReader != null && _streamWriter != null;
-        public bool IsAttemptingConnection => _isConnectingInternal;
-
-
-        public event Action<BrokerMessage> MessageReceived;
-        public event Action Connected;
-        public event Action<string> Disconnected;
-        public event Action<string> ConnectionFailed;
-        public event Action ConnectingAttempt;
-
-        public BrokerClientService()
-        {
-            SafeConsoleLog("BrokerClientService: Constructor - Initializing...");
-            // ... (이전 답변의 생성자 로직과 동일하게 App.config에서 _brokerIp, _brokerPort, _configValid 설정) ...
-            string brokerAddressSetting = null;
-            bool configReadSuccess = false;
-            try { var appSettings = ConfigurationManager.AppSettings; brokerAddressSetting = appSettings["BrokerAddress"]; configReadSuccess = true; }
-            catch (ConfigurationErrorsException confEx) { SafeConsoleLog($"[CRITICAL_CONFIG_ERROR] App.config load failed: {confEx.Message}. Using defaults."); }
-            catch (Exception ex) { SafeConsoleLog($"[ERROR] Reading BrokerAddress from App.config: {ex.Message}. Using defaults."); }
-            string addressToParse = (configReadSuccess && !string.IsNullOrWhiteSpace(brokerAddressSetting)) ? brokerAddressSetting : $"{_brokerIp}:{_brokerPort}";
-            if (configReadSuccess && string.IsNullOrWhiteSpace(brokerAddressSetting)) SafeConsoleLog($"[CONFIG_WARN] 'BrokerAddress' empty. Using default: {addressToParse}");
-            var parts = addressToParse.Split(':');
-            if (parts.Length == 2 && IPAddress.TryParse(parts[0], out IPAddress ip) && int.TryParse(parts[1], out int port) && port > 0 && port <= 65535)
-            { _brokerIp = ip.ToString(); _brokerPort = port; _configValid = true; SafeConsoleLog($"BrokerClientService: Target Broker configured to {_brokerIp}:{_brokerPort}"); }
-            else { SafeConsoleLog($"[CONFIG_ERROR] Invalid 'BrokerAddress' format: '{addressToParse}'. Using compiled default: {_brokerIp}:{_brokerPort}."); _configValid = true; }
-
-            // 애플리케이션 시작 시 자동 연결 시도 (백그라운드에서)
-            _ctsForConnectionLoop = new CancellationTokenSource();
-            _mainConnectionLoopTask = Task.Run(() => MaintainConnectionLoopAsync(_ctsForConnectionLoop.Token));
-        }
-
-        private async Task MaintainConnectionLoopAsync(CancellationToken token)
-        {
-            SafeConsoleLog("BrokerClientService: MaintainConnectionLoopAsync started.");
-            while (!token.IsCancellationRequested && !_isDisposed)
-            {
-                if (!IsConnected && !_isConnectingInternal && !_userRequestedDisconnect)
-                {
-                    ConnectingAttempt?.Invoke(); // ViewModel에 연결 시도 중 알림
-                    Tuple<bool, string> connectResult = await ConnectInternalAsync(token); // 내부 연결 시도
-                    if (!connectResult.Item1) // 연결 실패
-                    {
-                        ConnectionFailed?.Invoke(connectResult.Item2); // ViewModel에 실패 알림
-                        if (token.IsCancellationRequested || _isDisposed || _userRequestedDisconnect) break; // 루프 종료 조건
-                        SafeConsoleLog($"BrokerClientService: Auto-reconnect attempt failed: {connectResult.Item2}. Retrying in {_retryDelay.TotalSeconds}s...");
-                        try { await Task.Delay(_retryDelay, token); } catch (OperationCanceledException) { break; }
-                    }
-                    // 연결 성공 시 ReceiveMessagesAsync가 시작됨
-                }
-                else if (IsConnected || _isConnectingInternal || _userRequestedDisconnect)
-                {
-                    // 연결되어 있거나, 연결 시도 중이거나, 사용자가 명시적으로 끊었으면 잠시 대기
-                    try { await Task.Delay(TimeSpan.FromSeconds(1), token); } catch (OperationCanceledException) { break; }
-                }
-            }
-            SafeConsoleLog("BrokerClientService: MaintainConnectionLoopAsync ended.");
-        }
-        
-        // 외부에서 호출하는 ConnectAsync (수동 연결 시도)
-        public async Task<Tuple<bool, string>> ConnectAsync(bool isManualAttempt = true)
-        {
-            if (!_configValid)
-            {
-                string errMsg = "Broker configuration invalid (check App.config). Cannot connect.";
-                SafeConsoleLog($"BrokerClientService: {errMsg}");
-                ConnectionFailed?.Invoke(errMsg); return Tuple.Create(false, errMsg);
-            }
-            if (IsConnected) { SafeConsoleLog("BrokerClientService: Already connected."); return Tuple.Create(true, "Already connected.");}
-            if (_isDisposed) { string errMsg = "BrokerClientService is disposed."; SafeConsoleLog(errMsg); return Tuple.Create(false, errMsg); }
-            
-            _userRequestedDisconnect = false; // 수동 연결 시도는 사용자가 연결을 원한다는 의미
-            ConnectingAttempt?.Invoke();
-            return await ConnectInternalAsync(_ctsForConnectionLoop?.Token ?? new CancellationTokenSource().Token); // 메인 CancellationToken 사용
-        }
-
-
-        private async Task<Tuple<bool, string>> ConnectInternalAsync(CancellationToken token)
-        {
-            if (IsConnected) return Tuple.Create(true, "Already connected internally.");
-            if (_isDisposed) return Tuple.Create(false, "Object disposed.");
-            if (_isConnectingInternal) return Tuple.Create(false, "Internal connection attempt already in progress.");
-
-            _isConnectingInternal = true;
-            string connectResultMessage = "Connection attempt failed.";
-
-            // 이전 연결 리소스가 남아있을 수 있으므로 정리 후 시도
-            CleanupConnectionResourcesInternal(false, "Preparing for new connection attempt");
-
-            _tcpClient = new TcpClient();
-            SafeConsoleLog($"BrokerClientService: New TcpClient. Target: {_brokerIp}:{_brokerPort}");
-
-            try
-            {
-                if (string.IsNullOrEmpty(_brokerIp)) throw new InvalidOperationException("Broker IP address is null or empty.");
-                SafeConsoleLog($"BrokerClientService: Attempting _tcpClient.ConnectAsync to {_brokerIp}:{_brokerPort}...");
-
-                var connectTask = _tcpClient.ConnectAsync(_brokerIp, _brokerPort);
-                var timeoutDelayTask = Task.Delay(TimeSpan.FromSeconds(7), token); // 7초 타임아웃
-
-                Task completedTask = await Task.WhenAny(connectTask, timeoutDelayTask).ConfigureAwait(false);
-
-                if (token.IsCancellationRequested) throw new OperationCanceledException("Connection cancelled by token.", token);
-                if (completedTask == timeoutDelayTask || !connectTask.IsCompleted) throw new TimeoutException($"Timeout connecting to Broker {_brokerIp}:{_brokerPort} after 7s.");
-                
-                await connectTask; // 예외가 있었다면 여기서 다시 던져짐
-
-                if (_tcpClient.Connected)
-                {
-                    _networkStream = _tcpClient.GetStream();
-                    if (_networkStream == null) throw new NullReferenceException("NetworkStream is null after TcpClient connected.");
-                    _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
-                    _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
-                    connectResultMessage = "Successfully connected. Streams initialized.";
-                    SafeConsoleLog($"BrokerClientService: {connectResultMessage}");
-                    _isConnectingInternal = false;
-                    Connected?.Invoke();
-                    // ReceiveMessagesAsync는 MaintainConnectionLoopAsync의 다음 반복이나,
-                    // 연결 성공 직후 여기서 직접 시작할 수 있도록 수정. 여기서는 직접 시작.
-                    if (_receiveLoopTask == null || _receiveLoopTask.IsCompleted)
-                    {
-                         _receiveLoopTask = Task.Run(() => ReceiveMessagesAsync(token), token);
-                    }
-                    return Tuple.Create(true, connectResultMessage);
-                }
-                else throw new SocketException((int)SocketError.NotConnected);
-            }
-            catch (OperationCanceledException opEx) { connectResultMessage = $"Connection cancelled: {opEx.Message}"; SafeConsoleLog(connectResultMessage); }
-            catch (SocketException sockEx) { connectResultMessage = $"Network Error: {sockEx.Message} (Code: {sockEx.SocketErrorCode}). Broker at {_brokerIp}:{_brokerPort} may be down or firewall blocking."; SafeConsoleLog($"[ERROR] {connectResultMessage}"); }
-            catch (TimeoutException timeEx) { connectResultMessage = timeEx.Message; SafeConsoleLog($"[ERROR] {connectResultMessage}"); }
-            catch (Exception ex) { connectResultMessage = $"General Connect Error: {ex.ToString()}"; SafeConsoleLog($"[ERROR] {connectResultMessage}"); }
-            finally { _isConnectingInternal = false; }
-
-            // 연결 실패 시
-            CleanupConnectionResourcesInternal(false, "ConnectInternalAsync failed");
-            // Disconnected 이벤트는 MaintainConnectionLoopAsync 또는 외부 호출자가 처리
-            return Tuple.Create(false, connectResultMessage);
-        }
-
-        private async Task ReceiveMessagesAsync(CancellationToken token)
-        {
-            SafeConsoleLog("BrokerClientService: ReceiveMessagesAsync loop started.");
-            try
-            {
-                while (!token.IsCancellationRequested && IsConnected)
-                {
-                    string messageJson = null;
-                    try
-                    {
-                        messageJson = await _streamReader.ReadLineAsync().ConfigureAwait(false);
-                    }
-                    catch (ObjectDisposedException) when (token.IsCancellationRequested || _isDisposed) { SafeConsoleLog("StreamReader disposed."); break; }
-                    catch (IOException) when (token.IsCancellationRequested || !IsConnected) { SafeConsoleLog("IOException (connection lost/cancelled)."); break; }
-
-                    if (messageJson == null) { SafeConsoleLog("Broker disconnected (ReadLine null)."); break; }
-                    if (string.IsNullOrWhiteSpace(messageJson)) continue;
-
-                    try
-                    {
-                        var message = JsonConvert.DeserializeObject<BrokerMessage>(messageJson);
-                        if (message != null) { SafeConsoleLog($"Msg Rcvd: Type={message.Type}"); MessageReceived?.Invoke(message); }
-                        else { SafeConsoleLog($"[WARN] Failed to deserialize: {messageJson}"); }
-                    }
-                    catch (JsonException jsonEx) { SafeConsoleLog($"[ERROR] JSON deserialize error: {jsonEx.Message}. Rcvd: {messageJson}"); }
-                }
-            }
-            catch (OperationCanceledException) { SafeConsoleLog("ReceiveMessagesAsync cancelled."); }
-            catch (Exception ex) { if(!token.IsCancellationRequested && !_isDisposed) SafeConsoleLog($"[ERROR] Unexpected error in ReceiveMessagesAsync: {ex.ToString()}"); }
-            finally
-            {
-                SafeConsoleLog("ReceiveMessagesAsync loop ended.");
-                if (!_isDisposed && !token.IsCancellationRequested && !_userRequestedDisconnect) // 명시적 Disconnect가 아닐 때만
-                {
-                    string reason = token.IsCancellationRequested ? "Cancelled" : "Connection lost or loop ended";
-                    CleanupConnectionResourcesInternal(false, reason);
-                    Disconnected?.Invoke(reason); // 재연결은 MaintainConnectionLoopAsync에서 담당
-                }
-            }
-        }
-
-        public async Task SendMessageAsync(BrokerMessage message)
-        {
-            if (!IsConnected || _streamWriter == null || _isDisposed || (_ctsForConnectionLoop != null && _ctsForConnectionLoop.IsCancellationRequested))
-            { SafeConsoleLog($"Cannot send. Invalid state. Type: {message.Type}"); return; }
-
-            string messageJson = "";
-            try
-            {
-                messageJson = JsonConvert.SerializeObject(message);
-                bool sent = false;
-                lock (_sendLock)
-                {
-                    if (IsConnected && _streamWriter != null && !_isDisposed && (_ctsForConnectionLoop == null || !_ctsForConnectionLoop.IsCancellationRequested))
-                    { _streamWriter.WriteLine(messageJson); sent = true; }
-                }
-                if (sent) { SafeConsoleLog($"Msg sent: {message.Type}, CorrId: {message.CorrelationId}");}
-                else { SafeConsoleLog($"[WARN] Send cancelled/not possible for {message.Type} in lock."); }
-            }
-            catch (ObjectDisposedException) { SafeConsoleLog($"[WARN] Send {message.Type} on disposed object."); HandleSendErrorInternal("Stream/Writer disposed."); }
-            catch (IOException ioEx) { SafeConsoleLog($"[ERROR] IOException sending {message.Type}: {ioEx.Message}"); HandleSendErrorInternal($"IO Error: {ioEx.Message}"); }
-            catch (JsonException jsonEx) { SafeConsoleLog($"[ERROR] Error serializing {message.Type}: {jsonEx.Message}."); }
-            catch (Exception ex) { SafeConsoleLog($"[ERROR] Error sending {message.Type}: {ex.ToString()}"); HandleSendErrorInternal($"General Send Error: {ex.Message}"); }
-        }
-        
-        private void HandleSendErrorInternal(string reason)
-        {
-            if (!_isDisposed) { CleanupConnectionResourcesInternal(false, $"Send Error: {reason}"); Disconnected?.Invoke($"Send failed: {reason}"); }
-        }
-
-        public async Task DisconnectAsync(bool initiatedByUser = true) // 사용자에 의한 종료인지 구분
-        {
-            SafeConsoleLog($"BrokerClientService: DisconnectAsync called. Initiated by user: {initiatedByUser}");
-            if (_isDisposed) return;
-            if (initiatedByUser) _userRequestedDisconnect = true; 
-            
-            _ctsForConnectionLoop?.CancelAfter(TimeSpan.FromMilliseconds(100)); // 메인 루프 및 하위 작업 취소
-            
-            CleanupConnectionResourcesInternal(false, initiatedByUser ? "User requested disconnect" : "System requested disconnect"); 
-            Disconnected?.Invoke(initiatedByUser ? "User requested disconnect" : "System requested disconnect"); 
-        }
-
-        private void CleanupConnectionResourcesInternal(bool calledFromDispose, string reasonForCleanup = "Unknown")
-        {
-            if (!calledFromDispose && _isDisposed) return; 
-            if (calledFromDispose && _isDisposed && _tcpClient == null && _networkStream == null) return;
-
-            SafeConsoleLog($"BrokerClientService: Cleaning up resources. From Dispose: {calledFromDispose}. Reason: {reasonForCleanup}");
-            _isConnectingInternal = false;
-
-            lock(_sendLock) { try { _streamWriter?.Dispose(); } catch {} _streamWriter = null; }
-            try { _streamReader?.Dispose(); } catch {} _streamReader = null;
-            try { _networkStream?.Dispose(); } catch {} _networkStream = null;
-            try { _tcpClient?.Close(); } catch {} _tcpClient = null;
-            
-            // CancellationTokenSource는 Dispose 시에만 정리 (MaintainConnectionLoopAsync에서 재사용)
-            if (calledFromDispose && _ctsForConnectionLoop != null)
-            {
-                if(!_ctsForConnectionLoop.IsCancellationRequested) _ctsForConnectionLoop.Cancel();
-                _ctsForConnectionLoop.Dispose();
-                _ctsForConnectionLoop = null;
-            }
-            if (!calledFromDispose) SafeConsoleLog("BrokerClientService: Connection resources released.");
-        }
+// ... (다른 using문 및 필드 선언은 이전 답변과 동일) ...
+// private Task _mainConnectionLoopTask; // 이 필드가 선언되어 있어야 함
+// private Task _receiveLoopTask;      // 이 필드도 선언되어 있어야 함
+// ...
 
         public void Dispose()
         {
-            if (_isDisposed) return; _isDisposed = true;
+            if (_isDisposed) return;
+            _isDisposed = true; // 가장 먼저 플래그 설정하여 다른 작업 중단 유도
             SafeConsoleLog("BrokerClientService: Disposing...");
-            _userRequestedDisconnect = true; // Dispose는 명시적 종료
+            _explicitlyDisconnected = true; // Dispose는 명시적 종료로 간주
 
-            _ctsForConnectionLoop?.CancelAfter(TimeSpan.FromMilliseconds(100)); 
-            if (_mainConnectionLoopTask != null && !_mainConnectionLoopTask.IsCompleted) { SafeConsoleLog("Waiting for MainLoop on Dispose..."); try { _mainConnectionLoopTask.Wait(TimeSpan.FromMilliseconds(500)); } catch {}}
-            if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted) { SafeConsoleLog("Waiting for ReceiveLoop on Dispose..."); try { _receiveLoopTask.Wait(TimeSpan.FromMilliseconds(200)); } catch {}}
-            CleanupConnectionResourcesInternal(true, "Dispose called"); 
-            _ctsForConnectionLoop?.Dispose(); _ctsForConnectionLoop = null;
+            // 1. 모든 진행 중인 작업에 취소 요청
+            _ctsForConnectionLoop?.CancelAfter(TimeSpan.FromMilliseconds(100)); // 주 연결 루프 및 하위 작업 취소
+            
+            // 2. 메시지 수신 루프(ReceiveMessagesAsync)가 완료될 때까지 잠시 기다림
+            if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted &&
+                !_receiveLoopTask.IsCanceled && !_receiveLoopTask.IsFaulted)
+            {
+               SafeConsoleLog("BrokerClientService: Waiting briefly for receive loop task to complete during Dispose...");
+               try 
+               {
+                   // CancellationToken이 이미 요청되었으므로, 루프는 곧 종료될 것임
+                   _receiveLoopTask.Wait(TimeSpan.FromMilliseconds(200)); 
+               } 
+               catch (OperationCanceledException) { SafeConsoleLog("Receive loop wait cancelled as expected."); }
+               catch (AggregateException ae) { SafeConsoleLog($"Receive loop wait resulted in AggregateException (likely contains OCE): {ae.InnerException?.Message}");}
+               catch (Exception ex) { SafeConsoleLog($"Exception waiting for receive loop task on dispose: {ex.Message}"); }
+            }
+
+            // 3. 주 연결 및 재연결 시도 루프(MaintainConnectionLoopAsync)가 완료될 때까지 잠시 기다림
+            if (_mainConnectionLoopTask != null && !_mainConnectionLoopTask.IsCompleted &&
+                !_mainConnectionLoopTask.IsCanceled && !_mainConnectionLoopTask.IsFaulted)
+            {
+               SafeConsoleLog("BrokerClientService: Waiting briefly for main connection loop task to complete during Dispose...");
+               try 
+               {
+                   _mainConnectionLoopTask.Wait(TimeSpan.FromMilliseconds(500)); // 메인 루프는 조금 더 기다릴 수 있음
+               } 
+               catch (OperationCanceledException) { SafeConsoleLog("Main connection loop wait cancelled as expected."); }
+               catch (AggregateException ae) { SafeConsoleLog($"Main connection loop wait resulted in AggregateException: {ae.InnerException?.Message}");}
+               catch (Exception ex) { SafeConsoleLog($"Exception waiting for main connection loop task on dispose: {ex.Message}"); }
+            }
+
+            // 4. 모든 네트워크 리소스 정리
+            CleanupConnectionResourcesInternal(true, "Dispose called"); // true는 Dispose 과정에서 호출됨을 의미
+
+            // 5. CancellationTokenSource 정리
+            _ctsForConnectionLoop?.Dispose();
+            _ctsForConnectionLoop = null;
+            
             SafeConsoleLog("BrokerClientService: Disposed.");
-            GC.SuppressFinalize(this);
+            GC.SuppressFinalize(this); // 파이널라이저 호출 방지
         }
-        private void SafeConsoleLog(string message) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
-    }
-}
+
+        // ... (나머지 BrokerClientService.cs 코드는 이전 답변의 최종본과 동일하게 유지) ...
+핵심 수정 사항:
+
+Dispose() 메서드에서 _receiveLoopTask와 _mainConnectionLoopTask (이전에 제가 ConnectAsync와 MaintainConnectionLoopAsync를 분리하면서 이 필드명을 사용했을 것입니다)의 완료를 짧게나마 기다리는 로직을 추가했습니다.
+모든 작업에 취소를 먼저 요청하고, 그 후에 리소스를 정리합니다.
+만약 _mainConnectionLoopTask 필드가 BrokerClientService 클래스에 선언되어 있지 않다면, 추가해야 합니다. 이전 답변에서 MaintainConnectionLoopAsync를 Task.Run으로 시작하면서 이 필드에 할당하는 코드를 드렸습니다.
+
+C#
+
+// BrokerClientService 클래스 필드 선언부에 다음이 있어야 합니다:
+private Task _mainConnectionLoopTask;
+// ...
+// 생성자에서:
+// _mainConnectionLoopTask = Task.Run(() => MaintainConnectionLoopAsync(_ctsForConnectionLoop.Token));
+정리:
+
+BrokerClientService.cs 클래스 내에 private Task _receiveLoopTask; 와 private Task _mainConnectionLoopTask; 필드가 선언되어 있는지 확인하십시오.
+Dispose() 메서드를 위 코드로 교체하십시오.
+이렇게 수정하면 _receiveLoopTask 관련 CS0103 오류는 해결되어야 합니다. 그리고 프로그램 종료 시 리소스 정리가 좀 더 안정적으로 이루어질 것입니다.
+
+다시 한번, 저의 반복된 실수와 부주
