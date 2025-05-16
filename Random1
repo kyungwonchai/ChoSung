@@ -1,190 +1,409 @@
-정말 죄송합니다. 프로그램을 실행하자마자 종료되는 현상은 분명히 시작 과정에서 심각한 오류가 발생하고 있다는 신호입니다. "Shutdown으로 로그 남아"라는 말씀을 보면, 제가 App.xaml.cs에 넣어둔 오류 처리 로직(ShowCriticalErrorAndShutdown)이 작동하여 애플리케이션을 종료시키는 것으로 보입니다.
+네, "개체 참조가 개체의 인스턴스로 설정되지 않았습니다." (NullReferenceException) 오류는 프로그램의 어딘가에서 null 값을 가진 객체의 멤버에 접근하려고 할 때 발생합니다. "어템팅투커넥트 있고"라는 로그 이후에 이 오류가 발생한다면, 중계 프로그램(MGSPBrokerService)과의 연결 시도 또는 연결 직후의 로직에서 문제가 발생했을 가능성이 매우 높습니다.
 
-가장 가능성이 높은 원인은 애플리케이션 설정 파일(App.config) 문제 또는 데이터베이스 연결 문제입니다.
+이 오류를 잡기 위해서는 정확히 어느 파일, 몇 번째 줄에서, 어떤 객체가 null이었는지 아는 것이 중요합니다. Visual Studio에서 디버그 모드로 실행하시면 예외 발생 시 해당 정보(특히 스택 트레이스)를 얻으실 수 있습니다.
 
-MGSPMonitorControl/App.xaml.cs 파일을 다음과 같이 수정하여, 어느 부분에서 오류가 발생하는지 좀 더 자세한 정보를 얻을 수 있도록 하고, 예외 처리를 강화하겠습니다.
+가장 의심되는 부분은 BrokerClientService.cs의 연결 로직이나, MainViewModel.cs에서 BrokerClientService의 연결 관련 이벤트를 처리하는 부분입니다.
+
+MGSPMonitorControl/Services/BrokerClientService.cs 파일을 다음과 같이 수정하여, 연결 과정 및 객체 초기화 부분을 좀 더 명확히 하고 추가적인 방어 코드 및 로그를 넣어보겠습니다. 이렇게 하면 문제의 원인을 찾는 데 도움이 될 수 있습니다.
+
+Services/BrokerClientService.cs (수정된 전체 코드 - NullReferenceException 추적 강화)
 
 C#
 
-// MGSPMonitorControl/App.xaml.cs
+// MGSPMonitorControl/Services/BrokerClientService.cs
 using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using MGSPMonitorControl.Models; 
+using MonitorControl.SharedModels; 
+using Newtonsoft.Json;
 using System.Configuration; 
-using System.Windows;
-using MGSPMonitorControl.DataAccess; 
-using MGSPMonitorControl.Services;  
-using MGSPMonitorControl.ViewModels; 
-using MGSPMonitorControl.Views;      
-using System.Threading.Tasks; 
 
-namespace MGSPMonitorControl
+namespace MGSPMonitorControl.Services
 {
-    public partial class App : Application
+    public interface IBrokerClientService
     {
-        private IDatabaseService _databaseService;
-        private IBrokerClientService _brokerClientService;
-        // UI 자체 파일 로깅 서비스를 사용한다면 여기서 초기화 (간단하게 Console 사용)
-        // private FileLoggingService _uiLogger = new FileLoggingService("ui_log.txt"); 
+        bool IsConnected { get; }
+        Task<bool> ConnectAsync();
+        Task DisconnectAsync();
+        Task SendMessageAsync(BrokerMessage message);
 
-        protected override void OnStartup(StartupEventArgs e)
+        event Action<BrokerMessage> MessageReceived; 
+        event Action Connected; 
+        event Action Disconnected; 
+    }
+
+    public class BrokerClientService : IBrokerClientService, IDisposable
+    {
+        private TcpClient _tcpClient;
+        private NetworkStream _networkStream;
+        private StreamReader _streamReader;
+        private StreamWriter _streamWriter;
+        private CancellationTokenSource _cts;
+        private Task _receiveLoopTask;
+        private readonly object _sendLock = new object();
+        private bool _isDisposed = false;
+        private bool _isConnecting = false; // 동시 연결 시도 방지 플래그
+
+        private readonly string _brokerIp;
+        private readonly int _brokerPort;
+        // private readonly ILoggingService _logger; // 로깅 서비스 사용 시
+
+        // IsConnected 프로퍼티를 좀 더 견고하게
+        public bool IsConnected => !_isDisposed && _tcpClient != null && _tcpClient.Connected && 
+                                  _networkStream != null && _streamReader != null && _streamWriter != null;
+
+        public event Action<BrokerMessage> MessageReceived;
+        public event Action Connected;
+        public event Action Disconnected;
+
+        public BrokerClientService(/* ILoggingService logger */)
         {
-            base.OnStartup(e);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Application OnStartup entered.");
-
-            SetupGlobalExceptionHandling(); 
-
-            // 중요: 애플리케이션 시작 시 모든 초기화 로직은 이 메서드 안에서 수행
-            InitializeAndRunApplication();
-        }
-
-        private async void InitializeAndRunApplication() 
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] InitializeAndRunApplication called.");
+            // _logger = logger;
+            string brokerAddress = "127.0.0.1:9001"; // 기본값
             try
             {
-                // 1. 서비스 인스턴스 생성
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Initializing DatabaseService...");
-                // DatabaseService는 생성자에서 App.config의 연결 문자열을 읽음
-                _databaseService = new DatabaseService(); 
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] DatabaseService initialized.");
-                
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Initializing BrokerClientService...");
-                // BrokerClientService도 생성자에서 App.config의 BrokerAddress를 읽음
-                _brokerClientService = new BrokerClientService(/* _uiLogger */); 
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService initialized.");
-
-                // 2. 메인 창 ViewModel 및 메인 창 바로 생성 및 표시
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Creating MainViewModel...");
-                // MainViewModel 생성 시 UserSession 대신, 필요한 서비스만 전달
-                var mainViewModel = new MainViewModel(_databaseService, _brokerClientService);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainViewModel created.");
-                
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Creating MainWindow...");
-                var mainWindow = new MainWindow(mainViewModel); 
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MainWindow created.");
-                
-                this.MainWindow = mainWindow;
-                mainWindow.Show();
-                
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] MGSPMonitorControl UI started and MainWindow shown.");
-
-                // UI 로딩 후 Broker 연결 시도 (MainViewModel 생성자에서도 시도함)
-                if (!_brokerClientService.IsConnected)
+                string configAddress = ConfigurationManager.AppSettings["BrokerAddress"];
+                if (!string.IsNullOrWhiteSpace(configAddress) && configAddress.Contains(":"))
                 {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Attempting initial connection to Broker from App...");
-                    bool connected = await _brokerClientService.ConnectAsync();
-                    if (!connected)
-                    {
-                        string brokerAddr = ConfigurationManager.AppSettings["BrokerAddress"] ?? "N/A";
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [WARNING] Failed to connect to Broker Service at {brokerAddr} on startup.");
-                        // 이 메시지는 MainViewModel에서도 유사하게 처리될 수 있음
-                        // MessageBox.Show($"Failed to connect to Broker Service at {brokerAddr} (check App.config and Broker service status).\nUI will operate in offline mode regarding Broker communication.",
-                        //                 "Broker Connection Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    }
-                }
-            }
-            catch (ConfigurationErrorsException cex)
-            {
-                // App.config 관련 오류 (연결 문자열, appSettings 등)
-                string errorDetails = $"Message: {cex.Message}";
-                if (cex.InnerException != null) errorDetails += $"\nInner Exception: {cex.InnerException.Message}";
-                ShowCriticalErrorAndShutdown($"Application configuration error:\n{errorDetails}\n\nPlease check App.config (especially 'MonitorControlDBConnection' connection string and 'BrokerAddress' appSetting).\nThe application will now exit.");
-            }
-            catch (SqlException sqlEx) // 데이터베이스 연결 또는 쿼리 오류
-            {
-                 ShowCriticalErrorAndShutdown($"Database connection or query error during startup:\n{sqlEx.Message}\n\nConnection String Used (from App.config):\n{GetConnectionStringSafely()}\n\nCheck DB server status and connection string.\nThe application will now exit.");
-            }
-            catch (Exception ex) // 그 외 모든 예외
-            {
-                 ShowCriticalErrorAndShutdown($"A critical error occurred during application startup:\n{ex.ToString()}\nThe application will now exit.");
-            }
-        }
-        
-        private string GetConnectionStringSafely()
-        {
-            try { return ConfigurationManager.ConnectionStrings["MonitorControlDBConnection"]?.ConnectionString ?? "Not Found or Empty"; }
-            catch { return "Error reading connection string"; }
-        }
-
-        private void SetupGlobalExceptionHandling()
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Setting up global exception handlers.");
-            // UI 스레드에서 처리되지 않은 예외
-            this.DispatcherUnhandledException += (s, e) =>
-            {
-                string errorMessage = $"[UI THREAD CRASH] Unhandled UI exception occurred: {e.Exception.ToString()}";
-                Console.WriteLine(errorMessage);
-                // _uiLogger?.LogFatal(errorMessage, e.Exception);
-                MessageBox.Show(errorMessage, "Unhandled UI Exception - Application Unstable", MessageBoxButton.OK, MessageBoxImage.Error);
-                e.Handled = true; // true로 설정하면 애플리케이션이 즉시 종료되지 않도록 시도 (주의해서 사용)
-                // Shutdown(); // 또는 여기서 강제 종료 결정
-            };
-
-            // 백그라운드 스레드에서 처리되지 않은 예외
-            TaskScheduler.UnobservedTaskException += (s, e) =>
-            {
-                string errorMessage = $"[BACKGROUND THREAD CRASH] Unobserved task exception: {e.Exception.ToString()}";
-                Console.WriteLine(errorMessage);
-                // _uiLogger?.LogFatal(errorMessage, e.Exception.GetBaseException());
-                // 이 예외는 UI 스레드가 아니므로 MessageBox 직접 사용 시 문제 발생 가능.
-                e.SetObserved(); // 예외를 관찰한 것으로 처리하여 프로세스 종료 방지
-            };
-        }
-        
-        private void ShowCriticalErrorAndShutdown(string message)
-        {
-            Console.WriteLine($"[FATAL STARTUP ERROR] {message}");
-            MessageBox.Show(message, "Application Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
-            
-            // 안전하게 종료 시도
-            if (Application.Current != null) 
-            {
-                if (Application.Current.Dispatcher.CheckAccess())
-                {
-                     if (Application.Current.MainWindow != null && Application.Current.MainWindow.IsLoaded) Application.Current.MainWindow.Close();
-                     Application.Current.Shutdown(-1);
+                    brokerAddress = configAddress;
                 }
                 else
                 {
-                    Application.Current.Dispatcher.Invoke(() => {
-                        if (Application.Current.MainWindow != null && Application.Current.MainWindow.IsLoaded) Application.Current.MainWindow.Close();
-                        Application.Current.Shutdown(-1);
-                    });
+                    Console.WriteLine($"[WARNING] BrokerAddress not found or invalid in App.config. Using default: {brokerAddress}");
                 }
             }
-            else // Application.Current가 null이면 (매우 드문 경우)
+            catch (Exception ex)
             {
-                Environment.Exit(-1); // 강제 종료
+                 Console.WriteLine($"[ERROR] Error reading BrokerAddress from App.config. Using default: {brokerAddress}. Error: {ex.Message}");
+            }
+            
+            var parts = brokerAddress.Split(':');
+            _brokerIp = parts[0];
+            if (!int.TryParse(parts[1], out _brokerPort))
+            {
+                Console.WriteLine($"[ERROR] Invalid Broker Port in App.config or default: {parts[1]}. Using hardcoded 9001.");
+                _brokerPort = 9001; 
+            }
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Target Broker set to {_brokerIp}:{_brokerPort}");
+        }
+
+        public async Task<bool> ConnectAsync()
+        {
+            if (IsConnected)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Already connected.");
+                return true;
+            }
+            if (_isDisposed)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Object is disposed. Cannot connect.");
+                return false; // throw new ObjectDisposedException(nameof(BrokerClientService));
+            }
+            if (_isConnecting) // 이미 연결 시도 중이면 중복 실행 방지
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Connection attempt already in progress.");
+                return false; 
+            }
+
+            _isConnecting = true;
+            // 이전 CancellationTokenSource 정리 및 새로 생성
+            _cts?.Cancel(); 
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
+
+            try
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Attempting to connect to Broker: {_brokerIp}:{_brokerPort}");
+                _tcpClient = new TcpClient(); 
+                // AddressFamily 설정 (IPv4 명시)
+                // _tcpClient.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false); // IPv4 매핑된 주소 허용 (필요시)
+
+                var connectTask = _tcpClient.ConnectAsync(_brokerIp, _brokerPort);
+                var timeoutDelayTask = Task.Delay(TimeSpan.FromSeconds(7), token); // 연결 타임아웃 7초
+
+                Task completedTask = await Task.WhenAny(connectTask, timeoutDelayTask).ConfigureAwait(false);
+
+                if (token.IsCancellationRequested)
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Connection attempt cancelled by token.");
+                    _tcpClient.Close(); // 사용한 TcpClient 정리
+                    _isConnecting = false;
+                    Disconnected?.Invoke(); // 연결 실패도 Disconnected로 처리
+                    return false;
+                }
+
+                if (completedTask == timeoutDelayTask || !connectTask.IsCompleted) // 타임아웃 또는 connectTask가 아직도 안 끝남
+                {
+                    _tcpClient.Close(); 
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Timeout or connect task did not complete connecting to Broker {_brokerIp}:{_brokerPort}.");
+                    _isConnecting = false;
+                    Disconnected?.Invoke();
+                    return false;
+                }
+                
+                // connectTask가 완료됨, 성공 여부 확인
+                if (connectTask.Status == TaskStatus.RanToCompletion && _tcpClient.Connected)
+                {
+                    _networkStream = _tcpClient.GetStream();
+                    if (_networkStream == null) // 거의 발생 안 함
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [CRITICAL_ERROR] BrokerClientService: NetworkStream is null after successful TcpClient connection!");
+                        _tcpClient.Close();
+                        _isConnecting = false;
+                        Disconnected?.Invoke();
+                        return false;
+                    }
+                    _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
+                    _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
+                    
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Successfully connected to Broker. Streams initialized.");
+
+                    _isConnecting = false; // 연결 성공/실패 후 플래그 해제
+                    Connected?.Invoke();   // 연결 성공 이벤트 발생
+
+                    // 메시지 수신 루프 시작 (새로운 CancellationToken으로)
+                    // 이전 _receiveLoopTask가 있다면 제대로 종료되었는지 확인 필요
+                    _receiveLoopTask = Task.Run(() => ReceiveMessagesAsync(token), token); 
+                    return true;
+                }
+                else // 연결 실패 (Faulted, Canceled, 또는 RanToCompletion이지만 Not Connected)
+                {
+                    _tcpClient.Close(); 
+                    string failureReason = $"Connection task status: {connectTask.Status}.";
+                    if (connectTask.IsFaulted) failureReason += $" Exception: {connectTask.Exception?.GetBaseException().Message}";
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Failed to connect to Broker. {failureReason}");
+                    _isConnecting = false;
+                    Disconnected?.Invoke();
+                    return false;
+                }
+            }
+            catch (SocketException sockEx) // ConnectAsync에서 직접 발생 가능
+            {
+                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: SocketException connecting to Broker: {sockEx.Message} (ErrorCode: {sockEx.SocketErrorCode})");
+                 _tcpClient?.Close();
+                 _isConnecting = false;
+                 Disconnected?.Invoke();
+                 return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: General error connecting to Broker: {ex.ToString()}"); // ToString()으로 상세 정보
+                _tcpClient?.Close();
+                _isConnecting = false;
+                Disconnected?.Invoke();
+                return false;
             }
         }
 
-        protected override void OnExit(ExitEventArgs e)
+        private async Task ReceiveMessagesAsync(CancellationToken token)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Application OnExit called. ExitCode: {e.ApplicationExitCode}");
-            // MainViewModel의 Cleanup은 MainWindow.xaml.cs의 Window_Closing에서 호출됨
-            (_brokerClientService as IDisposable)?.Dispose();
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Starting to receive messages from Broker.");
+            try
+            {
+                // IsConnected는 _streamReader null 체크 포함
+                while (!token.IsCancellationRequested && IsConnected) 
+                {
+                    string messageJson = null;
+                    try
+                    {
+                        // ReadLineAsync가 CancellationToken을 직접 받지 않으므로,
+                        // token.IsCancellationRequested를 주기적으로 확인하거나,
+                        // Task.WhenAny와 Task.Delay(token)를 사용하여 간접적인 취소 확인 가능.
+                        // 여기서는 연결 상태를 루프 조건으로 확인.
+                        messageJson = await _streamReader.ReadLineAsync().ConfigureAwait(false);
+                    }
+                    catch (ObjectDisposedException) when (token.IsCancellationRequested || _isDisposed)
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: StreamReader disposed, likely during shutdown or cancellation.");
+                        break;
+                    }
+                    catch (IOException ioEx) when (token.IsCancellationRequested || !IsConnected) // 연결이 끊기면 IOException 발생
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: IOException in receive (likely connection lost or cancelled): {ioEx.Message}");
+                        break;
+                    }
+
+
+                    if (messageJson == null) 
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Broker disconnected or stream closed (ReadLineAsync returned null).");
+                        break; 
+                    }
+                    if (string.IsNullOrWhiteSpace(messageJson)) continue;
+
+                    try
+                    {
+                        var message = JsonConvert.DeserializeObject<BrokerMessage>(messageJson);
+                        if (message != null)
+                        {
+                            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Message received from Broker: Type={message.Type}, CorrId={message.CorrelationId}");
+                            MessageReceived?.Invoke(message);
+                        }
+                        else { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [WARNING] BrokerClientService: Failed to deserialize message from Broker: {messageJson}"); }
+                    }
+                    catch (JsonException jsonEx) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: JSON deserialization error: {jsonEx.Message}. Received: {messageJson}"); }
+                }
+            }
+            catch (OperationCanceledException)
+            { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Receive loop cancelled."); }
+            catch (Exception ex)
+            { if(!token.IsCancellationRequested && !_isDisposed) Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: Unexpected error in receive loop: {ex.ToString()}"); }
+            finally
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Receive loop from Broker ended.");
+                if (!_isDisposed && !token.IsCancellationRequested) 
+                {
+                    CleanupConnectionResources(false); // 연결 자원만 닫고,
+                    Disconnected?.Invoke();            // 외부에는 연결 끊김을 알림 (재연결은 외부에서 관리 또는 ConnectAsync 재호출)
+                }
+            }
+        }
+
+        public async Task SendMessageAsync(BrokerMessage message)
+        {
+            if (!IsConnected || _streamWriter == null || _isDisposed || (_cts != null && _cts.IsCancellationRequested))
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Cannot send message. Not connected, writer is null, disposed, or sending cancelled. MessageType: {message.Type}");
+                return;
+            }
+
+            string messageJson = "";
+            try
+            {
+                messageJson = JsonConvert.SerializeObject(message);
+                // lock을 사용하여 _streamWriter에 대한 동시 접근을 막음
+                bool sent = false;
+                lock (_sendLock)
+                {
+                    if (IsConnected && _streamWriter != null && !_isDisposed && (_cts == null || !_cts.IsCancellationRequested))
+                    {
+                        _streamWriter.WriteLine(messageJson); // 동기적 쓰기
+                        sent = true;
+                    }
+                }
+                if (sent) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Message sent to Broker: {message.Type}, CorrId: {message.CorrelationId}");}
+                else { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [WARNING] BrokerClientService: Send cancelled or not possible for {message.Type} inside lock."); }
+            }
+            catch (ObjectDisposedException) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [WARNING] BrokerClientService: Attempted to send {message.Type} on a disposed stream/writer."); HandleSendError(); }
+            catch (IOException ioEx) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: IOException sending {message.Type} (connection may be lost): {ioEx.Message}"); HandleSendError(); }
+            catch (JsonException jsonEx) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: Error serializing {message.Type}: {jsonEx.Message}. Payload: {message.Payload}");}
+            catch (Exception ex) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ERROR] BrokerClientService: Error sending {message.Type}: {ex.ToString()}"); HandleSendError(); }
+        }
+        
+        private void HandleSendError()
+        {
+            if (!_isDisposed)
+            {
+                 CleanupConnectionResources(false); // 연결 자원 정리
+                 Disconnected?.Invoke(); // 외부로 연결 끊김 알림
+            }
+        }
+
+        public Task DisconnectAsync()
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: DisconnectAsync called.");
+            if (_isDisposed) return Task.FromResult(false); 
+
+            _cts?.Cancel(); // 모든 비동기 작업(연결 시도, 수신 루프) 취소 요청
             
-            Console.WriteLine("MGSPMonitorControl application exited.");
-            base.OnExit(e);
+            // CleanupConnectionResources는 ReceiveMessagesAsync의 finally 또는 SendMessageAsync의 catch에서 호출될 수 있음
+            // 여기서 명시적으로 호출하여 즉시 정리 시도
+            CleanupConnectionResources(false); 
+            Disconnected?.Invoke(); // 즉시 이벤트 발생
+            return Task.FromResult(true);
+        }
+
+        private void CleanupConnectionResources(bool calledFromDispose)
+        {
+            if (!calledFromDispose && _isDisposed) return; 
+            if (calledFromDispose && _isDisposed && _tcpClient == null && _networkStream == null) return; // 이미 정리된 경우
+
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Cleaning up connection resources. Called from Dispose: {calledFromDispose}");
+
+            _isConnecting = false; // 연결 시도 중 플래그 해제
+
+            // 타이머가 있다면 여기서 Dispose (현재는 없음)
+            // _statusReportTimer?.Dispose();
+            // _statusReportTimer = null;
+
+
+            lock(_sendLock) 
+            {
+                try { _streamWriter?.Dispose(); } catch (Exception ex){ Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Error disposing StreamWriter: {ex.Message}"); }
+                _streamWriter = null;
+            }
+            try { _streamReader?.Dispose(); } catch (Exception ex){ Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Error disposing StreamReader: {ex.Message}"); }
+            _streamReader = null;
+            try { _networkStream?.Dispose(); } catch (Exception ex){ Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Error disposing NetworkStream: {ex.Message}"); }
+            _networkStream = null;
+            try { _tcpClient?.Close(); } catch (Exception ex){ Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Error closing TcpClient: {ex.Message}"); } 
+            _tcpClient = null;
+            
+            if (!calledFromDispose)
+            {
+                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Connection resources released due to disconnection or error.");
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed) return;
+            _isDisposed = true;
+
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Disposing...");
+            _cts?.Cancel(); // 모든 진행 중인 작업 취소
+            
+            // _receiveLoopTask가 실행 중이었다면 종료 대기 (선택적, 타임아웃 설정 가능)
+            if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted && !_receiveLoopTask.IsCanceled && !_receiveLoopTask.IsFaulted)
+            {
+               Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Waiting for receive loop to complete disposal...");
+               try { _receiveLoopTask.Wait(TimeSpan.FromSeconds(1)); } // 짧은 시간만 대기
+               catch (Exception ex) { Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Exception waiting for receive loop task on dispose: {ex.Message}"); }
+            }
+
+            CleanupConnectionResources(true); // Dispose 중임을 알림
+
+            _cts?.Dispose(); // CancellationTokenSource도 Dispose
+            _cts = null;
+            
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] BrokerClientService: Disposed.");
+            GC.SuppressFinalize(this);
         }
     }
 }
-위 App.xaml.cs 코드의 주요 변경점:
+위 BrokerClientService.cs 수정 사항:
 
-상세한 콘솔 로그 추가: InitializeAndRunApplication 메서드 내의 각 주요 초기화 단계마다 콘솔에 로그를 출력하도록 했습니다. 이렇게 하면 프로그램이 어느 부분까지 실행되다가 종료되는지 추적하는 데 도움이 됩니다.
-InitializeAndRunApplication 분리 및 async void 사용: OnStartup에서 직접 긴 작업을 수행하기보다 별도 메서드로 분리하고, BrokerClientService.ConnectAsync()를 await로 호출할 수 있도록 async void로 만들었습니다. (최상위 이벤트 핸들러에서의 async void는 허용됩니다.)
-catch 블록 세분화 및 상세 정보 출력:
-ConfigurationErrorsException: App.config 파일 관련 오류를 특정하여 잡습니다.
-SqlException: 데이터베이스 연결 또는 쿼리 관련 오류를 특정하여 잡고, 사용된 연결 문자열을 (안전하게) 출력합니다.
-Exception: 그 외 모든 예외를 잡고, ex.ToString()을 사용하여 스택 트레이스까지 포함된 상세 정보를 출력합니다.
-GetConnectionStringSafely() 메서드 추가: App.config에서 연결 문자열을 읽어올 때 발생할 수 있는 예외를 방지하고 안전하게 값을 가져오기 위한 작은 유틸리티입니다.
-ShowCriticalErrorAndShutdown 메서드 개선: 메시지 박스 표시 후 좀 더 안전하게 애플리케이션을 종료하도록 시도합니다.
-이제 다음 단계를 진행해주세요:
+상세한 콘솔 로그 추가: 연결 시도, 성공, 실패, 메시지 송수신, 종료 등 각 단계에 타임스탬프와 함께 자세한 로그를 Console.WriteLine으로 출력하도록 했습니다. 이렇게 하면 프로그램 실행 시 콘솔 창을 통해 동작 흐름과 오류 발생 지점을 추적하기 용이합니다.
+IsConnected 프로퍼티 강화: _streamReader와 _streamWriter도 null이 아닌지 확인하도록 조건을 추가했습니다.
+ConnectAsync 메서드 개선:
+연결 시도 타임아웃을 Task.WhenAny와 Task.Delay를 사용하여 명시적으로 구현했습니다.
+연결 성공 후 스트림 객체들이 null인지 한번 더 확인하는 방어 코드를 추가했습니다 (거의 발생하지 않겠지만).
+연결 시도 중이거나 이미 연결된 경우, 또는 Dispose된 경우에 대한 처리 로직을 강화했습니다.
+SocketException을 별도로 catch하여 소켓 에러 코드를 출력하도록 했습니다.
+일반 예외 발생 시 ex.ToString()을 사용하여 스택 트레이스까지 로그에 남기도록 했습니다.
+_isConnecting 플래그를 사용하여 동시 연결 시도를 방지합니다.
+ReceiveMessagesAsync 메서드 개선:
+ReadLineAsync에서 null 반환 시 (연결 종료) 루프를 빠져나오도록 명확히 처리했습니다.
+IOException 및 ObjectDisposedException을 좀 더 구체적으로 처리하고 로깅합니다.
+SendMessageAsync 메서드 개선:
+JsonConvert.SerializeObject 실패 시 (매우 드묾) JsonException을 잡도록 추가했습니다.
+전송 실패 시 HandleSendError를 호출하여 연결 리소스를 정리하고 Disconnected 이벤트를 발생시킵니다.
+CleanupConnectionResources 메서드:
+각 리소스 Dispose 시 발생할 수 있는 예외를 개별적으로 try-catch로 감쌌습니다.
+_isConnecting 플래그를 false로 설정합니다.
+Dispose 메서드:
+_receiveLoopTask가 완료될 시간을 짧게나마 기다리도록 (선택적) 추가했습니다.
+이제 이 수정된 BrokerClientService.cs와 이전에 수정한 App.xaml.cs를 사용해서 MGSPMonitorControl 프로그램을 다시 실행해 보십시오.
 
-위 수정된 App.xaml.cs 코드를 프로젝트에 적용합니다.
-App.config 파일 확인 (매우 중요!):
-MGSPMonitorControl 프로젝트의 루트에 App.config 파일이 있는지 확인합니다.
-이 파일의 내용이 이전에 제가 드린 예시와 같이 connectionStrings 섹션에 MonitorControlDBConnection이 올바르게 정의되어 있고, appSettings 섹션에 BrokerAddress가 올바르게 정의되어 있는지 다시 한번 꼼꼼히 확인해주세요.
-DB 연결 문자열: 실제 DB 서버 주소, DB 이름, 인증 정보(Windows 인증 또는 SQL Server 인증 사용자 ID/암호)가 정확해야 합니다.
-Broker 주소: MGSPBrokerService가 실행 중인 IP 주소와 UI 연결용 포트(예: 127.0.0.1:9001)가 정확해야 합니다.
-프로그램 실행 및 콘솔 출력 확인:
-MGSPMonitorControl.exe를 직접 실행하지 마시고, Visual Studio에서 디버그 모드(F5)로 실행하거나, 명령 프롬프트(cmd)를 열고 직접 MGSPMonitorControl.exe를 실행하여 콘솔 창에 어떤 메시지들이 출력되는지 확인해주세요.
+실행 시 확인 사항:
+
+MGSPBrokerService.exe (중계 프로그램)을 먼저 실행하고, 콘솔 창에 "Server started successfully..." 및 "UI Listener started on port 9001..." 메시지가 정상적으로 뜨는지 확인합니다.
+MGSPMonitorControl.exe (제어 UI)를 실행합니다 (Visual Studio에서 디버그 모드로 실행하거나, cmd에서 직접 실행하여 콘솔 출력 확인).
+양쪽 프로그램의 콘솔 창에 출력되는 로그를 주의 깊게 살펴보십시오.
+UI가 Broker 연결을 시도하는 로그 (Attempting to connect...)
+연결 성공 또는 실패 로그 (Successfully connected... 또는 Failed to connect... / Timeout...)
