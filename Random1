@@ -1,55 +1,243 @@
-네, IMonitorControlService 인터페이스는 이전에 MonitorAgent 프로그램 코드를 드릴 때 Services/MonitorControlService.cs 파일 안에 MonitorControlService 클래스와 함께 정의해서 드렸습니다.
+네, 알겠습니다. 이전 MGSPBrokerService와 MonitorAgent 코드가 기본적인 동작을 하는 것으로 확인되셨다니 다행입니다.
 
-MonitorAgent 프로젝트의 Services 폴더에 있는 MonitorControlService.cs 파일을 열어보시면 상단에 다음과 같이 인터페이스가 정의되어 있을 것입니다:
+이제 제어 UI 프로그램 (MGSPMonitorControl)의 전체 완성 코드를 처음부터 다시 구성하여 제공해 드리겠습니다. 이 UI 프로그램은 사용자님의 최종 요구사항을 반영하여 다음 핵심 기능들을 포함합니다:
+
+DB 직접 연동 (MonitorControlDB 사용):
+사용자 로그인 및 권한(Agent 관리 권한 - 비밀번호A, 전원 제어 권한 - 비밀번호B) 관리.
+제어 대상 Agent 목록 및 각 Agent의 상세 설정(Agent 고유 ID, 이름, 제어 방식 - 직접 또는 게이트웨이 경유, IP 정보 등) 추가/수정/삭제.
+Agent 제어 명령 실행 후 그 결과를 로그로 DB에 기록.
+중계 프로그램 (MGSPBrokerService)과 TCP 소켓 통신:
+중계 프로그램에 클라이언트로 접속하여 연결 유지.
+DB에서 가져온 Agent 제어 정보(대상 IP, 명령 등)를 중계 프로그램으로 전송.
+중계 프로그램으로부터 모든 Agent들의 실시간 상태(온라인/오프라인, 모니터 켜짐/꺼짐 등) 및 중계 서버 자체의 상태/로그를 수신하여 UI에 표시.
+사용자 인터페이스 (WPF):
+로그인 창: 프로그램 시작 시 표시.
+메인 창: Agent 목록(실시간 상태 포함), Agent 추가/수정/삭제 기능, 모니터 켜기/끄기 기능, 중계 서버 상태 및 로그 표시, UI 자체 활동 로그 표시.
+기술 스택 가정:
+
+UI: WPF (.NET Framework 4.5)
+통신: 순수 TCP 소켓
+DB 연동: ADO.NET (MS SQL Server)
+데이터 형식: JSON (Newtonsoft.Json)
+UI 패턴: 기본적인 MVVM 스타일을 따르기 위해 INotifyPropertyChanged 와 ICommand 수동 구현 또는 간단한 헬퍼 사용 (별도 MVVM 프레임워크 없이).
+프로젝트 생성 (MGSPMonitorControl):
+
+Visual Studio에서 "WPF 앱(.NET Framework)" 템플릿으로 생성.
+대상 프레임워크: .NET Framework 4.5
+필요한 NuGet 패키지:
+
+Newtonsoft.Json: JSON 직렬화/역직렬화.
+패키지 관리자 콘솔: Install-Package Newtonsoft.Json
+코드 구성:
+
+1. Models/ 폴더
+
+1.1. Models/MessageContract.cs (공통 파일 - Broker, Agent와 동일 내용)
+
+이 파일은 이전에 최종본으로 드린 MonitorControl.SharedModels 네임스페이스의 MessageContract.cs 파일과 내용이 완전히 동일해야 합니다. 해당 파일을 이 프로젝트의 Models 폴더에 복사하고, 네임스페이스가 MonitorControl.SharedModels로 되어 있는지 확인해주십시오. (이 코드 블록에서는 생략합니다. 이전 답변 참조)
+
+1.2. Models/UserSession.cs (로그인한 사용자 정보)
 
 C#
 
-// MonitorAgent/Services/MonitorControlService.cs
-using System;
-using System.Runtime.InteropServices;
-
-namespace MonitorAgent.Services
+// MGSPMonitorControl/Models/UserSession.cs
+namespace MGSPMonitorControl.Models
 {
-    // 여기가 IMonitorControlService 인터페이스 정의입니다.
-    public interface IMonitorControlService
+    public class UserSession // DB의 Users 테이블 정보 중 UI에서 사용할 부분
     {
-        bool TurnMonitorOn();
-        bool TurnMonitorOff();
-        string GetCurrentMonitorStateApproximation(); // 현재 상태 추정 (마지막 명령 기반)
+        public int UserId { get; set; }
+        public string Username { get; set; }
+        public bool CanManageAgents { get; set; } // 비밀번호 A에 해당하는 권한
+        public bool CanControlPower { get; set; } // 비밀번호 B에 해당하는 권한
+
+        // 이 객체는 로그인 성공 시 생성되어 MainWindowViewModel 등에 유지됩니다.
     }
+}
+1.3. Models/ManagedAgentDisplay.cs (UI 표시 및 DB 연동용 Agent 모델)
 
-    // 아래는 인터페이스의 구현 클래스입니다.
-    public class MonitorControlService : IMonitorControlService
+INotifyPropertyChanged를 구현하여 UI 바인딩을 지원합니다.
+
+C#
+
+// MGSPMonitorControl/Models/ManagedAgentDisplay.cs
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using MonitorControl.SharedModels; // LiveAgentInfoForUi 등 참조 위함
+
+namespace MGSPMonitorControl.Models
+{
+    public class ManagedAgentDisplay : INotifyPropertyChanged
     {
-        private readonly ILoggingService _logger;
-        // ... (Windows API 상수 및 메서드 구현 부분) ...
+        // DB 컬럼과 매핑되는 속성들
+        private Guid _agentGuid;
+        public Guid AgentGuid { get => _agentGuid; set { SetProperty(ref _agentGuid, value); } }
 
-        // 예시로 마지막 명령 기반 상태 추정 메서드
-        private string _lastKnownMonitorState = "Unknown";
+        private string _agentIdProvidedByApp;
+        public string AgentIdProvidedByApp { get => _agentIdProvidedByApp; set { SetProperty(ref _agentIdProvidedByApp, value); } }
 
-        public MonitorControlService(ILoggingService logger)
-        {
-            _logger = logger;
-        }
+        private string _agentName;
+        public string AgentName { get => _agentName; set { SetProperty(ref _agentName, value); } }
 
-        public bool TurnMonitorOn()
-        {
-            // ... (구현 내용) ...
-            _lastKnownMonitorState = "On";
-            return true; // 또는 실제 성공 여부
-        }
+        private string _description;
+        public string Description { get => _description; set { SetProperty(ref _description, value); } }
 
-        public bool TurnMonitorOff()
-        {
-            // ... (구현 내용) ...
-            _lastKnownMonitorState = "Off";
-            return true; // 또는 실제 성공 여부
-        }
+        private string _controlType = "Direct"; // "Direct" 또는 "Gatewayed"
+        public string ControlType { get => _controlType; set { SetProperty(ref _controlType, value); } }
+
+        private string _primaryIpAddress;
+        public string PrimaryIpAddress { get => _primaryIpAddress; set { SetProperty(ref _primaryIpAddress, value); } }
+
+        private int _primaryPort;
+        public int PrimaryPort { get => _primaryPort; set { SetProperty(ref _primaryPort, value); } }
+
+        private string _gatewayAgentIpAddress; // ControlType이 Gatewayed일 때 사용될 Gateway Agent의 IP
+        public string GatewayAgentIpAddress { get => _gatewayAgentIpAddress; set { SetProperty(ref _gatewayAgentIpAddress, value); } }
+
+        private int? _gatewayAgentPort; // Gateway Agent의 포트
+        public int? GatewayAgentPort { get => _gatewayAgentPort; set { SetProperty(ref _gatewayAgentPort, value); } }
         
-        public string GetCurrentMonitorStateApproximation()
+        private bool _isEnabled = true;
+        public bool IsEnabled { get => _isEnabled; set { SetProperty(ref _isEnabled, value); } }
+
+        // --- 실시간 상태 정보 (Broker로부터 수신하여 업데이트) ---
+        private bool _isOnline; 
+        public bool IsOnline { get => _isOnline; set { SetProperty(ref _isOnline, value); } }
+
+        private string _currentMonitorStatus = "Unknown";
+        public string CurrentMonitorStatus { get => _currentMonitorStatus; set { SetProperty(ref _currentMonitorStatus, value); } }
+
+        private DateTime _lastHeartbeatUtc;
+        public DateTime LastHeartbeatUtc { get => _lastHeartbeatUtc; set { SetProperty(ref _lastHeartbeatUtc, value); } }
+        
+        private string _lastStatusMessageFromAgent; 
+        public string LastStatusMessageFromAgent { get => _lastStatusMessageFromAgent; set { SetProperty(ref _lastStatusMessageFromAgent, value); } }
+
+        // UI 표시용 추가 속성 (선택적)
+        public string DisplayStatus => IsOnline ? $"Online ({CurrentMonitorStatus})" : "Offline";
+
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        protected virtual bool SetProperty<T>(ref T storage, T value, [CallerMemberName] string propertyName = null)
         {
-            return _lastKnownMonitorState;
+            if (EqualityComparer<T>.Default.Equals(storage, value)) return false;
+            storage = value;
+            OnPropertyChanged(propertyName);
+            return true;
+        }
+        protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
+        // Broker로부터 받은 LiveAgentInfoForUi 정보로 현재 상태 업데이트
+        public void UpdateLiveStatus(LiveAgentInfoForUi liveInfo)
+        {
+            if (liveInfo == null || this.AgentIdProvidedByApp != liveInfo.AgentIdProvidedByApp) return;
+
+            IsOnline = liveInfo.IsOnline;
+            CurrentMonitorStatus = liveInfo.CurrentMonitorStatus ?? "Unknown";
+            LastHeartbeatUtc = liveInfo.LastHeartbeatUtc;
+            LastStatusMessageFromAgent = liveInfo.StatusMessageFromAgent;
+            // AgentNameFromUiDb, PrimaryReportedIpAddress, AllIpAddresses 등은 참고용
         }
     }
 }
-AgentCore.cs 등에서 IMonitorControlService 타입으로 의존성을 주입받아 사용하고 있으며, 실제로는 위 MonitorControlService 클래스의 인스턴스가 전달됩니다.
+1.6. Models/ControlActionLogEntry.cs (DB 로그 기록용 모델)
+DB의 ControlActionLogs 테이블과 거의 1:1 매핑.
+
+C#
+
+// MGSPMonitorControl/Models/ControlActionLogEntry.cs
+using System;
+
+namespace MGSPMonitorControl.Models
+{
+    public class ControlActionLogEntry
+    {
+        public long LogId { get; set; } // DB에서 자동 증가
+        public Guid AgentGuid { get; set; }
+        public string ActionType { get; set; }
+        public string ActionParameters { get; set; } // JSON 문자열로 저장 가능
+        public int RequestedByUserId { get; set; }
+        public string RequestedByUsername { get; set; } // 로깅 편의상 추가 (DB에는 UserId만)
+        public DateTime RequestTimestamp { get; set; } = DateTime.UtcNow;
+        
+        // 단계별 타임스탬프는 DB에 직접 기록 시 UI가 채워서 보냄
+        public DateTime? RelayReceivedTimestamp { get; set; }
+        public DateTime? AgentReceivedTimestamp { get; set; }
+        public DateTime? ExecutionCompletedTimestamp { get; set; }
+        
+        public string FinalStatus { get; set; } // "Success", "Failure", "Timeout", "SentToRelay" 등
+        public string ResultMessage { get; set; }
+        public string ExecutedViaGatewayAgentId { get; set; } // 게이트웨이 경유 시 정보
+    }
+}
+1.7. Models/BrokerStatusDisplay.cs (중계 서버 상태 UI 표시용)
+MonitorControl.SharedModels.BrokerStatusInfoPayload를 UI에서 사용하기 편하게 변환하거나 래핑. INotifyPropertyChanged 구현.
+
+C#
+
+// MGSPMonitorControl/Models/BrokerStatusDisplay.cs
+using System;
+using System.Collections.ObjectModel; // ObservableCollection
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using MonitorControl.SharedModels; // BrokerStatusInfoPayload
+
+namespace MGSPMonitorControl.Models
+{
+    public class BrokerStatusDisplay : INotifyPropertyChanged
+    {
+        private DateTime _serverStartTimeUtc;
+        public DateTime ServerStartTimeUtc { get => _serverStartTimeUtc; set => SetProperty(ref _serverStartTimeUtc, value); }
+
+        private string _uptimeString;
+        public string UptimeString { get => _uptimeString; set => SetProperty(ref _uptimeString, value); }
+
+        private int _connectedUiClientCount;
+        public int ConnectedUiClientCount { get => _connectedUiClientCount; set => SetProperty(ref _connectedUiClientCount, value); }
+
+        private int _connectedAgentCount;
+        public int ConnectedAgentCount { get => _connectedAgentCount; set => SetProperty(ref _connectedAgentCount, value); }
+
+        private string _brokerVersion;
+        public string BrokerVersion { get => _brokerVersion; set => SetProperty(ref _brokerVersion, value); }
+
+        public ObservableCollection<string> RecentServerLogs { get; } = new ObservableCollection<string>();
+
+        public void UpdateFromServerPayload(BrokerStatusInfoPayload payload)
+        {
+            if (payload == null) return;
+            ServerStartTimeUtc = payload.ServerStartTimeUtc;
+            UptimeString = payload.UptimeString;
+            ConnectedUiClientCount = payload.ConnectedUiClientCount;
+            ConnectedAgentCount = payload.ConnectedAgentCount;
+            BrokerVersion = payload.BrokerVersion;
+
+            RecentServerLogs.Clear();
+            if (payload.RecentServerLogs != null)
+            {
+                foreach (var log in payload.RecentServerLogs)
+                {
+                    RecentServerLogs.Add(log);
+                }
+            }
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        protected virtual bool SetProperty<T>(ref T storage, T value, [CallerMemberName] string propertyName = null)
+        {
+            if (EqualityComparer<T>.Default.Equals(storage, value)) return false;
+            storage = value;
+            OnPropertyChanged(propertyName);
+            return true;
+        }
+        protected virtual void OnPropertyChanged([CallerMemberName] string propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+    }
+}
+여기까지가 UI 프로그램의 Models 폴더에 들어갈 주요 클래스들입니다. MessageContract.cs는 Broker, Agent와 내용을 동일하게 유지하는 것이 핵심입니다.
