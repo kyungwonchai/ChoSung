@@ -1,16 +1,15 @@
-네, 알겠습니다. 오류 메시지를 보니 몇 가지 수정이 필요해 보입니다. 하나씩 해결해 보겠습니다.
+알겠습니다. MainViewModel.cs 파일에서 여전히 CanUserManageAgents 관련 오류가 발생한다니 죄송합니다. 좀 더 면밀하게 검토하여 해당 오류를 해결할 수 있도록 수정된 전체 코드를 드리겠습니다.
 
-1. MainViewModel.cs의 CanUserManageAgents 오류
+오류의 주된 원인은 RelayCommand의 CanExecute 조건으로 사용되는 bool 타입의 권한 속성이 MainViewModel 내에 명확하게 정의되지 않았거나, 다른 이름으로 정의된 속성을 잘못 참조하고 있기 때문일 가능성이 높습니다.
 
-오류 메시지: "CanUserManageAgents 이름이 현재 컨텍스트에 없습니다."
+수정 방향:
 
-원인:
-MainViewModel에서 AddAgentCommand, EditAgentCommand, DeleteAgentCommand의 CanExecute 조건으로 CanUserManageAgents라는 bool 타입의 속성을 사용하려고 하는데, 이 속성이 MainViewModel 클래스에 명시적으로 정의되어 있지 않기 때문입니다. 이전에 XAML 바인딩용으로 ManageAgentsButtonVisibility라는 Visibility 타입 속성을 만들었지만, 커맨드의 실행 가능 여부는 bool 값으로 판단해야 합니다.
+MainViewModel에 bool 타입의 CanManageAgents와 CanControlPower라는 이름의 읽기 전용 속성을 명시적으로 정의합니다. 이 속성들은 생성자에서 _currentUserSession 객체를 통해 초기화됩니다.
+XAML에서 버튼 등의 Visibility를 제어할 때는 이 bool 속성들을 BooleanToVisibilityConverter와 함께 사용합니다 (이전 ManageAgentsButtonVisibility 같은 별도 Visibility 속성 대신).
+각 RelayCommand의 CanExecute 델리게이트에서는 새로 정의된 bool 타입의 CanManageAgents와 CanControlPower 속성을 직접 참조합니다.
+이렇게 하면 C# 코드 내에서 권한 관련 속성 이름이 일관되게 사용되어 오류를 줄일 수 있습니다.
 
-해결 방법:
-MainViewModel.cs에 bool 타입의 CanUserManageAgents와 CanUserControlPower 속성을 추가합니다.
-
-수정된 MainViewModel.cs (관련 부분):
+수정된 MGSPMonitorControl/ViewModels/MainViewModel.cs (전체 코드):
 
 C#
 
@@ -23,252 +22,565 @@ using System.Windows; // Dispatcher, MessageBox
 using System.Windows.Input;
 using MGSPMonitorControl.Models;
 using MGSPMonitorControl.Services;
-using MGSPMonitorControl.Views; 
-using MonitorControl.SharedModels; 
-using Newtonsoft.Json; 
+using MGSPMonitorControl.Views; // AgentConfigWindow (네임스페이스 주의)
+using MonitorControl.SharedModels; // BrokerMessage, LiveAgentInfoForUi 등
+using Newtonsoft.Json; // JsonConvert
 
 namespace MGSPMonitorControl.ViewModels
 {
     public class MainViewModel : ObservableObject
     {
         private readonly UserSession _currentUserSession;
-        // ... (다른 필드들은 이전과 동일) ...
+        private readonly IDatabaseService _databaseService;
+        private readonly IBrokerClientService _brokerClientService;
+        // private readonly ILoggingService _uiLocalLogger; // 필요시 추가
 
-        // 기존 Visibility 속성은 XAML용으로 유지하거나, bool 속성에 컨버터 사용으로 대체 가능
-        public Visibility ManageAgentsButtonVisibility => (_currentUserSession?.CanManageAgents ?? false) ? Visibility.Visible : Visibility.Collapsed;
-        public Visibility ControlPowerButtonVisibility => (_currentUserSession?.CanControlPower ?? false) ? Visibility.Visible : Visibility.Collapsed;
+        public ObservableCollection<ManagedAgentDisplay> Agents { get; }
+        public ObservableCollection<string> UiActionLogs { get; }
+        // BrokerServerLogs는 BrokerStatus.RecentServerLogs에 바인딩되므로 별도 컬렉션 불필요
 
-        // RelayCommand의 CanExecute에서 사용할 bool 타입 속성 추가
-        public bool CanUserManageAgentsProperty => _currentUserSession?.CanManageAgents ?? false;
-        public bool CanUserControlPowerProperty => _currentUserSession?.CanControlPower ?? false;
+        private ManagedAgentDisplay _selectedAgent;
+        public ManagedAgentDisplay SelectedAgent
+        {
+            get => _selectedAgent;
+            set 
+            { 
+                if (SetProperty(ref _selectedAgent, value))
+                {
+                    // 선택 변경 시 관련된 모든 Command들의 CanExecute 상태 업데이트
+                    RefreshCommandStates();
+                }
+            }
+        }
 
-        // ... (다른 속성들은 이전과 동일) ...
+        private BrokerStatusDisplay _brokerStatus = new BrokerStatusDisplay();
+        public BrokerStatusDisplay BrokerStatus
+        {
+            get => _brokerStatus;
+            set => SetProperty(ref _brokerStatus, value);
+        }
+        
+        private string _brokerConnectionStatus = "Disconnected";
+        public string BrokerConnectionStatus 
+        {
+            get => _brokerConnectionStatus;
+            set 
+            { 
+                if (SetProperty(ref _brokerConnectionStatus, value))
+                {
+                    RefreshCommandStates(); // 연결 상태 변경 시 Command 상태 업데이트
+                }
+            }
+        }
+
+        // 사용자 권한을 위한 bool 속성 (XAML 및 Command CanExecute에서 사용)
+        public bool CanManageAgents => _currentUserSession?.CanManageAgents ?? false;
+        public bool CanControlPower => _currentUserSession?.CanControlPower ?? false;
+        public string CurrentUsername => _currentUserSession?.Username ?? "N/A";
+
+
+        // Commands
+        public ICommand LoadAgentsCommand { get; }
+        public ICommand AddAgentCommand { get; }
+        public ICommand EditAgentCommand { get; }
+        public ICommand DeleteAgentCommand { get; }
+        public ICommand MonitorOnCommand { get; }
+        public ICommand MonitorOffCommand { get; }
+        public ICommand PingAgentCommand { get; }
+        public ICommand RequestBrokerStatusCommand { get; }
+        public ICommand ConnectToBrokerCommand { get; }
+        public ICommand DisconnectFromBrokerCommand { get; }
+        public ICommand ClearUiLogsCommand { get; }
+
 
         public MainViewModel(UserSession userSession, IDatabaseService databaseService, IBrokerClientService brokerClientService)
         {
             _currentUserSession = userSession ?? throw new ArgumentNullException(nameof(userSession));
-            // ... (나머지 생성자 코드는 이전과 동일) ...
-            AddUiLog($"User '{_currentUserSession.Username}' logged in. ManageAgents: {CanUserManageAgentsProperty}, ControlPower: {CanUserControlPowerProperty}");
+            _databaseService = databaseService ?? throw new ArgumentNullException(nameof(databaseService));
+            _brokerClientService = brokerClientService ?? throw new ArgumentNullException(nameof(brokerClientService));
 
+            Agents = new ObservableCollection<ManagedAgentDisplay>();
+            UiActionLogs = new ObservableCollection<string>();
+            // BrokerServerLogs는 BrokerStatus.RecentServerLogs를 통해 XAML에 직접 바인딩
 
-            // Commands 초기화 시 CanExecute 조건 수정
-            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync(), () => true);
-            AddAgentCommand = new RelayCommand(ExecuteAddAgent, () => CanUserManageAgentsProperty); // 수정됨
-            EditAgentCommand = new RelayCommand(ExecuteEditAgent, () => SelectedAgent != null && CanUserManageAgentsProperty); // 수정됨
-            DeleteAgentCommand = new RelayCommand(async () => await ExecuteDeleteAgentAsync(), () => SelectedAgent != null && CanUserManageAgentsProperty); // 수정됨
+            AddUiLog($"User '{CurrentUsername}' logged in. ManageAgents: {CanManageAgents}, ControlPower: {CanControlPower}");
+
+            _brokerClientService.Connected += OnBrokerConnected;
+            _brokerClientService.Disconnected += OnBrokerDisconnected;
+            _brokerClientService.MessageReceived += OnBrokerMessageReceived;
+
+            // Commands 초기화
+            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync()); // CanExecute는 항상 true 또는 연결 상태 기반
+            AddAgentCommand = new RelayCommand(ExecuteAddAgent, () => CanManageAgents);
+            EditAgentCommand = new RelayCommand(ExecuteEditAgent, () => SelectedAgent != null && CanManageAgents);
+            DeleteAgentCommand = new RelayCommand(async () => await ExecuteDeleteAgentAsync(), () => SelectedAgent != null && CanManageAgents);
             
             MonitorOnCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOn"), 
-                                              () => SelectedAgent != null && SelectedAgent.IsOnline && CanUserControlPowerProperty); // 수정됨
+                                              () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower);
             MonitorOffCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOff"), 
-                                               () => SelectedAgent != null && SelectedAgent.IsOnline && CanUserControlPowerProperty); // 수정됨
-            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(), () => SelectedAgent != null && SelectedAgent.IsOnline);
+                                               () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower);
+            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(), 
+                                              () => SelectedAgent != null && SelectedAgent.IsOnline); // Ping은 권한 무관하게 가능
 
             RequestBrokerStatusCommand = new RelayCommand(async () => await ExecuteRequestBrokerStatusAsync(), () => _brokerClientService.IsConnected);
             ConnectToBrokerCommand = new RelayCommand(async () => await _brokerClientService.ConnectAsync(), () => !_brokerClientService.IsConnected);
             DisconnectFromBrokerCommand = new RelayCommand(async () => await _brokerClientService.DisconnectAsync(), () => _brokerClientService.IsConnected);
             ClearUiLogsCommand = new RelayCommand(() => UiActionLogs.Clear());
 
-            // ... (나머지 생성자 코드) ...
+            // 초기 데이터 로드 및 Broker 연결 시도
+            Task.Run(async () => {
+                await ExecuteLoadAgentsAsync(); 
+                if (!_brokerClientService.IsConnected)
+                {
+                    await _brokerClientService.ConnectAsync();
+                }
+            });
         }
 
-        // ... (다른 메서드들은 이전과 동일) ...
-    }
-}
-주요 변경점:
-
-CanUserManageAgentsProperty 와 CanUserControlPowerProperty 라는 bool 타입 속성을 추가했습니다. (기존 Visibility 속성과 구분하기 위해 이름에 Property 추가)
-각 RelayCommand의 CanExecute 람다식에서 이 새로운 bool 속성들을 참조하도록 수정했습니다.
-2. LoginViewModel.cs의 RelayCommand 오류
-
-오류 메시지: "제네릭이 아닌 형식 'RelayCommand'는 형식 인수와 함께 사용할 수 없습니다."
-
-원인:
-이전에 제공한 RelayCommand 클래스가 제네릭 타입 <T>를 받는 형태로 완전히 정의되지 않았거나, 호출하는 부분에서 혼동이 있었을 수 있습니다. LoginCommand에서 RelayCommand<object>를 사용하고 있으므로, RelayCommand 클래스가 이를 지원해야 합니다.
-
-해결 방법:
-RelayCommand.cs 파일을 제네릭 RelayCommand<T>와 파라미터 없는 경우를 위한 논-제네릭 RelayCommand를 모두 명확하게 지원하도록 수정합니다.
-
-수정된 ViewModels/RelayCommand.cs (전체 코드):
-
-C#
-
-// MGSPMonitorControl/ViewModels/RelayCommand.cs
-using System;
-using System.Windows.Input;
-
-namespace MGSPMonitorControl.ViewModels
-{
-    /// <summary>
-    /// A command whose sole purpose is to relay its functionality to other
-    /// objects by invoking delegates. The default return value for the CanExecute
-    /// method is 'true'.
-    /// </summary>
-    public class RelayCommand : ICommand
-    {
-        private readonly Action _execute;
-        private readonly Func<bool> _canExecute;
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="RelayCommand"/> class.
-        /// </summary>
-        /// <param name="execute">The execution logic.</param>
-        /// <param name="canExecute">The execution status logic.</param>
-        public RelayCommand(Action execute, Func<bool> canExecute = null)
+        private void RefreshCommandStates()
         {
-            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
-            _canExecute = canExecute;
-        }
-
-        public event EventHandler CanExecuteChanged
-        {
-            add { CommandManager.RequerySuggested += value; }
-            remove { CommandManager.RequerySuggested -= value; }
-        }
-
-        public bool CanExecute(object parameter)
-        {
-            return _canExecute == null || _canExecute();
-        }
-
-        public void Execute(object parameter)
-        {
-            _execute();
-        }
-
-        public void RaiseCanExecuteChanged()
-        {
-            CommandManager.InvalidateRequerySuggested();
-        }
-    }
-
-    /// <summary>
-    /// A generic command whose sole purpose is to relay its functionality to other
-    /// objects by invoking delegates. The default return value for the CanExecute
-    /// method is 'true'.
-    /// </summary>
-    /// <typeparam name="T">The type of the command parameter.</typeparam>
-    public class RelayCommand<T> : ICommand
-    {
-        private readonly Action<T> _execute;
-        private readonly Predicate<T> _canExecute;
-
-        /// <summary>
-        /// Initializes a new instance of the <see cref="RelayCommand{T}"/> class.
-        /// </summary>
-        /// <param name="execute">The execution logic.</param>
-        /// <param name="canExecute">The execution status logic.</param>
-        public RelayCommand(Action<T> execute, Predicate<T> canExecute = null)
-        {
-            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
-            _canExecute = canExecute;
-        }
-
-        public event EventHandler CanExecuteChanged
-        {
-            add { CommandManager.RequerySuggested += value; }
-            remove { CommandManager.RequerySuggested -= value; }
-        }
-
-        public bool CanExecute(object parameter)
-        {
-            // 파라미터가 T 타입으로 변환 가능한지 확인 (또는 null 허용 시)
-            if (parameter == null && typeof(T).IsValueType && Nullable.GetUnderlyingType(typeof(T)) == null)
-                return _canExecute == null; // 값 타입이고 null을 받을 수 없는 T에 null이 오면 canExecute 조건만 따름 (또는 false 반환)
-
-            // 파라미터가 T이거나 T로 캐스팅 가능할 때만 _canExecute 호출
-            if (parameter is T || parameter == null) // null도 T 타입으로 간주 (참조 타입 또는 Nullable<T>)
+            // UI 스레드에서 실행 보장 (CommandManager.RequerySuggested는 UI 스레드에서 발생)
+            Application.Current.Dispatcher.Invoke(() =>
             {
-                 return _canExecute == null || _canExecute((T)parameter);
+                (LoadAgentsCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (AddAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (EditAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (DeleteAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MonitorOnCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MonitorOffCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (PingAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (RequestBrokerStatusCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (ConnectToBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (DisconnectFromBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            });
+        }
+
+        private void AddUiLog(string message)
+        {
+            Application.Current.Dispatcher.Invoke(() =>
+            {
+                string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+                UiActionLogs.Insert(0, logEntry);
+                if (UiActionLogs.Count > 200) UiActionLogs.RemoveAt(UiActionLogs.Count - 1);
+            });
+        }
+
+        private async Task ExecuteLoadAgentsAsync()
+        {
+            AddUiLog("Loading managed agents from database...");
+            try
+            {
+                var dbAgents = await _databaseService.GetManagedAgentsAsync();
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    Agents.Clear();
+                    foreach (var agent in dbAgents.OrderBy(a=>a.AgentName))
+                    {
+                        Agents.Add(agent);
+                    }
+                    SelectedAgent = null; // 목록 새로고침 후 선택 해제
+                });
+                AddUiLog($"Loaded {dbAgents.Count} agent configurations from DB.");
+                
+                if(_brokerClientService.IsConnected)
+                {
+                    await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = CurrentUsername });
+                }
+                RefreshCommandStates();
             }
-            // T로 변환 불가능한 타입이 오면 false (또는 예외 발생)
-            return false; 
-        }
-
-        public void Execute(object parameter)
-        {
-            _execute((T)parameter);
-        }
-        
-        public void RaiseCanExecuteChanged()
-        {
-            CommandManager.InvalidateRequerySuggested();
-        }
-    }
-}
-RelayCommand.cs 수정 사항:
-
-파라미터가 없는 명령을 위한 논-제네릭 RelayCommand 클래스를 유지했습니다.
-제네릭 파라미터를 받는 RelayCommand<T> 클래스를 추가했습니다.
-LoginViewModel에서 new RelayCommand<object>(...) 호출이 이제 이 제네릭 클래스를 올바르게 참조하게 됩니다.
-CanExecute(object parameter)와 Execute(object parameter) 메서드 내에서 파라미터 타입을 T로 안전하게 캐스팅하는 로직을 포함했습니다.
-LoginViewModel.cs의 LoginCommand 초기화 부분 확인:
-
-위 RelayCommand<T> 수정 후, LoginViewModel.cs의 LoginCommand 초기화는 다음과 같이 되어 있어야 합니다.
-
-C#
-
-// MGSPMonitorControl/ViewModels/LoginViewModel.cs
-// ...
-            // LoginCommand = new RelayCommand<object>(async (passwordBoxObj) => await ExecuteLoginAsync(passwordBoxObj as System.Windows.Controls.PasswordBox), CanExecuteLogin);
-            // CommandParameter는 object로 전달되므로, CanExecuteLogin도 object를 받도록 수정하거나,
-            // RelayCommand<PasswordBox>를 사용하고 ExecuteLoginAsync도 PasswordBox를 직접 받도록 하는 것이 더 타입 세이프합니다.
-            // 여기서는 object를 유지하되, CanExecuteLogin의 파라미터도 object로 맞춥니다.
-            LoginCommand = new RelayCommand<object>(
-                async (param) => await ExecuteLoginAsync(param as System.Windows.Controls.PasswordBox), 
-                (param) => CanExecuteLogin(param as System.Windows.Controls.PasswordBox) // CanExecuteLogin도 PasswordBox를 받도록 수정
-            );
-// ...
-        // CanExecuteLogin 메서드 시그니처도 PasswordBox 또는 object를 받도록 수정
-        private bool CanExecuteLogin(System.Windows.Controls.PasswordBox passwordBox) // 또는 (object parameter)
-        {
-            // var passwordBox = parameter as System.Windows.Controls.PasswordBox; // object로 받을 경우
-            return !string.IsNullOrWhiteSpace(Username) && 
-                   passwordBox?.SecurePassword.Length > 0 && 
-                   !IsLoggingIn;
-        }
-// ...
-수정된 LoginViewModel.cs (관련 부분만):
-
-C#
-
-// MGSPMonitorControl/ViewModels/LoginViewModel.cs
-// ... (다른 using 및 속성 정의는 동일) ...
-        public ICommand LoginCommand { get; }
-
-        public LoginViewModel(IDatabaseService databaseService, IPasswordService passwordService)
-        {
-            _databaseService = databaseService ?? throw new ArgumentNullException(nameof(databaseService));
-            _passwordService = passwordService ?? throw new ArgumentNullException(nameof(passwordService));
-
-            // RelayCommand<T>를 사용하도록 명확히 하고, CanExecute 델리게이트의 파라미터 타입도 맞춤
-            LoginCommand = new RelayCommand<System.Windows.Controls.PasswordBox>(
-                async (pBox) => await ExecuteLoginAsync(pBox), 
-                (pBox) => CanExecuteLogin(pBox) 
-            );
-            // ...
-        }
-
-        // CanExecuteLogin의 파라미터를 PasswordBox로 명시
-        private bool CanExecuteLogin(System.Windows.Controls.PasswordBox passwordBox)
-        {
-            return !string.IsNullOrWhiteSpace(Username) && 
-                   passwordBox != null && // null 체크 추가
-                   passwordBox.SecurePassword.Length > 0 && 
-                   !IsLoggingIn;
-        }
-
-        // ExecuteLoginAsync의 파라미터도 PasswordBox로 명시
-        private async Task ExecuteLoginAsync(System.Windows.Controls.PasswordBox passwordBox)
-        {
-            if (passwordBox == null) 
+            catch (Exception ex)
             {
-                ErrorMessage = "PasswordBox parameter is null."; // 방어 코드
+                AddUiLog($"[ERROR] Error loading agents from DB: {ex.Message}");
+                MessageBox.Show($"Error loading agents: {ex.Message}", "Database Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void ExecuteAddAgent()
+        {
+            AddUiLog("Opening 'Add New Agent' window...");
+            var agentConfigVm = new AgentConfigViewModel(_databaseService, _currentUserSession.UserId);
+            var agentConfigWindow = new AgentConfigWindow(agentConfigVm); 
+            
+            if (agentConfigWindow.ShowDialog() == true)
+            {
+                AddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' configuration saved. Refreshing list.");
+                Task.Run(async () => await ExecuteLoadAgentsAsync()); 
+            }
+            else
+            {
+                AddUiLog("'Add New Agent' window cancelled.");
+            }
+        }
+
+        private void ExecuteEditAgent()
+        {
+            if (SelectedAgent == null) return;
+            AddUiLog($"Opening 'Edit Agent' window for: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
+            
+            ManagedAgentDisplay agentToEditInDb = null;
+            try
+            {
+                // 비동기 호출 결과를 동기적으로 기다릴 때는 주의 (UI 스레드에서 호출 시 Deadlock 가능성)
+                // 여기서는 RelayCommand의 Execute가 백그라운드 스레드에서 호출되지 않으므로 Task.Result 사용.
+                // 더 안전한 방법은 이 메서드 전체를 async Task로 만들고 await 사용.
+                // 여기서는 생성자에서 이미 Task.Run으로 초기 로드를 호출하므로, 다른 버튼들도 async Task로 변경.
+                agentToEditInDb = Task.Run(async () => await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid)).Result;
+            }
+            catch (Exception ex)
+            {
+                 AddUiLog($"[ERROR] Error fetching agent details for editing: {ex.GetBaseException().Message}");
+                 MessageBox.Show($"Error fetching agent details: {ex.GetBaseException().Message}", "Database Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                 return;
+            }
+            
+            if(agentToEditInDb == null) {
+                AddUiLog($"Agent {SelectedAgent.AgentName} not found in DB for editing. Refreshing list.");
+                MessageBox.Show("Selected agent not found in database. It might have been deleted.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                Task.Run(async () => await ExecuteLoadAgentsAsync());
                 return;
             }
-            // ... (나머지 로직 동일) ...
-        }
-// ... (나머지 LoginViewModel.cs 코드는 이전과 동일) ...
-요약:
 
-MainViewModel.cs에 CanUserManageAgentsProperty와 CanUserControlPowerProperty라는 bool 타입 속성을 추가하고, 커맨드에서 이 속성들을 사용하도록 수정했습니다.
-RelayCommand.cs 파일을 파라미터 없는 버전과 제네릭 RelayCommand<T> 버전을 모두 포함하도록 수정했습니다.
+            var agentConfigVm = new AgentConfigViewModel(_databaseService, _currentUserSession.UserId, agentToEditInDb);
+            var agentConfigWindow = new AgentConfigWindow(agentConfigVm);
+            
+            if (agentConfigWindow.ShowDialog() == true)
+            {
+                AddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' configuration updated. Refreshing list.");
+                Task.Run(async () => await ExecuteLoadAgentsAsync());
+            }
+            else
+            {
+                AddUiLog("'Edit Agent' window cancelled.");
+            }
+        }
+
+        private async Task ExecuteDeleteAgentAsync()
+        {
+            if (SelectedAgent == null) return;
+            if (MessageBox.Show($"Are you sure you want to delete agent '{SelectedAgent.AgentName}' (ID: {SelectedAgent.AgentIdProvidedByApp}) from the database?\nThis will also delete associated control logs.",
+                                "Confirm Delete Agent Configuration", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+            {
+                AddUiLog($"Attempting to delete agent configuration: {SelectedAgent.AgentName}");
+                try
+                {
+                    bool success = await _databaseService.DeleteManagedAgentAsync(SelectedAgent.AgentGuid);
+                    if (success)
+                    {
+                        AddUiLog($"Agent configuration '{SelectedAgent.AgentName}' deleted successfully. Refreshing list.");
+                        await ExecuteLoadAgentsAsync(); // 목록 새로고침
+                    }
+                    else
+                    {
+                        AddUiLog($"[ERROR] Failed to delete agent configuration '{SelectedAgent.AgentName}'.");
+                        MessageBox.Show("Failed to delete agent configuration.", "Database Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AddUiLog($"[ERROR] Error deleting agent configuration '{SelectedAgent.AgentName}': {ex.Message}");
+                    MessageBox.Show($"Error deleting agent: {ex.Message}", "Database Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+        }
+
+        private async Task ExecuteMonitorControlAsync(string actionType)
+        {
+            if (SelectedAgent == null) return;
+
+            string correlationId = Guid.NewGuid().ToString();
+            AddUiLog($"Sending '{actionType}' command (CorrID: {correlationId}) to agent: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
+
+            ManagedAgentDisplay currentAgentConfig = null;
+            try
+            {
+                 currentAgentConfig = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid);
+            }
+            catch (Exception ex)
+            {
+                 AddUiLog($"[DB ERROR] Failed to get agent config for command: {ex.Message}");
+                 MessageBox.Show($"Database error: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                 return;
+            }
+
+            if (currentAgentConfig == null)
+            {
+                AddUiLog($"[ERROR] Agent configuration for {SelectedAgent.AgentName} not found in DB. Cannot send command.");
+                MessageBox.Show("Agent configuration not found. Please refresh the list.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            var payload = new UiControlAgentPayload 
+            {
+                TargetAgentIdProvidedByApp = currentAgentConfig.AgentIdProvidedByApp,
+                ControlAction = actionType,
+                ControlType = currentAgentConfig.ControlType,
+                PrimaryIpAddress = currentAgentConfig.PrimaryIpAddress,
+                PrimaryPort = currentAgentConfig.PrimaryPort,
+                GatewayAgentIdToUse = currentAgentConfig.ControlType == "Gatewayed" ? currentAgentConfig.GatewayAgentIpAddress : null,
+                OriginalParameters = null
+            };
+
+            var message = new BrokerMessage 
+            {
+                Type = MessageType.UiRequest_ControlAgent,
+                CorrelationId = correlationId, 
+                Payload = JsonConvert.SerializeObject(payload),
+                SourceId = CurrentUsername 
+            };
+
+            var logEntry = new ControlActionLogEntry
+            {
+                AgentGuid = currentAgentConfig.AgentGuid,
+                ActionType = actionType,
+                RequestedByUserId = _currentUserSession.UserId,
+                RequestTimestamp = DateTime.UtcNow,
+                FinalStatus = "SentToBroker",
+                ResultMessage = $"Command sent to broker. Waiting for response. CorrID: {correlationId}"
+            };
+            try { await _databaseService.LogControlActionAsync(logEntry); }
+            catch (Exception ex) { AddUiLog($"[DB ERROR] Failed to log initial command send: {ex.Message}"); }
+
+            await _brokerClientService.SendMessageAsync(message);
+        }
+        
+        private async Task ExecutePingAgentAsync()
+        {
+            if (SelectedAgent == null) return;
+            string correlationId = Guid.NewGuid().ToString();
+            AddUiLog($"Sending 'PingAgent' command (CorrID: {correlationId}) to agent: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
+            
+            var currentAgentConfig = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.AgentGuid);
+            if (currentAgentConfig == null) { AddUiLog($"[ERROR] Agent config for {SelectedAgent.AgentName} not found for Ping."); return; }
+
+            var payload = new UiControlAgentPayload
+            {
+                TargetAgentIdProvidedByApp = currentAgentConfig.AgentIdProvidedByApp,
+                ControlAction = "PingAgent", 
+                ControlType = currentAgentConfig.ControlType, 
+                PrimaryIpAddress = currentAgentConfig.PrimaryIpAddress,
+                PrimaryPort = currentAgentConfig.PrimaryPort,
+                GatewayAgentIdToUse = currentAgentConfig.ControlType == "Gatewayed" ? currentAgentConfig.GatewayAgentIpAddress : null
+            };
+            var message = new BrokerMessage
+            {
+                Type = MessageType.UiRequest_ControlAgent, 
+                CorrelationId = correlationId,
+                Payload = JsonConvert.SerializeObject(payload),
+                SourceId = CurrentUsername
+            };
+            await _brokerClientService.SendMessageAsync(message);
+        }
+
+        private async Task ExecuteRequestBrokerStatusAsync()
+        {
+            AddUiLog("Requesting broker status and logs...");
+            var message = new BrokerMessage { Type = MessageType.UiRequest_GetBrokerStatus, SourceId = CurrentUsername };
+            await _brokerClientService.SendMessageAsync(message);
+        }
+
+        #region Broker Event Handlers
+        private void OnBrokerConnected()
+        {
+            Application.Current.Dispatcher.Invoke(() => {
+                BrokerConnectionStatus = "Connected"; // 더 간결하게
+                AddUiLog("Successfully connected to Broker Service.");
+                RefreshCommandStates();
+            });
+            Task.Run(async () => {
+                await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiClientHello, SourceId = CurrentUsername });
+                await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = CurrentUsername });
+                await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetBrokerStatus, SourceId = CurrentUsername });
+                // await ExecuteLoadAgentsAsync(); // DB 목록은 이미 로드되어 있을 수 있음, Broker 상태와 병합
+            });
+        }
+
+        private void OnBrokerDisconnected()
+        {
+             Application.Current.Dispatcher.Invoke(() => {
+                BrokerConnectionStatus = "Disconnected";
+                AddUiLog("Disconnected from Broker Service. Attempting to reconnect if BrokerClientService is designed to do so.");
+                foreach(var agent in Agents) { agent.IsOnline = false; agent.CurrentMonitorStatus = "Offline (Broker D/C)"; }
+                RefreshCommandStates();
+             });
+        }
+
+        private void OnBrokerMessageReceived(BrokerMessage message) 
+        {
+             Application.Current.Dispatcher.Invoke(() =>
+            {
+                // AddUiLog($"Broker Msg Rcvd: Type={message.Type}, Src={message.SourceId}, CorrId={message.CorrelationId}");
+                try
+                {
+                    switch (message.Type)
+                    {
+                        case MessageType.BrokerToUi_InitialAgentList:
+                            var agentListPayload = JsonConvert.DeserializeObject<List<LiveAgentInfoForUi>>(message.Payload);
+                            if (agentListPayload != null)
+                            {
+                                UpdateAgentListFromBroker(agentListPayload, true);
+                                AddUiLog($"Received initial list of {agentListPayload.Count} live agents from Broker.");
+                            }
+                            break;
+                        case MessageType.BrokerToUi_BroadcastAgentRegisteredOrUpdated:
+                        case MessageType.BrokerToUi_BroadcastAgentStatus:
+                            var liveAgentInfo = JsonConvert.DeserializeObject<LiveAgentInfoForUi>(message.Payload);
+                            if (liveAgentInfo != null)
+                            {
+                                UpdateSingleAgentStatus(liveAgentInfo);
+                                if(message.Type == MessageType.BrokerToUi_BroadcastAgentRegisteredOrUpdated)
+                                    AddUiLog($"Agent '{liveAgentInfo.AgentIdProvidedByApp}' registered/updated on Broker.");
+                            }
+                            break;
+                        case MessageType.BrokerToUi_BroadcastAgentDisconnected:
+                            string disconnectedAgentId = message.SourceId; 
+                            var agentToMarkOffline = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == disconnectedAgentId);
+                            if (agentToMarkOffline != null)
+                            {
+                                agentToMarkOffline.IsOnline = false;
+                                agentToMarkOffline.CurrentMonitorStatus = "Offline";
+                                agentToMarkOffline.LastStatusMessageFromAgent = "Disconnected from Broker";
+                                AddUiLog($"Agent disconnected from Broker: {disconnectedAgentId}");
+                                RefreshCommandStates(); // Agent 상태 변경 시 Command 상태 업데이트
+                            }
+                            break;
+                        case MessageType.BrokerToUi_ForwardAgentCommandResult:
+                            var cmdResultPayload = JsonConvert.DeserializeObject<AgentCommandResultPayload>(message.Payload);
+                            if (cmdResultPayload != null)
+                            {
+                                AddUiLog($"Result for CmdID [{message.CorrelationId}] from Agent [{message.SourceId}]: {(cmdResultPayload.Success ? "OK" : "NG")} - {cmdResultPayload.Message}");
+                                var agentForResult = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == message.SourceId);
+                                if(agentForResult != null)
+                                {
+                                    agentForResult.CurrentMonitorStatus = cmdResultPayload.CurrentMonitorStatus;
+                                    agentForResult.LastStatusMessageFromAgent = $"Cmd: {cmdResultPayload.Message.Substring(0, Math.Min(cmdResultPayload.Message.Length,100))}";
+                                    agentForResult.IsOnline = true; 
+                                    RefreshCommandStates();
+                                }
+                                UpdateControlActionLogAsync(message.CorrelationId, message.SourceId, cmdResultPayload.Success, cmdResultPayload.Message, cmdResultPayload.CurrentMonitorStatus, DateTime.UtcNow).ConfigureAwait(false);
+                            }
+                            break;
+                        case MessageType.BrokerToUi_CommandDispatchFailed:
+                             var dispatchFailPayload = JsonConvert.DeserializeObject<dynamic>(message.Payload);
+                             string reason = dispatchFailPayload?.Message ?? "Unknown dispatch error";
+                             string failedTargetAgentId = message.TargetId ?? message.SourceId; // Broker가 TargetId를 채워줬다면 그것 사용
+                             AddUiLog($"[ERROR] Broker failed to dispatch command [{message.CorrelationId}] for Agent [{failedTargetAgentId}]: {reason}");
+                             UpdateControlActionLogAsync(message.CorrelationId, failedTargetAgentId, false, $"Broker Dispatch Failed: {reason}", null, DateTime.UtcNow, "FailureAtBroker").ConfigureAwait(false);
+                            break;
+                        case MessageType.BrokerToUi_SendBrokerStatus:
+                            var brokerStatusPayload = JsonConvert.DeserializeObject<BrokerStatusInfoPayload>(message.Payload);
+                            if (brokerStatusPayload != null)
+                            {
+                                BrokerStatus.UpdateFromServerPayload(brokerStatusPayload);
+                                AddUiLog("Broker status and logs updated from server.");
+                            }
+                            break;
+                    }
+                }
+                catch (JsonException jsonEx) { AddUiLog($"[ERROR] Failed to parse payload for message type {message.Type} from Broker: {jsonEx.Message}"); }
+                catch (Exception ex) { AddUiLog($"[ERROR] Error processing message type {message.Type} from Broker: {ex.Message}"); }
+            });
+        }
+        
+        private void UpdateAgentListFromBroker(List<LiveAgentInfoForUi> liveAgents, bool isInitialLoad)
+        {
+            foreach (var liveAgent in liveAgents)
+            {
+                UpdateSingleAgentStatus(liveAgent);
+            }
+            if(isInitialLoad) {
+                foreach(var dbAgent in Agents) {
+                    if(!liveAgents.Any(la => la.AgentIdProvidedByApp == dbAgent.AgentIdProvidedByApp && la.IsOnline)) {
+                        dbAgent.IsOnline = false;
+                        dbAgent.CurrentMonitorStatus = "Offline";
+                    }
+                }
+            }
+            RefreshCommandStates();
+        }
+
+        private void UpdateSingleAgentStatus(LiveAgentInfoForUi liveInfo)
+        {
+            var agent = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == liveInfo.AgentIdProvidedByApp);
+            if (agent != null)
+            {
+                agent.UpdateLiveStatus(liveInfo);
+                if(SelectedAgent == agent) // 선택된 Agent의 상태가 변경되면 Command 상태 갱신
+                {
+                    RefreshCommandStates();
+                }
+            }
+            else
+            {
+                 AddUiLog($"Live agent '{liveInfo.AgentIdProvidedByApp}' from Broker not found in local DB list. Please add via 'Add Agent' if it's a new valid agent.");
+            }
+        }
+        
+        private async Task UpdateControlActionLogAsync(string correlationId, string agentIdProvidedByApp, bool success, string message, string monitorStatus, DateTime completedTime, string statusOverride = null)
+        {
+            // TODO: CorrelationId로 기존 로그를 '찾아서 업데이트'하는 로직 필요.
+            // 현재는 ExecuteMonitorControlAsync에서 'SentToBroker' 로그를 남기고, 여기서 최종 결과를 '별도의 로그'로 남기거나,
+            // 아니면 'SentToBroker' 로그를 찾아 업데이트해야 함.
+            // 단순화를 위해, 여기서는 새 로그를 기록한다고 가정 (중복 가능성, 또는 CorrelationId로 Update 쿼리)
+            // 여기서는 CorrelationId가 없다고 가정하고 새 로그를 만듬 (이전 ExecuteMonitorControlAsync에서 correlationId를 포함한 로그를 남겼어야함)
+
+            var agent = Agents.FirstOrDefault(a => a.AgentIdProvidedByApp == agentIdProvidedByApp);
+            if (agent == null)
+            {
+                AddUiLog($"[DB LOG ERROR] Cannot log final status: Agent with AppID {agentIdProvidedByApp} not found for CorrId {correlationId}.");
+                return;
+            }
+
+            // 실제로는 CorrelationId로 어떤 ActionType이었는지 찾아야 함.
+            // 혹은 UI가 명령 보낼때 CorrelationId와 ActionType을 어딘가에 매핑해둬야 함.
+            // 지금은 그냥 "ControlActionResult" 같은 타입으로 기록.
+            var logEntry = new ControlActionLogEntry
+            {
+                AgentGuid = agent.AgentGuid,
+                ActionType = $"ResultFor_{correlationId}", // 임시
+                RequestTimestamp = DateTime.UtcNow, // 이것은 결과 수신 시간이므로, 원래 요청시간을 찾아야함.
+                ExecutionCompletedTimestamp = completedTime,
+                FinalStatus = statusOverride ?? (success ? "Success" : "FailureAtAgent"),
+                ResultMessage = message,
+                RequestedByUserId = _currentUserSession.UserId,
+            };
+             AddUiLog($"Logging final status for {agent.AgentName} (CorrId: {correlationId}) to DB.");
+            try
+            {
+                await _databaseService.LogControlActionAsync(logEntry);
+            }
+            catch (Exception ex)
+            {
+                AddUiLog($"[DB ERROR] Failed to log final command status for {agent.AgentName} to DB: {ex.Message}");
+            }
+        }
+        
+        #endregion
+
+        public void Cleanup() 
+        {
+            AddUiLog("MainViewModel cleaning up broker connection...");
+            if (_brokerClientService != null)
+            {
+                _brokerClientService.Connected -= OnBrokerConnected;
+                _brokerClientService.Disconnected -= OnBrokerDisconnected;
+                _brokerClientService.MessageReceived -= OnBrokerMessageReceived;
+                
+                // DisconnectAsync가 Task를 반환하므로, 동기적으로 기다리려면 Wait() 사용 (UI 스레드에서 직접 호출 시 주의)
+                // 여기서는 ViewModel의 Cleanup이므로 애플리케이션 종료 시 호출된다고 가정.
+                try
+                {
+                    Task.Run(async () => await _brokerClientService.DisconnectAsync()).Wait(TimeSpan.FromSeconds(2)); 
+                }
+                catch (Exception ex) { AddUiLog($"Error during broker disconnect on cleanup: {ex.Message}");}
+
+                (_brokerClientService as IDisposable)?.Dispose();
+            }
+        }
+    }
+}
+MainViewModel.cs 주요 변경점:
+
+CanUserManageAgentsProperty와 CanUserControlPowerProperty를 각각 CanManageAgents와 CanControlPower라는 이름의 읽기 전용 bool 속성으로 변경하고, 생성자에서 _currentUserSession을 통해 값을 받아 초기화합니다. XAML에서는 이 bool 속성에 BooleanToVisibilityConverter를 사용하게 됩니다.
+각 RelayCommand의 CanExecute 조건에서 이 새로운 bool 속성 (CanManageAgents, CanControlPower)을 정확히 참조하도록 수정했습니다.
+SelectedAgent 속성 변경 시 및 BrokerConnectionStatus 변경 시 관련된 커맨드들의 CanExecuteChanged를 호출하여 버튼 활성화 상태를 동적으로 업데이트하기 위해 RefreshCommandStates() 메서드를 추가하고 호출하는 부분을 넣었습니다.
+로그 메시지 처리 및 DB 로깅 관련 로직을 좀 더 상세화했습니다. (특히 UpdateControlActionLogAsync는 CorrelationID를 사용하여 기존 로그를 업데이트하는 방식으로 개선이 필요합니다. 현재는 새 로그를 생성할 수 있습니다.)
