@@ -1,654 +1,80 @@
-네, 이어서 Network 폴더의 클래스들과 App.xaml.cs 코드를 제공하겠습니다.
+네, 맞습니다. 현재 코드는 별도의 메인 윈도우(MainWindow.xaml)를 사용하지 않고, App.xaml.cs에서 직접 AgentCoreService를 초기화하고 트레이 아이콘을 통해 최소한의 상호작용만 제공하는 백그라운드 애플리케이션 형태로 구성되어 있습니다.
 
-2.12. Network/CentralServerClient.cs (SignalR 클라이언트)
+지적해주신 코드 오류들에 대해 수정하겠습니다.
 
-이 클래스는 중앙 SignalR 서버와 통신하는 역할을 합니다.
+1. App.xaml.cs의 SetupTrayIcon 내부 오류 수정
 
-C#
+SystemIcons.Shield와 ContextMenuStrip 등은 System.Drawing과 System.Windows.Forms 네임스페이스에 있습니다. 이 네임스페이스를 사용하기 위해서는 해당 어셈블리 참조가 프로젝트에 추가되어야 하고, using 지시문도 포함되어야 합니다.
 
-// MonitorAgent/Network/CentralServerClient.cs
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
-using System.Threading.Tasks;
-using Microsoft.AspNet.SignalR.Client; // Microsoft.AspNet.SignalR.Client NuGet
-using MonitorAgent.Models;
-using MonitorAgent.Config; // RuntimeConfig
-using MonitorAgent.Services;
+프로젝트 참조 확인/추가:
 
-namespace MonitorAgent.Network
-{
-    public class CentralServerClient : IDisposable
-    {
-        private readonly string _serverUrl;
-        private readonly string _agentId;
-        private readonly ILoggingService _logger;
-        private HubConnection _hubConnection;
-        private IHubProxy _hubProxy;
-        private bool _isDisposed = false;
-        private readonly TimeSpan _retryDelay = TimeSpan.FromSeconds(10); // 재연결 시도 간격
+솔루션 탐색기에서 프로젝트 이름을 마우스 오른쪽 버튼으로 클릭합니다.
+"참조 추가"(Add Reference)를 선택합니다.
+"어셈블리" > "프레임워크" 탭으로 이동합니다.
+System.Drawing과 System.Windows.Forms를 찾아 체크하고 확인을 누릅니다.
+App.xaml.cs 상단에 using 지시문 추가:
 
-        public event Action OnConnected;
-        public event Action OnDisconnected;
-        public event Action<ServerCommand> OnExecuteCommandReceived;
-        public event Action<RuntimeConfig> OnUpdateConfigurationReceived;
-
-        public bool IsConnected => _hubConnection?.State == ConnectionState.Connected;
-
-        public CentralServerClient(string serverUrl, string agentId, ILoggingService logger)
-        {
-            _serverUrl = serverUrl;
-            _agentId = agentId;
-            _logger = logger;
-        }
-
-        public async Task<bool> ConnectAsync()
-        {
-            if (IsConnected) return true;
-            if (string.IsNullOrEmpty(_serverUrl))
-            {
-                _logger.LogError("Server URL is not provided. Cannot connect.");
-                return false;
-            }
-
-            _hubConnection = new HubConnection(_serverUrl);
-            _hubConnection.Headers.Add("AgentId", _agentId); // 연결 시 헤더에 AgentId 추가 (서버에서 식별용)
-
-            // 프록시 설정 (필요한 경우)
-            // _hubConnection.Proxy = System.Net.HttpWebRequest.GetSystemWebProxy();
-
-            _hubProxy = _hubConnection.CreateHubProxy("MonitorControlHub"); // 서버의 Hub 이름과 일치해야 함
-
-            // 서버에서 호출할 클라이언트 메서드들 등록
-            _hubProxy.On<ServerCommand>("ExecuteCommand", (cmd) => OnExecuteCommandReceived?.Invoke(cmd));
-            _hubProxy.On<RuntimeConfig>("UpdateConfiguration", (config) => OnUpdateConfigurationReceived?.Invoke(config));
-            _hubProxy.On("PingAgent", async () => { // 서버로부터 Ping 요청 시
-                 _logger.LogDebug("Ping received from server. Sending Pong.");
-                 await SendPongAsync();
-            });
-
-
-            _hubConnection.Closed += async () =>
-            {
-                _logger.LogWarning("SignalR connection closed.");
-                OnDisconnected?.Invoke();
-                // 자동 재연결 시도
-                await Task.Delay(_retryDelay); // 잠시 대기 후 재연결
-                if (!_isDisposed) // Dispose 되지 않았을 경우에만 재연결 시도
-                {
-                    _logger.LogInfo("Attempting to reconnect to SignalR server...");
-                    await ConnectAsync(); 
-                }
-            };
-
-            _hubConnection.Error += ex =>
-            {
-                _logger.LogError($"SignalR connection error: {ex.Message}", ex);
-                // 연결 오류 발생 시 Closed 이벤트가 보통 뒤따름.
-            };
-            
-            _hubConnection.StateChanged += change =>
-            {
-                _logger.LogInfo($"SignalR connection state changed: {change.OldState} -> {change.NewState}");
-            };
-
-
-            try
-            {
-                _logger.LogInfo($"Attempting to connect to SignalR server: {_serverUrl}");
-                await _hubConnection.Start();
-                if (IsConnected)
-                {
-                    _logger.LogInfo("Successfully connected to SignalR server.");
-                    OnConnected?.Invoke();
-                    return true;
-                }
-                else
-                {
-                     _logger.LogError("Failed to connect to SignalR server. State: " + _hubConnection.State);
-                     return false;
-                }
-            }
-            catch (HttpRequestException httpEx)
-            {
-                _logger.LogError($"HTTP error connecting to SignalR server: {httpEx.Message}. Ensure server is running and URL is correct.", httpEx);
-                return false;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error connecting to SignalR server: {ex.Message}", ex);
-                return false;
-            }
-        }
-        
-        private async Task SendPongAsync()
-        {
-            if (!IsConnected || _hubProxy == null)
-            {
-                _logger.LogWarning("Cannot send Pong, not connected to server.");
-                return;
-            }
-            try
-            {
-                await _hubProxy.Invoke("PongFromAgent", _agentId);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error sending Pong: {ex.Message}", ex);
-            }
-        }
-
-
-        // 서버로 Agent 정보 등록/업데이트
-        public async Task RegisterAgentAsync(AgentRegistrationInfo regInfo)
-        {
-            if (!IsConnected || _hubProxy == null)
-            {
-                _logger.LogWarning("Cannot register agent, not connected to server.");
-                return;
-            }
-            try
-            {
-                _logger.LogInfo($"Registering agent with ID: {regInfo.AgentId}");
-                await _hubProxy.Invoke("RegisterAgent", regInfo);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error registering agent: {ex.Message}", ex);
-            }
-        }
-
-        // 서버로 명령 실행 결과 보고
-        public async Task ReportCommandResultAsync(string commandId, string targetAgentId, bool success, string message, string currentMonitorStatus)
-        {
-            if (!IsConnected || _hubProxy == null)
-            {
-                _logger.LogWarning("Cannot report command result, not connected to server.");
-                return;
-            }
-            try
-            {
-                _logger.LogInfo($"Reporting command result for CmdId {commandId}: Success={success}, Msg='{message}'");
-                await _hubProxy.Invoke("ReportCommandResult", commandId, targetAgentId, success, message, currentMonitorStatus);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error reporting command result: {ex.Message}", ex);
-            }
-        }
-        
-        // 서버로 Agent의 현재 상태 보고 (주기적 하트비트 또는 상태 변경 시)
-        public async Task ReportAgentStatusAsync(string agentRole, string statusMessage, string monitorStatus)
-        {
-            if (!IsConnected || _hubProxy == null)
-            {
-                // _logger.LogWarning("Cannot report agent status, not connected to server."); // 너무 자주 로깅될 수 있음
-                return;
-            }
-            try
-            {
-                // _logger.LogDebug($"Reporting agent status: Role={agentRole}, Status='{statusMessage}', Monitor='{monitorStatus}'"); // 너무 자주 로깅될 수 있음
-                await _hubProxy.Invoke("AgentHeartbeat", _agentId, agentRole, statusMessage, monitorStatus, GetLocalIpAddresses());
-            }
-            catch (InvalidOperationException ioe) when (ioe.Message.Contains("Connection started reconnecting")) {
-                 _logger.LogWarning("Attempted to report status while connection was reconnecting. Will retry after connection.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error reporting agent status: {ex.Message}", ex);
-            }
-        }
-
-        public async Task DisconnectAsync()
-        {
-            if (_hubConnection != null)
-            {
-                _isDisposed = true; // 재연결 로직 중단 플래그
-                _hubConnection.Closed -= async () => { /* 핸들러 제거 또는 수정 */ }; // 자동 재연결 핸들러 제거
-                _logger.LogInfo("Disconnecting from SignalR server...");
-                _hubConnection.Stop(TimeSpan.FromSeconds(5)); // 정상 종료 시도
-            }
-        }
-
-        public static List<string> GetLocalIpAddresses()
-        {
-            var ipAddresses = new List<string>();
-            try
-            {
-                foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (item.OperationalStatus == OperationalStatus.Up && 
-                        (item.NetworkInterfaceType == NetworkInterfaceType.Ethernet || item.NetworkInterfaceType == NetworkInterfaceType.Wireless80211))
-                    {
-                        foreach (UnicastIPAddressInformation ip in item.GetIPProperties().UnicastAddresses)
-                        {
-                            if (ip.Address.AddressFamily == AddressFamily.InterNetwork) // IPv4
-                            {
-                                ipAddresses.Add(ip.Address.ToString());
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                // _logger.LogError("Error getting local IP addresses", ex); // CentralServerClient 생성 전 로거 없을 수 있음
-                Console.WriteLine($"Error getting local IP addresses: {ex.Message}");
-            }
-            return ipAddresses.Distinct().ToList();
-        }
-
-
-        public void Dispose()
-        {
-            if (!_isDisposed)
-            {
-                _isDisposed = true;
-                DisconnectAsync().Wait(); // 동기적으로 호출 (Dispose 패턴에 따라)
-                _hubConnection?.Dispose();
-                _logger.LogInfo("CentralServerClient disposed.");
-            }
-        }
-    }
-}
-CentralServerClient.cs 주요 기능:
-
-SignalR Hub 연결 (ConnectAsync) 및 자동 재연결 시도.
-연결 시 AgentId를 헤더에 포함.
-서버에서 클라이언트로 호출하는 메서드 등록 (ExecuteCommand, UpdateConfiguration, PingAgent).
-클라이언트에서 서버의 메서드를 호출하는 기능 (RegisterAgent, ReportCommandResult, AgentHeartbeat, PongFromAgent).
-로컬 IP 주소 가져오기 유틸리티 (GetLocalIpAddresses).
-리소스 정리 (Dispose).
-2.13. Network/GatewayTcpServer.cs (Gateway 역할 시 TCP 소켓 서버)
-
-이 클래스는 Proxied Agent들의 TCP 연결을 수신하고 메시지를 중계합니다.
+<!-- end list -->
 
 C#
 
-// MonitorAgent/Network/GatewayTcpServer.cs
+// MonitorAgent/App.xaml.cs
 using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using MonitorAgent.Models;
+using System.Windows;
+// System.Windows.Forms와 System.Drawing 참조 및 using 지시문 추가
+using System.Windows.Forms; // NotifyIcon, ContextMenuStrip, ToolStripSeparator 등
+using System.Drawing;       // Icon, SystemIcons 등
+using MonitorAgent.Core;
 using MonitorAgent.Services;
-using Newtonsoft.Json; // InternalTcpMessage 직렬화/역직렬화
+using MonitorAgent.Config;
+using System.Threading.Tasks;
+// Mutex 사용 시 (중복 실행 방지)
+// using System.Threading;
+수정된 SetupTrayIcon 메서드:
 
-namespace MonitorAgent.Network
-{
-    public class GatewayTcpServer
-    {
-        private readonly int _port;
-        private readonly ILoggingService _logger;
-        private readonly string _gatewayAgentId;
-        private TcpListener _tcpListener;
-        private CancellationTokenSource _cancellationTokenSource;
-        private readonly Dictionary<string, TcpClientState> _connectedProxiedAgents = new Dictionary<string, TcpClientState>(); // Key: ProxiedAgentId
-        private readonly object _clientsLock = new object();
+C#
 
-        // Proxied Agent로부터 메시지 수신 시 발생 이벤트 (AgentCoreService에서 처리)
-        public event Action<string, InternalTcpMessage> OnProxiedMessageReceived; // <proxiedAgentId, message>
+// MonitorAgent/App.xaml.cs
+// ... (다른 코드는 동일)
 
-        public GatewayTcpServer(int port, ILoggingService logger, string gatewayAgentId)
+        private void SetupTrayIcon()
         {
-            _port = port;
-            _logger = logger;
-            _gatewayAgentId = gatewayAgentId;
+            _notifyIcon = new NotifyIcon
+            {
+                // Icon 리소스 로드 (프로젝트 리소스에 아이콘 파일(예: agent.ico) 추가 후 사용)
+                // 예시: Icon = new Icon(GetType(), "agent.ico"); // 리소스로 포함된 경우
+                // 또는 간단하게 시스템 아이콘 사용 (배포 시 적절한 아이콘으로 교체 권장)
+                Icon = SystemIcons.Application, // SystemIcons 사용 예시 (System.Drawing 참조 필요)
+                Visible = true,
+                Text = "Monitor Agent - Initializing..."
+            };
+
+            var contextMenu = new ContextMenuStrip(); // System.Windows.Forms.ContextMenuStrip
+            contextMenu.Items.Add("Show Status", null, OnShowStatusClicked);
+            contextMenu.Items.Add(new ToolStripSeparator()); // System.Windows.Forms.ToolStripSeparator
+            contextMenu.Items.Add("Exit", null, OnExitClicked);
+
+            _notifyIcon.ContextMenuStrip = contextMenu;
+            _notifyIcon.DoubleClick += OnShowStatusClicked;
         }
 
-        public void Start()
-        {
-            if (_tcpListener != null && _tcpListener.Server.IsBound)
-            {
-                _logger.LogWarning("Gateway TCP server is already running.");
-                return;
-            }
+// ... (나머지 App.xaml.cs 코드는 이전과 동일)
+아이콘 설정 참고:
 
-            _cancellationTokenSource = new CancellationTokenSource();
-            try
-            {
-                _tcpListener = new TcpListener(IPAddress.Any, _port);
-                _tcpListener.Start();
-                _logger.LogInfo($"Gateway TCP server started. Listening on port {_port} for Proxied Agents.");
+SystemIcons.Application 또는 SystemIcons.Shield 등은 간단한 테스트용이며, 실제 배포 시에는 프로젝트에 .ico 파일을 추가하고 리소스로 빌드한 후 로드하는 것이 좋습니다.
+프로젝트에 agent.ico 파일을 추가하고 속성에서 "빌드 작업(Build Action)"을 "포함 리소스(Embedded Resource)"로 설정합니다.
+코드에서 Icon = new System.Drawing.Icon(System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("MonitorAgent.agent.ico")); 와 같이 로드할 수 있습니다. (네임스페이스와 파일명에 주의)
+또는 Icon = new Icon("path/to/your/icon.ico"); 처럼 파일 경로에서 직접 로드할 수도 있지만, 실행 파일과 함께 아이콘 파일이 배포되어야 합니다.
+2. ProxiedTcpClient.cs의 ConnectAsync 내부 IsCompletedSuccessfully 오류 수정
 
-                // 비동기적으로 클라이언트 연결 수락 루프 시작
-                Task.Run(() => AcceptClientsAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
-            }
-            catch (SocketException sockEx)
-            {
-                _logger.LogError($"SocketException starting Gateway TCP server on port {_port}: {sockEx.Message}. Port might be in use.", sockEx);
-                // 필요시 AgentCoreService로 상태 전파
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error starting Gateway TCP server: {ex.Message}", ex);
-            }
-        }
+.NET Framework 4.5의 Task에는 IsCompletedSuccessfully 속성이 없습니다. 대신 Status 속성을 사용하거나 IsCompleted, IsFaulted, IsCanceled 속성을 조합하여 확인해야 합니다.
 
-        private async Task AcceptClientsAsync(CancellationToken token)
-        {
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    TcpClient tcpClient = await _tcpListener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    IPEndPoint remoteEndPoint = tcpClient.Client.RemoteEndPoint as IPEndPoint;
-                    _logger.LogInfo($"New Proxied Agent connection accepted from: {remoteEndPoint?.Address}:{remoteEndPoint?.Port}");
-                    
-                    // 클라이언트 처리 로직을 별도 태스크로 분리
-                    // 주의: 여기서는 HandleClientAsync가 첫 메시지(Hello)를 기다려 ProxiedAgentId를 확정하므로,
-                    // 그 전까지는 _connectedProxiedAgents에 추가하지 않음.
-                    _ = HandleClientAsync(tcpClient, token); 
-                }
-                catch (ObjectDisposedException) when (token.IsCancellationRequested)
-                {
-                    _logger.LogInfo("TcpListener stopped as requested.");
-                    break;
-                }
-                catch (SocketException sockEx) when (token.IsCancellationRequested)
-                {
-                     _logger.LogInfo($"TcpListener socket closed during shutdown: {sockEx.Message}");
-                     break;
-                }
-                catch (Exception ex)
-                {
-                    if (!token.IsCancellationRequested) // 종료 중이 아닐 때만 오류 로깅
-                    {
-                       _logger.LogError($"Error accepting new Proxied Agent connection: {ex.Message}", ex);
-                    }
-                    await Task.Delay(1000, token); // 오류 발생 시 잠시 대기 후 재시도
-                }
-            }
-            _logger.LogInfo("Gateway TCP server client acceptance loop stopped.");
-        }
-
-        private async Task HandleClientAsync(TcpClient tcpClient, CancellationToken token)
-        {
-            string currentProxiedAgentId = null; // 이 핸들러에서 관리하는 Proxied Agent의 ID
-            NetworkStream stream = null;
-            StreamReader reader = null;
-            StreamWriter writer = null; // 필요시 응답용
-
-            try
-            {
-                stream = tcpClient.GetStream();
-                // 메시지 끝을 \n으로 가정. 큰 메시지 처리를 위해 버퍼링 및 분할 로직 필요할 수 있음.
-                reader = new StreamReader(stream, Encoding.UTF8); 
-                writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true }; // writer는 Hello에 대한 Ack 등에 사용 가능
-
-                // 첫 메시지는 ProxiedAgentHello 여야 함.
-                string helloJsonLine = await ReadLineAsyncWithTimeout(reader, TimeSpan.FromSeconds(10), token); // 10초 타임아웃
-                if (string.IsNullOrEmpty(helloJsonLine))
-                {
-                    _logger.LogWarning("Proxied agent did not send Hello message or timed out. Closing connection.");
-                    return; // finally에서 tcpClient.Close()
-                }
-
-                InternalTcpMessage helloMsg = InternalTcpMessage.FromJson(helloJsonLine);
-                if (helloMsg != null && helloMsg.MessageType == InternalMessageType.ProxiedAgentHello && !string.IsNullOrWhiteSpace(helloMsg.SourceAgentId))
-                {
-                    currentProxiedAgentId = helloMsg.SourceAgentId;
-                    var clientState = new TcpClientState(tcpClient, stream, reader, writer, currentProxiedAgentId, _logger);
-                    
-                    lock (_clientsLock)
-                    {
-                        if (_connectedProxiedAgents.ContainsKey(currentProxiedAgentId))
-                        {
-                            _logger.LogWarning($"Proxied Agent {currentProxiedAgentId} reconnected. Closing previous connection if any.");
-                            _connectedProxiedAgents[currentProxiedAgentId].Close(); // 이전 연결 닫기
-                        }
-                        _connectedProxiedAgents[currentProxiedAgentId] = clientState;
-                    }
-                    _logger.LogInfo($"Proxied Agent {currentProxiedAgentId} identified and registered with Gateway.");
-                    OnProxiedMessageReceived?.Invoke(currentProxiedAgentId, helloMsg); // Hello 메시지도 CoreService로 전달
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid or no Hello message from Proxied Agent. Received: '{helloJsonLine}'. Closing connection.");
-                    return;
-                }
-
-                // 메시지 수신 루프
-                while (!token.IsCancellationRequested && tcpClient.Connected)
-                {
-                    string jsonLine = await ReadLineAsyncWithTimeout(reader, TimeSpan.FromMinutes(5), token); // 5분 타임아웃 (하트비트 고려)
-                    if (jsonLine == null) // null은 연결 종료 또는 타임아웃 의미
-                    {
-                        _logger.LogInfo($"Connection closed or timed out for Proxied Agent: {currentProxiedAgentId}.");
-                        break;
-                    }
-                    if (string.IsNullOrWhiteSpace(jsonLine)) continue; // 빈 줄 무시
-
-                    InternalTcpMessage receivedMsg = InternalTcpMessage.FromJson(jsonLine);
-                    if (receivedMsg != null)
-                    {
-                        // 모든 메시지는 일단 SourceAgentId를 현재 연결된 currentProxiedAgentId로 간주.
-                        // 메시지 내 SourceAgentId와 currentProxiedAgentId가 다르면 경고.
-                        if (receivedMsg.SourceAgentId != currentProxiedAgentId)
-                        {
-                             _logger.LogWarning($"Message SourceAgentId ({receivedMsg.SourceAgentId}) mismatch with connected agentId ({currentProxiedAgentId}). Using connected agentId.");
-                             receivedMsg.SourceAgentId = currentProxiedAgentId; // 보안/일관성 위해 덮어쓰기
-                        }
-                        OnProxiedMessageReceived?.Invoke(currentProxiedAgentId, receivedMsg);
-                    }
-                    else
-                    {
-                        _logger.LogWarning($"Failed to parse JSON message from {currentProxiedAgentId}: {jsonLine}");
-                    }
-                }
-            }
-            catch (IOException ioEx) when (ioEx.InnerException is SocketException)
-            {
-                 _logger.LogInfo($"IOException (likely connection reset) with Proxied Agent {currentProxiedAgentId}: {ioEx.Message}");
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogInfo($"Message reading cancelled for Proxied Agent {currentProxiedAgentId}.");
-            }
-            catch (Exception ex)
-            {
-                if (!token.IsCancellationRequested)
-                {
-                     _logger.LogError($"Error handling Proxied Agent {currentProxiedAgentId}: {ex.Message}", ex);
-                }
-            }
-            finally
-            {
-                if (currentProxiedAgentId != null)
-                {
-                    lock (_clientsLock)
-                    {
-                        // 현재 핸들러가 관리하던 clientState와 동일한 경우에만 제거
-                        if (_connectedProxiedAgents.TryGetValue(currentProxiedAgentId, out var state) && state.TcpClient == tcpClient)
-                        {
-                            _connectedProxiedAgents.Remove(currentProxiedAgentId);
-                             _logger.LogInfo($"Proxied Agent {currentProxiedAgentId} removed from connected list.");
-                        }
-                    }
-                }
-                reader?.Dispose();
-                writer?.Dispose(); // StreamWriter는 내부적으로 Stream을 닫을 수 있으므로 순서 중요
-                stream?.Dispose(); // NetworkStream 닫기
-                tcpClient?.Close(); // TcpClient 닫기 (Stream이 닫힐 때 같이 닫힐 수도 있음)
-                _logger.LogInfo($"Connection with Proxied Agent ({(currentProxiedAgentId ?? "Unknown")}) closed and resources released.");
-            }
-        }
-        
-        private async Task<string> ReadLineAsyncWithTimeout(StreamReader reader, TimeSpan timeout, CancellationToken token)
-        {
-            var readTask = reader.ReadLineAsync();
-            var timeoutTask = Task.Delay(timeout, token);
-
-            var completedTask = await Task.WhenAny(readTask, timeoutTask).ConfigureAwait(false);
-
-            if (completedTask == timeoutTask || token.IsCancellationRequested)
-            {
-                if (token.IsCancellationRequested) _logger.LogDebug("ReadLine operation cancelled.");
-                else _logger.LogWarning("ReadLine operation timed out.");
-                return null; // 타임아웃 또는 취소
-            }
-            return await readTask.ConfigureAwait(false); // 실제 읽기 결과 반환
-        }
-
-
-        public async Task<bool> SendMessageToProxiedAsync(string targetProxiedAgentId, InternalTcpMessage message)
-        {
-            TcpClientState clientState;
-            lock (_clientsLock)
-            {
-                _connectedProxiedAgents.TryGetValue(targetProxiedAgentId, out clientState);
-            }
-
-            if (clientState != null && clientState.TcpClient.Connected)
-            {
-                try
-                {
-                    string jsonMessage = message.ToJson();
-                    await clientState.Writer.WriteLineAsync(jsonMessage).ConfigureAwait(false);
-                    // await clientState.Writer.FlushAsync().ConfigureAwait(false); // StreamWriter가 AutoFlush=true면 필요 없을 수 있음.
-                    _logger.LogDebug($"Message sent to Proxied Agent {targetProxiedAgentId}: {message.MessageType}");
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError($"Error sending message to Proxied Agent {targetProxiedAgentId}: {ex.Message}", ex);
-                    // 연결 문제 발생 시 클라이언트 정리 로직 필요할 수 있음 (예: HandleClientAsync에서처럼)
-                    clientState.Close(); // 문제 발생 시 해당 클라이언트 연결 강제 종료
-                    lock(_clientsLock) { _connectedProxiedAgents.Remove(targetProxiedAgentId); }
-                    return false;
-                }
-            }
-            else
-            {
-                _logger.LogWarning($"Proxied Agent {targetProxiedAgentId} not found or not connected. Cannot send message.");
-                return false;
-            }
-        }
-
-        public void Stop()
-        {
-            _logger.LogInfo("Stopping Gateway TCP server...");
-            _cancellationTokenSource?.Cancel();
-            _tcpListener?.Stop(); // AcceptTcpClientAsync에서 예외 발생시키며 루프 종료 유도
-
-            lock (_clientsLock)
-            {
-                foreach (var clientState in _connectedProxiedAgents.Values)
-                {
-                    clientState.Close();
-                }
-                _connectedProxiedAgents.Clear();
-            }
-            _tcpListener = null; // 리소스 해제 명시
-            _cancellationTokenSource?.Dispose();
-            _logger.LogInfo("Gateway TCP server stopped.");
-        }
-
-        // TcpClient와 관련 Stream들을 함께 관리하기 위한 내부 클래스
-        private class TcpClientState
-        {
-            public TcpClient TcpClient { get; }
-            public NetworkStream Stream { get; }
-            public StreamReader Reader { get; }
-            public StreamWriter Writer { get; }
-            public string AgentId { get; }
-            private ILoggingService _logger;
-
-
-            public TcpClientState(TcpClient client, NetworkStream stream, StreamReader reader, StreamWriter writer, string agentId, ILoggingService logger)
-            {
-                TcpClient = client;
-                Stream = stream;
-                Reader = reader;
-                Writer = writer;
-                AgentId = agentId;
-                _logger = logger;
-            }
-
-            public void Close()
-            {
-                try
-                {
-                    // Dispose 순서 중요: Reader/Writer 먼저, 그 다음 Stream, 마지막으로 TcpClient
-                    Reader?.Dispose();
-                    Writer?.Dispose(); // AutoFlush여도 Dispose 필요
-                    Stream?.Dispose();
-                    TcpClient?.Close(); // Close는 Dispose를 호출
-                    _logger.LogInfo($"Closed connection and resources for TcpClientState (Agent: {AgentId})");
-                }
-                catch (Exception ex)
-                {
-                     _logger.LogError($"Error closing TcpClientState for Agent {AgentId}: {ex.Message}", ex);
-                }
-            }
-        }
-    }
-}
-GatewayTcpServer.cs 주요 기능:
-
-지정된 포트에서 TCP 연결 수신 대기 (Start, AcceptClientsAsync).
-연결된 각 Proxied Agent 클라이언트를 비동기적으로 처리 (HandleClientAsync).
-첫 메시지로 ProxiedAgentHello를 받아 해당 클라이언트의 AgentId를 식별하고 _connectedProxiedAgents 딕셔너리에 저장.
-이후 줄 단위로 JSON 메시지 수신, InternalTcpMessage로 역직렬화하여 OnProxiedMessageReceived 이벤트 발생.
-특정 Proxied Agent에게 메시지 전송 (SendMessageToProxiedAsync).
-서버 중지 시 모든 연결 종료 및 리소스 해제 (Stop).
-TcpClientState 내부 클래스를 두어 각 클라이언트의 연결 정보(TcpClient, Stream, Reader, Writer)와 Agent ID를 관리.
-메시지 읽기 시 타임아웃 처리 (ReadLineAsyncWithTimeout).
-2.14. Network/ProxiedTcpClient.cs (Proxied 역할 시 TCP 소켓 클라이언트)
-
-이 클래스는 지정된 Gateway Agent에게 TCP로 연결하고 메시지를 주고받습니다.
+수정된 ConnectAsync 메서드 내 연결 시도 부분:
 
 C#
 
 // MonitorAgent/Network/ProxiedTcpClient.cs
-using System;
-using System.IO;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using MonitorAgent.Models;
-using MonitorAgent.Services;
-using Newtonsoft.Json;
-
-namespace MonitorAgent.Network
-{
-    public class ProxiedTcpClient
-    {
-        private readonly string _gatewayIp;
-        private readonly int _gatewayPort;
-        private readonly string _proxiedAgentId;
-        private readonly ILoggingService _logger;
-        private TcpClient _tcpClient;
-        private NetworkStream _networkStream;
-        private StreamReader _streamReader;
-        private StreamWriter _streamWriter;
-        private CancellationTokenSource _cancellationTokenSource;
-        private Task _receiveLoopTask;
-        private readonly TimeSpan _retryConnectDelay = TimeSpan.FromSeconds(15);
-        private readonly TimeSpan _heartbeatInterval = TimeSpan.FromMinutes(1); // 게이트웨이로 하트비트 보내는 간격
-        private Timer _heartbeatTimer;
-
-
-        public bool IsConnected => _tcpClient != null && _tcpClient.Connected;
-
-        public event Action<InternalTcpMessage> OnGatewayMessageReceived;
-        public event Action OnDisconnectedFromGateway; // 연결 끊김 이벤트
-
-        public ProxiedTcpClient(string gatewayIp, int gatewayPort, string proxiedAgentId, ILoggingService logger)
-        {
-            _gatewayIp = gatewayIp;
-            _gatewayPort = gatewayPort;
-            _proxiedAgentId = proxiedAgentId;
-            _logger = logger;
-        }
+// ... (다른 코드는 동일)
 
         public async Task<bool> ConnectAsync()
         {
@@ -662,374 +88,110 @@ namespace MonitorAgent.Network
                 {
                     _logger.LogInfo($"Attempting to connect to Gateway: {_gatewayIp}:{_gatewayPort}");
                     _tcpClient = new TcpClient();
-                    // 연결 시도에 타임아웃 적용 (예: 5초)
+                    
                     var connectTask = _tcpClient.ConnectAsync(_gatewayIp, _gatewayPort);
-                    if (await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5), _cancellationTokenSource.Token)) != connectTask || !connectTask.IsCompletedSuccessfully)
+                    var timeoutDelayTask = Task.Delay(TimeSpan.FromSeconds(10), _cancellationTokenSource.Token); // 연결 타임아웃 10초로 증가
+
+                    Task completedTask = await Task.WhenAny(connectTask, timeoutDelayTask).ConfigureAwait(false);
+
+                    if (completedTask == timeoutDelayTask || _cancellationTokenSource.IsCancellationRequested)
                     {
-                        _tcpClient.Close(); // 타임아웃 또는 실패 시 리소스 정리
+                        _tcpClient.Close(); // 연결 시도 중이던 TcpClient 닫기
                         if (_cancellationTokenSource.IsCancellationRequested) {
                              _logger.LogInfo("Connection attempt cancelled.");
-                             return false;
+                             return false; // 취소 시 루프 및 메서드 종료
                         }
-                        _logger.LogWarning($"Timeout or error connecting to Gateway {_gatewayIp}:{_gatewayPort}. Retrying in {_retryConnectDelay.TotalSeconds} seconds...");
-                        await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token);
-                        continue;
+                        _logger.LogWarning($"Timeout connecting to Gateway {_gatewayIp}:{_gatewayPort}. Retrying in {_retryConnectDelay.TotalSeconds} seconds...");
+                        await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token); // 여기서도 취소 가능성 확인
+                        if (_cancellationTokenSource.IsCancellationRequested) return false;
+                        continue; // 다음 재시도
                     }
-
-                    _networkStream = _tcpClient.GetStream();
-                    _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
-                    _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
-                    _logger.LogInfo("Successfully connected to Gateway.");
-
-                    // 메시지 수신 루프 시작
-                    _receiveLoopTask = Task.Run(() => ReceiveMessagesAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
                     
-                    // 하트비트 타이머 시작
-                    _heartbeatTimer = new Timer(async _ => await SendHeartbeatAsync(), null, _heartbeatInterval, _heartbeatInterval);
+                    // connectTask가 완료되었는지, 그리고 성공적으로 완료되었는지 확인
+                    // .NET Framework 4.5에서는 IsCompletedSuccessfully가 없으므로 Status로 확인
+                    if (connectTask.Status == TaskStatus.RanToCompletion) // 작업이 성공적으로 완료됨
+                    {
+                        // _tcpClient.Connected는 ConnectAsync 성공 후 true가 됨.
+                         if (!_tcpClient.Connected) // 혹시 모를 상황 대비
+                         {
+                            _logger.LogWarning($"ConnectAsync RanToCompletion but TcpClient not connected. Retrying...");
+                            _tcpClient.Close();
+                            await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token);
+                            if (_cancellationTokenSource.IsCancellationRequested) return false;
+                            continue;
+                         }
 
-                    return true; // 연결 성공
+                        _networkStream = _tcpClient.GetStream();
+                        _streamReader = new StreamReader(_networkStream, Encoding.UTF8);
+                        _streamWriter = new StreamWriter(_networkStream, Encoding.UTF8) { AutoFlush = true };
+                        _logger.LogInfo("Successfully connected to Gateway.");
+
+                        _receiveLoopTask = Task.Run(() => ReceiveMessagesAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
+                        
+                        _heartbeatTimer?.Dispose(); // 이전 타이머가 있다면 정리
+                        _heartbeatTimer = new Timer(async _ => await SendHeartbeatAsync(), null, _heartbeatInterval, _heartbeatInterval);
+
+                        return true; // 연결 성공 및 루프 종료
+                    }
+                    else // connectTask가 실패(Faulted)하거나 취소(Canceled)된 경우
+                    {
+                        _tcpClient.Close();
+                        if (connectTask.IsFaulted)
+                        {
+                             _logger.LogError($"Connection task faulted: {connectTask.Exception?.GetBaseException().Message}. Retrying...", connectTask.Exception);
+                        }
+                        else if (connectTask.IsCanceled) // 외부에서 CancellationToken으로 취소된 경우
+                        {
+                             _logger.LogInfo("Connection task was cancelled. Retrying or exiting if app is stopping...");
+                             // 여기서 _cancellationTokenSource.IsCancellationRequested 확인하여 앱 종료인지 판단 가능
+                        }
+                        else // 기타 상태
+                        {
+                            _logger.LogWarning($"Connection task completed with status: {connectTask.Status}. Retrying...");
+                        }
+                        
+                        await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token);
+                        if (_cancellationTokenSource.IsCancellationRequested) return false;
+                        continue; // 다음 재시도
+                    }
                 }
+                // ... (catch 블록들은 이전과 동일) ...
                 catch (SocketException sockEx)
                 {
                      _logger.LogError($"SocketException connecting to Gateway: {sockEx.Message}. Retrying in {_retryConnectDelay.TotalSeconds} seconds...", sockEx);
+                     // 연결 실패 시 _tcpClient가 null이거나 이미 닫혔을 수 있으므로, 명시적으로 닫아줄 필요는 없음.
+                     // 하지만 다음 루프에서 new TcpClient() 하므로 괜찮음.
                 }
                 catch (OperationCanceledException) when (_cancellationTokenSource.IsCancellationRequested)
                 {
-                    _logger.LogInfo("Connection to Gateway cancelled.");
-                    return false;
+                    _logger.LogInfo("Connection to Gateway cancelled by CancellationTokenSource.");
+                    return false; // 루프 및 메서드 종료
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError($"Error connecting to Gateway: {ex.Message}. Retrying in {_retryConnectDelay.TotalSeconds} seconds...", ex);
                 }
                 
-                if (_cancellationTokenSource.IsCancellationRequested) break;
-                await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token);
-            }
-            return false; // 최종 연결 실패 (루프 종료)
-        }
-
-        private async Task ReceiveMessagesAsync(CancellationToken token)
-        {
-            try
-            {
-                while (!token.IsCancellationRequested && _tcpClient.Connected)
+                if (_cancellationTokenSource.IsCancellationRequested) break; // 루프 조건 확인
+                
+                // 재시도 전 딜레이 중에도 취소될 수 있도록 CancellationToken 전달
+                try
                 {
-                    // GatewayTcpServer의 ReadLineAsyncWithTimeout과 유사한 로직 사용 가능
-                    string jsonLine = await _streamReader.ReadLineAsync(); 
-                    if (jsonLine == null) // 연결 종료
-                    {
-                        _logger.LogInfo("Connection to Gateway closed by remote host or stream ended.");
-                        break;
-                    }
-                     if (string.IsNullOrWhiteSpace(jsonLine)) continue;
-
-                    InternalTcpMessage receivedMsg = InternalTcpMessage.FromJson(jsonLine);
-                    if (receivedMsg != null)
-                    {
-                        OnGatewayMessageReceived?.Invoke(receivedMsg);
-                    }
-                    else
-                    {
-                        _logger.LogWarning($"Failed to parse JSON message from Gateway: {jsonLine}");
-                    }
+                    await Task.Delay(_retryConnectDelay, _cancellationTokenSource.Token);
+                }
+                catch(OperationCanceledException) when (_cancellationTokenSource.IsCancellationRequested)
+                {
+                    _logger.LogInfo("Retry delay cancelled.");
+                    return false; // 루프 및 메서드 종료
                 }
             }
-            catch (IOException ioEx) when (ioEx.InnerException is SocketException || token.IsCancellationRequested)
-            {
-                 if (token.IsCancellationRequested) _logger.LogInfo("Receive loop cancelled for Gateway connection.");
-                 else _logger.LogInfo($"IOException (likely connection reset by Gateway): {ioEx.Message}");
-            }
-            catch (ObjectDisposedException) when (token.IsCancellationRequested) {
-                _logger.LogInfo("Stream disposed during receive loop cancellation for Gateway.");
-            }
-            catch (Exception ex)
-            {
-                if(!token.IsCancellationRequested)
-                    _logger.LogError($"Error in Gateway message receiving loop: {ex.Message}", ex);
-            }
-            finally
-            {
-                _logger.LogInfo("Gateway message receiving loop ended.");
-                if (!token.IsCancellationRequested) // 의도치 않은 종료 시
-                {
-                    CloseConnectionResources();
-                    OnDisconnectedFromGateway?.Invoke(); // 연결 끊김 이벤트 발생 -> AgentCoreService에서 재연결 시도 가능
-                }
-            }
+            return false; // 최종 연결 실패 (루프가 정상적으로 또는 취소로 종료)
         }
 
-        public async Task SendMessageAsync(InternalTcpMessage message)
-        {
-            if (!IsConnected || _streamWriter == null)
-            {
-                _logger.LogWarning("Not connected to Gateway. Cannot send message.");
-                return;
-            }
-            try
-            {
-                string jsonMessage = message.ToJson();
-                await _streamWriter.WriteLineAsync(jsonMessage).ConfigureAwait(false);
-                // await _streamWriter.FlushAsync().ConfigureAwait(false); // AutoFlush=true
-                _logger.LogDebug($"Message sent to Gateway: {message.MessageType}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error sending message to Gateway: {ex.Message}", ex);
-                // 연결 문제 발생 시 정리
-                CloseConnectionResources();
-                OnDisconnectedFromGateway?.Invoke();
-            }
-        }
-        
-        private async Task SendHeartbeatAsync()
-        {
-            if (!IsConnected) return;
-            var heartbeatMsg = new InternalTcpMessage
-            {
-                MessageType = InternalMessageType.ProxiedHeartbeat,
-                SourceAgentId = _proxiedAgentId,
-                Payload = DateTime.UtcNow.ToString("o") // 선택적 페이로드 (타임스탬프)
-            };
-            await SendMessageAsync(heartbeatMsg);
-        }
+// ... (나머지 ProxiedTcpClient.cs 코드는 이전과 동일)
+ConnectAsync 수정 사항 설명:
 
-
-        private void CloseConnectionResources()
-        {
-            _heartbeatTimer?.Dispose();
-            _heartbeatTimer = null;
-
-            _streamReader?.Dispose();
-            _streamWriter?.Dispose();
-            _networkStream?.Dispose();
-            _tcpClient?.Close(); // TcpClient.Close()는 내부적으로 Dispose 호출
-
-            _streamReader = null;
-            _streamWriter = null;
-            _networkStream = null;
-            _tcpClient = null;
-            _logger.LogInfo("Proxied TCP client connection resources released.");
-        }
-
-        public void Disconnect()
-        {
-            _logger.LogInfo("Disconnecting from Gateway...");
-            _cancellationTokenSource?.Cancel(); // 모든 비동기 작업 취소 요청
-            
-            if(_receiveLoopTask != null && !_receiveLoopTask.IsCompleted)
-            {
-                // Task.WaitAny 또는 Task.WhenAny 등으로 작업 완료 대기 (선택적, Dispose에서 처리)
-            }
-
-            CloseConnectionResources();
-            _cancellationTokenSource?.Dispose();
-            _cancellationTokenSource = null; // 재사용 방지
-            _logger.LogInfo("Disconnected from Gateway.");
-        }
-    }
-}
-ProxiedTcpClient.cs 주요 기능:
-
-지정된 IP와 포트로 Gateway Agent에게 TCP 연결 시도 (ConnectAsync).
-연결 실패 시 주기적으로 재시도.
-연결 성공 시 메시지 수신 루프 (ReceiveMessagesAsync) 시작 및 하트비트 타이머 시작.
-Gateway로부터 줄 단위로 JSON 메시지를 받아 InternalTcpMessage로 역직렬화 후 OnGatewayMessageReceived 이벤트 발생.
-Gateway로 InternalTcpMessage를 JSON으로 직렬화하여 전송 (SendMessageAsync).
-주기적으로 Gateway에 하트비트 메시지 전송 (SendHeartbeatAsync).
-연결 종료 시 리소스 정리 및 OnDisconnectedFromGateway 이벤트 발생 (Disconnect, CloseConnectionResources).
-2.15. App.xaml.cs (WPF 애플리케이션 진입점, 트레이 아이콘 및 서비스 관리)
-
-이 파일은 WPF 애플리케이션의 시작점이며, 트레이 아이콘을 설정하고 AgentCoreService를 시작/종료합니다.
-
-C#
-
-// MonitorAgent/App.xaml.cs
-using System;
-using System.Windows;
-using System.Windows.Forms; // System.Windows.Forms.dll 참조 필요
-using System.Drawing;       // System.Drawing.dll 참조 필요
-using MonitorAgent.Core;
-using MonitorAgent.Services;
-using MonitorAgent.Config;
-using System.Threading.Tasks;
-
-namespace MonitorAgent
-{
-    public partial class App : System.Windows.Application
-    {
-        private NotifyIcon _notifyIcon;
-        private AgentCoreService _agentCoreService;
-        private FileLoggingService _loggingService; // 직접 참조하여 로그 레벨 설정 등 가능하게
-        private AgentIdentifier _agentIdentifier;
-        private ServerUrlProvider _serverUrlProvider;
-        private MonitorControlService _monitorControlService;
-
-        // MainWindow _statusWindow; // 상태 표시창 (선택적)
-
-        protected override async void OnStartup(StartupEventArgs e)
-        {
-            base.OnStartup(e);
-
-            // 애플리케이션 중복 실행 방지 (선택적)
-            // Mutex mutex = new Mutex(true, "Global\\MonitorAgentSingleton", out bool createdNew);
-            // if (!createdNew)
-            // {
-            //     MessageBox.Show("Monitor Agent is already running.", "Monitor Agent", MessageBoxButton.OK, MessageBoxImage.Information);
-            //     Shutdown();
-            //     return;
-            // }
-
-
-            // 1. 서비스 초기화
-            _loggingService = new FileLoggingService();
-            _agentIdentifier = new AgentIdentifier(_loggingService);
-            _serverUrlProvider = new ServerUrlProvider(_loggingService);
-            _monitorControlService = new MonitorControlService(_loggingService);
-
-            _agentCoreService = new AgentCoreService(_loggingService, _agentIdentifier, _serverUrlProvider, _monitorControlService);
-
-            // AgentCoreService에서 발생하는 상태 변경 및 로그 메시지 이벤트 구독 (UI 업데이트용)
-            _agentCoreService.OnStatusChanged += CoreService_OnStatusChanged;
-            _agentCoreService.OnLogRelay += CoreService_OnLogRelay;
-
-
-            // 2. 트레이 아이콘 설정
-            SetupTrayIcon();
-
-            // 3. Agent 핵심 서비스 시작
-            try
-            {
-                await _agentCoreService.StartAsync();
-                // 시작 후 _loggingService의 로그 레벨을 RuntimeConfig에서 읽은 값으로 설정할 수 있음.
-                // 예: if(_agentCoreService.GetCurrentRuntimeConfig()?.LogLevelString != null)
-                //        _loggingService.SetLogLevel(_agentCoreService.GetCurrentRuntimeConfig().LogLevelString);
-            }
-            catch (Exception ex)
-            {
-                _loggingService.LogError("Failed to start AgentCoreService during application startup.", ex);
-                // 사용자에게 심각한 오류 알림 (예: MessageBox)
-                System.Windows.MessageBox.Show($"Critical error starting agent: {ex.Message}\nCheck logs for details.", "Monitor Agent Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                Shutdown(); // 심각한 오류 시 종료
-                return;
-            }
-            
-            // (선택적) 상태 표시창 생성 및 표시
-            // _statusWindow = new MainWindow(); // ViewModel을 통해 CoreService와 연동
-            // _statusWindow.Show();
-            // 이 프로젝트에서는 MainWindow.xaml을 만들지 않았으므로 주석 처리. 필요시 추가.
-            // 대신 트레이 아이콘의 툴팁이나 메뉴로 상태 표시.
-        }
-
-        private void SetupTrayIcon()
-        {
-            _notifyIcon = new NotifyIcon
-            {
-                Icon = SystemIcons.Shield, // TODO: 적절한 아이콘 리소스 사용
-                Visible = true,
-                Text = "Monitor Agent - Initializing..."
-            };
-
-            var contextMenu = new ContextMenuStrip();
-            contextMenu.Items.Add("Show Status", null, OnShowStatusClicked); // '상태 보기' 메뉴
-            contextMenu.Items.Add(new ToolStripSeparator());
-            contextMenu.Items.Add("Exit", null, OnExitClicked); // '종료' 메뉴
-
-            _notifyIcon.ContextMenuStrip = contextMenu;
-            _notifyIcon.DoubleClick += OnShowStatusClicked; // 더블 클릭 시 상태 보기
-        }
-        
-        private void CoreService_OnStatusChanged(AgentOperationalStatus status, string message)
-        {
-            // UI 스레드에서 트레이 아이콘 업데이트
-            Dispatcher.Invoke(() =>
-            {
-                if (_notifyIcon != null)
-                {
-                    _notifyIcon.Text = $"Monitor Agent - {status}: {message.Substring(0, Math.Min(message.Length, 40))}{(message.Length > 40 ? "..." : "")}";
-                }
-                // 상태창이 있다면 여기서 업데이트
-                // _statusWindow?.UpdateStatus(status, message);
-            });
-             _loggingService.LogDebug($"Tray Updated: {status} - {message}"); // 상태 업데이트 로깅
-        }
-        
-        private void CoreService_OnLogRelay(string logMessage)
-        {
-            // 상태창이 있다면 로그 메시지 전달
-            // Dispatcher.Invoke(() => _statusWindow?.AddLogMessage(logMessage));
-        }
-
-
-        private void OnShowStatusClicked(object sender, EventArgs e)
-        {
-            // MessageBox로 간단한 상태 정보 표시 또는 전용 상태창 표시
-            // string currentStatusText = _notifyIcon?.Text ?? "Status unavailable.";
-            // MessageBox.Show(currentStatusText, "Monitor Agent Status", MessageBoxButton.OK, MessageBoxImage.Information);
-            
-            // 전용 상태창 로직 (MainWindow.xaml이 있다고 가정)
-            // if (_statusWindow == null || !_statusWindow.IsVisible)
-            // {
-            //     _statusWindow = new MainWindow(); // ViewModel 주입 필요
-            //     _statusWindow.Show();
-            // }
-            // else
-            // {
-            //     _statusWindow.Activate();
-            // }
-             System.Windows.MessageBox.Show("Status window functionality is not fully implemented in this version.", "Monitor Agent", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-
-        private async void OnExitClicked(object sender, EventArgs e)
-        {
-            if (_agentCoreService != null)
-            {
-                await _agentCoreService.StopAsync();
-                _agentCoreService.Dispose();
-            }
-            _notifyIcon?.Dispose();
-            Shutdown();
-        }
-
-        protected override async void OnExit(ExitEventArgs e)
-        {
-            // 애플리케이션 종료 시 리소스 정리 (OnExitClicked에서 이미 호출되었을 수 있음)
-            if (_agentCoreService != null)
-            {
-                // StopAsync가 이미 호출되지 않았다면 호출
-                // await _agentCoreService.StopAsync(); // 중복 호출 방지 로직 필요
-                _agentCoreService.Dispose();
-            }
-            _notifyIcon?.Dispose();
-            _loggingService?.LogInfo("Monitor Agent application exited.");
-            base.OnExit(e);
-        }
-    }
-}
-App.xaml.cs 주요 기능:
-
-OnStartup:
-필요한 서비스들(LoggingService, AgentIdentifier, ServerUrlProvider, MonitorControlService, AgentCoreService)을 초기화.
-트레이 아이콘(NotifyIcon)을 설정하고 메뉴(상태 보기, 종료)를 추가.
-AgentCoreService를 비동기적으로 시작.
-AgentCoreService의 상태 변경 및 로그 이벤트에 대한 핸들러를 등록하여 트레이 아이콘 텍스트 등을 업데이트.
-SetupTrayIcon: 트레이 아이콘 생성 및 컨텍스트 메뉴 설정.
-CoreService_OnStatusChanged: AgentCoreService의 상태가 변경될 때 트레이 아이콘 툴팁 업데이트.
-OnShowStatusClicked: (현재는 간단한 메시지 박스) 상태 정보를 보여주는 기능 (추후 전용 창으로 확장 가능).
-OnExitClicked: 애플리케이션 종료 시 AgentCoreService를 안전하게 중지/정리하고 트레이 아이콘 제거.
-OnExit: 애플리케이션 종료 시 최종 리소스 정리.
-참고:
-
-App.xaml 파일은 기본 WPF 애플리케이션 템플릿에서 생성되는 내용을 그대로 사용하거나, StartupUri를 제거하여 MainWindow가 자동으로 뜨지 않도록 할 수 있습니다 (여기서는 OnStartup에서 모든 것을 관리).
-아이콘 리소스: SystemIcons.Shield 대신 프로젝트에 적절한 .ico 파일을 리소스로 추가하고 new Icon("your_icon.ico") 형태로 사용하는 것이 좋습니다.
-프로젝트 참조: System.Windows.Forms.dll과 System.Drawing.dll에 대한 참조가 프로젝트에 추가되어야 합니다. (솔루션 탐색기 > 프로젝트 > 참조 마우스 우클릭 > 참조 추가 > 어셈블리 > 프레임워크에서 선택)
-이것으로 요청하신 Agent 프로그램의 주요 코드 구성이 완료되었습니다.
-
-남은 작업 및 고려 사항:
-
-중앙 서버 구현: 이 Agent와 통신할 SignalR Hub (MonitorControlHub) 및 관련 로직(DB 연동, Agent 관리, 명령 중계 결정 등)을 서버 측에 구현해야 합니다.
-제어 UI 구현: 관리자가 Agent들을 보고 제어하며, 설정을 변경할 수 있는 UI가 필요합니다.
-GetCurrentMonitorStatus() 상세 구현: 실제 모니터 전원 상태를 정확히 가져오는 것은 복잡할 수 있습니다. ReadDisplayConfig 또는 WMI 같은 방법을 연구해야 할 수 있습니다. 현재는 "Unknown" 또는 마지막 명령 기반 추정으로 되어 있습니다.
-오류 처리 및 안정성 강화: 각 네트워크 통신 부분의 타임아웃, 재시도 로직, 예외 처리 등을 더욱 견고하게 만들어야 합니다.
-보안: Agent ID 생성 방식, 서버와의 통신 암호화(HTTPS for SignalR), Gateway-Proxied 간 통신 보안(SSL/TLS Stream 등)을 고려해야 합니다.
-배포 및 설치: server_address.txt 파일 배포, 시작 프로그램 등록 (필요시 StartupRegistryService 구현), 방화벽 설정 등을 고려한 설치 패키지 준비.
+Task.WhenAny를 사용하여 연결 작업(connectTask)과 타임아웃 지연 작업(timeoutDelayTask) 중 먼저 완료되는 것을 기다립니다.
+만약 timeoutDelayTask가 먼저 완료되거나, 전체 작업이 외부에서 취소되면 연결 실패로 간주하고 재시도 또는 종료합니다.
+connectTask가 먼저 완료된 경우, connectTask.Status == TaskStatus.RanToCompletion을 통해 연결이 성공했는지 확인합니다.
+TaskStatus.Faulted는 예외 발생, TaskStatus.Canceled는 작업 취소를 의미합니다.
