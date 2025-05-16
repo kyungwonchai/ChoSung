@@ -1,38 +1,107 @@
 // MGSPMonitorControl/ViewModels/MainViewModel.cs
-
-// ... (다른 using 문 및 클래스 정의 시작은 이전과 동일) ...
+using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Security;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using MGSPMonitorControl.Models;
+using MGSPMonitorControl.Services;
+using MGSPMonitorControl.Views;
+using MonitorControl.SharedModels; // 공용 네임스페이스
+using Newtonsoft.Json;
 
 namespace MGSPMonitorControl.ViewModels
 {
-    // ... (ApplicationMode Enum 정의는 이전과 동일) ...
+    public enum ApplicationMode { Basic, User, Admin }
 
     public class MainViewModel : ObservableObject
     {
-        // ... (필드 선언은 이전과 동일) ...
-        private readonly IDatabaseService _databaseService; // 이제 null일 수 있음
-        private readonly IBrokerClientService _brokerClientService; // 이제 null일 수 있음
+        // --- 비밀번호 (하드코딩) ---
+        private const string UserModePassword = "user123";
+        private const string AdminModePassword = "admin123";
+        // --- ---
 
-        // ... (다른 속성 및 커맨드 선언은 이전과 동일) ...
+        private readonly IDatabaseService _databaseService;
+        private readonly IBrokerClientService _brokerClientService;
 
-        // !!! 여기가 수정된 생성자입니다 !!!
+        public ObservableCollection<ManagedAgentDisplay> Agents { get; }
+        public ObservableCollection<string> UiActionLogs { get; }
+        public BrokerStatusDisplay BrokerStatus { get; private set; } = new BrokerStatusDisplay();
+
+        private ManagedAgentDisplay _selectedAgent;
+        public ManagedAgentDisplay SelectedAgent
+        {
+            get => _selectedAgent;
+            set { if (SetProperty(ref _selectedAgent, value)) RefreshAllCommandStates(); }
+        }
+
+        private string _brokerConnectionStatus = "Broker Not Initialized";
+        public string BrokerConnectionStatus
+        {
+            get => _brokerConnectionStatus;
+            set { if (SetProperty(ref _brokerConnectionStatus, value)) RefreshAllCommandStates(); }
+        }
+
+        private ApplicationMode _currentMode = ApplicationMode.Basic;
+        public ApplicationMode CurrentMode
+        {
+            get => _currentMode;
+            private set
+            {
+                if (SetProperty(ref _currentMode, value))
+                {
+                    OnPropertyChanged(nameof(CanManageAgents));
+                    OnPropertyChanged(nameof(CanControlPower));
+                    OnPropertyChanged(nameof(CurrentModeDisplay));
+                    RefreshAllCommandStates();
+                    AddUiLog($"Application mode changed to: {CurrentMode}");
+                }
+            }
+        }
+
+        public string CurrentModeDisplay => $"Current Mode: {CurrentMode}";
+        public bool CanManageAgents => CurrentMode == ApplicationMode.Admin;
+        public bool CanControlPower => CurrentMode == ApplicationMode.Admin || CurrentMode == ApplicationMode.User;
+        public string UiUserIdentifier => $"{Environment.UserName}@{Environment.MachineName}";
+
+        // !!! 여기가 추가된 부분 !!!
+        /// <summary>
+        /// Broker 서비스가 초기화되었고 현재 연결되어 있는지 여부를 반환합니다.
+        /// </summary>
+        private bool IsBrokerConnectedAndReady() => _brokerClientService != null && _brokerClientService.IsConnected;
+        // !!! 추가된 부분 끝 !!!
+
+        // Commands
+        public ICommand LoadAgentsCommand { get; }
+        public RelayCommand<PasswordBox> ApplyModeCommand { get; }
+        public ICommand LogoutCommand { get; }
+        public ICommand AddAgentCommand { get; }
+        public ICommand EditAgentCommand { get; }
+        public ICommand DeleteAgentCommand { get; }
+        public ICommand MonitorOnCommand { get; }
+        public ICommand MonitorOffCommand { get; }
+        public ICommand PingAgentCommand { get; }
+        public ICommand RequestBrokerStatusCommand { get; }
+        public ICommand ConnectToBrokerCommand { get; }
+        public ICommand DisconnectFromBrokerCommand { get; }
+        public ICommand ClearUiLogsCommand { get; }
+
         public MainViewModel(IDatabaseService databaseService, IBrokerClientService brokerClientService)
         {
-            // null을 허용하도록 수정합니다.
-            _databaseService = databaseService; 
+            _databaseService = databaseService;
             _brokerClientService = brokerClientService;
-
-            // 나머지 초기화 로직은 동일하게 진행하되,
-            // _databaseService나 _brokerClientService를 사용하는 모든 곳에서
-            // 사용 전에 null 체크를 반드시 해야 합니다.
-            // (이전 답변에서 드린 MainViewModel 최종본에는 이 null 체크들이 이미 포함되어 있습니다.)
 
             Agents = new ObservableCollection<ManagedAgentDisplay>();
             UiActionLogs = new ObservableCollection<string>();
-            BrokerStatus = new BrokerStatusDisplay(); 
+            BrokerStatus = new BrokerStatusDisplay();
 
             AddUiLog($"Application MainViewModel initialized. Initial mode: {CurrentMode}.");
-            if (_databaseService == null) AddUiLog("[CRITICAL_WARNING] DatabaseService IS NULL. All database related functions will FAIL.");
-            if (_brokerClientService == null) AddUiLog("[CRITICAL_WARNING] BrokerClientService IS NULL. All broker communication will FAIL.");
+            if (_databaseService == null) AddUiLog("[CRITICAL_WARNING] DatabaseService IS NULL. DB functions will be unavailable.");
+            if (_brokerClientService == null) AddUiLog("[CRITICAL_WARNING] BrokerClientService IS NULL. Broker communication will be unavailable.");
             else
             {
                 _brokerClientService.Connected += OnBrokerConnected;
@@ -41,48 +110,120 @@ namespace MGSPMonitorControl.ViewModels
                 BrokerConnectionStatus = _brokerClientService.IsConnected ? "Connected" : "Disconnected (UI Init)";
             }
 
-            // Commands 초기화 (CanExecute 조건에서 서비스 null 체크 포함)
-            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync(), () => _databaseService != null); // null 체크!
-            ApplyModeCommand = new RelayCommand<PasswordBox>(ExecuteApplyMode, (pBox) => pBox != null );
+            // Commands 초기화 (CanExecute 조건에서 IsBrokerConnectedAndReady 사용)
+            LoadAgentsCommand = new RelayCommand(async () => await ExecuteLoadAgentsAsync(), () => _databaseService != null);
+            ApplyModeCommand = new RelayCommand<PasswordBox>(ExecuteApplyMode, (pBox) => pBox != null);
             LogoutCommand = new RelayCommand(ExecuteLogout, () => CurrentMode != ApplicationMode.Basic);
 
             AddAgentCommand = new RelayCommand(ExecuteAddAgent, () => CanManageAgents && _databaseService != null);
             EditAgentCommand = new RelayCommand(ExecuteEditAgent, () => SelectedAgent != null && CanManageAgents && _databaseService != null);
             DeleteAgentCommand = new RelayCommand(async () => await ExecuteDeleteAgentAsync(), () => SelectedAgent != null && CanManageAgents && _databaseService != null);
-            
-            MonitorOnCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOn"), 
-                                              () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
-            MonitorOffCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOff"), 
-                                               () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady());
-            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(), 
-                                              () => SelectedAgent != null && SelectedAgent.IsOnline && IsBrokerConnectedAndReady());
 
-            RequestBrokerStatusCommand = new RelayCommand(async () => await ExecuteRequestBrokerStatusAsync(), () => IsBrokerConnectedAndReady());
+            MonitorOnCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOn"),
+                                              () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady()); // 수정됨
+            MonitorOffCommand = new RelayCommand(async () => await ExecuteMonitorControlAsync("TurnMonitorOff"),
+                                               () => SelectedAgent != null && SelectedAgent.IsOnline && CanControlPower && IsBrokerConnectedAndReady()); // 수정됨
+            PingAgentCommand = new RelayCommand(async () => await ExecutePingAgentAsync(),
+                                              () => SelectedAgent != null && SelectedAgent.IsOnline && IsBrokerConnectedAndReady()); // 수정됨
+
+            RequestBrokerStatusCommand = new RelayCommand(async () => await ExecuteRequestBrokerStatusAsync(), IsBrokerConnectedAndReady); // 수정됨
             ConnectToBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.ConnectAsync(); }, () => _brokerClientService != null && !_brokerClientService.IsConnected);
-            DisconnectFromBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.DisconnectAsync(); }, () => IsBrokerConnectedAndReady());
+            DisconnectFromBrokerCommand = new RelayCommand(async () => { if (_brokerClientService != null) await _brokerClientService.DisconnectAsync(); }, IsBrokerConnectedAndReady); // 수정됨
             ClearUiLogsCommand = new RelayCommand(() => UiActionLogs.Clear());
 
-            // 초기 데이터 로드 및 Broker 연결 시도 (서비스가 null이 아닐 경우)
-            if (_databaseService != null)
-            {
-                // 생성자에서 직접 await 호출은 피하는 것이 좋으므로, 별도 메서드로 분리하거나 Task.Run 사용
-                // 여기서는 UI가 로드된 후 사용자가 "Refresh" 버튼을 누르거나,
-                // 또는 App.xaml.cs에서 메인 창 Show() 이후에 초기 로드 명령을 실행하도록 유도.
-                // 지금은 일단 생성자에서 Task.Run으로 호출.
-                Task.Run(async () => await ExecuteLoadAgentsAsync());
-            }
-            if (_brokerClientService != null && !_brokerClientService.IsConnected)
-            {
-                 Task.Run(async () => await _brokerClientService.ConnectAsync());
-            }
-            RefreshAllCommandStates(); // 초기 Command 상태 설정
+            if (_databaseService != null) { Task.Run(async () => await ExecuteLoadAgentsAsync()); }
+            if (_brokerClientService != null && !_brokerClientService.IsConnected) { Task.Run(async () => await _brokerClientService.ConnectAsync()); }
+            RefreshAllCommandStates();
         }
 
-        // ... (나머지 MainViewModel.cs 코드는 이전 최종본 답변과 동일하게 유지) ...
-        // (RefreshAllCommandStates, AddUiLog, ExecuteApplyMode, ExecuteLogout, 
+        // --- 나머지 메서드들은 이전 답변의 MainViewModel.cs 최종본과 동일하게 유지 ---
+        // (RefreshAllCommandStates, AddUiLog, ExecuteApplyMode, ExecuteLogout,
         //  ExecuteLoadAgentsAsync, ExecuteAddAgent, ExecuteEditAgent, ExecuteDeleteAgentAsync,
         //  ExecuteMonitorControlAsync, ExecutePingAgentAsync, ExecuteRequestBrokerStatusAsync,
         //  Broker Event Handlers, UpdateAgentListFromBroker, UpdateSingleAgentStatus,
         //  UpdateControlActionLogAsync, Cleanup 메서드 등)
-    }
-}
+        // 아래는 이전 답변에서 제공된 해당 메서드들을 그대로 가져온 것입니다.
+
+        private void RefreshAllCommandStates()
+        {
+            Application.Current?.Dispatcher?.Invoke(() => 
+            {
+                (LoadAgentsCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (ApplyModeCommand as RelayCommand<PasswordBox>)?.RaiseCanExecuteChanged();
+                (LogoutCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (AddAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (EditAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (DeleteAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MonitorOnCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (MonitorOffCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (PingAgentCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (RequestBrokerStatusCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (ConnectToBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+                (DisconnectFromBrokerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            });
+        }
+
+        private void AddUiLog(string message)
+        {
+            Application.Current?.Dispatcher?.Invoke(() =>
+            {
+                string logEntry = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+                UiActionLogs.Insert(0, logEntry);
+                if (UiActionLogs.Count > 200) UiActionLogs.RemoveAt(UiActionLogs.Count - 1);
+            });
+        }
+
+        private void ExecuteApplyMode(PasswordBox passwordBox) 
+        {
+            if (passwordBox == null) { AddUiLog("[ERROR] PasswordBox is null in ApplyMode."); return; }
+            string enteredPassword = passwordBox.Password;
+            passwordBox.Clear(); 
+            if (string.IsNullOrEmpty(enteredPassword)) { AddUiLog("[WARNING] Empty password for mode change."); return; }
+            if (enteredPassword == AdminModePassword) CurrentMode = ApplicationMode.Admin;
+            else if (enteredPassword == UserModePassword) CurrentMode = ApplicationMode.User;
+            else { AddUiLog($"[WARNING] Invalid password ('{enteredPassword}') for mode change. Mode: {CurrentMode}."); MessageBox.Show("Invalid password.", "Access Denied", MessageBoxButton.OK, MessageBoxImage.Warning); }
+        }
+        private void ExecuteLogout() { CurrentMode = ApplicationMode.Basic; }
+
+        private async Task ExecuteLoadAgentsAsync()
+        {
+            if (_databaseService == null) { AddUiLog("[ERROR] DatabaseService unavailable for loading agents."); return; }
+            AddUiLog("Loading managed agent configurations from database...");
+            try
+            {
+                var dbAgents = await _databaseService.GetManagedAgentsAsync();
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    Agents.Clear();
+                    if (dbAgents != null)
+                    {
+                        foreach (var agent in dbAgents.OrderBy(a => a.AgentName))
+                        {
+                            agent.IsOnline = false; agent.CurrentMonitorStatus = "Unknown (Offline)"; Agents.Add(agent);
+                        }
+                    }
+                    SelectedAgent = null;
+                });
+                AddUiLog($"Loaded {dbAgents?.Count ?? 0} agent configurations from DB.");
+                if (IsBrokerConnectedAndReady()) { await _brokerClientService.SendMessageAsync(new BrokerMessage { Type = MessageType.UiRequest_GetInitialAgentList, SourceId = UiUserIdentifier }); }
+            }
+            catch (Exception ex) { AddUiLog($"[ERROR] Loading agents from DB: {ex.ToString()}"); MessageBox.Show($"Error loading agents: {ex.Message}", "DB Error", MessageBoxButton.OK, MessageBoxImage.Error); }
+            finally { RefreshAllCommandStates(); }
+        }
+
+        private async void ExecuteAddAgent()
+        {
+            if (_databaseService == null) { AddUiLog("[ERROR] DatabaseService unavailable for Add Agent."); return; }
+            AddUiLog("Opening 'Add New Agent' window...");
+            var agentConfigVm = new AgentConfigViewModel(_databaseService, CurrentMode.ToString() + "Mode");
+            var agentConfigWindow = new AgentConfigWindow(agentConfigVm);
+            if (agentConfigWindow.ShowDialog() == true) { AddUiLog($"Agent '{agentConfigVm.Agent.AgentName}' config saved. Refreshing."); await ExecuteLoadAgentsAsync(); }
+            else { AddUiLog("'Add New Agent' cancelled."); }
+        }
+
+        private async void ExecuteEditAgent()
+        {
+            if (SelectedAgent == null || _databaseService == null) { AddUiLog(SelectedAgent == null ? "[WARN] No agent selected for edit." : "[ERROR] DatabaseService unavailable for Edit Agent."); return; }
+            AddUiLog($"Opening 'Edit Agent' window for: {SelectedAgent.AgentName} (AppID: {SelectedAgent.AgentIdProvidedByApp})");
+            ManagedAgentDisplay agentToEditInDb = null;
+            try { agentToEditInDb = await _databaseService.GetManagedAgentByGuidAsync(SelectedAgent.
