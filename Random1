@@ -1,554 +1,304 @@
-네, 알겠습니다. SAgentM.App의 핵심 로직을 담당하는 AgentCoreService.cs 파일의 코드를 제공해 드리겠습니다. 이 서비스는 백그라운드에서 소켓 통신을 처리하고, 수신된 명령을 실행하거나 중계합니다.
+네, 알겠습니다! SAgentM.App의 MainViewModel.cs와 UI를 담당하는 MainWindow.xaml, MainWindow.xaml.cs 그리고 애플리케이션 진입점인 App.xaml, App.xaml.cs 코드를 이어서 제공해 드리겠습니다.
 
-UI 스레드가 차단되지 않도록 네트워킹 작업은 별도의 스레드 또는 Task를 사용하여 비동기적으로 처리됩니다.
+먼저 ICommand 인터페이스를 구현하는 간단한 헬퍼 클래스인 RelayCommand.cs를 Utils 폴더에 추가하겠습니다.
 
-Services/AgentCoreService.cs
+Utils/RelayCommand.cs
 
 C#
 
-// SAgentM.App/Services/AgentCoreService.cs
-using Newtonsoft.Json; // Newtonsoft.Json 사용
-using SControl.Common; // CommandPacket, Enums, Payloads, LocalDeviceControl
+// SAgentM.App/Utils/RelayCommand.cs
 using System;
-using System.Configuration;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Windows.Input;
 
-namespace SAgentM.App.Services
+namespace SAgentM.App.Utils
 {
-    public interface IAgentCoreService
+    public class RelayCommand : ICommand
     {
-        void Start();
-        void Stop();
-        bool IsRunning { get; }
-    }
+        private readonly Action<object> _execute;
+        private readonly Predicate<object> _canExecute;
 
-    public class AgentCoreService : IAgentCoreService
-    {
-        private readonly ILoggingService _loggingService;
-        private readonly int _port;
-        private TcpListener _listener;
-        private Thread _listenThread;
-        private volatile bool _isRunning; // 서비스 실행 상태 플래그
-        private CancellationTokenSource _cancellationTokenSource; // 자식 작업 취소용
-
-        public bool IsRunning => _isRunning;
-
-        public AgentCoreService(ILoggingService loggingService)
+        public RelayCommand(Action<object> execute, Predicate<object> canExecute = null)
         {
-            _loggingService = loggingService;
-            if (!int.TryParse(ConfigurationManager.AppSettings["ListenPort"], out _port))
-            {
-                _port = 12345; // App.config에 설정이 없거나 잘못된 경우 기본값
-                _loggingService.Warn($"ListenPort 설정이 App.config에 없거나 잘못되어 기본값 {_port} 포트를 사용합니다.");
-            }
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+            _canExecute = canExecute;
         }
 
-        public void Start()
+        public event EventHandler CanExecuteChanged
         {
-            if (_isRunning)
-            {
-                _loggingService.Warn("AgentCoreService가 이미 실행 중입니다.");
-                return;
-            }
-
-            _isRunning = true;
-            _cancellationTokenSource = new CancellationTokenSource();
-
-            // 리스너 스레드 시작
-            _listenThread = new Thread(ListenLoop);
-            _listenThread.IsBackground = true; // 주 애플리케이션 종료 시 함께 종료되도록 설정
-            _listenThread.Name = "AgentListenThread";
-            _listenThread.Start();
-
-            _loggingService.Info($"AgentCoreService 시작됨. 포트: {_port}");
+            add { CommandManager.RequerySuggested += value; }
+            remove { CommandManager.RequerySuggested -= value; }
         }
 
-        public void Stop()
+        public bool CanExecute(object parameter)
         {
-            if (!_isRunning)
-            {
-                _loggingService.Warn("AgentCoreService가 이미 중지되어 있습니다.");
-                return;
-            }
-
-            _loggingService.Info("AgentCoreService 중지 요청 중...");
-            _isRunning = false;
-
-            // 자식 작업(클라이언트 핸들러 등)에 취소 요청
-            if (_cancellationTokenSource != null)
-            {
-                _cancellationTokenSource.Cancel();
-                _cancellationTokenSource.Dispose();
-                _cancellationTokenSource = null;
-            }
-            
-            // TcpListener 중지 (AcceptTcpClient에서 SocketException 발생 유도하여 루프 종료)
-            if (_listener != null)
-            {
-                try
-                {
-                    _listener.Stop();
-                }
-                catch (Exception ex)
-                {
-                     _loggingService.Error("리스너 중지 중 오류 발생 (정상 종료 과정일 수 있음)", ex);
-                }
-            }
-
-            // 리스닝 스레드가 완전히 종료될 때까지 잠시 대기 (선택적, 타임아웃 설정 권장)
-            if (_listenThread != null && _listenThread.IsAlive)
-            {
-                if (!_listenThread.Join(TimeSpan.FromSeconds(5))) // 예: 5초 타임아웃
-                {
-                    _loggingService.Warn("리스닝 스레드가 시간 내에 종료되지 않았습니다.");
-                    // 필요시 _listenThread.Abort(); 고려 (주의해서 사용)
-                }
-            }
-            
-            _loggingService.Info("AgentCoreService 중지됨.");
+            return _canExecute == null || _canExecute(parameter);
         }
 
-        private void ListenLoop()
+        public void Execute(object parameter)
         {
-            try
-            {
-                _listener = new TcpListener(IPAddress.Any, _port);
-                _listener.Start();
-                _loggingService.Info($"포트 {_port}에서 클라이언트 연결 대기 중...");
-
-                while (_isRunning)
-                {
-                    try
-                    {
-                        // 블로킹 호출. Stop()에서 _listener.Stop()이 호출되면 SocketException 발생.
-                        TcpClient client = _listener.AcceptTcpClient(); 
-                        
-                        if (!_isRunning) // Stop() 호출 직후 AcceptTcpClient가 반환될 수 있음
-                        {
-                            client.Close();
-                            break;
-                        }
-                        
-                        string clientIp = client.Client.RemoteEndPoint?.ToString() ?? "Unknown IP";
-                        _loggingService.Info($"클라이언트 연결됨: {clientIp}");
-
-                        // 각 클라이언트를 별도의 Task로 처리 (Thread Pool 사용)
-                        // CancellationToken을 전달하여 Stop() 시점에 클라이언트 처리 작업도 취소 시도
-                        Task.Run(() => HandleClientAsync(client, clientIp, _cancellationTokenSource.Token), _cancellationTokenSource.Token);
-                    }
-                    catch (SocketException se)
-                    {
-                        if (!_isRunning && (se.SocketErrorCode == SocketError.Interrupted || se.SocketErrorCode == SocketError.OperationAborted))
-                        {
-                            // _listener.Stop()에 의해 정상적으로 발생한 예외. 루프 종료.
-                            _loggingService.Info("리스너 소켓이 정상적으로 중단되었습니다 (Interrupted).");
-                            break;
-                        }
-                        // 그 외 소켓 오류
-                        _loggingService.Error("클라이언트 연결 수락 중 소켓 오류 발생.", se);
-                        if (!_isRunning) break; // 서비스 중지 중 발생한 다른 소켓 오류면 루프 종료
-                        Thread.Sleep(100); // 과도한 CPU 사용 방지를 위해 잠시 대기 후 재시도
-                    }
-                    catch (Exception ex)
-                    {
-                        _loggingService.Error("클라이언트 연결 수락 중 예기치 않은 오류 발생.", ex);
-                        if (!_isRunning) break;
-                        Thread.Sleep(100);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _loggingService.Error("ListenLoop에서 심각한 오류 발생. 리스너가 중단됩니다.", ex);
-            }
-            finally
-            {
-                // _isRunning이 false가 되어 루프가 종료되면 리스너를 확실히 중지.
-                if (_listener != null && _listener.Server.IsBound) // .Active 대신 .Server.IsBound 사용 (최신 프레임워크 경향)
-                {
-                    _listener.Stop();
-                }
-                _loggingService.Info("ListenLoop 종료됨.");
-            }
-        }
-
-        private async Task HandleClientAsync(TcpClient client, string clientIpInfo, CancellationToken token)
-        {
-            try
-            {
-                _loggingService.Debug($"[{clientIpInfo}] 클라이언트 처리 시작.");
-                using (client) // using 블록 끝나면 client.Close() 자동 호출
-                using (NetworkStream stream = client.GetStream())
-                // StreamReader/Writer의 기본 버퍼 크기 및 leaveOpen 설정은 상황에 맞게 조절 가능
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 1024, true)) // leaveOpen: true
-                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true) { AutoFlush = true }) // leaveOpen: true
-                {
-                    while (_isRunning && client.Connected && !token.IsCancellationRequested)
-                    {
-                        string requestJson = null;
-                        try
-                        {
-                            // ReadLineAsync는 .NET 4.6에서 CancellationToken을 직접 지원하지 않음.
-                            // token.IsCancellationRequested를 주기적으로 확인하거나,
-                            // 외부에서 client.Close()를 호출하여 IOException을 유발시켜 루프를 중단해야 함.
-                            // 여기서는 Task.Run으로 실행되므로, CancellationTokenSource.Cancel() 호출 시
-                            // IOException이 발생하거나, client.Connected가 false가 되거나, _isRunning이 false가 되어 루프 종료.
-                            var readTask = reader.ReadLineAsync(); 
-                            
-                            // 타임아웃을 직접 구현하거나, CancellationToken을 활용한 Task.WhenAny와 Delay 조합 가능
-                            if (await Task.WhenAny(readTask, Task.Delay(Timeout.Infinite, token)) == readTask) // token으로 취소 가능
-                            {
-                                requestJson = await readTask;
-                            }
-                            else // Task.Delay가 먼저 완료 (취소됨)
-                            {
-                                token.ThrowIfCancellationRequested();
-                            }
-
-                            if (requestJson == null) // 클라이언트 연결 정상 종료 (스트림 끝)
-                            {
-                                _loggingService.Info($"[{clientIpInfo}] 클라이언트가 연결을 종료했습니다 (스트림 끝).");
-                                break;
-                            }
-                            _loggingService.Debug($"[{clientIpInfo}] 수신 데이터: {requestJson}");
-
-                            CommandPacket requestPacket = null;
-                            try
-                            {
-                                requestPacket = JsonConvert.DeserializeObject<CommandPacket>(requestJson);
-                            }
-                            catch (JsonException jsonEx)
-                            {
-                                _loggingService.Error($"[{clientIpInfo}] JSON 역직렬화 실패: {requestJson}", jsonEx);
-                                // 오류 응답을 클라이언트에게 보낼 수 있음 (선택 사항)
-                                await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Invalid JSON format: {jsonEx.Message}")));
-                                continue;
-                            }
-
-                            if (requestPacket != null)
-                            {
-                                _loggingService.Info($"[{clientIpInfo}] 명령 수신: ID={requestPacket.PacketId}, Command={requestPacket.CommandName}, Instruction={requestPacket.Instruction}");
-                                CommandPacket responsePacket = await ProcessCommandAsync(requestPacket, clientIpInfo, token);
-
-                                if (responsePacket != null)
-                                {
-                                    string responseJson = JsonConvert.SerializeObject(responsePacket);
-                                    await writer.WriteLineAsync(responseJson);
-                                    _loggingService.Debug($"[{clientIpInfo}] 응답 전송: ID={responsePacket.PacketId}, Command={responsePacket.CommandName}");
-                                }
-                            }
-                        }
-                        catch (IOException ioEx) // 네트워크 오류 (클라이언트 연결 끊김 등)
-                        {
-                            _loggingService.Warn($"[{clientIpInfo}] 네트워크 IO 오류 발생 (연결 끊김 예상): {ioEx.Message}");
-                            break; // 루프 종료
-                        }
-                        catch (OperationCanceledException) // CancellationToken에 의해 취소됨
-                        {
-                            _loggingService.Info($"[{clientIpInfo}] 클라이언트 처리 작업 취소됨.");
-                            break;
-                        }
-                        catch (ObjectDisposedException odEx) // 스트림 또는 클라이언트가 이미 닫힌 경우
-                        {
-                            _loggingService.Warn($"[{clientIpInfo}] 객체 이미 해제됨 (연결 끊김 예상): {odEx.Message}");
-                            break;
-                        }
-                        catch (Exception ex)
-                        {
-                            _loggingService.Error($"[{clientIpInfo}] 클라이언트 처리 중 예기치 않은 오류 발생.", ex);
-                            // 여기서도 오류 응답을 보낼 수 있으나, 연결 상태에 따라 실패할 수 있음
-                            if (client.Connected && stream.CanWrite)
-                            {
-                                try 
-                                {
-                                   await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Server error: {ex.Message}")));
-                                } catch (Exception writeEx){
-                                   _loggingService.Error($"[{clientIpInfo}] 오류 응답 전송 실패.", writeEx);
-                                }
-                            }
-                            // 루프를 계속할지 결정 (일시적 오류면 continue, 심각하면 break)
-                            // 여기서는 일단 continue 하나, 반복적인 오류 발생 시 문제될 수 있음
-                        }
-                    }
-                }
-            }
-            catch (OperationCanceledException) // Task.Run 자체가 취소된 경우 (CancellationTokenSource.Cancel 호출 시)
-            {
-                _loggingService.Info($"[{clientIpInfo}] HandleClientAsync 작업 자체가 취소되었습니다.");
-            }
-            catch (Exception ex)
-            {
-                // using 블록 진입 전 또는 매우 예외적인 상황
-                _loggingService.Error($"[{clientIpInfo}] HandleClientAsync 외부에서 심각한 오류 발생.", ex);
-            }
-            finally
-            {
-                _loggingService.Info($"[{clientIpInfo}] 클라이언트 처리 종료.");
-                // client.Close()는 using 블록에 의해 자동으로 호출됨
-            }
-        }
-        
-        private async Task<CommandPacket> ProcessCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            _loggingService.Debug($"[{clientIp}] 명령 처리 시작: {requestPacket.CommandName}, ID: {requestPacket.PacketId}");
-            try
-            {
-                token.ThrowIfCancellationRequested(); // 명령 처리 시작 전 취소 확인
-
-                switch (requestPacket.Instruction)
-                {
-                    case CommandInstruction.DirectExecute:
-                        return await ExecuteDirectCommandAsync(requestPacket, clientIp, token);
-                    case CommandInstruction.RelayToTarget:
-                        return await RelayCommandAsync(requestPacket, clientIp, token);
-                    default:
-                        _loggingService.Warn($"[{clientIp}] 알 수 없는 Instruction: {requestPacket.Instruction}, Packet ID: {requestPacket.PacketId}");
-                        return CreateErrorResponse(requestPacket, $"Unknown instruction: {requestPacket.Instruction}");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                 _loggingService.Info($"[{clientIp}] 명령 처리 중 취소됨: {requestPacket.CommandName}, ID: {requestPacket.PacketId}");
-                 return CreateErrorResponse(requestPacket, "Operation was canceled.");
-            }
-            catch (Exception ex)
-            {
-                _loggingService.Error($"[{clientIp}] 명령 처리 중 오류 발생: {requestPacket.CommandName}, ID: {requestPacket.PacketId}", ex);
-                return CreateErrorResponse(requestPacket, $"Error processing command: {ex.Message}");
-            }
-        }
-
-        private async Task<CommandPacket> ExecuteDirectCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            _loggingService.Info($"[{clientIp}] 직접 실행 명령: {requestPacket.CommandName}");
-            bool success = false;
-            string message = "Command execution failed or not implemented.";
-
-            try
-            {
-                token.ThrowIfCancellationRequested();
-
-                switch (requestPacket.CommandName)
-                {
-                    case CommandNames.MonitorControl:
-                        if (string.IsNullOrEmpty(requestPacket.PayloadJson))
-                        {
-                            message = "MonitorControl: PayloadJson is missing.";
-                            _loggingService.Warn($"[{clientIp}] {message}");
-                            break;
-                        }
-                        var monitorPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
-                        if (monitorPayload == null) 
-                        {
-                            message = "MonitorControl: Failed to deserialize payload.";
-                            _loggingService.Warn($"[{clientIp}] {message}");
-                            break;
-                        }
-                        
-                        _loggingService.Info($"[{clientIp}] 모니터 상태 변경 시도: {monitorPayload.Action}");
-                        LocalDeviceControl.SetMonitorState(monitorPayload.Action); // 동기 호출
-                        success = true;
-                        message = $"Monitor state set to {monitorPayload.Action} successfully.";
-                        _loggingService.Info($"[{clientIp}] {message}");
-                        break;
-                    
-                    // --- 다른 직접 실행 명령 추가 ---
-                    // case CommandNames.SystemShutdown:
-                    //    _loggingService.Info($"[{clientIp}] 시스템 종료 명령 수신 (미구현)");
-                    //    message = "SystemShutdown command received but not implemented.";
-                    //    break;
-
-                    default:
-                        message = $"Unknown direct command: {requestPacket.CommandName}";
-                        _loggingService.Warn($"[{clientIp}] {message}");
-                        break;
-                }
-            }
-            catch (JsonException jsonEx)
-            {
-                message = $"Payload deserialization error for {requestPacket.CommandName}: {jsonEx.Message}";
-                _loggingService.Error($"[{clientIp}] {message}", jsonEx);
-                success = false;
-            }
-            catch (OperationCanceledException)
-            {
-                message = $"Direct command {requestPacket.CommandName} execution canceled.";
-                _loggingService.Info($"[{clientIp}] {message}");
-                success = false; // 또는 다른 상태
-            }
-            catch (Exception ex)
-            {
-                message = $"Error executing {requestPacket.CommandName}: {ex.Message}";
-                _loggingService.Error($"[{clientIp}] {message}", ex);
-                success = false;
-            }
-            
-            // 응답 패킷 생성
-            return CreateExecutionResponse(requestPacket, success, message);
-        }
-
-        private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
-        {
-            _loggingService.Info($"[{clientIp}] 릴레이 명령: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
-            
-            if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || 
-                !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue)
-            {
-                return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP or Port missing.");
-            }
-
-            var packetForFinalTarget = new CommandPacket
-            {
-                // PacketId = Guid.NewGuid(), // 새 ID 또는 원래 ID 유지/추적
-                Instruction = CommandInstruction.DirectExecute, // 최종 목적지는 직접 실행
-                CommandName = originalRelayRequest.CommandName,
-                PayloadJson = originalRelayRequest.PayloadJson,
-                // 최종 목적지로부터의 응답을 이 에이전트를 거치지 않고 원 요청자에게 직접 보내야 한다면, 
-                // ResponseAddress/Port를 원 요청자의 것으로 설정.
-                // 여기서는 이 에이전트가 중간에서 응답을 받아 전달하는 시나리오는 단순화.
-                // 릴레이 작업 자체의 성공/실패를 원 요청자에게 알림.
-                ResponseAddress = null, // 릴레이 대상으로부터 응답 받을 주소 (필요시 설정)
-                ResponsePort = null,
-            };
-            // packetForFinalTarget.OriginalPacketId = originalRelayRequest.PacketId; // 추적용으로 원래 ID 전달
-
-            string relayStatusMessage = $"Relay attempt for command '{packetForFinalTarget.CommandName}'";
-            bool relaySuccess = false;
-
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                using (var targetClient = new TcpClient())
-                {
-                    // ConnectAsync는 CancellationToken을 직접 받지 않으므로, 별도 처리 필요
-                    var connectTask = targetClient.ConnectAsync(
-                        originalRelayRequest.FinalTargetIpForRelayedCommand,
-                        originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
-
-                    // 연결 타임아웃 처리 (예: 5초)
-                    if (await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5), token)) != connectTask || token.IsCancellationRequested)
-                    {
-                        if (token.IsCancellationRequested) token.ThrowIfCancellationRequested();
-                        // 타임아웃 발생
-                        targetClient.Close(); // 연결 시도 중단
-                        throw new TimeoutException("Connection to relay target timed out.");
-                    }
-                    // connectTask가 예외를 던졌다면 여기서 전파됨
-
-                    _loggingService.Debug($"[{clientIp}] 릴레이 대상 ({originalRelayRequest.FinalTargetIpForRelayedCommand}) 연결 성공.");
-
-                    using (NetworkStream targetStream = targetClient.GetStream())
-                    using (StreamWriter writer = new StreamWriter(targetStream, Encoding.UTF8) { AutoFlush = true })
-                    using (StreamReader reader = new StreamReader(targetStream, Encoding.UTF8)) // 최종 타겟 응답 수신용
-                    {
-                        string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget);
-                        await writer.WriteLineAsync(jsonToRelay);
-                        _loggingService.Debug($"[{clientIp}] 릴레이 데이터 전송: {jsonToRelay}");
-                        
-                        // --- 최종 타겟으로부터 응답을 수신하는 로직 (선택적) ---
-                        // 이 예제에서는 릴레이 '시도'에 대한 성공/실패만 응답하고, 최종 타겟의 응답은 직접 처리하지 않음.
-                        // 만약 최종 타겟의 응답을 받아 원 요청자에게 전달해야 한다면, 여기서 reader.ReadLineAsync() 등으로 응답을 읽고,
-                        // 그 결과를 포함하여 originalRelayRequest에 대한 응답을 구성해야 함.
-                        // 예시:
-                        // var targetResponseTask = reader.ReadLineAsync();
-                        // if (await Task.WhenAny(targetResponseTask, Task.Delay(TimeSpan.FromSeconds(10), token)) == targetResponseTask && !token.IsCancellationRequested)
-                        // {
-                        //     string targetResponseJson = await targetResponseTask;
-                        //     _loggingService.Info($"[{clientIp}] 릴레이 대상으로부터 응답 수신: {targetResponseJson}");
-                        //     // 이 응답을 originalRelayRequest의 응답으로 가공
-                        //     // return JsonConvert.DeserializeObject<CommandPacket>(targetResponseJson); 
-                        // } else {
-                        //    _loggingService.Warn($"[{clientIp}] 릴레이 대상으로부터 응답 시간 초과 또는 취소됨.");
-                        //    relayStatusMessage += " but no response from final target or timed out.";
-                        // }
-                        // --- 최종 타겟 응답 수신 로직 끝 ---
-
-                        relaySuccess = true; // 데이터 전송 성공 (응답 수신 여부와는 별개)
-                        relayStatusMessage = $"Command '{originalRelayRequest.CommandName}' relayed successfully to {originalRelayRequest.FinalTargetIpForRelayedCommand}.";
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                relayStatusMessage = $"Relay of {originalRelayRequest.CommandName} canceled.";
-                _loggingService.Info($"[{clientIp}] {relayStatusMessage}");
-            }
-            catch (TimeoutException tex)
-            {
-                relayStatusMessage = $"Relay failed: Timeout connecting to target - {tex.Message}";
-                _loggingService.Warn($"[{clientIp}] {relayStatusMessage}");
-            }
-            catch (SocketException sockEx)
-            {
-                relayStatusMessage = $"Relay failed: Socket error connecting to target - {sockEx.Message} (Code: {sockEx.SocketErrorCode})";
-                _loggingService.Error($"[{clientIp}] {relayStatusMessage}", sockEx);
-            }
-            catch (Exception ex)
-            {
-                relayStatusMessage = $"Relay failed: Unexpected error - {ex.Message}";
-                _loggingService.Error($"[{clientIp}] {relayStatusMessage}", ex);
-            }
-
-            return CreateExecutionResponse(originalRelayRequest, relaySuccess, relayStatusMessage);
-        }
-
-        // 응답 패킷 생성 헬퍼
-        private CommandPacket CreateExecutionResponse(CommandPacket requestPacket, bool success, string message, object data = null)
-        {
-            var responsePayload = new GenericResponsePayload
-            {
-                Success = success,
-                Message = message,
-                Data = data 
-            };
-            return new CommandPacket
-            {
-                PacketId = requestPacket.PacketId, // 원본 요청 ID 유지
-                Instruction = CommandInstruction.DirectExecute, // 응답은 항상 DirectExecute
-                CommandName = $"{requestPacket.CommandName}_Response", // 응답임을 명시
-                PayloadJson = JsonConvert.SerializeObject(responsePayload),
-                // ResponseAddress/Port는 이 응답을 수신할 SControlM의 주소. 
-                // 만약 ClientHandler에서 직접 이 패킷을 전송한다면, 여기서는 설정 불필요.
-                // 여기서는 CommandHandler가 생성하므로, 원 요청의 ResponseAddress/Port를 참조하여 설정하거나 비워둘 수 있음.
-            };
-        }
-        
-        private CommandPacket CreateErrorResponse(CommandPacket requestPacket, string errorMessage)
-        {
-            // requestPacket이 null일 수 있음 (예: JSON 역직렬화 실패 시)
-            Guid originalPacketId = requestPacket?.PacketId ?? Guid.Empty;
-            string originalCommandName = requestPacket?.CommandName ?? "UNKNOWN_COMMAND";
-
-            _loggingService.Error($"Error response for Packet ID {originalPacketId}: {errorMessage}");
-             var responsePayload = new GenericResponsePayload
-            {
-                Success = false,
-                Message = errorMessage
-            };
-            return new CommandPacket
-            {
-                PacketId = originalPacketId,
-                Instruction = CommandInstruction.DirectExecute,
-                CommandName = $"{originalCommandName}_ErrorResponse", // 에러 응답 명시
-                PayloadJson = JsonConvert.SerializeObject(responsePayload)
-            };
+            _execute(parameter);
         }
     }
 }
-AgentCoreService.cs 주요 특징 (.NET Framework 4.6 기준):
+ViewModels/MainViewModel.cs
 
-스레딩:
-ListenLoop는 전용 Thread (_listenThread)에서 실행됩니다.
-각 클라이언트 연결 처리는 Task.Run을 통해 스레드 풀의 스레드에서 비동기적으로 수행됩니다.
-취소 처리 (CancellationToken):
-Stop() 메서드에서 CancellationTokenSource.Cancel()을 호출하여 진행 중인 클라이언트 처리 작업(HandleClientAsync) 및 일부 비동기 작업(예: Task.Delay, Task.WhenAny)에 취소 신호를 보냅니다.
-.NET Framework 4.6의 일부 구형 비동기 메서드(예: StreamReader.ReadLineAsync)는 CancellationToken을 직접 지원하지 않으므로, 취소는 주로 루프 조건(_isRunning, client.Connected) 또는 연결 외부 종료(IOException 유발)를 통해 간접적으로 처리됩니다. HandleClientAsync 내 Task.WhenAny 사용은 ReadLineAsync에 대한 타임아웃/취소 기능을 일부 제공합니다.
-TcpListener 중지: _listener.Stop()은 AcceptTcpClient()에서 SocketException (오류 코드 10004 등)을 발생시켜 ListenLoop를 안전하게 종료하는 데 사용됩니다.
-JSON 처리: Newtonsoft.Json을 사용하여 CommandPacket 직렬화/역직렬화를 수행합니다.
-로깅: ILoggingService를 통해 UI에 표시될 로그를 기록합니다.
-명령 처리: ProcessCommandAsync, ExecuteDirectCommandAsync, RelayCommandAsync 메서드에서 실제 명령 로직을 담당합니다.
+C#
+
+// SAgentM.App/ViewModels/MainViewModel.cs
+using SAgentM.App.Models;
+using SAgentM.App.Services;
+using SAgentM.App.Utils; // ObservableObject, RelayCommand
+using System.Collections.ObjectModel;
+using System.Windows.Input;
+
+namespace SAgentM.App.ViewModels
+{
+    public class MainViewModel : ObservableObject
+    {
+        private readonly ILoggingService _loggingService;
+        private readonly IAgentCoreService _agentCoreService;
+
+        private string _agentStatus = "Stopped";
+        public string AgentStatus
+        {
+            get => _agentStatus;
+            set => SetProperty(ref _agentStatus, value);
+        }
+
+        private bool _isAgentRunning;
+        public bool IsAgentRunning
+        {
+            get => _isAgentRunning;
+            set
+            {
+                if (SetProperty(ref _isAgentRunning, value))
+                {
+                    // IsAgentRunning이 변경되면 Command들의 CanExecute 상태 갱신 요청
+                    ((RelayCommand)StartAgentCommand).RaiseCanExecuteChanged();
+                    ((RelayCommand)StopAgentCommand).RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public ObservableCollection<LogEntry> LogEntries => _loggingService.LogEntries;
+
+        public ICommand StartAgentCommand { get; }
+        public ICommand StopAgentCommand { get; }
+
+        public MainViewModel(ILoggingService loggingService, IAgentCoreService agentCoreService)
+        {
+            _loggingService = loggingService;
+            _agentCoreService = agentCoreService;
+
+            StartAgentCommand = new RelayCommand(ExecuteStartAgent, CanExecuteStartAgent);
+            StopAgentCommand = new RelayCommand(ExecuteStopAgent, CanExecuteStopAgent);
+
+            UpdateAgentStatus(); // 초기 상태 설정
+            _loggingService.Info("SAgentM UI 초기화 완료.");
+        }
+
+        private bool CanExecuteStartAgent(object parameter) => !_agentCoreService.IsRunning;
+        private void ExecuteStartAgent(object parameter)
+        {
+            _loggingService.Info("에이전트 시작 명령 수신.");
+            try
+            {
+                _agentCoreService.Start();
+            }
+            catch (System.Exception ex)
+            {
+                _loggingService.Error("에이전트 시작 중 오류 발생.", ex);
+            }
+            finally
+            {
+                UpdateAgentStatus();
+            }
+        }
+
+        private bool CanExecuteStopAgent(object parameter) => _agentCoreService.IsRunning;
+        private void ExecuteStopAgent(object parameter)
+        {
+            _loggingService.Info("에이전트 중지 명령 수신.");
+            try
+            {
+                _agentCoreService.Stop();
+            }
+            catch (System.Exception ex)
+            {
+                _loggingService.Error("에이전트 중지 중 오류 발생.", ex);
+            }
+            finally
+            {
+                UpdateAgentStatus();
+            }
+        }
+
+        private void UpdateAgentStatus()
+        {
+            IsAgentRunning = _agentCoreService.IsRunning;
+            AgentStatus = _agentCoreService.IsRunning ? "Running" : "Stopped";
+            // 추가적인 상태 (Error 등)는 AgentCoreService에서 이벤트를 통해 전달받아 처리 가능
+        }
+
+        // 애플리케이션 종료 시 호출될 메서드 (AgentCoreService의 리소스 정리)
+        public void Cleanup()
+        {
+            _loggingService.Info("애플리케이션 종료 절차 시작. 에이전트 중지 시도.");
+            ExecuteStopAgent(null); // 에이전트 중지
+        }
+    }
+
+    // RelayCommand 클래스에 CanExecuteChanged 이벤트를 수동으로 발생시키는 메서드 추가
+    // (ObservableObject와 같은 파일에 있거나, RelayCommand 파일에 직접 추가)
+    public static class RelayCommandExtensions
+    {
+        public static void RaiseCanExecuteChanged(this RelayCommand command)
+        {
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+}
+MainViewModel.cs 수정 사항:
+
+RelayCommandExtensions 클래스를 추가하여 RelayCommand의 CanExecuteChanged를 명시적으로 호출할 수 있는 RaiseCanExecuteChanged 확장 메서드를 만들었습니다. 이는 IsAgentRunning 속성이 변경될 때 버튼의 활성화 상태를 즉시 갱신하기 위함입니다.
+IsAgentRunning 속성의 setter에서 RaiseCanExecuteChanged()를 호출합니다.
+MainWindow.xaml
+
+XML
+
+<Window x:Class="SAgentM.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:SAgentM.App"
+        xmlns:viewModels="clr-namespace:SAgentM.App.ViewModels"
+        mc:Ignorable="d"
+        Title="SAgentM - Agent Monitoring" Height="450" Width="800"
+        Loaded="Window_Loaded" Closing="Window_Closing">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/> <RowDefinition Height="*"/>    <RowDefinition Height="Auto"/> </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <Button Content="에이전트 시작" Command="{Binding StartAgentCommand}" Width="120" Margin="0,0,5,0"/>
+            <Button Content="에이전트 중지" Command="{Binding StopAgentCommand}" Width="120"/>
+        </StackPanel>
+
+        <ListView Grid.Row="1" ItemsSource="{Binding LogEntries}" Margin="0,0,0,5" HorizontalContentAlignment="Stretch">
+            <ListView.ItemTemplate>
+                <DataTemplate>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="{Binding Timestamp, StringFormat='[{0:HH:mm:ss}]'}" FontWeight="SemiBold" Margin="0,0,5,0"/>
+                        <TextBlock Grid.Column="1" Text="{Binding Level, StringFormat='[{0}]'}" Margin="0,0,5,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Level}" Value="Error">
+                                            <Setter Property="Foreground" Value="Red"/>
+                                            <Setter Property="FontWeight" Value="Bold"/>
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Level}" Value="Warning">
+                                            <Setter Property="Foreground" Value="OrangeRed"/>
+                                        </DataTrigger>
+                                         <DataTrigger Binding="{Binding Level}" Value="Info">
+                                            <Setter Property="Foreground" Value="DarkGreen"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <TextBlock Grid.Column="2" Text="{Binding Message}" TextWrapping="Wrap"/>
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+
+        <StatusBar Grid.Row="2">
+            <StatusBarItem>
+                <TextBlock Text="{Binding AgentStatus, StringFormat='Agent Status: {0}'}"/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>
+MainWindow.xaml.cs
+
+C#
+
+// SAgentM.App/MainWindow.xaml.cs
+using SAgentM.App.Services;
+using SAgentM.App.ViewModels;
+using System.ComponentModel;
+using System.Windows;
+
+namespace SAgentM.App
+{
+    public partial class MainWindow : Window
+    {
+        private MainViewModel _viewModel;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+        }
+
+        private void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            // 서비스 및 ViewModel 인스턴스 생성 및 주입
+            // 실제 애플리케이션에서는 DI 컨테이너를 사용하는 것이 좋음
+            ILoggingService loggingService = new LoggingService();
+            IAgentCoreService agentCoreService = new AgentCoreService(loggingService);
+            _viewModel = new MainViewModel(loggingService, agentCoreService);
+            
+            DataContext = _viewModel;
+
+            // 애플리케이션 시작 시 자동으로 에이전트 시작 (선택 사항)
+            // if (_viewModel.StartAgentCommand.CanExecute(null))
+            // {
+            //    _viewModel.StartAgentCommand.Execute(null);
+            // }
+        }
+
+        private void Window_Closing(object sender, CancelEventArgs e)
+        {
+            // ViewModel을 통해 리소스 정리 (AgentCoreService 중지 등)
+            _viewModel?.Cleanup();
+        }
+    }
+}
+App.xaml (대부분 기본 생성된 내용 유지)
+
+XML
+
+<Application x:Class="SAgentM.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:SAgentM.App"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+         
+    </Application.Resources>
+</Application>
+App.xaml.cs (대부분 기본 생성된 내용 유지)
+
+C#
+
+// SAgentM.App/App.xaml.cs
+using System.Windows;
+
+namespace SAgentM.App
+{
+    /// <summary>
+    /// App.xaml에 대한 상호 작용 논리
+    /// </summary>
+    public partial class App : Application
+    {
+    }
+}
+여기까지가 SAgentM.App의 UI 및 ViewModel 관련 코드입니다.
+MainWindow.xaml.cs의 Window_Loaded에서는 서비스와 ViewModel을 직접 생성하여 주입하고 있으며, Window_Closing 이벤트에서는 ViewModel의 Cleanup 메서드를 호출하여 AgentCoreService가 안전하게 중지되도록 처리합니다.
