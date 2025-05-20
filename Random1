@@ -1,580 +1,107 @@
-알겠습니다. 이전에 "모니터 끄기" 시 응답 문제를 해결하기 위해 ExecuteDirectCommandAsync 부분을 수정한 내용을 포함하여, SAgentM.App 프로젝트의 Services/AgentCoreService.cs 전체 코드를 다시 제공해 드리겠습니다.
+문제 해결을 위한 제안 (응답을 더 확실히 먼저 보내는 방식):
 
-이 코드는 .NET Framework 4.6 환경에서 WPF 애플리케이션 (SAgentM.App)의 백그라운드 핵심 로직으로 동작합니다.
+SAgentM.App의 로직을 수정하여, "모니터 끄기" 명령에 대한 "조기 확인" 응답을 SControlM으로 완전히 전송한 후, 실제 모니터 끄기 동작을 수행하도록 변경하는 것입니다.
 
-SAgentM.App/Services/AgentCoreService.cs (전체 코드)
+1. SAgentM.App/Services/AgentCoreService.cs의 ExecuteDirectCommandAsync 수정:
+MonitorAction.Off의 경우, 실제 LocalDeviceControl.SetMonitorState(MonitorAction.Off) 호출을 제거하고, 메시지를 약간 수정하여 "곧 꺼질 것"임을 명시합니다.
 
 C#
 
-// SAgentM.App/Services/AgentCoreService.cs
-using Newtonsoft.Json; // Newtonsoft.Json 사용
-using SControl.Common; // CommandPacket, Enums, Payloads, LocalDeviceControl
-using System;
-using System.Configuration;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace SAgentM.App.Services
-{
-    public interface IAgentCoreService
+// SAgentM.App/Services/AgentCoreService.cs - ExecuteDirectCommandAsync 메서드 내
+// ...
+case CommandNames.MonitorControl:
+    // ... (payload deserialization 등의 코드는 동일)
+    if (monitorPayload.Action == MonitorAction.Off)
     {
-        void Start();
-        void Stop();
-        bool IsRunning { get; }
+        success = true;
+        // 메시지를 변경하여, 응답이 먼저 가고 모니터가 잠시 후 꺼질 것임을 명확히 함
+        message = $"Monitor Off command acknowledged. Monitor will turn off shortly. Early confirmation sent.";
+        _loggingService.Info($"[{clientIp}] {message} (Packet ID: {requestPacket.PacketId})");
+        responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
+        // 여기서 LocalDeviceControl.SetMonitorState(MonitorAction.Off)를 호출하지 않습니다!
     }
-
-    public class AgentCoreService : IAgentCoreService
+    else 
     {
-        private readonly ILoggingService _loggingService;
-        private readonly int _port;
-        private TcpListener _listener;
-        private Thread _listenThread;
-        private volatile bool _isRunning; // 서비스 실행 상태 플래그
-        private CancellationTokenSource _cancellationTokenSource; // 자식 작업 취소용
+        LocalDeviceControl.SetMonitorState(monitorPayload.Action); // 켜기/대기는 즉시 실행
+        success = true;
+        message = $"Monitor state set to {monitorPayload.Action} successfully.";
+        _loggingService.Info($"[{clientIp}] {message}");
+        responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
+    }
+    break;
+// ...
+2. SAgentM.App/Services/AgentCoreService.cs의 HandleClientAsync 수정:
+ProcessCommandAsync로부터 응답 패킷을 받은 후, 만약 해당 명령이 "모니터 끄기"였고 "조기 확인" 응답이었다면, 응답을 클라이언트에게 전송한 후에 실제 모니터 끄기 작업을 백그라운드에서 수행합니다.
 
-        public bool IsRunning => _isRunning;
+C#
 
-        public AgentCoreService(ILoggingService loggingService)
+// SAgentM.App/Services/AgentCoreService.cs - HandleClientAsync 메서드 내
+// ...
+if (requestPacket != null)
+{
+    _loggingService.Info($"[{clientIpInfo}] 명령 수신: ID={requestPacket.PacketId}, Command={requestPacket.CommandName}, Instruction={requestPacket.Instruction}");
+    CommandPacket responsePacket = await ProcessCommandAsync(requestPacket, clientIpInfo, token);
+
+    if (responsePacket != null)
+    {
+        string responseJson = JsonConvert.SerializeObject(responsePacket);
+        if (token.IsCancellationRequested)
         {
-            _loggingService = loggingService ?? throw new ArgumentNullException(nameof(loggingService));
-            if (!int.TryParse(ConfigurationManager.AppSettings["ListenPort"], out _port))
-            {
-                _port = 12345; // App.config에 설정이 없거나 잘못된 경우 기본값
-                _loggingService.Warn($"ListenPort 설정이 App.config에 없거나 잘못되어 기본값 {_port} 포트를 사용합니다.");
-            }
+            _loggingService.Debug($"[{clientIpInfo}] 응답 전송 전 취소 감지됨.");
+            token.ThrowIfCancellationRequested();
         }
+        await writer.WriteLineAsync(responseJson); // <<--- 먼저 응답 전송
+        _loggingService.Debug($"[{clientIpInfo}] 응답 전송: ID={responsePacket.PacketId}, Command={responsePacket.CommandName}");
 
-        public void Start()
-        {
-            if (_isRunning)
-            {
-                _loggingService.Warn("AgentCoreService가 이미 실행 중입니다.");
-                return;
-            }
-
-            _isRunning = true;
-            _cancellationTokenSource = new CancellationTokenSource();
-
-            _listenThread = new Thread(ListenLoop)
-            {
-                IsBackground = true, // 주 애플리케이션 종료 시 함께 종료
-                Name = "AgentListenThread"
-            };
-            _listenThread.Start();
-
-            _loggingService.Info($"AgentCoreService 시작됨. 포트: {_port}");
-        }
-
-        public void Stop()
-        {
-            if (!_isRunning)
-            {
-                _loggingService.Warn("AgentCoreService가 이미 중지되어 있습니다.");
-                return;
-            }
-
-            _loggingService.Info("AgentCoreService 중지 요청 중...");
-            _isRunning = false;
-
-            if (_cancellationTokenSource != null)
-            {
-                _cancellationTokenSource.Cancel();
-                // _cancellationTokenSource.Dispose(); // Dispose는 루프가 다 끝나고 하는게 더 안전할 수 있음
-            }
-            
-            if (_listener != null)
-            {
-                try
-                {
-                    _listener.Stop(); // AcceptTcpClient()에서 SocketException 발생 유도
-                }
-                catch (Exception ex)
-                {
-                     _loggingService.Error("리스너 중지 중 오류 발생 (정상 종료 과정일 수 있음)", ex);
-                }
-            }
-
-            if (_listenThread != null && _listenThread.IsAlive)
-            {
-                if (!_listenThread.Join(TimeSpan.FromSeconds(5))) 
-                {
-                    _loggingService.Warn("리스닝 스레드가 시간 내에 종료되지 않았습니다.");
-                    // 필요시 _listenThread.Abort(); // 최후의 수단, 가급적 사용 피함
-                }
-            }
-            
-            // CancellationTokenSource를 여기서 Dispose
-            _cancellationTokenSource?.Dispose();
-            _cancellationTokenSource = null;
-            
-            _loggingService.Info("AgentCoreService 중지됨.");
-        }
-
-        private void ListenLoop()
+        // 만약 방금 처리한 요청이 "모니터 끄기" 직접 실행이었고, 응답이 성공(조기 확인)이었다면,
+        // 여기서 실제 모니터 끄기 작업을 수행합니다.
+        if (requestPacket.Instruction == CommandInstruction.DirectExecute &&
+            requestPacket.CommandName == CommandNames.MonitorControl)
         {
             try
             {
-                _listener = new TcpListener(IPAddress.Any, _port);
-                _listener.Start();
-                _loggingService.Info($"포트 {_port}에서 클라이언트 연결 대기 중...");
-
-                while (_isRunning)
+                var originalPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
+                if (originalPayload != null && originalPayload.Action == MonitorAction.Off)
                 {
-                    try
+                    // 응답 페이로드에서 성공 여부 확인 (선택적이지만 더 안전)
+                    bool wasEarlyConfirmSuccess = false;
+                    if (!string.IsNullOrEmpty(responsePacket.PayloadJson)) {
+                        var responsePayload = JsonConvert.DeserializeObject<GenericResponsePayload>(responsePacket.PayloadJson);
+                        if (responsePayload != null) wasEarlyConfirmSuccess = responsePayload.Success;
+                    }
+
+                    if (wasEarlyConfirmSuccess) // 조기 확인 응답이 '성공'이었을 경우에만
                     {
-                        TcpClient client = _listener.AcceptTcpClient(); 
-                        
-                        if (!_isRunning) 
+                        _loggingService.Info($"[{clientIpInfo}] 조기 확인 응답 전송 완료. 실제 모니터 끄기 작업 시작 (백그라운드). Packet ID: {requestPacket.PacketId}");
+                        // 이 작업은 현재 HandleClientAsync의 흐름을 막지 않도록 Task.Run으로 분리
+                        Task.Run(() =>
                         {
-                            client.Close();
-                            break;
-                        }
-                        
-                        string clientIp = client.Client.RemoteEndPoint?.ToString() ?? "Unknown IP";
-                        _loggingService.Info($"클라이언트 연결됨: {clientIp}");
-
-                        // CancellationTokenSource가 null이 아닌지 확인 (Stop 후 Start 시 재생성되므로)
-                        var currentToken = _cancellationTokenSource?.Token ?? CancellationToken.None;
-                        Task.Run(() => HandleClientAsync(client, clientIp, currentToken), currentToken);
-                    }
-                    catch (SocketException se)
-                    {
-                        if (!_isRunning && (se.SocketErrorCode == SocketError.Interrupted || se.SocketErrorCode == SocketError.OperationAborted))
-                        {
-                            _loggingService.Info("리스너 소켓이 정상적으로 중단되었습니다 (Interrupted).");
-                            break;
-                        }
-                        _loggingService.Error("클라이언트 연결 수락 중 소켓 오류 발생.", se);
-                        if (!_isRunning) break; 
-                        Thread.Sleep(100); 
-                    }
-                    catch (InvalidOperationException ioe) when (!_isRunning)
-                    {
-                         _loggingService.Info($"리스너가 중지된 후 InvalidOperationException 발생 (무시): {ioe.Message}");
-                         break;
-                    }
-                    catch (Exception ex)
-                    {
-                        _loggingService.Error("클라이언트 연결 수락 중 예기치 않은 오류 발생.", ex);
-                        if (!_isRunning) break;
-                        Thread.Sleep(100);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _loggingService.Error("ListenLoop에서 심각한 오류 발생. 리스너가 중단됩니다.", ex);
-            }
-            finally
-            {
-                if (_listener != null && _listener.Server.IsBound)
-                {
-                    _listener.Stop();
-                }
-                _loggingService.Info("ListenLoop 종료됨.");
-            }
-        }
-
-        private async Task HandleClientAsync(TcpClient client, string clientIpInfo, CancellationToken token)
-        {
-            try
-            {
-                _loggingService.Debug($"[{clientIpInfo}] 클라이언트 처리 시작.");
-                using (client) 
-                using (NetworkStream stream = client.GetStream())
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 1024, true))
-                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true) { AutoFlush = true })
-                {
-                    while (_isRunning && client.Connected && !token.IsCancellationRequested)
-                    {
-                        string requestJson = null;
-                        try
-                        {
-                            var readTask = reader.ReadLineAsync();
-                            if (await Task.WhenAny(readTask, Task.Delay(Timeout.Infinite, token)) == readTask)
-                            {
-                                if (token.IsCancellationRequested) // Task.Delay가 완료되지 않았더라도, readTask 직후 토큰 확인
-                                {
-                                   _loggingService.Debug($"[{clientIpInfo}] ReadLineAsync 반환 후 취소 감지됨.");
-                                   token.ThrowIfCancellationRequested();
-                                }
-                                requestJson = await readTask;
-                            }
-                            else 
-                            {
-                                _loggingService.Debug($"[{clientIpInfo}] ReadLineAsync 대기 중 취소 감지됨.");
-                                token.ThrowIfCancellationRequested();
-                            }
-
-                            if (requestJson == null) 
-                            {
-                                _loggingService.Info($"[{clientIpInfo}] 클라이언트가 연결을 종료했습니다 (스트림 끝).");
-                                break;
-                            }
-                            _loggingService.Debug($"[{clientIpInfo}] 수신 데이터: {requestJson}");
-
-                            CommandPacket requestPacket = null;
                             try
                             {
-                                requestPacket = JsonConvert.DeserializeObject<CommandPacket>(requestJson);
-                            }
-                            catch (JsonException jsonEx)
-                            {
-                                _loggingService.Error($"[{clientIpInfo}] JSON 역직렬화 실패: {requestJson}", jsonEx);
-                                await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Invalid JSON format: {jsonEx.Message}")));
-                                continue;
-                            }
-
-                            if (requestPacket != null)
-                            {
-                                _loggingService.Info($"[{clientIpInfo}] 명령 수신: ID={requestPacket.PacketId}, Command={requestPacket.CommandName}, Instruction={requestPacket.Instruction}");
-                                CommandPacket responsePacket = await ProcessCommandAsync(requestPacket, clientIpInfo, token);
-
-                                if (responsePacket != null)
-                                {
-                                    string responseJson = JsonConvert.SerializeObject(responsePacket);
-                                    // WriteLineAsync는 CancellationToken을 직접 지원하지 않으므로, 전송 전 확인
-                                    if (token.IsCancellationRequested)
-                                    {
-                                        _loggingService.Debug($"[{clientIpInfo}] 응답 전송 전 취소 감지됨.");
-                                        token.ThrowIfCancellationRequested();
-                                    }
-                                    await writer.WriteLineAsync(responseJson);
-                                    _loggingService.Debug($"[{clientIpInfo}] 응답 전송: ID={responsePacket.PacketId}, Command={responsePacket.CommandName}");
-                                }
-                            }
-                        }
-                        catch (IOException ioEx) 
-                        {
-                            _loggingService.Warn($"[{clientIpInfo}] 네트워크 IO 오류 발생 (연결 끊김 예상): {ioEx.Message}");
-                            break; 
-                        }
-                        catch (ObjectDisposedException odEx) 
-                        {
-                            _loggingService.Warn($"[{clientIpInfo}] 객체 이미 해제됨 (연결 끊김 예상): {odEx.Message}");
-                            break;
-                        }
-                        catch (OperationCanceledException) // token.ThrowIfCancellationRequested() 또는 Task.WhenAny의 타임아웃 부분에서 발생
-                        {
-                            _loggingService.Info($"[{clientIpInfo}] 클라이언트 처리 작업 취소됨.");
-                            break;
-                        }
-                        catch (Exception ex)
-                        {
-                            _loggingService.Error($"[{clientIpInfo}] 클라이언트 처리 중 예기치 않은 오류 발생.", ex);
-                            if (client.Connected && stream.CanWrite)
-                            {
-                                try 
-                                {
-                                   await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Server error: {ex.Message}")));
-                                } catch (Exception writeEx){
-                                   _loggingService.Error($"[{clientIpInfo}] 오류 응답 전송 실패.", writeEx);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (OperationCanceledException) 
-            {
-                _loggingService.Info($"[{clientIpInfo}] HandleClientAsync 작업 자체가 취소되었습니다 (Task.Run 취소).");
-            }
-            catch (Exception ex)
-            {
-                _loggingService.Error($"[{clientIpInfo}] HandleClientAsync 외부에서 심각한 오류 발생.", ex);
-            }
-            finally
-            {
-                _loggingService.Info($"[{clientIpInfo}] 클라이언트 처리 종료.");
-            }
-        }
-        
-        private async Task<CommandPacket> ProcessCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            _loggingService.Debug($"[{clientIp}] 명령 처리 시작: {requestPacket.CommandName}, ID: {requestPacket.PacketId}");
-            try
-            {
-                // 명령 처리 시작 직전에 취소 상태 확인
-                if (token.IsCancellationRequested) 
-                {
-                    _loggingService.Info($"[{clientIp}] 명령 처리 시작 전 취소됨: {requestPacket.CommandName}, ID: {requestPacket.PacketId}");
-                    token.ThrowIfCancellationRequested();
-                }
-
-
-                switch (requestPacket.Instruction)
-                {
-                    case CommandInstruction.DirectExecute:
-                        return await ExecuteDirectCommandAsync(requestPacket, clientIp, token);
-                    case CommandInstruction.RelayToTarget:
-                        return await RelayCommandAsync(requestPacket, clientIp, token);
-                    default:
-                        _loggingService.Warn($"[{clientIp}] 알 수 없는 Instruction: {requestPacket.Instruction}, Packet ID: {requestPacket.PacketId}");
-                        return CreateErrorResponse(requestPacket, $"Unknown instruction: {requestPacket.Instruction}");
-                }
-            }
-            catch (OperationCanceledException) // ExecuteDirectCommandAsync 또는 RelayCommandAsync 내부에서 발생
-            {
-                 _loggingService.Info($"[{clientIp}] 명령 처리 중 취소됨: {requestPacket.CommandName}, ID: {requestPacket.PacketId}");
-                 return CreateErrorResponse(requestPacket, "Operation was canceled during command processing.");
-            }
-            catch (Exception ex)
-            {
-                _loggingService.Error($"[{clientIp}] 명령 처리 중 오류 발생: {requestPacket.CommandName}, ID: {requestPacket.PacketId}", ex);
-                return CreateErrorResponse(requestPacket, $"Error processing command '{requestPacket.CommandName}': {ex.Message}");
-            }
-        }
-
-        private async Task<CommandPacket> ExecuteDirectCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            _loggingService.Info($"[{clientIp}] 직접 실행 명령: {requestPacket.CommandName}");
-            bool success = false;
-            string message = "Command execution failed or not implemented.";
-            CommandPacket responsePacketToReturn = null;
-
-            try
-            {
-                token.ThrowIfCancellationRequested();
-
-                switch (requestPacket.CommandName)
-                {
-                    case CommandNames.MonitorControl:
-                        if (string.IsNullOrEmpty(requestPacket.PayloadJson))
-                        {
-                            message = "MonitorControl: PayloadJson is missing.";
-                            _loggingService.Warn($"[{clientIp}] {message}");
-                            responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-                            break; 
-                        }
-                        
-                        MonitorControlPayload monitorPayload = null;
-                        try
-                        {
-                            monitorPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
-                        }
-                        catch (JsonException jsonEx)
-                        {
-                            message = $"MonitorControl: Payload JSON deserialization error - {jsonEx.Message}";
-                            _loggingService.Error($"[{clientIp}] {message}", jsonEx);
-                            responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-                            break; 
-                        }
-                        
-                        if (monitorPayload == null) 
-                        {
-                            message = "MonitorControl: Failed to deserialize payload (resulted in null).";
-                            _loggingService.Warn($"[{clientIp}] {message}");
-                            responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-                            break; 
-                        }
-                        
-                        _loggingService.Info($"[{clientIp}] 모니터 상태 변경 시도: {monitorPayload.Action}");
-
-                        if (monitorPayload.Action == MonitorAction.Off)
-                        {
-                            // 모니터 끄기 명령: 먼저 성공 응답 준비, 그 후 실제 동작
-                            success = true;
-                            message = $"Monitor Off command received. Attempting to turn off monitor. Early confirmation sent.";
-                            _loggingService.Info($"[{clientIp}] {message}");
-                            responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
-                            
-                            // 응답 패킷은 여기서 반환되고, ClientHandler가 전송할 것임.
-                            // 실제 모니터 끄기 작업은 그 후에 P/Invoke로 호출됨.
-                            // 이 호출이 예외를 던지더라도, 이미 응답은 '성공'으로 준비된 상태.
-                            try
-                            {
-                                // P/Invoke 호출은 UI 스레드나 특정 STA 스레드에서 필요한 경우가 있을 수 있으나,
-                                // SendMessageTimeout은 일반적으로 MTA 스레드에서도 문제 없음.
-                                // 만약 문제가 된다면 Task.Factory.StartNew 등으로 STA 스레드에서 실행해야 함.
                                 LocalDeviceControl.SetMonitorState(MonitorAction.Off);
-                                _loggingService.Info($"[{clientIp}] Monitor Off P/Invoke call initiated for packet {requestPacket.PacketId}.");
+                                _loggingService.Info($"[{clientIpInfo}] 실제 모니터 끄기 작업 완료 (백그라운드). Packet ID: {requestPacket.PacketId}");
                             }
-                            catch (Exception pInvokeEx)
+                            catch (Exception ex)
                             {
-                                _loggingService.Error($"[{clientIp}] Monitor Off P/Invoke call FAILED for packet {requestPacket.PacketId} (after preparing success response).", pInvokeEx);
-                                // 이미 보낸 응답은 성공 응답일 수 있으므로, 여기서는 에이전트 로그에만 기록.
-                                // 필요하다면, 별도의 오류 알림 메커니즘을 SControlM에 보낼 수도 있음 (더 복잡)
+                                _loggingService.Error($"[{clientIpInfo}] 백그라운드 모니터 끄기 작업 중 오류 발생. Packet ID: {requestPacket.PacketId}", ex);
                             }
-                        }
-                        else 
-                        {
-                            LocalDeviceControl.SetMonitorState(monitorPayload.Action);
-                            success = true;
-                            message = $"Monitor state set to {monitorPayload.Action} successfully.";
-                            _loggingService.Info($"[{clientIp}] {message}");
-                            responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
-                        }
-                        break;
-                    
-                    default:
-                        message = $"Unknown direct command: {requestPacket.CommandName}";
-                        _loggingService.Warn($"[{clientIp}] {message}");
-                        responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-                        break;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                message = $"Direct command {requestPacket.CommandName} execution canceled.";
-                _loggingService.Info($"[{clientIp}] {message}");
-                responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-            }
-            catch (Exception ex) // 위의 case에서 발생한 예외가 아닌, switch 진입 전이나 다른 일반 예외
-            {
-                message = $"Error executing direct command {requestPacket.CommandName}: {ex.Message}";
-                _loggingService.Error($"[{clientIp}] {message}", ex);
-                responsePacketToReturn = CreateExecutionResponse(requestPacket, false, message);
-            }
-            
-            return responsePacketToReturn;
-        }
-
-        private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
-        {
-            _loggingService.Info($"[{clientIp}] 릴레이 명령: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
-            
-            if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || 
-                !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue)
-            {
-                return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP or Port missing.");
-            }
-
-            var packetForFinalTarget = new CommandPacket
-            {
-                Instruction = CommandInstruction.DirectExecute, 
-                CommandName = originalRelayRequest.CommandName,
-                PayloadJson = originalRelayRequest.PayloadJson,
-                ResponseAddress = originalRelayRequest.ResponseAddress, // 원 요청자의 응답 주소 전달
-                ResponsePort = originalRelayRequest.ResponsePort,       // 원 요청자의 응답 포트 전달
-            };
-
-            string relayStatusMessage = $"Relay attempt for command '{packetForFinalTarget.CommandName}' to {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}.";
-            bool relaySuccess = false;
-            CommandPacket responseFromFinalTarget = null;
-
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                using (var targetClient = new TcpClient())
-                {
-                    var connectTask = targetClient.ConnectAsync(
-                        originalRelayRequest.FinalTargetIpForRelayedCommand,
-                        originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
-
-                    if (await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5), token)) != connectTask || token.IsCancellationRequested)
-                    {
-                        token.ThrowIfCancellationRequested();
-                        targetClient.Close(); 
-                        throw new TimeoutException("Connection to relay target timed out.");
-                    }
-                    await connectTask; // 연결 성공 또는 예외 발생
-
-                    _loggingService.Debug($"[{clientIp}] 릴레이 대상 ({originalRelayRequest.FinalTargetIpForRelayedCommand}) 연결 성공.");
-
-                    using (NetworkStream targetStream = targetClient.GetStream())
-                    using (StreamWriter writer = new StreamWriter(targetStream, Encoding.UTF8) { AutoFlush = true })
-                    using (StreamReader reader = new StreamReader(targetStream, Encoding.UTF8))
-                    {
-                        string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget);
-                        await writer.WriteLineAsync(jsonToRelay); // CancellationToken 지원 안함
-                        _loggingService.Debug($"[{clientIp}] 릴레이 데이터 전송: {jsonToRelay}");
-                        
-                        var targetResponseTask = reader.ReadLineAsync();
-                        if (await Task.WhenAny(targetResponseTask, Task.Delay(TimeSpan.FromSeconds(10), token)) == targetResponseTask && !token.IsCancellationRequested)
-                        {
-                            string targetResponseJson = await targetResponseTask;
-                            if (!string.IsNullOrEmpty(targetResponseJson))
-                            {
-                                _loggingService.Info($"[{clientIp}] 릴레이 대상으로부터 응답 수신: {targetResponseJson}");
-                                responseFromFinalTarget = JsonConvert.DeserializeObject<CommandPacket>(targetResponseJson);
-                                relaySuccess = true; 
-                                // relayStatusMessage은 최종 응답으로 대체되므로 여기서 설정 불필요
-                            } else {
-                                _loggingService.Warn($"[{clientIp}] 릴레이 대상으로부터 빈 응답 수신.");
-                                relayStatusMessage = "Relay sent, but empty response from final target.";
-                            }
-                        } else {
-                           _loggingService.Warn($"[{clientIp}] 릴레이 대상으로부터 응답 시간 초과 또는 취소됨.");
-                           relayStatusMessage = "Relay sent, but no response from final target or timed out/canceled.";
-                        }
+                        }); // 이 Task는 await하지 않음 (Fire and forget)
                     }
                 }
             }
-            catch (OperationCanceledException)
+            catch (JsonException jsonEx)
             {
-                relayStatusMessage = $"Relay of {originalRelayRequest.CommandName} canceled.";
-                _loggingService.Info($"[{clientIp}] {relayStatusMessage}");
+                _loggingService.Error($"[{clientIpInfo}] 모니터 끄기 후처리 중 PayloadJson 역직렬화 오류. Packet ID: {requestPacket.PacketId}", jsonEx);
             }
-            catch (TimeoutException tex)
-            {
-                relayStatusMessage = $"Relay failed: Timeout - {tex.Message}";
-                _loggingService.Warn($"[{clientIp}] {relayStatusMessage}");
-            }
-            catch (SocketException sockEx)
-            {
-                relayStatusMessage = $"Relay failed: Socket error - {sockEx.Message} (Code: {sockEx.SocketErrorCode})";
-                _loggingService.Error($"[{clientIp}] {relayStatusMessage}", sockEx);
-            }
-            catch (Exception ex)
-            {
-                relayStatusMessage = $"Relay failed: Unexpected error - {ex.Message}";
-                _loggingService.Error($"[{clientIp}] {relayStatusMessage}", ex);
-            }
-
-            // 최종 타겟으로부터 응답을 받았다면 그 응답을 반환, 아니면 릴레이 시도 상태 응답 반환
-            return responseFromFinalTarget ?? CreateExecutionResponse(originalRelayRequest, relaySuccess, relayStatusMessage);
-        }
-
-        private CommandPacket CreateExecutionResponse(CommandPacket requestPacket, bool success, string message, object data = null)
-        {
-            var responsePayload = new GenericResponsePayload { Success = success, Message = message, Data = data };
-            return new CommandPacket
-            {
-                PacketId = requestPacket.PacketId, 
-                Instruction = CommandInstruction.DirectExecute, 
-                CommandName = $"{requestPacket.CommandName}_Response", 
-                PayloadJson = JsonConvert.SerializeObject(responsePayload),
-                ResponseAddress = requestPacket.ResponseAddress, // 원 요청자에게 응답 주소 유지
-                ResponsePort = requestPacket.ResponsePort
-            };
-        }
-        
-        private CommandPacket CreateErrorResponse(CommandPacket requestPacket, string errorMessage)
-        {
-            Guid originalPacketId = requestPacket?.PacketId ?? Guid.Empty;
-            string originalCommandName = requestPacket?.CommandName ?? "UNKNOWN_COMMAND";
-            _loggingService.Error($"Error response for Packet ID {originalPacketId} (OrigCmd: {originalCommandName}): {errorMessage}");
-            
-            var responsePayload = new GenericResponsePayload { Success = false, Message = errorMessage };
-            return new CommandPacket
-            {
-                PacketId = originalPacketId,
-                Instruction = CommandInstruction.DirectExecute,
-                CommandName = $"{originalCommandName}_ErrorResponse", 
-                PayloadJson = JsonConvert.SerializeObject(responsePayload),
-                ResponseAddress = requestPacket?.ResponseAddress,
-                ResponsePort = requestPacket?.ResponsePort
-            };
         }
     }
 }
-주요 변경 및 재확인 사항:
+// ...
+위 수정의 핵심 아이디어:
 
-ExecuteDirectCommandAsync 내 MonitorAction.Off 처리:
-모니터 끄기 명령(MonitorAction.Off)의 경우, 응답 패킷(responsePacketToReturn)을 먼저 "성공"으로 준비합니다.
-그 후에 LocalDeviceControl.SetMonitorState(MonitorAction.Off)를 호출합니다.
-SetMonitorState 호출 자체에서 예외가 발생하면, 해당 정보는 에이전트 로그에만 기록되고, 이미 준비된 "성공" 응답이 SControlM으로 전달될 수 있습니다. (이 부분은 정책에 따라 P/Invoke 실패 시 응답을 오류로 덮어쓰도록 수정할 수도 있습니다.)
-RelayCommandAsync 응답 처리:
-릴레이 대상(FinalTarget)에게 명령을 전송한 후, 그 대상으로부터 응답을 기다립니다.
-최종 대상으로부터 응답을 받으면 그 응답 패킷을 그대로 반환합니다.
-최종 대상으로부터 응답을 받지 못하거나 오류가 발생하면, 릴레이 시도 자체에 대한 성공/실패 상태를 담은 응답을 생성하여 반환합니다.
-원 요청자의 응답 주소(ResponseAddress, ResponsePort)를 릴레이 패킷에 포함하여, 최종 목적지 에이전트가 원 요청자에게 직접 응답할 수 있도록 할 수도 있습니다 (현재 코드는 릴레이 에이전트가 응답을 받아 전달하는 구조는 아님, 단지 릴레이 시도 자체에 대한 응답을 함).
-CancellationToken 처리:
-HandleClientAsync 및 ProcessCommandAsync 등 주요 비동기 메서드에 CancellationToken을 전달하고, 작업 중간중간 token.IsCancellationRequested를 확인하거나 token.ThrowIfCancellationRequested()를 호출하여 취소 요청에 반응하도록 했습니다.
-ReadLineAsync와 같이 CancellationToken을 직접 지원하지 않는 .NET Framework 4.6의 비동기 메서드에 대해서는 Task.WhenAny와 Task.Delay(Timeout.Infinite, token)를 조합하여 취소 가능성을 높였습니다.
-오류 및 예외 처리: 각 단계에서 발생할 수 있는 예외(JSON, IO, Socket 등)를 보다 구체적으로 처리하고 로깅합니다.
-리소스 정리: Stop() 메서드에서 CancellationTokenSource를 Dispose하는 시점을 스레드 Join 이후로 옮겨 좀 더 안정적으로 처리하도록 했습니다. ListenLoop의 finally 블록에서도 리스너 중지를 확실히 합니다.
+ExecuteDirectCommandAsync에서 MonitorAction.Off의 경우, 실제 P/Invoke 호출 없이 "곧 꺼질 것"이라는 메시지를 담은 성공 응답만 생성해서 반환합니다.
+HandleClientAsync에서는 이 "조기 확인" 응답을 SControlM에 먼저 보냅니다.
+응답을 성공적으로 보낸 후, 만약 해당 명령이 MonitorAction.Off였음을 확인하고 Task.Run을 사용하여 별도의 백그라운드 작업으로 실제 모니터 끄기(LocalDeviceControl.SetMonitorState(MonitorAction.Off))를 실행합니다. 이 작업은 await하지 않으므로, 모니터가 꺼지면서 네트워크가 끊기더라도 이미 응답은 전송된 상태가 됩니다.
+확인 요청:
+
+이 코드를 적용하기 전에, 혹시 현재 SControlM에 표시되는 정확한 "명령 실패" 메시지 내용과, 해당 시점의 SAgentM.App 로그를 조금 더 자세히 알려주실 수 있나요? 특히 SAgentM.App의 ClientHandler 로그에서 IOException이나 다른 오류가 기록되는지 확인해주시면 진단에 큰 도움이 됩니다.
