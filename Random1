@@ -1,14 +1,120 @@
-네, 알겠습니다. "비밀번호를 적용해도 모든 사람이 다 볼 수 있다"는 말씀은, 게시글을 비밀번호로 보호하도록 설정했음에도 불구하고, 실제로 글을 볼 때 비밀번호를 묻는 과정 없이 바로 내용이 보인다는 뜻입니다.
+네, 알겠습니다. 제가 이전 답변들에서 여러 파일에 걸쳐 수정 사항을 안내해 드리다 보니 혼란스러우셨을 것 같습니다. "글마다 비밀번호 적용" 기능을 구현하기 위해 최종적으로 수정해야 하는 파일들의 전체 코드를 다시 한번 명확하게 정리해서 드리겠습니다.
 
-이는 app.py의 view_post 라우트에서 비밀번호 보호 여부를 확인하고 그에 따라 내용을 보여주거나 비밀번호 입력창을 보여주는 로직이 제대로 작동하지 않거나, 혹은 게시글을 저장할 때 is_password_protected 플래그나 password_hash가 데이터베이스에 올바르게 저장되지 않았기 때문일 가능성이 큽니다.
+수정이 필요한 주요 파일:
 
-다음 파일들의 전체 코드를 다시 한번 점검하고, 비밀번호 보호 로직을 확실하게 수정하여 드리겠습니다.
+models.py: Post 모델에 비밀번호 관련 필드 및 메서드 추가.
+app.py: 비밀번호 설정/확인 로직 및 관련 라우트 수정.
+templates/edit_post.html: 글 작성/수정 시 비밀번호 설정 UI 추가.
+templates/view_post.html: 비밀번호가 설정된 글 보기 처리.
+templates/index.html (선택적 수정): 목록에 비밀글 표시.
+중요: 아래 코드를 적용하시기 전에, 기존 board.db 파일을 삭제하고 애플리케이션을 재시작하여 데이터베이스 스키마를 새로 생성해야 합니다. (이전에 이 작업을 하셨다면 반복할 필요는 없지만, 확실하게 하기 위해 권장합니다.)
 
-중요: 데이터베이스 스키마에 is_password_protected 필드가 이미 추가되어 있고, models.py는 이전 답변의 내용과 동일하다고 가정합니다. 만약 models.py가 이전 버전이라면, 이전에 안내해 드린 password_hash와 is_password_protected 필드가 포함된 models.py로 먼저 업데이트하시고, board.db 파일을 삭제 후 앱을 재시작하여 데이터베이스를 새로 생성해야 합니다.
+1. flask_board/models.py (전체 코드)
 
-1. app.py 수정 (게시글 보기, 생성, 수정 로직 중점)
+Python
 
-view_post 라우트에서 비밀번호 확인 로직을 명확히 하고, new_post와 edit_post에서 비밀번호 관련 정보를 정확히 저장하도록 수정합니다.
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime, timezone
+import re
+from werkzeug.security import generate_password_hash, check_password_hash # 비밀번호 해싱을 위해 추가
+
+db = SQLAlchemy()
+
+def slugify(text_to_slugify):
+    """
+    문자열로부터 URL 친화적인 슬러그를 생성합니다.
+    """
+    if not text_to_slugify:
+        return "default-slug" # 기본값
+        
+    text_processed = str(text_to_slugify)
+    # 한글 등을 고려하여 유니코드 단어 문자(\w)를 사용하고, re.UNICODE 플래그는 Python 3에서 기본 동작
+    text_processed = re.sub(r'[^\w\s-]', '', text_processed).strip().lower()
+    text_processed = re.sub(r'[-\s]+', '-', text_processed)
+    
+    if not text_processed: # 모든 문자가 제거된 경우
+        return "default-slug" 
+    return text_processed
+
+class Category(db.Model):
+    __tablename__ = 'category'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    slug = db.Column(db.String(120), nullable=False, unique=True)
+    posts_in_category = db.relationship('Post', back_populates='category', lazy='dynamic', foreign_keys='Post.category_id')
+
+    def __init__(self, name):
+        self.name = name
+        self.slug = self._generate_unique_slug(name)
+
+    def _generate_unique_slug(self, name_to_slug):
+        base_slug = slugify(name_to_slug)
+        current_slug_candidate = base_slug
+        counter = 1
+        while Category.query.filter_by(slug=current_slug_candidate).first():
+            current_slug_candidate = f"{base_slug}-{counter}"
+            counter += 1
+        return current_slug_candidate
+
+    def __repr__(self):
+        return f'<Category {self.name}>'
+
+class Post(db.Model):
+    __tablename__ = 'post'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    slug = db.Column(db.String(200), unique=True, nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, index=True, default=lambda: datetime.now(timezone.utc))
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
+    category = db.relationship('Category', back_populates='posts_in_category', foreign_keys=[category_id])
+
+    # --- 게시글 비밀번호 기능 추가 ---
+    password_hash = db.Column(db.String(256), nullable=True) 
+    is_password_protected = db.Column(db.Boolean, default=False, nullable=False)
+    # --- 게시글 비밀번호 기능 추가 끝 ---
+
+    def __init__(self, title, content, category_id=None, slug_text=None): # password 관련 인자 제거, set_password로 처리
+        self.title = title
+        self.content = content
+        self.category_id = category_id
+        
+        # is_password_protected와 password_hash는 set_password 또는 명시적 해제를 통해 관리
+        self.is_password_protected = False # 기본값
+        self.password_hash = None      # 기본값
+
+        if slug_text:
+            self.slug = slug_text
+        else:
+            self.slug = self._generate_unique_slug(self.title)
+
+    def _generate_unique_slug(self, title_to_slug):
+        base_slug = slugify(title_to_slug)
+        current_slug_candidate = base_slug
+        counter = 1
+        while Post.query.filter_by(slug=current_slug_candidate).first():
+            current_slug_candidate = f"{base_slug}-{counter}"
+            counter += 1
+        return current_slug_candidate
+
+    # --- 게시글 비밀번호 메서드 ---
+    def set_password(self, password):
+        if password: # 비밀번호가 제공된 경우 (빈 문자열이 아님)
+            self.password_hash = generate_password_hash(password)
+            self.is_password_protected = True
+        else: # 비밀번호가 제공되지 않거나 빈 문자열인 경우 (보호 해제)
+            self.password_hash = None
+            self.is_password_protected = False
+
+    def check_password(self, password):
+        if not self.password_hash or not self.is_password_protected: # 해시가 없거나 보호 플래그가 꺼져있으면 False
+            return False
+        return check_password_hash(self.password_hash, password)
+    # --- 게시글 비밀번호 메서드 끝 ---
+
+    def __repr__(self):
+        return f'<Post {self.title}>'
+2. flask_board/app.py (전체 코드 - 비밀번호 로직 중점 수정)
 
 Python
 
@@ -27,55 +133,56 @@ from werkzeug.utils import secure_filename
 try:
     from config import Config
 except ImportError:
-    print("CRITICAL: config.py not found or Config class cannot be imported.")
-    class Config:
-        SECRET_KEY = os.environ.get('SECRET_KEY') or 'a_very_strong_default_secret_key_for_dev_only_change_me'
+    print("CRITICAL: config.py not found. Using emergency defaults.")
+    class Config: # 임시 Config
+        SECRET_KEY = os.environ.get('SECRET_KEY') or 'emergency_secret_key_please_set_properly'
         SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///board.db'
         SQLALCHEMY_TRACK_MODIFICATIONS = False
         ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or 'kkkwww'
         UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/uploads')
         ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-        MAX_CONTENT_LENGTH = 5000 * 1024 * 1024
+        MAX_CONTENT_LENGTH = 50 * 1024 * 1024 # 예시: 50MB (테스트 후 실제 원하는 값으로!)
+
 try:
     from models import db, Post, Category
 except ImportError:
-    print("CRITICAL: models.py not found or db, Post, Category cannot be imported.")
+    print("CRITICAL: models.py not found or models cannot be imported.")
     db = None; Post = None; Category = None
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
-if db: db.init_app(app)
+if db: 
+    db.init_app(app)
+else:
+    print("CRITICAL: Database (db) object not initialized from models.py.")
 
-upload_folder_path = app.config.get('UPLOAD_FOLDER', os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/uploads_fallback'))
+
+upload_folder_path = app.config.get('UPLOAD_FOLDER', './static/uploads_fallback')
 if not os.path.exists(upload_folder_path):
-    try:
-        os.makedirs(upload_folder_path)
-    except OSError as e:
-        app.logger.error(f"Error creating upload folder {upload_folder_path}: {e}")
+    try: os.makedirs(upload_folder_path)
+    except OSError as e: app.logger.error(f"Error creating upload folder {upload_folder_path}: {e}")
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in app.config.get('ALLOWED_EXTENSIONS', {'png', 'jpg', 'jpeg', 'gif'})
 
-# --- 인증 관련 ---
-def is_admin_logged_in():
-    return session.get('is_admin_logged_in', False)
+# --- 인증 및 전역 변수 ---
+def is_admin_logged_in(): return session.get('is_admin_logged_in', False)
 
 @app.context_processor
-def inject_admin_status_and_global_vars():
+def inject_global_vars():
     all_cats = []
     if Category:
         try: all_cats = Category.query.order_by(Category.name).all()
-        except Exception as e: app.logger.error(f"Error fetching categories: {e}")
+        except Exception as e: app.logger.error(f"Error fetching categories for context: {e}")
     return dict(is_admin=is_admin_logged_in(), now=datetime.now(timezone.utc), all_categories=all_cats)
 
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not is_admin_logged_in():
-            flash('로그인이 필요합니다.', 'warning')
-            return redirect(url_for('login', next=request.url))
+            flash('로그인이 필요합니다.', 'warning'); return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
 
@@ -85,27 +192,20 @@ def login():
     if request.method == 'POST':
         password = request.form.get('password')
         if password == app.config['ADMIN_PASSWORD']:
-            session['is_admin_logged_in'] = True
-            session.permanent = True
+            session['is_admin_logged_in'] = True; session.permanent = True
             app.permanent_session_lifetime = timedelta(days=7)
-            flash('로그인되었습니다.', 'success')
-            return redirect(request.args.get('next') or url_for('index'))
-        else:
-            flash('잘못된 비밀번호입니다.', 'danger')
+            flash('로그인되었습니다.', 'success'); return redirect(request.args.get('next') or url_for('index'))
+        else: flash('잘못된 비밀번호입니다.', 'danger')
     return render_template('login.html')
 
 @app.route('/logout')
 def logout():
-    session.pop('is_admin_logged_in', None)
-    flash('로그아웃되었습니다.', 'info')
-    return redirect(url_for('index'))
+    session.pop('is_admin_logged_in', None); flash('로그아웃되었습니다.', 'info'); return redirect(url_for('index'))
 
 # --- 게시판 라우트 ---
 @app.route('/')
 def index():
-    if not Post:
-        flash("게시글 기능을 사용할 수 없습니다.", "danger")
-        return render_template('index.html', posts_pagination=None, current_category=None)
+    if not Post: flash("게시글 기능을 사용할 수 없습니다.", "danger"); return render_template('index.html', posts_pagination=None, current_category=None)
     page = request.args.get('page', 1, type=int)
     posts_pagination = Post.query.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
     return render_template('index.html', posts_pagination=posts_pagination, current_category=None)
@@ -113,42 +213,34 @@ def index():
 @app.route('/post/<string:slug>', methods=['GET', 'POST'])
 def view_post(slug):
     if not Post: abort(500, description="Post model not available.")
-    
     post_instance = Post.query.filter_by(slug=slug).first_or_404()
     session_key_for_post_unlock = f'unlocked_post_{post_instance.id}'
     is_unlocked_in_session = session.get(session_key_for_post_unlock, False)
 
-    if post_instance.is_password_protected: # 1. 비밀번호로 보호된 글인가?
-        if is_unlocked_in_session: # 2. 세션에 이미 이 글에 대한 잠금 해제 정보가 있는가?
-            # 보호된 글이지만 이미 잠금 해제됨 -> 내용 표시
+    if post_instance.is_password_protected and post_instance.password_hash: # 보호 플래그와 해시 둘 다 확인
+        if is_unlocked_in_session:
             return render_template('view_post.html', post=post_instance, show_password_form=False)
         else:
-            # 보호된 글이고 아직 잠금 해제 안됨 -> 비밀번호 입력 처리 또는 폼 표시
             if request.method == 'POST':
                 submitted_password = request.form.get('post_password_view')
-                if post_instance.check_password(submitted_password):
-                    session[session_key_for_post_unlock] = True # 잠금 해제!
+                if post_instance.check_password(submitted_password): # check_password는 해시 존재 시에만 유효
+                    session[session_key_for_post_unlock] = True
                     flash('비밀번호가 확인되었습니다.', 'success')
-                    return redirect(url_for('view_post', slug=post_instance.slug)) # GET으로 리다이렉트
+                    return redirect(url_for('view_post', slug=post_instance.slug))
                 else:
                     flash('비밀번호가 올바르지 않습니다.', 'danger')
-                    # 비밀번호 틀렸으므로 다시 비밀번호 폼 보여줌
-                    return render_template('view_post.html', post=post_instance, show_password_form=True)
-            
-            # GET 요청 시 (또는 POST에서 비밀번호 틀렸을 때 다시 폼 로드 - 실제로는 위에서 처리됨)
-            # 비밀번호 입력 폼 보여줌
             return render_template('view_post.html', post=post_instance, show_password_form=True)
-    else:
-        # 비밀번호로 보호되지 않은 글 -> 바로 내용 표시
+    else: # 보호되지 않았거나, 보호 플래그는 True인데 해시가 없는 비정상 상태 포함
+        if post_instance.is_password_protected and not post_instance.password_hash:
+             app.logger.warning(f"Post ID {post_instance.id} is marked protected but has no password hash.")
         return render_template('view_post.html', post=post_instance, show_password_form=False)
 
 
 @app.route('/new', methods=['GET', 'POST'])
 @admin_required
 def new_post():
-    # ... (카테고리 로드 로직은 이전과 동일) ...
-    cats = []
-    if Category:
+    cats = []; 
+    if Category: 
         try: cats = Category.query.order_by(Category.name).all()
         except Exception as e: app.logger.error(f"Error fetching categories: {e}")
 
@@ -167,17 +259,15 @@ def new_post():
         processed_category_id = int(category_id_str) if category_id_str and category_id_str.isdigit() else None
 
         try:
-            if not Post: raise Exception("Post model is not available.")
-
-            new_post_obj = Post(title=title, content=content, category_id=processed_category_id) # 기본 객체 생성
+            if not Post: raise Exception("Post model not available.")
+            new_post_obj = Post(title=title, content=content, category_id=processed_category_id)
             
             if is_protected_from_form:
                 if password_from_form: # 보호 체크 & 비밀번호 입력됨
-                    new_post_obj.set_password(password_from_form)
-                    # new_post_obj.is_password_protected = True # set_password에서 처리됨
-                else: # 보호 체크는 했으나 비밀번호 입력 안 함 (새 글이므로)
+                    new_post_obj.set_password(password_from_form) # is_password_protected도 True로 설정됨
+                else: # 새 글인데 보호 체크하고 비밀번호 입력 안 한 경우
                     flash('비밀번호로 보호를 선택했지만, 비밀번호를 입력하지 않았습니다. 보호되지 않은 글로 저장됩니다.', 'warning')
-                    new_post_obj.is_password_protected = False # 명시적으로 보호 해제
+                    new_post_obj.is_password_protected = False 
                     new_post_obj.password_hash = None
             else: # 보호 체크 안 함
                 new_post_obj.is_password_protected = False
@@ -188,8 +278,7 @@ def new_post():
             flash('게시글이 성공적으로 작성되었습니다.', 'success')
             return redirect(url_for('view_post', slug=new_post_obj.slug))
         except Exception as e:
-            db.session.rollback()
-            app.logger.error(f"Error creating post: {e}")
+            db.session.rollback(); app.logger.error(f"Error creating post: {e}")
             flash(f'게시글 작성 중 오류: {str(e)}', 'danger')
             return render_template('edit_post.html', title=title, content=content, categories=cats, post=None, selected_category_id=category_id_str)
 
@@ -199,7 +288,6 @@ def new_post():
 @app.route('/edit/<string:slug>', methods=['GET', 'POST'])
 @admin_required
 def edit_post(slug):
-    # ... (카테고리 로드 로직 및 post_to_edit 가져오는 부분은 이전과 동일) ...
     if not Post or not Category: abort(500)
     post_to_edit = Post.query.filter_by(slug=slug).first_or_404()
     cats = []
@@ -226,21 +314,18 @@ def edit_post(slug):
         post_to_edit.category_id = processed_category_id
 
         if is_protected_from_form:
-            post_to_edit.is_password_protected = True # 일단 보호 상태로 설정
-            if password_from_form: # 새 비밀번호가 입력되었다면 변경/설정
+            # "보호" 체크 시
+            if password_from_form: # 새 비밀번호가 입력된 경우 -> 비밀번호 변경/설정
                 post_to_edit.set_password(password_from_form)
-            # else: 새 비밀번호 입력 안 했으면 기존 비밀번호 해시 유지 (set_password 호출 안 함)
-            #       단, 이 경우 기존 비밀번호가 없었다면, is_password_protected는 True이지만 password_hash는 None인 상태가 됨.
-            #       이런 상태를 방지하려면, 보호 체크 & 새 비밀번호 없음 & 기존 비밀번호 없음 -> 보호 해제 또는 경고 필요
-            elif not post_to_edit.password_hash: # 새 비밀번호 입력 없고, 기존 비밀번호도 없는데 보호 체크한 경우
-                 flash('비밀번호 보호를 선택했지만, 설정할 비밀번호가 없습니다. 보호되지 않습니다.', 'warning')
-                 post_to_edit.is_password_protected = False # 보호 해제
-                 post_to_edit.password_hash = None # 명시적 해제
-            # (기존 비밀번호가 있고, 새 비밀번호 입력이 없으면 기존 비밀번호 유지됨)
-        else: # 보호 체크 해제
-            post_to_edit.is_password_protected = False
-            post_to_edit.password_hash = None # 비밀번호 해시 제거
-            
+            elif post_to_edit.password_hash: # 새 비밀번호 입력 없고, 기존 비밀번호가 있는 경우 -> 기존 비밀번호 유지, 보호 상태 유지
+                post_to_edit.is_password_protected = True # 명시적으로 보호 상태 유지
+            else: # 새 비밀번호 입력 없고, 기존 비밀번호도 없는 경우 -> 보호할 비밀번호가 없으므로 보호 해제
+                flash('비밀번호 보호를 선택했지만, 설정할 비밀번호가 없습니다. 보호되지 않습니다.', 'warning')
+                post_to_edit.is_password_protected = False
+                post_to_edit.password_hash = None
+        else: # "보호" 체크 해제 시 -> 비밀번호 보호 해제
+            post_to_edit.set_password(None) # password_hash = None, is_password_protected = False 로 설정됨
+
         if original_title != post_to_edit.title:
             post_to_edit.slug = post_to_edit._generate_unique_slug(post_to_edit.title)
         post_to_edit.timestamp = datetime.now(timezone.utc)
@@ -250,40 +335,36 @@ def edit_post(slug):
             flash('게시글이 성공적으로 수정되었습니다.', 'success')
             return redirect(url_for('view_post', slug=post_to_edit.slug))
         except Exception as e:
-            db.session.rollback()
-            app.logger.error(f"Error editing post {slug}: {e}")
+            db.session.rollback(); app.logger.error(f"Error editing post {slug}: {e}")
             flash(f'게시글 수정 중 오류: {str(e)}', 'danger')
             return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
 
     return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
 
-# ... (delete_post, upload_image, 카테고리 관리 라우트, 실행 부분 등은 이전과 동일하게 유지) ...
-# 아래는 생략된 나머지 부분들의 시작과 끝입니다. 이 사이에 있는 코드는 이전 답변의 내용을 사용하세요.
+# --- 나머지 라우트 (delete_post, upload_image, 카테고리 관리, 디버그, 실행 부분) ---
+# 이 부분은 이전 답변의 최종 app.py 코드와 동일하게 유지합니다.
+# 공간 절약을 위해 여기에 모든 코드를 다시 반복하지 않겠습니다.
+# 이전에 제공해드린 app.py 전체 코드에서 위 new_post, edit_post, view_post 부분만
+# 지금 드린 내용으로 교체하시면 됩니다.
 
 @app.route('/delete/<string:slug>', methods=['POST'])
 @admin_required
 def delete_post(slug):
-    # ... (이전 코드 복사) ...
     if not Post: abort(500)
     post_to_delete = Post.query.filter_by(slug=slug).first_or_404()
     try:
-        db.session.delete(post_to_delete)
-        db.session.commit()
+        db.session.delete(post_to_delete); db.session.commit()
         flash('게시글이 삭제되었습니다.', 'success')
     except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error deleting post {slug}: {e}")
-        flash(f'게시글 삭제 중 오류가 발생했습니다: {str(e)}', 'danger')
+        db.session.rollback(); app.logger.error(f"Error deleting post {slug}: {e}"); flash(f'삭제 오류: {str(e)}', 'danger')
     return redirect(url_for('index'))
-
 
 @app.route('/upload_image', methods=['POST'])
 @admin_required
 def upload_image():
-    # ... (이전 코드 복사) ...
-    if 'file' not in request.files: return jsonify({'error': {'message': 'No file part in the request'}}), 400
+    if 'file' not in request.files: return jsonify({'error': {'message': 'No file part'}}), 400
     file = request.files['file']
-    if file.filename == '': return jsonify({'error': {'message': 'No file selected for uploading'}}), 400
+    if file.filename == '': return jsonify({'error': {'message': 'No selected file'}}), 400
     if file and allowed_file(file.filename):
         original_filename = secure_filename(file.filename); filename_prefix = str(uuid.uuid4())[:8]
         base, ext = os.path.splitext(original_filename); safe_base = re.sub(r'[^\w-]', '', base)[:50]
@@ -300,36 +381,33 @@ def upload_image():
         except Exception as e:
             app.logger.error(f"Image upload failed: {e}, filepath: {final_filepath}")
             return jsonify({'error': {'message': f'Image upload failed: {str(e)}'}}), 500
-    else: return jsonify({'error': {'message': f'Allowed file types are {app.config.get("ALLOWED_EXTENSIONS", set())}'}}), 400
+    return jsonify({'error': {'message': f'Allowed types: {app.config.get("ALLOWED_EXTENSIONS", set())}'}}), 400
 
-@app.route('/admin/categories') # 이하 카테고리 관리 라우트는 이전과 동일
+@app.route('/admin/categories')
 @admin_required
 def admin_categories(): return render_template('admin_categories.html')
 
 @app.route('/admin/category/new', methods=['GET', 'POST'])
 @admin_required
 def new_category():
-    # ... (이전 코드 복사) ...
     if not Category: abort(500)
     if request.method == 'POST':
         name = request.form.get('name')
         if not name: flash('카테고리 이름을 입력해주세요.', 'warning')
         else:
             try:
-                if Category.query.filter_by(name=name).first(): flash('이미 존재하는 카테고리 이름입니다.', 'warning')
+                if Category.query.filter_by(name=name).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
                 else:
-                    category = Category(name=name); db.session.add(category); db.session.commit()
+                    db.session.add(Category(name=name)); db.session.commit()
                     flash(f'카테고리 "{name}" 추가 완료.', 'success'); return redirect(url_for('admin_categories'))
             except Exception as e:
                 db.session.rollback(); app.logger.error(f"Error creating category: {e}"); flash(f'카테고리 추가 오류: {str(e)}', 'danger')
         return render_template('edit_category.html', category_name=name, category=None)
     return render_template('edit_category.html', category=None, category_name='')
 
-
 @app.route('/admin/category/edit/<int:category_id>', methods=['GET', 'POST'])
 @admin_required
 def edit_category(category_id):
-    # ... (이전 코드 복사) ...
     if not Category: abort(500)
     category_to_edit = Category.query.get_or_404(category_id); category_name_for_form = category_to_edit.name
     if request.method == 'POST':
@@ -338,7 +416,7 @@ def edit_category(category_id):
         elif new_name == category_to_edit.name: flash('변경된 내용이 없습니다.', 'info'); return redirect(url_for('admin_categories'))
         else:
             try:
-                if Category.query.filter(Category.name == new_name, Category.id != category_id).first(): flash('이미 존재하는 카테고리 이름입니다.', 'warning')
+                if Category.query.filter(Category.name == new_name, Category.id != category_id).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
                 else:
                     original_name = category_to_edit.name; category_to_edit.name = new_name
                     category_to_edit.slug = category_to_edit._generate_unique_slug(new_name); db.session.commit()
@@ -351,11 +429,10 @@ def edit_category(category_id):
 @app.route('/admin/category/delete/<int:category_id>', methods=['POST'])
 @admin_required
 def delete_category(category_id):
-    # ... (이전 코드 복사) ...
     if not Category: abort(500)
     category_to_delete = Category.query.get_or_404(category_id)
     if category_to_delete.posts_in_category.count() > 0:
-        flash(f'카테고리 "{category_to_delete.name}"에 속한 게시글이 있어 삭제할 수 없습니다.', 'danger'); return redirect(url_for('admin_categories'))
+        flash(f'"{category_to_delete.name}"에 속한 글이 있어 삭제 불가.', 'danger'); return redirect(url_for('admin_categories'))
     try:
         db.session.delete(category_to_delete); db.session.commit(); flash(f'카테고리 "{category_to_delete.name}" 삭제 완료.', 'success')
     except Exception as e:
@@ -364,7 +441,6 @@ def delete_category(category_id):
 
 @app.route('/category/<string:slug>')
 def posts_by_category(slug):
-    # ... (이전 코드 복사) ...
     if not Category or not Post: abort(500)
     category = Category.query.filter_by(slug=slug).first_or_404(); page = request.args.get('page', 1, type=int)
     posts_pagination = category.posts_in_category.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
@@ -395,27 +471,7 @@ if __name__ == '__main__':
     if db is not None:
         with app.app_context(): db.create_all() 
     app.run(host='10.244.122.25', port=8099, debug=True, threaded=True)
-app.py 변경 사항 요약:
-
-new_post 및 edit_post 라우트:
-is_password_protected_checkbox (체크박스)와 post_password_input (비밀번호 입력 필드)의 값을 가져옵니다.
-새 글 작성 시: "보호" 체크 + 비밀번호 입력 시에만 비밀번호를 설정합니다. "보호" 체크 + 비밀번호 미입력 시 경고 후 보호 해제 상태로 저장합니다.
-글 수정 시:
-"보호" 체크 + 새 비밀번호 입력 시 -> 비밀번호 변경/설정.
-"보호" 체크 + 비밀번호 미입력 + 기존 비밀번호 없음 -> 경고 후 보호 해제.
-"보호" 체크 + 비밀번호 미입력 + 기존 비밀번호 있음 -> 기존 비밀번호 유지 (이 로직을 명확히 하기 위해, set_password 호출을 if password_from_form: 조건 안으로 넣고, 기존 해시가 있는 경우는 별도 처리하지 않아 유지되도록 합니다. 혹은 명시적으로 post_to_edit.password_hash를 건드리지 않습니다). 위 코드에서는 elif not post_to_edit.password_hash: 조건을 추가하여 이 경우를 명확히 했습니다.
-"보호" 체크 해제 시 -> 비밀번호 보호 해제 (해시값 None으로).
-view_post 라우트:
-게시글이 is_password_protected True이고, 세션에 unlocked_post_{id}가 없으면 비밀번호 입력 폼을 보여줍니다 (show_password_form=True).
-비밀번호 폼에서 POST 요청으로 비밀번호가 제출되면, post_instance.check_password()로 확인합니다.
-성공하면 세션에 unlocked_post_{id} = True로 기록하고, 같은 페이지로 GET 리다이렉트하여 글 내용을 보여줍니다.
-실패하면 오류 메시지를 flash하고 다시 비밀번호 입력 폼을 보여줍니다.
-보호되지 않거나 이미 잠금 해제된 글은 바로 내용을 보여줍니다 (show_password_form=False).
-2. templates/view_post.html 수정
-
-비밀번호 입력 폼과 실제 글 내용을 조건부로 표시하도록 수정합니다.
-
-templates/view_post.html (최종 수정본)
+3. templates/view_post.html (전체 코드 - 비밀번호 폼 및 내용 표시 로직 포함)
 
 HTML
 
@@ -427,99 +483,80 @@ HTML
 {# base.html에서 col-md-9 안으로 이동했으므로, 이 div는 필요 없을 수 있음. 레이아웃에 따라 조절. #}
 {# <div class="container mt-4"> #}
 
+    {# show_password_form 플래그는 app.py의 view_post 라우트에서 전달됨 #}
     {% if show_password_form %}
         {# --- 비밀번호 입력 폼 --- #}
-        <div class="password-form-container mt-4 p-4 border rounded bg-light">
-            <h4 class="mb-3">비밀번호 입력</h4>
-            <p>이 게시글은 비밀번호로 보호되어 있습니다. 내용을 보시려면 비밀번호를 입력해주세요.</p>
+        <div class="password-form-container mt-5 p-4 border rounded bg-light shadow-sm">
+            <h4 class="mb-3 text-center">비밀번호 입력</h4>
+            <p class="text-center text-muted">이 게시글은 비밀번호로 보호되어 있습니다. 내용을 보시려면 비밀번호를 입력해주세요.</p>
             <form method="POST" action="{{ url_for('view_post', slug=post.slug) }}">
                 <div class="form-group">
-                    <label for="post_password_view_input">비밀번호:</label>
-                    <input type="password" class="form-control" id="post_password_view_input" name="post_password_view" required autofocus>
+                    <label for="post_password_view_input" class="sr-only">비밀번호:</label> {# sr-only for accessibility #}
+                    <input type="password" class="form-control form-control-lg" id="post_password_view_input" name="post_password_view" placeholder="비밀번호" required autofocus>
                 </div>
-                <button type="submit" class="btn btn-primary">확인</button>
-                <a href="{{ url_for('index') }}" class="btn btn-link">목록으로</a>
+                <button type="submit" class="btn btn-primary btn-block">확인</button>
+                <div class="text-center mt-3">
+                    <a href="{{ url_for('index') }}" class="btn btn-link btn-sm">목록으로 돌아가기</a>
+                </div>
             </form>
         </div>
         {# --- 비밀번호 입력 폼 끝 --- #}
     {% else %}
         {# --- 실제 게시글 내용 --- #}
-        <article>
-            <header class="mb-4">
+        <article class="mt-4">
+            <header class="mb-4 pb-3 border-bottom">
                 <h1>{{ post.title }}</h1>
                 <div class="text-muted">
                     <small>
-                        작성일: {{ post.timestamp.strftime('%Y년 %m월 %d일 %H:%M') }}
+                        작성일: {{ post.timestamp.strftime('%Y년 %m월 %d일 %H:%M') }} (UTC)
                         {% if post.category %}
                             | 카테고리: <a href="{{ url_for('posts_by_category', slug=post.category.slug) }}">{{ post.category.name }}</a>
                         {% endif %}
-                        {% if post.is_password_protected %}
-                            | <span class="text-danger">비밀글</span>
+                        {% if post.is_password_protected and post.password_hash %} {# 비밀글 표시 (해시가 실제로 있을 때만) #}
+                            | <span class="text-danger font-weight-bold">🔒 비밀글</span>
                         {% endif %}
                     </small>
                 </div>
                 {% if is_admin %}
                     <div class="mt-2">
-                        <a href="{{ url_for('edit_post', slug=post.slug) }}" class="btn btn-sm btn-secondary">수정</a>
+                        <a href="{{ url_for('edit_post', slug=post.slug) }}" class="btn btn-sm btn-outline-secondary">수정</a>
                         <form action="{{ url_for('delete_post', slug=post.slug) }}" method="POST" class="d-inline" onsubmit="return confirm('정말로 이 게시글을 삭제하시겠습니까?');">
-                            <button type="submit" class="btn btn-sm btn-danger">삭제</button>
+                            <button type="submit" class="btn btn-sm btn-outline-danger">삭제</button>
                         </form>
                     </div>
                 {% endif %}
             </header>
-            <section class="post-content">
+            <section class="post-content lead"> {# 'lead' 클래스 추가로 본문 텍스트 약간 크게 #}
                 {{ post.content | safe }}
             </section>
         </article>
-        <hr>
-        <a href="{{ url_for('index') }}" class="btn btn-outline-primary mt-3">목록으로 돌아가기</a>
+        <hr class="my-4">
+        <a href="{{ url_for('index') }}" class="btn btn-outline-primary">목록으로 돌아가기</a>
         {# --- 실제 게시글 내용 끝 --- #}
     {% endif %}
 
 {# </div> #}
 {% endblock %}
-view_post.html 변경 사항 요약:
-
-app.py의 view_post 라우트에서 전달된 show_password_form 변수 값에 따라 분기합니다.
-show_password_form이 True이면: 비밀번호 입력 폼을 표시합니다. 이 폼은 현재 view_post URL로 POST 요청을 보냅니다. 입력 필드의 name은 post_password_view입니다.
-show_password_form이 False이면: 기존처럼 게시글의 제목, 내용 등을 표시합니다. 게시글 정보에 "비밀글" 표시를 추가했습니다.
-3. templates/index.html 수정 (선택 사항 - 비밀글 표시)
-
-목록에서 비밀글임을 아이콘 등으로 표시해 줄 수 있습니다.
+4. templates/index.html (비밀글 아이콘 표시 부분만 수정 - 선택 사항)
 
 HTML
 
-{# ... index.html의 게시글 루프 부분 ... #}
+{# ... index.html의 게시글 루프 내 <small> 태그 안쪽 ... #}
 <small class="text-muted">
-    작성일: {{ post_item.timestamp.strftime('%Y년 %m월 %d일 %H:%M') }}
+    작성일: {{ post_item.timestamp.strftime('%Y년 %m월 %d일 %H:%M') }} (UTC)
     {% if post_item.category %}
         | 카테고리: <a href="{{ url_for('posts_by_category', slug=post_item.category.slug) }}">{{ post_item.category.name }}</a>
     {% endif %}
-    {# --- 비밀글 표시 추가 --- #}
-    {% if post_item.is_password_protected %}
+    {% if post_item.is_password_protected and post_item.password_hash %} {# 비밀글 표시 (해시가 실제로 있을 때만) #}
         | <span class="text-danger" title="비밀글">🔒</span>
     {% endif %}
-    {# --- 비밀글 표시 추가 끝 --- #}
 </small>
 {# ... #}
-최종 점검 및 테스트:
+templates/edit_post.html은 이전 답변("아씨발 됐고 edit post 수정된 최종을달라고 수정한걸 되는걸 달라고")에서 드린 최종 버전을 사용하시면 됩니다. (비밀번호 입력 필드가 항상 보이는 버전)
 
-위에 제공된 app.py 전체 코드와 templates/view_post.html 전체 코드로 해당 파일을 완전히 교체합니다.
-models.py와 templates/edit_post.html 파일이 이전 답변들에서 비밀번호 기능을 위해 수정된 최신 버전인지 다시 한번 확인합니다.
-데이터베이스를 다시 초기화합니다 (board.db 파일 삭제 후 앱 재시작). 스키마 변경이 있었으므로 필수입니다.
-애플리케이션을 재시작합니다.
-다음 시나리오들을 테스트합니다:
-글 작성: "비밀번호로 보호" 체크 + 비밀번호 입력 후 저장.
-글 보기 (보호된 글):
-처음 접속 시 비밀번호 입력창이 뜨는지 확인.
-틀린 비밀번호 입력 시 오류 메시지 및 다시 입력창 뜨는지 확인.
-맞는 비밀번호 입력 시 글 내용이 보이고, "비밀번호가 확인되었습니다" 메시지 뜨는지 확인.
-한번 인증 후 같은 브라우저에서 다시 해당 글 접속 시 바로 내용이 보이는지 확인 (세션 유지).
-다른 브라우저나 시크릿 모드에서 접속 시 다시 비밀번호 묻는지 확인.
-글 수정 (보호된 글):
-"비밀번호로 보호" 체크 유지 + 비밀번호 입력 안 함 -> 기존 비밀번호 유지되는지 확인.
-"비밀번호로 보호" 체크 유지 + 새 비밀번호 입력 -> 비밀번호 변경되는지 확인.
-"비밀번호로 보호" 체크 해제 -> 비밀번호 보호 해제되는지 확인.
-보호되지 않은 글 보기: 바로 내용이 보이는지 확인.
-이 수정된 코드들로 사용자님께서 원하시는 "글마다 필요시 비밀번호 적용" 기능이 제대로 동작하기를 바랍니다. 다시 한번, 이전 과정에서의 혼란과 불편에 대해 사과드립니다.
+적용 순서:
 
+위에 제공된 models.py, app.py, templates/view_post.html, templates/index.html (선택) 코드로 해당 파일들을 완전히 교체합니다.
+templates/edit_post.html은 이전 답변에서 드린 "비밀번호 입력 필드 항상 표시" 버전인지 확인합니다.
+데이터베이스 파일 (board.db)을 삭제합니다.
+Flask 애플리케이션을 재시작합니다.
