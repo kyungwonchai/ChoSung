@@ -1,131 +1,24 @@
-import os
-import uuid
-import re
-from functools import wraps
-from datetime import datetime, timezone, timedelta
+# app.py (new_post 라우트 부분만 수정)
 
-from flask import (
-    Flask, render_template, request, redirect, url_for, flash, session, jsonify, abort
-)
-from werkzeug.utils import secure_filename
+# ... (다른 import 구문 및 Flask 앱 초기화, 다른 라우트들은 이전 최종본과 동일하게 유지) ...
 
-# --- 사용자 정의 모듈 임포트 ---
-try:
-    from config import Config
-except ImportError:
-    print("CRITICAL: config.py not found. Using emergency defaults.")
-    class Config: # 임시 Config
-        SECRET_KEY = os.environ.get('SECRET_KEY') or 'emergency_secret_key_please_set_properly'
-        SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///board.db'
-        SQLALCHEMY_TRACK_MODIFICATIONS = False
-        ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or 'kkkwww'
-        UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/uploads')
-        ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
-        MAX_CONTENT_LENGTH = 50 * 1024 * 1024 # 예시: 50MB
-
-try:
-    from models import db, Post, Category
-except ImportError:
-    print("CRITICAL: models.py not found or models cannot be imported.")
-    db = None; Post = None; Category = None
-
-app = Flask(__name__)
-app.config.from_object(Config)
-
-if db: 
-    db.init_app(app)
-else:
-    print("CRITICAL: Database (db) object not initialized from models.py.")
-
-upload_folder_path = app.config.get('UPLOAD_FOLDER', './static/uploads_fallback')
-if not os.path.exists(upload_folder_path):
-    try: os.makedirs(upload_folder_path)
-    except OSError as e: app.logger.error(f"Error creating upload folder {upload_folder_path}: {e}")
-
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config.get('ALLOWED_EXTENSIONS', {'png', 'jpg', 'jpeg', 'gif'})
-
-def is_admin_logged_in(): return session.get('is_admin_logged_in', False)
-
-@app.context_processor
-def inject_global_vars():
-    all_cats = []
-    if Category:
-        try: all_cats = Category.query.order_by(Category.name).all()
-        except Exception as e: app.logger.error(f"Error fetching categories for context: {e}")
-    return dict(is_admin=is_admin_logged_in(), now=datetime.now(timezone.utc), all_categories=all_cats)
-
-def admin_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not is_admin_logged_in():
-            flash('로그인이 필요합니다.', 'warning'); return redirect(url_for('login', next=request.url))
-        return f(*args, **kwargs)
-    return decorated_function
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if is_admin_logged_in(): return redirect(url_for('index'))
-    if request.method == 'POST':
-        password = request.form.get('password')
-        if password == app.config['ADMIN_PASSWORD']:
-            session['is_admin_logged_in'] = True; session.permanent = True
-            app.permanent_session_lifetime = timedelta(days=7)
-            flash('로그인되었습니다.', 'success'); return redirect(request.args.get('next') or url_for('index'))
-        else: flash('잘못된 비밀번호입니다.', 'danger')
-    return render_template('login.html')
-
-@app.route('/logout')
-def logout():
-    session.pop('is_admin_logged_in', None); flash('로그아웃되었습니다.', 'info'); return redirect(url_for('index'))
-
-@app.route('/')
-def index():
-    if not Post: flash("게시글 기능을 사용할 수 없습니다.", "danger"); return render_template('index.html', posts_pagination=None, current_category=None)
-    page = request.args.get('page', 1, type=int)
-    posts_pagination = Post.query.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
-    return render_template('index.html', posts_pagination=posts_pagination, current_category=None)
-
-@app.route('/post/<string:slug>', methods=['GET', 'POST'])
-def view_post(slug):
-    if not Post: abort(500, description="Post model not available.")
-    post_instance = Post.query.filter_by(slug=slug).first_or_404()
-    session_key_for_post_unlock = f'unlocked_post_{post_instance.id}'
-    is_unlocked_in_session = session.get(session_key_for_post_unlock, False)
-
-    if post_instance.is_password_protected and post_instance.password_hash:
-        if is_unlocked_in_session:
-            return render_template('view_post.html', post=post_instance, show_password_form=False)
-        else:
-            if request.method == 'POST':
-                submitted_password = request.form.get('post_password_view')
-                if post_instance.check_password(submitted_password):
-                    session[session_key_for_post_unlock] = True
-                    flash('비밀번호가 확인되었습니다.', 'success')
-                    return redirect(url_for('view_post', slug=post_instance.slug))
-                else:
-                    flash('비밀번호가 올바르지 않습니다.', 'danger')
-            return render_template('view_post.html', post=post_instance, show_password_form=True)
-    else:
-        if post_instance.is_password_protected and not post_instance.password_hash:
-             app.logger.warning(f"Post ID {post_instance.id} is marked protected but has no password hash. Treating as unprotected.")
-        return render_template('view_post.html', post=post_instance, show_password_form=False)
-
-# --- 새 글 작성 라우트 수정 ---
 @app.route('/new', methods=['GET', 'POST'])
 @admin_required
 def new_post():
     cats = []
     if Category:
-        try: cats = Category.query.order_by(Category.name).all()
-        except Exception as e: app.logger.error(f"Error fetching categories for new_post: {e}")
+        try:
+            cats = Category.query.order_by(Category.name).all()
+        except Exception as e:
+            app.logger.error(f"Error fetching categories for new_post: {e}")
+            flash("카테고리 목록을 불러오는 데 실패했습니다.", "warning")
 
     if request.method == 'POST':
         title = request.form.get('title')
-        # 폼에서 'content' 필드 값을 가져옴. onsubmit="tinymce.triggerSave();"로 인해 이 값은 TinyMCE의 최신 내용을 담고 있어야 함.
+        # onsubmit="tinymce.triggerSave();"를 통해 이 content_from_form은 TinyMCE의 최신 내용을 담고 있어야 합니다.
         content_from_form = request.form.get('content', '') 
         category_id_str = request.form.get('category_id')
+        
         is_protected_from_form = request.form.get('is_password_protected_checkbox') == 'y'
         password_from_form = request.form.get('post_password_input', '').strip()
 
@@ -133,241 +26,59 @@ def new_post():
             flash('제목을 입력해주세요.', 'warning')
             return render_template('edit_post.html', title=title, content=content_from_form, categories=cats, post=None, selected_category_id=category_id_str)
 
-        # 디버깅: 서버로 전달된 content 값을 터미널에 출력
-        app.logger.debug(f"--- RAW CONTENT RECEIVED IN NEW_POST ---")
-        app.logger.debug(content_from_form) # 또는 print() 사용
-        app.logger.debug(f"--------------------------------------")
-
+        app.logger.debug(f"--- RAW CONTENT RECEIVED IN NEW_POST (from form): [{content_from_form}]")
 
         processed_category_id = int(category_id_str) if category_id_str and category_id_str.isdigit() else None
-
+        
+        new_post_obj = None
         try:
-            if not Post: raise Exception("Post model is not available.")
+            if not Post:
+                 raise Exception("Post model is not available.")
 
-            # Post 객체 생성 시, 폼에서 받은 content_from_form 값을 직접 전달
-            new_post_obj = Post(title=title, content=content_from_form, category_id=processed_category_id)
+            # 1단계: Post 객체를 먼저 생성하고 최소한의 정보로 DB에 추가하여 ID를 받습니다.
+            # content는 이 단계에서는 임시값이나 빈 값으로 설정합니다.
+            new_post_obj = Post(title=title, content="[TEMP_CONTENT_PLACEHOLDER]", category_id=processed_category_id)
             
-            # 비밀번호 처리 로직 (객체 생성 후 바로 적용)
+            # 비밀번호는 객체 생성 후 바로 설정 가능 (해시값만 가짐)
             if is_protected_from_form:
                 if password_from_form:
                     new_post_obj.set_password(password_from_form)
                 else: 
                     flash('비밀번호로 보호를 선택했지만, 비밀번호를 입력하지 않았습니다. 보호되지 않은 글로 저장됩니다.', 'warning')
-                    # models.py의 Post.__init__에서 is_password_protected와 password_hash가 기본값(False, None)으로 설정되므로,
-                    # set_password를 호출하지 않으면 그 상태가 유지됨.
-                    # 명시적으로 다시 설정할 필요는 없지만, 의도를 명확히 하려면 아래 코드 사용 가능.
-                    # new_post_obj.is_password_protected = False 
-                    # new_post_obj.password_hash = None
-            # else: (보호 체크 안 함) Post.__init__에서 이미 is_password_protected=False, password_hash=None 으로 초기화됨.
+                    new_post_obj.is_password_protected = False
+                    new_post_obj.password_hash = None
+            else: 
+                new_post_obj.is_password_protected = False
+                new_post_obj.password_hash = None
 
             db.session.add(new_post_obj)
-            db.session.commit() # 모든 정보를 한 번에 커밋
+            db.session.commit() # 첫 번째 커밋: Post 객체가 ID를 할당받음
+
+            app.logger.debug(f"--- Post object created with ID: {new_post_obj.id}, Current content: [{new_post_obj.content}]")
+
+            # 2단계: 이제 ID가 있는 new_post_obj 객체에 실제 content를 업데이트합니다.
+            # 이 시점에서 new_post_obj는 DB 세션에 의해 관리되는 객체입니다.
+            post_to_update_content = Post.query.get(new_post_obj.id) # DB에서 다시 가져와도 되고, new_post_obj를 그대로 써도 됩니다.
+            if post_to_update_content:
+                post_to_update_content.content = content_from_form # TinyMCE에서 받은 실제 내용으로 업데이트
+                app.logger.debug(f"--- Content for Post ID {post_to_update_content.id} updated to: [{post_to_update_content.content}]")
+                db.session.commit() # 두 번째 커밋: content 업데이트 저장
+            else:
+                # 이 경우는 거의 발생하지 않아야 함
+                raise Exception(f"Failed to retrieve post with ID {new_post_obj.id} after first commit.")
 
             flash('게시글이 성공적으로 작성되었습니다.', 'success')
             return redirect(url_for('view_post', slug=new_post_obj.slug))
         
         except Exception as e:
-            if db and db.session.is_active : db.session.rollback()
-            app.logger.error(f"Error creating post: {e}")
+            if db and db.session.is_active:
+                 db.session.rollback()
+            app.logger.error(f"Error creating post (potentially after partial commit): {e}")
             flash(f'게시글 작성 중 오류가 발생했습니다: {str(e)}', 'danger')
+            # 오류 발생 시, 폼 값을 유지하며 다시 렌더링
             return render_template('edit_post.html', title=title, content=content_from_form, categories=cats, post=None, selected_category_id=category_id_str)
 
+    # GET 요청 시
     return render_template('edit_post.html', categories=cats, post=None, selected_category_id=None)
-# --- 새 글 작성 라우트 수정 끝 ---
 
-
-@app.route('/edit/<string:slug>', methods=['GET', 'POST'])
-@admin_required
-def edit_post(slug):
-    # ... (이전 최종본과 동일 - 이 부분의 로직은 "수정 시에는 이미지가 잘 저장된다"고 하셨으므로 큰 문제는 없을 것으로 보입니다.) ...
-    # 하지만 new_post와 일관성을 위해 content 기본값, password_from_form 공백제거 등을 동일하게 적용합니다.
-    if not Post or not Category: abort(500)
-    post_to_edit = Post.query.filter_by(slug=slug).first_or_404()
-    cats = []
-    try: cats = Category.query.order_by(Category.name).all()
-    except Exception as e: app.logger.error(f"Error fetching categories for edit_post: {e}")
-    
-    selected_category_id = str(post_to_edit.category_id) if post_to_edit.category_id is not None else ""
-    
-    if request.method == 'POST':
-        original_title = post_to_edit.title
-        post_to_edit.title = request.form.get('title')
-        post_to_edit.content = request.form.get('content', '') # 기본값 '' 추가
-        category_id_str = request.form.get('category_id')
-        selected_category_id = category_id_str
-
-        is_protected_from_form = request.form.get('is_password_protected_checkbox') == 'y'
-        password_from_form = request.form.get('post_password_input', '').strip() # 공백 제거
-
-        if not post_to_edit.title:
-            flash('제목을 입력해주세요.', 'warning')
-            return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
-
-        processed_category_id = int(category_id_str) if category_id_str and category_id_str.isdigit() else None
-        post_to_edit.category_id = processed_category_id
-
-        if is_protected_from_form:
-            if password_from_form:
-                post_to_edit.set_password(password_from_form)
-            elif post_to_edit.password_hash: 
-                post_to_edit.is_password_protected = True
-            else: 
-                flash('비밀번호 보호를 선택했지만, 설정할 비밀번호가 없고 기존 비밀번호도 없습니다. 보호되지 않습니다.', 'warning')
-                post_to_edit.is_password_protected = False
-                post_to_edit.password_hash = None
-        else: 
-            post_to_edit.set_password(None)
-            
-        if original_title != post_to_edit.title:
-            post_to_edit.slug = post_to_edit._generate_unique_slug(post_to_edit.title)
-        post_to_edit.timestamp = datetime.now(timezone.utc)
-        
-        try:
-            db.session.commit()
-            flash('게시글이 성공적으로 수정되었습니다.', 'success')
-            return redirect(url_for('view_post', slug=post_to_edit.slug))
-        except Exception as e:
-            db.session.rollback(); app.logger.error(f"Error editing post {slug}: {e}")
-            flash(f'게시글 수정 중 오류: {str(e)}', 'danger')
-            return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
-
-    return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
-
-# --- 나머지 모든 라우트 및 실행 부분은 이전 답변의 최종본과 동일하게 유지 ---
-# (delete_post, upload_image, 카테고리 관리, 디버그 라우트, if __name__ == '__main__' 등)
-# 이전에 제공해드린 app.py 전체 코드에서 new_post 와 edit_post 라우트 부분만
-# 지금 드린 내용으로 교체하시면 됩니다.
-# 아래는 생략된 나머지 부분들의 시작과 끝입니다.
-
-@app.route('/delete/<string:slug>', methods=['POST'])
-@admin_required
-def delete_post(slug):
-    # ... (이전 최종본과 동일) ...
-    if not Post: abort(500)
-    post_to_delete = Post.query.filter_by(slug=slug).first_or_404()
-    try:
-        db.session.delete(post_to_delete); db.session.commit()
-        flash('게시글이 삭제되었습니다.', 'success')
-    except Exception as e:
-        db.session.rollback(); app.logger.error(f"Error deleting post {slug}: {e}"); flash(f'삭제 오류: {str(e)}', 'danger')
-    return redirect(url_for('index'))
-
-
-@app.route('/upload_image', methods=['POST'])
-@admin_required
-def upload_image():
-    # ... (이전 최종본과 동일) ...
-    if 'file' not in request.files: return jsonify({'error': {'message': 'No file part'}}), 400
-    file = request.files['file']
-    if file.filename == '': return jsonify({'error': {'message': 'No selected file'}}), 400
-    if file and allowed_file(file.filename):
-        original_filename = secure_filename(file.filename); filename_prefix = str(uuid.uuid4())[:8]
-        base, ext = os.path.splitext(original_filename); safe_base = re.sub(r'[^\w-]', '', base)[:50]
-        filename = f"{filename_prefix}_{safe_base}{ext}"; counter = 1; temp_filename_to_check = filename
-        upload_path = app.config.get('UPLOAD_FOLDER', './static/uploads_fallback')
-        final_filepath = os.path.join(upload_path, temp_filename_to_check)
-        while os.path.exists(final_filepath):
-            temp_filename_to_check = f"{filename_prefix}_{safe_base}_{counter}{ext}"
-            final_filepath = os.path.join(upload_path, temp_filename_to_check); counter += 1
-        filename = temp_filename_to_check
-        try:
-            file.save(final_filepath); image_url = url_for('static', filename=f'uploads/{filename}') 
-            return jsonify({'location': image_url})
-        except Exception as e:
-            app.logger.error(f"Image upload failed: {e}, filepath: {final_filepath}")
-            return jsonify({'error': {'message': f'Image upload failed: {str(e)}'}}), 500
-    return jsonify({'error': {'message': f'Allowed types: {app.config.get("ALLOWED_EXTENSIONS", set())}'}}), 400
-
-@app.route('/admin/categories')
-@admin_required
-def admin_categories(): return render_template('admin_categories.html')
-
-@app.route('/admin/category/new', methods=['GET', 'POST'])
-@admin_required
-def new_category():
-    # ... (이전 최종본과 동일) ...
-    if not Category: abort(500)
-    if request.method == 'POST':
-        name = request.form.get('name')
-        if not name: flash('카테고리 이름을 입력해주세요.', 'warning')
-        else:
-            try:
-                if Category.query.filter_by(name=name).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
-                else:
-                    db.session.add(Category(name=name)); db.session.commit()
-                    flash(f'카테고리 "{name}" 추가 완료.', 'success'); return redirect(url_for('admin_categories'))
-            except Exception as e:
-                db.session.rollback(); app.logger.error(f"Error creating category: {e}"); flash(f'카테고리 추가 오류: {str(e)}', 'danger')
-        return render_template('edit_category.html', category_name=name, category=None)
-    return render_template('edit_category.html', category=None, category_name='')
-
-
-@app.route('/admin/category/edit/<int:category_id>', methods=['GET', 'POST'])
-@admin_required
-def edit_category(category_id):
-    # ... (이전 최종본과 동일) ...
-    if not Category: abort(500)
-    category_to_edit = Category.query.get_or_404(category_id); category_name_for_form = category_to_edit.name
-    if request.method == 'POST':
-        new_name = request.form.get('name'); category_name_for_form = new_name
-        if not new_name: flash('카테고리 이름을 입력해주세요.', 'warning')
-        elif new_name == category_to_edit.name: flash('변경된 내용이 없습니다.', 'info'); return redirect(url_for('admin_categories'))
-        else:
-            try:
-                if Category.query.filter(Category.name == new_name, Category.id != category_id).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
-                else:
-                    original_name = category_to_edit.name; category_to_edit.name = new_name
-                    category_to_edit.slug = category_to_edit._generate_unique_slug(new_name); db.session.commit()
-                    flash(f'카테고리 "{original_name}"이 "{new_name}"(으)로 수정 완료.', 'success'); return redirect(url_for('admin_categories'))
-            except Exception as e:
-                db.session.rollback(); app.logger.error(f"Error editing category: {e}"); flash(f'카테고리 수정 오류: {str(e)}', 'danger')
-        return render_template('edit_category.html', category=category_to_edit, category_name=category_name_for_form)
-    return render_template('edit_category.html', category=category_to_edit, category_name=category_name_for_form)
-
-@app.route('/admin/category/delete/<int:category_id>', methods=['POST'])
-@admin_required
-def delete_category(category_id):
-    # ... (이전 최종본과 동일) ...
-    if not Category: abort(500)
-    category_to_delete = Category.query.get_or_404(category_id)
-    if category_to_delete.posts_in_category.count() > 0:
-        flash(f'"{category_to_delete.name}"에 속한 글이 있어 삭제 불가.', 'danger'); return redirect(url_for('admin_categories'))
-    try:
-        db.session.delete(category_to_delete); db.session.commit(); flash(f'카테고리 "{category_to_delete.name}" 삭제 완료.', 'success')
-    except Exception as e:
-        db.session.rollback(); app.logger.error(f"Error deleting category: {e}"); flash(f'카테고리 삭제 오류: {str(e)}', 'danger')
-    return redirect(url_for('admin_categories'))
-
-@app.route('/category/<string:slug>')
-def posts_by_category(slug):
-    # ... (이전 최종본과 동일) ...
-    if not Category or not Post: abort(500)
-    category = Category.query.filter_by(slug=slug).first_or_404(); page = request.args.get('page', 1, type=int)
-    posts_pagination = category.posts_in_category.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
-    return render_template('index.html', posts_pagination=posts_pagination, current_category=category)
-
-@app.cli.command('init-db')
-def init_db_cli_command():
-    if db is None: print("DB not initialized."); return
-    with app.app_context(): db.drop_all(); db.create_all()
-    print('Initialized the database.')
-
-_db_initialized_flag = False
-@app.before_request
-def ensure_tables_exist():
-    global _db_initialized_flag
-    if not _db_initialized_flag and db is not None:
-        with app.app_context(): db.create_all()
-        _db_initialized_flag = True
-
-@app.route('/debug_config_check')
-def debug_config_check():
-    max_size = app.config.get('MAX_CONTENT_LENGTH')
-    if max_size is None: return "MAX_CONTENT_LENGTH is not set."
-    is_expected_size = (max_size == 50 * 1024 * 1024) or (max_size == 5000 * 1024 * 1024)
-    return f"MAX_CONTENT_LENGTH: {max_size} bytes. Is this as expected (50MB or 5GB)? {is_expected_size}"
-
-if __name__ == '__main__':
-    if db is not None:
-        with app.app_context(): db.create_all() 
-    app.run(host='10.244.122.25', port=8099, debug=True, threaded=True)
+# ... (edit_post 및 나머지 app.py 코드는 이전 최종본과 동일하게 유지) ...
