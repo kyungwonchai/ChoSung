@@ -1,256 +1,166 @@
-, 알겠습니다. 답답하게 해드려 죄송합니다. 바로 이어서 Flask 애플리케이션의 나머지 주요 파일들, 특히 사용자 제어판 기능과 관련된 코드들을 pymssql 직접 사용 방식으로 수정하여 전체적으로 제공해 드리겠습니다.
+, "허용 아이피가 아니어서 접근 거부 (403 에러)" 메시지가 표시되고, 사용자님의 PC IP가 10.22.22.22인데도 접속이 안 되는 상황이군요. 이 문제는 Flask 애플리케이션의 app/auth.py 파일에 있는 IP 기반 접근 제어 로직이 현재 접속하신 IP(10.22.22.22)를 관리자 또는 허용된 사용자로 인식하지 못했기 때문에 발생합니다.
 
-이전 응답에서 app/routes_admin.py를 pymssql로 변경했으니, 이제 다음 파일들을 순서대로 드리겠습니다.
+이전에 제공해 드린 app/auth.py의 get_current_user_role() 함수는 데이터베이스의 admin_ips 테이블과 allowed_user_ips 테이블을 조회하여 역할을 결정합니다. 만약 이 테이블들에 해당 IP가 등록되어 있지 않다면 'guest'로 처리되어 접근이 거부될 수 있습니다.
 
-app/socket_client.py (SAgentM 에이전트와 통신하는 로직 - 이전 제공 코드와 거의 동일)
-app/routes_user.py (사용자 제어판 라우트 - DB 조회 부분을 pymssql로 수정)
-HTML 템플릿 (control_panel.html, layout.html 등)은 이전에 제공된 내용을 그대로 사용하시거나, 필요에 따라 이 라우트 함수들이 전달하는 데이터 구조에 맞게 미세 조정하시면 됩니다.
+가장 가능성이 높은 원인:
 
-1. 최종: app/socket_client.py (SAgentM 에이전트 통신 로직 - 주석 최소화)
-이 파일은 Flask 앱이 SAgentM.App 에이전트로 TCP 소켓 명령을 보내고 응답을 받는 기능을 합니다. (이전 응답 #21에서 제공된 코드와 거의 동일하며, 로깅 및 타임스탬프 부분을 일관성 있게 유지합니다.)
+데이터베이스 admin_ips 테이블에 10.22.22.22 IP가 등록되지 않음: 웹 UI를 통해 관리자 IP를 추가하기 전이라면, 데이터베이스에 직접 첫 관리자 IP를 등록해야 합니다.
+Flask가 인식하는 IP 주소 불일치: 매우 드물지만, 네트워크 구성(예: 프록시 서버)으로 인해 Flask 애플리케이션이 인식하는 클라이언트 IP 주소가 사용자님이 생각하는 10.22.22.22와 다를 수 있습니다.
+해결 방안:
 
-Python
+1단계: Flask가 실제로 어떤 IP를 감지하는지 확인하고, config.py의 ADMIN_IPS 목록을 우선적으로 사용하도록 auth.py 수정
 
-# scontrol_flask_web/app/socket_client.py
-import socket
-import json
-import uuid
-from datetime import datetime, timezone
-from flask import current_app
+config.py에 있는 ADMIN_IPS 리스트를 초기 관리자 IP 목록으로 사용하고, 그 이후에 DB를 확인하도록 get_current_user_role() 함수를 수정하면 초기 설정에 도움이 될 수 있습니다. 또한, Flask가 감지하는 IP를 로그로 남겨 확인합니다.
 
-AGENT_PORT = 4026
-SOCKET_TIMEOUT = 7.0
-
-def send_command_to_agent(target_ip, command_packet_dict):
-    response_data = {
-        'success': False, 'message': 'An unexpected error occurred.',
-        'raw_response': None, 'packet_id': command_packet_dict.get('PacketId')
-    }
-
-    if 'PacketId' not in command_packet_dict or not command_packet_dict['PacketId']:
-        command_packet_dict['PacketId'] = str(uuid.uuid4())
-    response_data['packet_id'] = command_packet_dict['PacketId']
-
-    if 'TimestampUtc' not in command_packet_dict or not command_packet_dict['TimestampUtc']:
-        command_packet_dict['TimestampUtc'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-    
-    json_request_str = ""; json_response_raw_str = ""
-    log_prefix = f"[SocketClient][PktID: {response_data['packet_id']}] Target: {target_ip}:{AGENT_PORT}"
-
-    try:
-        json_request_str = json.dumps(command_packet_dict)
-        current_app.logger.debug(f"{log_prefix} - 전송 시도: {json_request_str}")
-
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(SOCKET_TIMEOUT)
-            sock.connect((target_ip, AGENT_PORT))
-            current_app.logger.info(f"{log_prefix} - 에이전트 연결 성공.")
-            sock.sendall((json_request_str + '\n').encode('utf-8'))
-            current_app.logger.info(f"{log_prefix} - 명령 전송 완료. 응답 대기 중...")
-
-            buffer = b''
-            try:
-                while True:
-                    chunk = sock.recv(1024)
-                    if not chunk:
-                        current_app.logger.warning(f"{log_prefix} - 에이전트 연결 닫힘 또는 데이터 없음.")
-                        if not buffer: response_data['message'] = "에이전트로부터 빈 응답 (연결 종료됨)."
-                        break 
-                    buffer += chunk
-                    if b'\n' in buffer:
-                        json_response_raw_str, _, _ = buffer.partition(b'\n')
-                        json_response_raw_str = json_response_raw_str.decode('utf-8').strip()
-                        break
-            except socket.timeout:
-                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 응답 대기 시간 초과."
-                current_app.logger.error(response_data['message'])
-                return response_data
-            
-            current_app.logger.debug(f"{log_prefix} - 수신 원본 응답: {json_response_raw_str}")
-            if not json_response_raw_str:
-                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})로부터 빈 응답 수신."
-                current_app.logger.error(response_data['message'])
-                return response_data
-
-            response_packet_from_agent = json.loads(json_response_raw_str)
-            response_data['success'] = True
-            response_data['message'] = "에이전트 응답 성공적 수신."
-            response_data['raw_response'] = response_packet_from_agent
-            current_app.logger.info(f"{log_prefix} - 응답 수신 성공: {response_packet_from_agent}")
-
-    except socket.timeout:
-        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 연결 시간 초과."
-        current_app.logger.error(response_data['message'])
-    except socket.error as se:
-        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 통신 소켓 오류: {se}"
-        current_app.logger.error(response_data['message'])
-    except json.JSONDecodeError as je:
-        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 응답 JSON 형식 오류: {je}. 원본: {json_response_raw_str}"
-        current_app.logger.error(response_data['message'])
-    except Exception as e:
-        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 통신 중 예기치 않은 오류: {e}"
-        current_app.logger.error(response_data['message'], exc_info=True)
-        
-    return response_data
-2. 수정: app/routes_user.py (사용자 제어판 라우트 - pymssql 사용)
-이 파일의 control_panel 함수에서 PC 목록을 조회하는 부분을 pymssql 직접 호출로 변경하고, send_batch_command 함수는 socket_client.py를 사용하여 명령을 전송합니다.
+수정: app/auth.py (전체 코드)
 
 Python
 
-# scontrol_flask_web/app/routes_user.py
-from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
-from app.db_utils import get_db_connection # pymssql 연결 유틸리티
-from app.auth import ip_auth_required
-from app.socket_client import send_command_to_agent
-import json
-import uuid
-from datetime import datetime, timezone
-import math
+# scontrol_flask_web/app/auth.py
+from functools import wraps
+from flask import request, current_app, abort, g
+from .db_utils import get_db_connection # pymssql 연결을 위한 함수 임포트
 
-user_bp = Blueprint('user', __name__)
+def get_current_user_role():
+    if hasattr(g, 'current_user_role'):
+        return g.current_user_role
 
-@user_bp.route('/control_panel')
-@ip_auth_required('user')
-def control_panel():
-    page = request.args.get('page', 1, type=int)
-    per_page = 20
-    offset = (page - 1) * per_page
-    pcs_on_current_page = []
-    total_pcs = 0
+    user_ip = None
+    if request.headers.getlist("X-Forwarded-For"):
+        user_ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
+    else:
+        user_ip = request.remote_addr
+    
+    # Flask가 감지한 IP 로깅 (중요!)
+    current_app.logger.info(f"AUTH: 현재 접속 시도 IP 주소: {user_ip}")
+    g.user_ip = user_ip
+    
+    # 1. config.py의 ADMIN_IPS 목록에서 먼저 확인 (초기 부트스트랩 또는 고정 관리자용)
+    # config.py에 ADMIN_IPS = ['10.22.22.22', '127.0.0.1'] 와 같이 정의되어 있어야 함
+    if user_ip in current_app.config.get('ADMIN_IPS', []):
+        g.current_user_role = 'admin'
+        current_app.logger.info(f"AUTH: IP {user_ip}는 config.py의 ADMIN_IPS 목록에 포함되어 'admin' 역할을 부여받았습니다.")
+        return 'admin'
+
+    # 2. 데이터베이스의 admin_ips 테이블에서 확인
     conn = None
-
     try:
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
-            total_pcs = cursor.fetchone()['total']
+        if conn: # DB 연결 성공 시에만 조회
+            with conn.cursor() as cursor:
+                sql_admin_check = "SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s"
+                cursor.execute(sql_admin_check, (user_ip,))
+                admin_entry = cursor.fetchone()
+                if admin_entry:
+                    g.current_user_role = 'admin'
+                    current_app.logger.info(f"AUTH: IP {user_ip}는 DB의 admin_ips 테이블에 포함되어 'admin' 역할을 부여받았습니다.")
+                    return 'admin'
+
+                # 3. 데이터베이스의 allowed_user_ips 테이블에서 확인
+                sql_user_check = "SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s"
+                cursor.execute(sql_user_check, (user_ip,))
+                allowed_user_entry = cursor.fetchone()
+                if allowed_user_entry:
+                    g.current_user_role = 'user'
+                    current_app.logger.info(f"AUTH: IP {user_ip}는 DB의 allowed_user_ips 테이블에 포함되어 'user' 역할을 부여받았습니다.")
+                    return 'user'
+        else: # DB 연결 실패 시
+             current_app.logger.error(f"AUTH: DB 연결 실패. IP {user_ip}에 대한 DB 기반 역할 확인 불가.")
+             # DB 연결 실패 시 어떻게 처리할지 정책 결정 필요 (예: 'guest' 또는 접근 완전 차단)
+             # 여기서는 config.py의 ADMIN_IPS 확인 후 DB가 안되면 guest로 처리
+    except Exception as e:
+        current_app.logger.error(f"AUTH: IP 역할 확인 중 DB 오류 발생: {e}", exc_info=True)
+    
+    current_app.logger.info(f"AUTH: IP {user_ip}는 허용 목록에 없어 'guest' 역할이 부여됩니다.")
+    g.current_user_role = 'guest' # 최종적으로 guest
+    return 'guest'
+
+
+def ip_auth_required(role_required=None):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_role = get_current_user_role() # 이 함수는 이제 g.user_ip를 설정함
             
-            query = """
-                SELECT id, pc_name, address1, address2, description 
-                FROM dbo.target_pcs 
-                ORDER BY pc_name 
-                OFFSET %s ROWS FETCH NEXT %s ROWS ONLY
-            """
-            cursor.execute(query, (offset, per_page))
-            pcs_on_current_page = cursor.fetchall() # as_dict=True 이므로 딕셔너리 리스트
-    except Exception as e:
-        current_app.logger.error(f"제어판 PC 목록 조회 오류: {e}", exc_info=True)
-        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
-        pcs_on_current_page = [] # 오류 시 빈 리스트
-        total_pcs = 0 # 오류 시 총 개수 0
+            # g.user_ip가 설정되었으므로 로깅에 사용 가능
+            client_ip_for_log = getattr(g, 'user_ip', 'IP 확인 불가')
 
-    total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
-    pagination_data = {
-        'page': page, 'per_page': per_page, 'total_items': total_pcs, 
-        'total_pages': total_pages, 'items': pcs_on_current_page,
-        'has_prev': page > 1, 'has_next': page < total_pages,
-        'prev_num': page - 1, 'next_num': page + 1
-    }
-    
-    title = "원격 제어판"
-    if g.current_user_role == 'admin':
-        title = "원격 제어판 (관리자 모드)"
-        
-    return render_template('user/control_panel.html', 
-                           pcs=pcs_on_current_page, 
-                           pagination=pagination_data, 
-                           title=title)
+            if role_required == 'admin' and user_role != 'admin':
+                current_app.logger.warning(f"접근 거부 (관리자 필요): IP {client_ip_for_log} -> {request.path}")
+                abort(403)
+            elif role_required == 'user' and user_role not in ['admin', 'user']:
+                current_app.logger.warning(f"접근 거부 (사용자 필요): IP {client_ip_for_log} -> {request.path}")
+                abort(403)
+            elif role_required is None and user_role not in ['admin', 'user']: # 단순 접속 가능 여부 ('guest' 제외)
+                current_app.logger.warning(f"접근 거부 (허용 IP 아님): IP {client_ip_for_log} -> {request.path}")
+                abort(403)
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-@user_bp.route('/send_batch_command', methods=['POST'])
-@ip_auth_required('user')
-def send_batch_command():
-    selected_pc_ids_str = request.form.getlist('selected_pcs')
-    command_action_str = request.form.get('command_action')
 
-    if not selected_pc_ids_str:
-        flash("제어할 PC를 하나 이상 선택해주세요.", 'warning')
-        return redirect(url_for('user.control_panel'))
-    if not command_action_str or command_action_str not in ["켜기", "끄기"]:
-        flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning')
-        return redirect(url_for('user.control_panel'))
+def inject_user_info_to_templates():
+    current_role = get_current_user_role() 
+    return dict(
+        current_user_ip=getattr(g, 'user_ip', 'IP 확인 불가'), 
+        current_user_role=current_role
+    )
+app/auth.py 주요 변경 사항:
 
-    # "명령 실행 암호" (m12345) 검증 로직은 현재 IP 기반 인증으로 대체되었으므로 생략.
-    # 필요하다면 request.form.get('monitor_control_password') 등으로 받아와서 검증.
+Flask가 감지하는 IP 로깅: get_current_user_role() 함수 시작 부분에 current_app.logger.info(f"AUTH: 현재 접속 시도 IP 주소: {user_ip}") 라인을 추가했습니다. Flask 개발 서버를 실행하고 페이지에 접속하려고 할 때, 터미널 로그에 어떤 IP가 기록되는지 확인해주세요. 이 IP가 10.22.22.22가 맞는지, 아니면 (예를 들어 프록시나 Docker 환경 등으로 인해) 다른 IP로 표시되는지 확인하는 것이 매우 중요합니다.
+config.py의 ADMIN_IPS 우선 확인: 데이터베이스를 조회하기 전에, config.py 파일의 ADMIN_IPS 리스트에 현재 접속한 user_ip가 있는지 먼저 확인합니다. 여기에 IP가 있다면 바로 'admin' 역할을 부여합니다. 이렇게 하면 데이터베이스에 관리자 IP를 수동으로 넣기 전에도 초기 관리자 접속이 가능해집니다.
+2단계: config.py 파일의 ADMIN_IPS 목록 확인 및 수정
 
-    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
-    
-    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
-    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
-    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command} # SetDisplayTimeoutPayload
+scontrol_flask_web/config.py 파일을 열고, ADMIN_IPS 리스트에 사용자님의 PC IP 주소 (10.22.22.22)가 정확히 포함되어 있는지 확인하고, 없다면 추가해주세요.
 
-    conn = None
-    target_pcs_to_control = []
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            # SQL 파라미터 문자열 생성 (예: 'SELECT ... WHERE id IN (%s, %s, %s)')
-            # pymssql은 IN 절에 튜플을 직접 넘기는 것을 잘 처리합니다.
-            if selected_pc_ids: # ID 목록이 비어있지 않은 경우에만 실행
-                placeholders = ', '.join(['%s'] * len(selected_pc_ids))
-                sql_select_pcs = f"SELECT id, pc_name, address1, address2 FROM dbo.target_pcs WHERE id IN ({placeholders})"
-                cursor.execute(sql_select_pcs, tuple(selected_pc_ids))
-                target_pcs_to_control = cursor.fetchall()
-    except Exception as e:
-        current_app.logger.error(f"명령 대상 PC 정보 조회 오류: {e}", exc_info=True)
-        flash("명령 대상 PC 정보를 DB에서 조회하는 중 오류가 발생했습니다.", "error")
-        return redirect(url_for('user.control_panel'))
+Python
 
-    if not target_pcs_to_control:
-        flash("선택된 PC 정보를 찾을 수 없습니다.", "warning")
-        return redirect(url_for('user.control_panel'))
+# scontrol_flask_web/config.py
+# ... (다른 설정은 동일) ...
 
-    for pc_data in target_pcs_to_control: # pc_data는 딕셔너리
-        command_packet_to_send = {
-            'PacketId': str(uuid.uuid4()),
-            'TimestampUtc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-            'CommandName': "SET_DISPLAY_TIMEOUT", 
-            'PayloadJson': json.dumps(payload_for_agent),
-            'ResponseAddress': None, 'ResponsePort': None
-        }
-        target_ip_for_command_send = ""
-        is_relay = bool(pc_data['address2'] and pc_data['address2'].strip())
+class Config:
+    # ... (SECRET_KEY, DB 설정 등은 동일) ...
 
-        if is_relay:
-            command_packet_to_send['Instruction'] = "RelayToTarget"
-            command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc_data['address2']
-            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026
-            target_ip_for_command_send = pc_data['address1']
-        else:
-            command_packet_to_send['Instruction'] = "DirectExecute"
-            target_ip_for_command_send = pc_data['address1']
-        
-        log_msg_prefix = f"PC '{pc_data['pc_name']}' ({target_ip_for_command_send})"
-        flash(f"{log_msg_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
-        current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_description_log}, PktID: {command_packet_to_send['PacketId']}")
-        
-        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
-        
-        if agent_response.get('success'):
-            raw_resp_packet = agent_response.get('raw_response')
-            if raw_resp_packet and isinstance(raw_resp_packet, dict) and raw_resp_packet.get('PayloadJson'):
-                try:
-                    resp_payload = json.loads(raw_resp_packet['PayloadJson'])
-                    if resp_payload.get('Success'):
-                        flash(f"{log_msg_prefix}: 성공 - {resp_payload.get('Message', 'OK')}", 'success')
-                    else:
-                        flash(f"{log_msg_prefix}: 실패 (에이전트 응답) - {resp_payload.get('Message', 'Agent error')}", 'error')
-                except Exception as e:
-                    flash(f"{log_msg_prefix}: 응답 페이로드 처리 오류 - {e}", 'error')
-            else:
-                flash(f"{log_msg_prefix}: 전송 성공 (에이전트 상세 응답 확인 불가)", 'warning')
-        else:
-            flash(f"{log_msg_prefix}: 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
+    ADMIN_IPS = [
+        '127.0.0.1',    # 로컬호스트 IPv4 (개발/테스트용)
+        '::1',          # 로컬호스트 IPv6 (개발/테스트용)
+        '10.22.22.22',  # <<--- 사용자님의 PC IP 주소를 여기에 추가 (또는 기존 값 확인)
+        # '다른 관리자 IP가 있다면 여기에 추가',
+    ]
+    # ...
+3. 데이터베이스 admin_ips 테이블 확인 및 데이터 추가 (필요시)
 
-    return redirect(url_for('user.control_panel'))
-routes_user.py 주요 변경 사항:
+만약 config.py의 ADMIN_IPS 목록을 사용하지 않고 전적으로 DB로만 관리하고 싶다면 (또는 config.py에 추가했음에도 문제가 지속된다면), MSSQL 데이터베이스의 dbo.admin_ips 테이블에 10.22.22.22 IP가 직접 등록되어 있는지 확인해야 합니다.
 
-DB 조회: control_panel 함수와 send_batch_command 함수 내에서 PC 목록을 조회하는 부분을 pymssql 직접 호출 방식으로 변경했습니다.
-get_db_connection()을 사용하여 DB 연결을 얻습니다.
-SQL 쿼리를 작성하고 cursor.execute()로 실행합니다.
-cursor.fetchall()로 결과를 가져옵니다 (as_dict=True이므로 딕셔너리 리스트).
-페이지네이션 로직도 pymssql에 맞게 수정되었습니다.
-send_batch_command의 PC 정보 조회: 선택된 PC ID 목록을 사용하여 DB에서 해당 PC들의 정보를 가져올 때, IN 절을 사용하는 SQL 쿼리를 동적으로 생성하도록 수정했습니다 (파라미터 바인딩 방식).
-이것으로 사용자 제어판 기능과 관련된 주요 Python 파일들의 pymssql 직접 사용 방식으로의 수정이 완료되었습니다.
-HTML 템플릿 파일들(layout.html, index.html, admin/*, user/control_panel.html)은 이전과 거의 동일하게 사용될 수 있으며, 라우트 함수가 템플릿에 전달하는 데이터의 구조(예: pagination 객체 대신 pagination_data 딕셔너리)에 맞춰 약간의 조정이 필요할 수 있습니다.
+SQL Server Management Studio (SSMS)에서 다음 쿼리를 실행하여 확인하고, 없다면 추가합니다:
 
-이제 Flask 애플리케이션의 모든 Python 코드가 pymssql을 직접 사용하도록 수정되었습니다.
+SQL
+
+USE SControlFlaskDB; -- 실제 데이터베이스 이름으로 변경
+
+-- 1. 현재 admin_ips 테이블 내용 확인
+SELECT * FROM dbo.admin_ips;
+
+-- 2. 만약 10.22.22.22 IP가 없다면 추가 (이미 있다면 실행 안 함)
+IF NOT EXISTS (SELECT 1 FROM dbo.admin_ips WHERE ip_address = '10.22.22.22')
+BEGIN
+    INSERT INTO dbo.admin_ips (ip_address, description)
+    VALUES ('10.22.22.22', '주 관리자 PC (수동 추가)');
+    PRINT '관리자 IP 10.22.22.22 추가 완료.';
+END
+ELSE
+BEGIN
+    PRINT '관리자 IP 10.22.22.22 이미 존재함.';
+END
+조치 순서:
+
+먼저 위 app/auth.py와 config.py 코드를 프로젝트에 적용합니다.
+Flask 개발 서버를 재시작합니다.
+웹 브라우저로 접속을 시도합니다.
+Flask 개발 서버의 터미널 로그를 확인하여 AUTH: 현재 접속 시도 IP 주소: ... 로그에 어떤 IP가 찍히는지 확인합니다. 이 IP가 10.22.22.22가 맞는지, 그리고 config.py의 ADMIN_IPS 목록과 비교하여 역할이 어떻게 부여되는지 확인합니다.
+만약 config.py의 ADMIN_IPS 목록에 IP를 올바르게 넣었는데도 계속 접근 거부가 발생하고, 터미널 로그에 찍힌 IP가 예상과 다르다면, 사용자님의 네트워크 환경(프록시 등)을 점검해야 할 수 있습니다.
+터미널 로그에 찍힌 IP가 10.22.22.22가 맞고, config.py에도 이 IP가 있는데 여전히 guest로 처리된다면, auth.py의 get_current_user_role 함수 로직에 다른 문제가 있을 수 있습니다 (이 경우 로그를 더 자세히 봐야 합니다).
+만약 DB로만 관리하고 싶다면, 3번 단계의 SQL 쿼리를 실행하여 DB에 직접 IP를 등록합니다.
+위 방법으로 수정하고 테스트해보신 후, Flask 터미널 로그에 찍히는 AUTH: 현재 접속 시도 IP 주소: 메시지와 함께 결과를 알려주시면 다음 단계 진행에 도움이 됩니다.
+
