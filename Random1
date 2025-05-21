@@ -1,171 +1,376 @@
-{% extends "base.html" %}
+import os
+import uuid
+import re
+from functools import wraps
+from datetime import datetime, timezone, timedelta
 
-{% block title %}{{ '게시글 수정' if post else '새 게시글 작성' }} - 나의 게시판{% endblock %}
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash, session, jsonify, abort
+)
+from werkzeug.utils import secure_filename
 
-{% block head_extra %}
-    {# --- TinyMCE 로컬 경로 --- #}
-    {# 이 경로가 flask_board/static/tinymce/tinymce.min.js를 정확히 가리켜야 합니다. #}
-    <script src="{{ url_for('static', filename='tinymce/tinymce.min.js') }}" referrerpolicy="origin"></script>
-    {# --- TinyMCE 로컬 경로 끝 --- #}
-{% endblock %}
+# --- 사용자 정의 모듈 임포트 ---
+try:
+    from config import Config
+except ImportError:
+    print("CRITICAL: config.py not found. Using emergency defaults.")
+    class Config: # 임시 Config
+        SECRET_KEY = os.environ.get('SECRET_KEY') or 'emergency_secret_key_please_set_properly'
+        SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///board.db'
+        SQLALCHEMY_TRACK_MODIFICATIONS = False
+        ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or 'kkkwww'
+        UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/uploads')
+        ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+        MAX_CONTENT_LENGTH = 50 * 1024 * 1024 # 예시: 50MB
 
-{% block content %}
-<div class="container-fluid mt-4"> {# 또는 이전에 사용하시던 container 클래스 #}
-    <h2>{{ '게시글 수정' if post else '새 게시글 작성' }}</h2>
-    <form method="POST" action="{{ url_for('edit_post', slug=post.slug) if post else url_for('new_post') }}">
-        <div class="form-group">
-            <label for="title">제목</label>
-            <input type="text" class="form-control" id="title" name="title" value="{{ title or (post.title if post else '') }}" required>
-        </div>
+try:
+    from models import db, Post, Category
+except ImportError:
+    print("CRITICAL: models.py not found or models cannot be imported.")
+    db = None; Post = None; Category = None
 
-        <div class="form-group">
-            <label for="category_id">카테고리</label>
-            <select class="form-control" id="category_id" name="category_id">
-                <option value="">-- 카테고리 선택 안 함 --</option>
-                {% for category_item in categories %}
-                    <option value="{{ category_item.id }}" {% if selected_category_id and category_item.id == selected_category_id|int %}selected{% endif %}>
-                        {{ category_item.name }}
-                    </option>
-                {% endfor %}
-            </select>
-        </div>
+app = Flask(__name__)
+app.config.from_object(Config)
 
-        <div class="form-group form-check">
-            <input type="checkbox" class="form-check-input" id="is_password_protected_checkbox" name="is_password_protected_checkbox" value="y"
-                   {% if post and post.is_password_protected %}checked{% endif %}>
-            <label class="form-check-label" for="is_password_protected_checkbox">이 글을 비밀번호로 보호합니다 (체크 시 아래 비밀번호 사용).</label>
-        </div>
+if db: 
+    db.init_app(app)
+else:
+    print("CRITICAL: Database (db) object not initialized from models.py.")
 
-        <div id="password_fields_container"> {# 비밀번호 필드는 항상 보이도록 style 속성 제거됨 #}
-            <div class="form-group">
-                <label for="post_password_input">글 비밀번호</label>
-                <input type="password" class="form-control" id="post_password_input" name="post_password_input" placeholder="비밀번호 보호 체크 시 사용할 비밀번호">
-                <small class="form-text text-muted">
-                    위 "비밀번호로 보호" 체크 시, 여기에 입력된 비밀번호가 사용됩니다.
-                    체크하지 않으면 이 필드에 입력된 값은 무시됩니다.
-                    기존 글 수정 시, 비밀번호를 변경하고 싶을 때만 새 비밀번호를 입력하세요. 비워두고 체크하면 기존 비밀번호가 유지됩니다 (단, 기존 비밀번호가 없는 상태에서 비워두고 체크하면 보호되지 않습니다).
-                </small>
-            </div>
-        </div>
+upload_folder_path = app.config.get('UPLOAD_FOLDER', './static/uploads_fallback')
+if not os.path.exists(upload_folder_path):
+    try: os.makedirs(upload_folder_path)
+    except OSError as e: app.logger.error(f"Error creating upload folder {upload_folder_path}: {e}")
 
-        <div class="form-group">
-            <label for="content_editor">내용</label> {# textarea의 id를 content_editor로 사용 #}
-            <textarea class="form-control" id="content_editor" name="content" rows="15">{{ content or (post.content if post else '') }}</textarea>
-        </div>
-        <button type="submit" class="btn btn-primary">저장</button>
-        <a href="{{ url_for('index') }}" class="btn btn-secondary">취소</a>
-    </form>
-</div>
-{% endblock %}
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config.get('ALLOWED_EXTENSIONS', {'png', 'jpg', 'jpeg', 'gif'})
 
-{% block scripts_extra %}
-<script>
-document.addEventListener('DOMContentLoaded', function () {
-    // --- TinyMCE 초기화 스크립트 ---
-    // tinymce 객체가 전역 스코프에 로드되었는지 확인
-    if (typeof tinymce !== 'undefined') {
-        tinymce.init({
-            selector: 'textarea#content_editor', // HTML의 textarea id와 일치해야 함
-            plugins: 'preview importcss searchreplace autolink autosave save directionality code visualblocks visualchars fullscreen image link media template codesample table charmap pagebreak nonbreaking anchor insertdatetime advlist lists wordcount help charmap quickbars emoticons accordion',
-            menubar: 'file edit view insert format tools table help',
-            toolbar: 'undo redo | accordion accordionremove | blocks fontfamily fontsize | bold italic underline strikethrough | align numlist bullist | link image media table | lineheight outdent indent| forecolor backcolor removeformat | charmap emoticons | code fullscreen preview | save print | pagebreak anchor codesample | ltr rtl',
-            height: 600,
-            language: 'ko_KR', // 한국어팩 (static/tinymce/langs/ko_KR.js)이 올바른 경로에 있는지 확인
+def is_admin_logged_in(): return session.get('is_admin_logged_in', False)
+
+@app.context_processor
+def inject_global_vars():
+    all_cats = []
+    if Category:
+        try: all_cats = Category.query.order_by(Category.name).all()
+        except Exception as e: app.logger.error(f"Error fetching categories for context: {e}")
+    return dict(is_admin=is_admin_logged_in(), now=datetime.now(timezone.utc), all_categories=all_cats)
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not is_admin_logged_in():
+            flash('로그인이 필요합니다.', 'warning'); return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    # ... (이전 최종본과 동일) ...
+    if is_admin_logged_in(): return redirect(url_for('index'))
+    if request.method == 'POST':
+        password = request.form.get('password')
+        if password == app.config['ADMIN_PASSWORD']:
+            session['is_admin_logged_in'] = True; session.permanent = True
+            app.permanent_session_lifetime = timedelta(days=7)
+            flash('로그인되었습니다.', 'success'); return redirect(request.args.get('next') or url_for('index'))
+        else: flash('잘못된 비밀번호입니다.', 'danger')
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    # ... (이전 최종본과 동일) ...
+    session.pop('is_admin_logged_in', None); flash('로그아웃되었습니다.', 'info'); return redirect(url_for('index'))
+
+@app.route('/')
+def index():
+    # ... (이전 최종본과 동일) ...
+    if not Post: flash("게시글 기능을 사용할 수 없습니다.", "danger"); return render_template('index.html', posts_pagination=None, current_category=None)
+    page = request.args.get('page', 1, type=int)
+    posts_pagination = Post.query.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
+    return render_template('index.html', posts_pagination=posts_pagination, current_category=None)
+
+@app.route('/post/<string:slug>', methods=['GET', 'POST'])
+def view_post(slug):
+    # ... (이전 최종본과 동일 - 비밀번호 확인 로직 포함) ...
+    if not Post: abort(500, description="Post model not available.")
+    post_instance = Post.query.filter_by(slug=slug).first_or_404()
+    session_key_for_post_unlock = f'unlocked_post_{post_instance.id}'
+    is_unlocked_in_session = session.get(session_key_for_post_unlock, False)
+
+    if post_instance.is_password_protected and post_instance.password_hash:
+        if is_unlocked_in_session:
+            return render_template('view_post.html', post=post_instance, show_password_form=False)
+        else:
+            if request.method == 'POST':
+                submitted_password = request.form.get('post_password_view')
+                if post_instance.check_password(submitted_password):
+                    session[session_key_for_post_unlock] = True
+                    flash('비밀번호가 확인되었습니다.', 'success')
+                    return redirect(url_for('view_post', slug=post_instance.slug))
+                else:
+                    flash('비밀번호가 올바르지 않습니다.', 'danger')
+            return render_template('view_post.html', post=post_instance, show_password_form=True)
+    else:
+        if post_instance.is_password_protected and not post_instance.password_hash:
+             app.logger.warning(f"Post ID {post_instance.id} is marked protected but has no password hash. Treating as unprotected.")
+        return render_template('view_post.html', post=post_instance, show_password_form=False)
+
+
+@app.route('/new', methods=['GET', 'POST'])
+@admin_required
+def new_post():
+    cats = []
+    if Category:
+        try: cats = Category.query.order_by(Category.name).all()
+        except Exception as e: app.logger.error(f"Error fetching categories for new_post: {e}")
+
+    if request.method == 'POST':
+        title = request.form.get('title')
+        content_from_tinymce = request.form.get('content', '') # 기본값 '' 추가
+        category_id_str = request.form.get('category_id')
+        
+        is_protected_from_form = request.form.get('is_password_protected_checkbox') == 'y'
+        password_from_form = request.form.get('post_password_input', '').strip()
+
+        if not title: # 최소한 제목은 있어야 함
+            flash('제목을 입력해주세요.', 'warning')
+            return render_template('edit_post.html', title=title, content=content_from_tinymce, categories=cats, post=None, selected_category_id=category_id_str)
+
+        processed_category_id = int(category_id_str) if category_id_str and category_id_str.isdigit() else None
+        
+        # --- 새 글 저장 로직 변경 ---
+        new_post_obj = None # Post 객체 선언
+        try:
+            if not Post: raise Exception("Post model is not available.")
+
+            # 1. 제목, 카테고리 등 최소 정보로 Post 객체 생성 (content는 임시 또는 빈 값)
+            # Post 모델의 __init__은 title과 content를 필수로 받으므로, 임시 content를 넣어줍니다.
+            # 실제 content는 나중에 업데이트합니다.
+            temp_content_for_init = "[내용은 곧 업데이트 됩니다...]" if content_from_tinymce else "" # 또는 그냥 content_from_tinymce
+            new_post_obj = Post(title=title, content=temp_content_for_init, category_id=processed_category_id)
             
-            // 이미지 업로드 관련 설정
-            automatic_uploads: true,
-            images_upload_url: "{{ url_for('upload_image') }}", // Flask 업로드 엔드포인트
-            file_picker_types: 'image',
-            paste_data_images: true,
+            # 임시로 객체를 세션에 추가하고 flush하여 ID를 먼저 받도록 시도
+            db.session.add(new_post_obj)
+            db.session.flush() # DB에 보내서 ID 등을 할당받음 (아직 커밋은 아님)
 
-            images_upload_handler: function (blobInfo, progress) {
-                return new Promise((resolve, reject) => {
-                    const image_size_mb = blobInfo.blob().size / 1024 / 1024;
-                    const client_max_size_mb = 10; // 예시: 클라이언트 측 최대 10MB
+            # 이제 new_post_obj.id 사용 가능
+            # 실제 content와 비밀번호 정보 설정
+            new_post_obj.content = content_from_tinymce # TinyMCE에서 받은 실제 내용으로 업데이트
 
-                    if (image_size_mb > client_max_size_mb) {
-                        reject({ 
-                            message: '이미지 용량이 너무 큽니다 (' + image_size_mb.toFixed(1) + 'MB). 클라이언트 최대 허용 용량은 ' + client_max_size_mb + 'MB 입니다.', 
-                            remove: true
-                        });
-                        return;
-                    }
+            if is_protected_from_form:
+                if password_from_form:
+                    new_post_obj.set_password(password_from_form)
+                else: 
+                    flash('비밀번호로 보호를 선택했지만, 비밀번호를 입력하지 않았습니다. 보호되지 않은 글로 저장됩니다.', 'warning')
+                    new_post_obj.is_password_protected = False 
+                    new_post_obj.password_hash = None
+            else: 
+                new_post_obj.is_password_protected = False
+                new_post_obj.password_hash = None
+            
+            # 슬러그는 title 기반이므로, title이 확정된 후 한번 더 _generate_unique_slug를 호출할 수 있으나,
+            # __init__에서 이미 title 기반으로 생성됨. 만약 content 변경 후 slug도 변경해야 한다면 여기서 new_post_obj.slug = new_post_obj._generate_unique_slug(...) 호출.
+            # 현재는 title이 먼저 확정되므로 __init__에서 생성된 slug를 그대로 사용.
 
-                    const xhr = new XMLHttpRequest();
-                    xhr.withCredentials = false;
-                    xhr.open('POST', "{{ url_for('upload_image') }}");
+            db.session.commit() # 모든 변경사항을 최종 커밋
+            flash('게시글이 성공적으로 작성되었습니다.', 'success')
+            return redirect(url_for('view_post', slug=new_post_obj.slug))
+        
+        except Exception as e:
+            if db and db.session.is_active : db.session.rollback()
+            app.logger.error(f"Error creating post: {e}")
+            flash(f'게시글 작성 중 오류가 발생했습니다: {str(e)}', 'danger')
+            return render_template('edit_post.html', title=title, content=content_from_tinymce, categories=cats, post=None, selected_category_id=category_id_str)
+        # --- 새 글 저장 로직 변경 끝 ---
 
-                    xhr.upload.onprogress = (e) => {
-                        if (e.lengthComputable) {
-                            progress(e.loaded / e.total * 100);
-                        }
-                    };
-                    
-                    xhr.onload = () => {
-                        if (xhr.status < 200 || xhr.status >= 300) {
-                            let errorMessage = 'HTTP Error: ' + xhr.status;
-                            try {
-                                const jsonError = JSON.parse(xhr.responseText);
-                                if (jsonError && jsonError.error && jsonError.error.message) {
-                                    errorMessage = jsonError.error.message;
-                                }
-                            } catch (e) {
-                                if (xhr.status === 413) {
-                                     errorMessage = '파일이 너무 큽니다. 서버에서 요청을 거부했습니다 (HTTP 413).';
-                                } else if (xhr.responseText && xhr.responseText.length < 300) {
-                                    errorMessage = `서버 오류: ${xhr.status} - ${xhr.responseText.substring(0,100)}`;
-                                } else {
-                                    errorMessage = `서버에서 예상치 못한 응답을 받았습니다 (HTTP ${xhr.status}).`;
-                                }
-                            }
-                            reject({ message: errorMessage, remove: true });
-                            return;
-                        }
-                        try {
-                            const json = JSON.parse(xhr.responseText);
-                            if (!json || typeof json.location != 'string') {
-                                reject({ message: '서버로부터 잘못된 JSON 응답을 받았습니다: ' + xhr.responseText, remove: true });
-                                return;
-                            }
-                            resolve(json.location);
-                        } catch (e) {
-                            reject({ message: '서버 응답 처리 중 오류 발생 (JSON 파싱 실패): ' + e.message + ' 응답내용: ' + xhr.responseText.substring(0,100), remove: true });
-                        }
-                    };
-                    
-                    xhr.onerror = () => {
-                        reject({ message: '네트워크 오류로 이미지 업로드에 실패했습니다. 서버 연결을 확인해주세요.', remove: true });
-                    };
-                    
-                    const formData = new FormData();
-                    formData.append('file', blobInfo.blob(), blobInfo.filename());
-                    
-                    xhr.send(formData);
-                });
-            },
-            content_style: 'body { font-family:Helvetica,Arial,sans-serif; font-size:16px } img { max-width: 100%; height: auto; }'
-            // skin: 'oxide-dark', // 다크 모드 사용 시 예시 (관련 skin 파일 필요)
-            // content_css: 'dark' // 다크 모드 사용 시 예시
-        });
-    } else {
-        // 이 메시지가 콘솔에 보인다면, TinyMCE의 메인 JS 파일 로드에 실패한 것입니다.
-        console.error("CRITICAL: TinyMCE library (tinymce) is not defined. Check the script src path for tinymce.min.js in your base.html or edit_post.html.");
-        // 사용자에게도 간단한 알림을 줄 수 있습니다.
-        const contentTextarea = document.getElementById('content_editor');
-        if (contentTextarea) {
-            const errorDiv = document.createElement('div');
-            errorDiv.textContent = '텍스트 에디터를 불러오는 데 실패했습니다. 페이지를 새로고침하거나 관리자에게 문의하세요. (TinyMCE 로드 실패)';
-            errorDiv.style.color = 'red';
-            errorDiv.style.padding = '10px';
-            errorDiv.style.border = '1px solid red';
-            errorDiv.style.marginBottom = '10px';
-            contentTextarea.parentNode.insertBefore(errorDiv, contentTextarea);
-            contentTextarea.style.display = 'none'; // textarea 숨기기
-        }
-    }
-    // --- TinyMCE 초기화 스크립트 끝 ---
+    return render_template('edit_post.html', categories=cats, post=None, selected_category_id=None)
 
-    // --- 비밀번호 필드 표시/숨김 관련 JavaScript는 이제 사용하지 않음 (항상 표시) ---
-});
-</script>
-{% endblock %}
+
+@app.route('/edit/<string:slug>', methods=['GET', 'POST'])
+@admin_required
+def edit_post(slug):
+    # ... (이전 최종본과 동일 - 비밀번호 로직 포함) ...
+    if not Post or not Category: abort(500)
+    post_to_edit = Post.query.filter_by(slug=slug).first_or_404()
+    cats = []
+    try: cats = Category.query.order_by(Category.name).all()
+    except Exception as e: app.logger.error(f"Error fetching categories for edit_post: {e}")
+    
+    selected_category_id = str(post_to_edit.category_id) if post_to_edit.category_id is not None else ""
+    
+    if request.method == 'POST':
+        original_title = post_to_edit.title
+        post_to_edit.title = request.form.get('title')
+        post_to_edit.content = request.form.get('content', '') # 기본값 '' 추가
+        category_id_str = request.form.get('category_id')
+        selected_category_id = category_id_str
+
+        is_protected_from_form = request.form.get('is_password_protected_checkbox') == 'y'
+        password_from_form = request.form.get('post_password_input', '').strip()
+
+        if not post_to_edit.title: # 내용(content)은 비어있을 수 있지만, 제목은 필수라고 가정
+            flash('제목을 입력해주세요.', 'warning')
+            return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
+
+        processed_category_id = int(category_id_str) if category_id_str and category_id_str.isdigit() else None
+        post_to_edit.category_id = processed_category_id
+
+        if is_protected_from_form:
+            if password_from_form:
+                post_to_edit.set_password(password_from_form)
+            elif post_to_edit.password_hash: 
+                post_to_edit.is_password_protected = True
+            else: 
+                flash('비밀번호 보호를 선택했지만, 설정할 비밀번호가 없고 기존 비밀번호도 없습니다. 보호되지 않습니다.', 'warning')
+                post_to_edit.is_password_protected = False
+                post_to_edit.password_hash = None
+        else: 
+            post_to_edit.set_password(None)
+            
+        if original_title != post_to_edit.title:
+            post_to_edit.slug = post_to_edit._generate_unique_slug(post_to_edit.title)
+        post_to_edit.timestamp = datetime.now(timezone.utc)
+        
+        try:
+            db.session.commit()
+            flash('게시글이 성공적으로 수정되었습니다.', 'success')
+            return redirect(url_for('view_post', slug=post_to_edit.slug))
+        except Exception as e:
+            db.session.rollback(); app.logger.error(f"Error editing post {slug}: {e}")
+            flash(f'게시글 수정 중 오류: {str(e)}', 'danger')
+            return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
+
+    return render_template('edit_post.html', post=post_to_edit, categories=cats, title=post_to_edit.title, content=post_to_edit.content, selected_category_id=selected_category_id)
+
+# --- 나머지 모든 라우트 및 실행 부분은 이전 최종본과 동일하게 유지 ---
+# (delete_post, upload_image, 카테고리 관리, 디버그 라우트, if __name__ == '__main__' 등)
+# 이전에 제공해드린 app.py 전체 코드에서 new_post 와 edit_post 라우트 부분만
+# 지금 드린 내용으로 교체하시면 됩니다.
+# 아래는 생략된 나머지 부분들의 시작과 끝입니다.
+
+@app.route('/delete/<string:slug>', methods=['POST'])
+@admin_required
+def delete_post(slug):
+    if not Post: abort(500)
+    post_to_delete = Post.query.filter_by(slug=slug).first_or_404()
+    try:
+        db.session.delete(post_to_delete); db.session.commit()
+        flash('게시글이 삭제되었습니다.', 'success')
+    except Exception as e:
+        db.session.rollback(); app.logger.error(f"Error deleting post {slug}: {e}"); flash(f'삭제 오류: {str(e)}', 'danger')
+    return redirect(url_for('index'))
+
+@app.route('/upload_image', methods=['POST'])
+@admin_required
+def upload_image():
+    if 'file' not in request.files: return jsonify({'error': {'message': 'No file part'}}), 400
+    file = request.files['file']
+    if file.filename == '': return jsonify({'error': {'message': 'No selected file'}}), 400
+    if file and allowed_file(file.filename):
+        original_filename = secure_filename(file.filename); filename_prefix = str(uuid.uuid4())[:8]
+        base, ext = os.path.splitext(original_filename); safe_base = re.sub(r'[^\w-]', '', base)[:50]
+        filename = f"{filename_prefix}_{safe_base}{ext}"; counter = 1; temp_filename_to_check = filename
+        upload_path = app.config.get('UPLOAD_FOLDER', './static/uploads_fallback')
+        final_filepath = os.path.join(upload_path, temp_filename_to_check)
+        while os.path.exists(final_filepath):
+            temp_filename_to_check = f"{filename_prefix}_{safe_base}_{counter}{ext}"
+            final_filepath = os.path.join(upload_path, temp_filename_to_check); counter += 1
+        filename = temp_filename_to_check
+        try:
+            file.save(final_filepath); image_url = url_for('static', filename=f'uploads/{filename}') 
+            return jsonify({'location': image_url})
+        except Exception as e:
+            app.logger.error(f"Image upload failed: {e}, filepath: {final_filepath}")
+            return jsonify({'error': {'message': f'Image upload failed: {str(e)}'}}), 500
+    return jsonify({'error': {'message': f'Allowed types: {app.config.get("ALLOWED_EXTENSIONS", set())}'}}), 400
+
+@app.route('/admin/categories')
+@admin_required
+def admin_categories(): return render_template('admin_categories.html')
+
+@app.route('/admin/category/new', methods=['GET', 'POST'])
+@admin_required
+def new_category():
+    if not Category: abort(500)
+    if request.method == 'POST':
+        name = request.form.get('name')
+        if not name: flash('카테고리 이름을 입력해주세요.', 'warning')
+        else:
+            try:
+                if Category.query.filter_by(name=name).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
+                else:
+                    db.session.add(Category(name=name)); db.session.commit()
+                    flash(f'카테고리 "{name}" 추가 완료.', 'success'); return redirect(url_for('admin_categories'))
+            except Exception as e:
+                db.session.rollback(); app.logger.error(f"Error creating category: {e}"); flash(f'카테고리 추가 오류: {str(e)}', 'danger')
+        return render_template('edit_category.html', category_name=name, category=None)
+    return render_template('edit_category.html', category=None, category_name='')
+
+
+@app.route('/admin/category/edit/<int:category_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_category(category_id):
+    if not Category: abort(500)
+    category_to_edit = Category.query.get_or_404(category_id); category_name_for_form = category_to_edit.name
+    if request.method == 'POST':
+        new_name = request.form.get('name'); category_name_for_form = new_name
+        if not new_name: flash('카테고리 이름을 입력해주세요.', 'warning')
+        elif new_name == category_to_edit.name: flash('변경된 내용이 없습니다.', 'info'); return redirect(url_for('admin_categories'))
+        else:
+            try:
+                if Category.query.filter(Category.name == new_name, Category.id != category_id).first(): flash('이미 존재하는 카테고리 이름.', 'warning')
+                else:
+                    original_name = category_to_edit.name; category_to_edit.name = new_name
+                    category_to_edit.slug = category_to_edit._generate_unique_slug(new_name); db.session.commit()
+                    flash(f'카테고리 "{original_name}"이 "{new_name}"(으)로 수정 완료.', 'success'); return redirect(url_for('admin_categories'))
+            except Exception as e:
+                db.session.rollback(); app.logger.error(f"Error editing category: {e}"); flash(f'카테고리 수정 오류: {str(e)}', 'danger')
+        return render_template('edit_category.html', category=category_to_edit, category_name=category_name_for_form)
+    return render_template('edit_category.html', category=category_to_edit, category_name=category_name_for_form)
+
+@app.route('/admin/category/delete/<int:category_id>', methods=['POST'])
+@admin_required
+def delete_category(category_id):
+    if not Category: abort(500)
+    category_to_delete = Category.query.get_or_404(category_id)
+    if category_to_delete.posts_in_category.count() > 0:
+        flash(f'"{category_to_delete.name}"에 속한 글이 있어 삭제 불가.', 'danger'); return redirect(url_for('admin_categories'))
+    try:
+        db.session.delete(category_to_delete); db.session.commit(); flash(f'카테고리 "{category_to_delete.name}" 삭제 완료.', 'success')
+    except Exception as e:
+        db.session.rollback(); app.logger.error(f"Error deleting category: {e}"); flash(f'카테고리 삭제 오류: {str(e)}', 'danger')
+    return redirect(url_for('admin_categories'))
+
+@app.route('/category/<string:slug>')
+def posts_by_category(slug):
+    if not Category or not Post: abort(500)
+    category = Category.query.filter_by(slug=slug).first_or_404(); page = request.args.get('page', 1, type=int)
+    posts_pagination = category.posts_in_category.order_by(Post.timestamp.desc()).paginate(page=page, per_page=10, error_out=False)
+    return render_template('index.html', posts_pagination=posts_pagination, current_category=category)
+
+@app.cli.command('init-db')
+def init_db_cli_command():
+    if db is None: print("DB not initialized."); return
+    with app.app_context(): db.drop_all(); db.create_all()
+    print('Initialized the database.')
+
+_db_initialized_flag = False
+@app.before_request
+def ensure_tables_exist():
+    global _db_initialized_flag
+    if not _db_initialized_flag and db is not None:
+        with app.app_context(): db.create_all()
+        _db_initialized_flag = True
+
+@app.route('/debug_config_check')
+def debug_config_check():
+    max_size = app.config.get('MAX_CONTENT_LENGTH')
+    if max_size is None: return "MAX_CONTENT_LENGTH is not set."
+    is_expected_size = (max_size == 50 * 1024 * 1024) or (max_size == 5000 * 1024 * 1024) # 50MB or 5GB
+    return f"MAX_CONTENT_LENGTH: {max_size} bytes. Is this as expected (50MB or 5GB)? {is_expected_size}"
+
+if __name__ == '__main__':
+    if db is not None:
+        with app.app_context(): db.create_all() 
+    app.run(host='10.244.122.25', port=8099, debug=True, threaded=True)
