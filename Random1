@@ -1,107 +1,315 @@
-네, app/__init__.py 파일에서 "name 'current_app' is not defined" 오류가 발생하셨군요. 이 오류는 Flask의 current_app 프록시 객체를 사용하려고 할 때, 해당 시점에 활성화된 애플리케이션 컨텍스트(Application Context)가 없기 때문에 발생합니다.
+게시글마다 필요에 따라 비밀번호를 설정하는 기능은 충분히 구현 가능합니다. 블로그나 게시판에서 특정 글을 비공개로 하거나 특정 사람들만 볼 수 있게 할 때 유용한 기능이죠.
 
-create_app 함수 내에서 Flask 애플리케이션 인스턴스는 app이라는 변수로 직접 참조 가능합니다. 따라서 create_app 함수 내부에서 로깅을 할 때는 current_app.logger 대신 app.logger를 사용하는 것이 더 직접적이고 안전합니다.
+이 기능을 추가하려면 다음과 같은 주요 변경 사항이 필요합니다:
 
-또한, datetimeformat 필터 내에서도 current_app.logger를 사용한 부분이 있었는데, 이 부분도 app.logger로 변경하거나, 필터가 실제 템플릿 렌더링 시점에 호출될 때는 이미 앱 컨텍스트가 활성화되어 current_app 사용이 가능하지만, 일관성을 위해 app 객체를 직접 사용할 수 있다면 그것을 사용하는 것이 좋습니다. (다만, 필터 함수는 app 객체를 직접 클로저로 잡지 않는 이상 current_app을 사용하는 것이 일반적입니다. 여기서는 로깅 부분만 수정하고, 필터 내부는 current_app을 그대로 두거나, 로깅이 꼭 필요하지 않다면 제거할 수 있습니다.)
+데이터베이스 모델 변경 (models.py): Post 모델에 비밀번호 해시를 저장할 컬럼을 추가하고, 비밀번호 설정 및 확인을 위한 메서드를 추가합니다.
+애플리케이션 로직 변경 (app.py):
+게시글 작성/수정 시 비밀번호를 입력받고 저장하는 로직 추가.
+비밀번호가 설정된 게시글을 보려고 할 때 비밀번호를 입력받아 확인하는 로직 추가.
+비밀번호가 맞으면 세션 등을 이용해 해당 글에 대한 접근 권한을 잠시 저장할 수 있습니다.
+템플릿 변경 (templates/):
+edit_post.html: 게시글 작성/수정 폼에 비밀번호를 설정/변경할 수 있는 입력 필드와 "비밀번호 보호 사용" 체크박스 추가.
+view_post.html: 비밀번호가 설정된 글이라면, 내용을 보여주기 전에 비밀번호 입력 폼을 먼저 보여주도록 수정.
+index.html: 비밀번호가 설정된 글임을 시각적으로 표시 (예: 자물쇠 아이콘).
+중요: 데이터베이스 모델이 변경되므로, 이전에 안내해 드린 것처럼 기존 board.db 파일을 삭제하고 애플리케이션을 재시작하여 새로운 구조로 데이터베이스를 생성해야 합니다. (또는 Flask-Migrate 같은 마이그레이션 도구를 사용해야 하지만, 현재 프로젝트에는 도입되지 않았습니다.) 작업 전에 반드시 현재 프로젝트를 백업해주세요.
 
-가장 문제가 되는 부분은 create_app 함수 마지막의 로깅 라인일 것입니다. 이 부분을 app.logger로 수정하겠습니다.
+아래에 수정이 필요한 파일들과 그 전체 내용을 단계별로 안내해 드리겠습니다.
 
-수정: app/__init__.py (전체 코드)
-current_app.logger를 app.logger로 변경하고, datetimeformat 필터 내의 로깅은 그대로 두거나 (템플릿 렌더링 시 컨텍스트 존재) 필요시 app 객체를 전달하는 방식으로 수정할 수 있습니다. 여기서는 create_app 함수 내의 로깅만 수정합니다.
+1. models.py 수정
+
+Post 모델에 비밀번호 관련 필드와 메서드를 추가합니다. 비밀번호는 안전하게 해시(hash)하여 저장합니다.
 
 Python
 
-# scontrol_flask_web/app/__init__.py
-from flask import Flask, current_app # current_app 임포트는 유지 (컨텍스트 프로세서나 필터에서 사용될 수 있음)
 from flask_sqlalchemy import SQLAlchemy
-from config import config # 프로젝트 루트의 config.py 임포트
-import datetime
+from datetime import datetime, timezone
+import re
+from werkzeug.security import generate_password_hash, check_password_hash # 비밀번호 해싱을 위해 추가
 
-db = SQLAlchemy() # SQLAlchemy 객체 전역 선언
+db = SQLAlchemy()
 
-def create_app(config_name='default'):
-    """
-    Flask 애플리케이션 인스턴스를 생성하고 초기화하는 팩토리 함수입니다.
-    """
-    app = Flask(__name__) # 여기서 'app' 인스턴스 생성
-    
-    # 1. 설정 로드
-    app.config.from_object(config[config_name])
-    config[config_name].init_app(app) 
+def slugify(text_to_slugify):
+    if not text_to_slugify:
+        return "default-slug"
+    text_processed = str(text_to_slugify)
+    text_processed = re.sub(r'[^\w\s-]', '', text_processed).strip().lower()
+    text_processed = re.sub(r'[-\s]+', '-', text_processed)
+    if not text_processed:
+        return "default-slug"
+    return text_processed
 
-    # 2. 확장 기능 초기화 (예: SQLAlchemy)
-    db.init_app(app)
+class Category(db.Model):
+    __tablename__ = 'category'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    slug = db.Column(db.String(120), nullable=False, unique=True)
+    posts_in_category = db.relationship('Post', back_populates='category', lazy='dynamic', foreign_keys='Post.category_id')
 
-    # 3. Jinja2 커스텀 필터 및 컨텍스트 프로세서 등록
-    # datetime 필터 등록
-    def format_datetime(value, fmt='%Y-%m-%d %H:%M'):
-        if not value: 
-            return ""
-        if isinstance(value, str): 
-            original_value_for_log = value # 로깅을 위해 원본 값 저장
-            try: 
-                # 다양한 ISO 및 일반적인 날짜/시간 형식 파싱 시도
-                # 'Z' 제거, 마이크로초 부분 제거, T를 공백으로 변경 등 시도
-                processed_value = value.upper().replace('Z', '')
-                if '.' in processed_value: # 마이크로초가 있다면 제거
-                    processed_value = processed_value.split('.')[0]
-                
-                processed_value = processed_value.replace('T', ' ')
+    def __init__(self, name):
+        self.name = name
+        self.slug = self._generate_unique_slug(name)
 
-                # 알려진 형식들로 파싱 시도
-                formats_to_try = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-                parsed_dt = None
-                for dt_format in formats_to_try:
-                    try:
-                        parsed_dt = datetime.datetime.strptime(processed_value, dt_format)
-                        break
-                    except ValueError:
-                        continue
-                
-                if parsed_dt is None: # 모든 형식 파싱 실패
-                    # app.logger 사용 (create_app 함수 스코프 내에서는 app 직접 사용)
-                    app.logger.warning(f"날짜 문자열 파싱 실패 (format_datetime filter): '{original_value_for_log}'")
-                    return original_value_for_log # 파싱 실패 시 원본 값 반환
-                value = parsed_dt
-            except Exception as e_parse: 
-                app.logger.error(f"날짜 문자열 파싱 중 예외 발생 (format_datetime filter) '{original_value_for_log}': {e_parse}")
-                return original_value_for_log 
+    def _generate_unique_slug(self, name_to_slug):
+        base_slug = slugify(name_to_slug)
+        current_slug_candidate = base_slug
+        counter = 1
+        while Category.query.filter_by(slug=current_slug_candidate).first():
+            current_slug_candidate = f"{base_slug}-{counter}"
+            counter += 1
+        return current_slug_candidate
+
+    def __repr__(self):
+        return f'<Category {self.name}>'
+
+class Post(db.Model):
+    __tablename__ = 'post'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    slug = db.Column(db.String(200), unique=True, nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, index=True, default=lambda: datetime.now(timezone.utc))
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
+    category = db.relationship('Category', back_populates='posts_in_category', foreign_keys=[category_id])
+
+    # --- 게시글 비밀번호 기능 추가 ---
+    password_hash = db.Column(db.String(256), nullable=True) # 비밀번호 해시 저장 (충분한 길이)
+    is_password_protected = db.Column(db.Boolean, default=False, nullable=False) # 비밀번호 보호 여부 플래그
+    # --- 게시글 비밀번호 기능 추가 끝 ---
+
+    def __init__(self, title, content, category_id=None, slug_text=None, password=None, is_protected=False):
+        self.title = title
+        self.content = content
+        self.category_id = category_id
         
-        if not isinstance(value, (datetime.datetime, datetime.date)):
-             return value 
-        return value.strftime(fmt)
-    app.jinja_env.filters['datetimeformat'] = format_datetime
-    
-    @app.context_processor
-    def inject_now(): 
-        return {'now': datetime.datetime.utcnow()}
+        self.is_password_protected = is_protected
+        if is_protected and password:
+            self.set_password(password)
+        else: # 보호되지 않거나, 보호되지만 비밀번호가 제공되지 않으면 (새 글 작성 시)
+            self.password_hash = None
+            self.is_password_protected = False # 명시적으로 False 설정
 
-    # IP 주소 및 사용자 역할 정보를 모든 템플릿에 주입하는 컨텍스트 프로세서 등록
-    from .auth import inject_user_info_to_templates
-    app.context_processor(inject_user_info_to_templates)
+        if slug_text:
+            self.slug = slug_text
+        else:
+            self.slug = self._generate_unique_slug(self.title)
 
-    # 4. 블루프린트(Blueprint) 등록
-    from .routes_main import main_bp
-    app.register_blueprint(main_bp) 
+    def _generate_unique_slug(self, title_to_slug):
+        base_slug = slugify(title_to_slug)
+        current_slug_candidate = base_slug
+        counter = 1
+        while Post.query.filter_by(slug=current_slug_candidate).first():
+            current_slug_candidate = f"{base_slug}-{counter}"
+            counter += 1
+        return current_slug_candidate
 
-    from .routes_admin import admin_bp
-    app.register_blueprint(admin_bp, url_prefix='/admin') 
-    
-    from .routes_user import user_bp
-    app.register_blueprint(user_bp, url_prefix='/user') 
-    
-    # 애플리케이션 생성 완료 로깅 (current_app 대신 app.logger 사용)
-    app.logger.info("Flask application created and configured successfully.")
-    # DB URI는 민감 정보일 수 있으므로, DEBUG 모드에서만 로깅하거나 주의해서 로깅
-    if app.debug:
-        app.logger.debug(f"Database URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+    # --- 게시글 비밀번호 메서드 추가 ---
+    def set_password(self, password):
+        if password: # 비밀번호가 제공된 경우에만 해시 설정
+            self.password_hash = generate_password_hash(password)
+            self.is_password_protected = True
+        else: # 빈 비밀번호는 비밀번호 없음으로 간주 (보호 해제)
+            self.password_hash = None
+            self.is_password_protected = False
 
-    return app
-주요 변경 사항:
+    def check_password(self, password):
+        if not self.password_hash: # 저장된 비밀번호 해시가 없으면 항상 False
+            return False
+        return check_password_hash(self.password_hash, password)
+    # --- 게시글 비밀번호 메서드 추가 끝 ---
 
-로거 사용 변경:
-create_app 함수 마지막 부분의 current_app.logger.info(...)와 current_app.logger.debug(...) 호출을 app.logger.info(...) 와 app.logger.debug(...) 로 변경했습니다. create_app 함수 내에서는 app 변수를 통해 Flask 애플리케이션 인스턴스에 직접 접근할 수 있으므로, 이 인스턴스의 로거를 사용하는 것이 더 명확하고 컨텍스트 문제 발생 가능성이 적습니다.
-datetimeformat 필터 내 로깅 수정:
-날짜/시간 문자열 파싱 실패 시 로깅하는 부분도 app.logger.warning(...) 또는 app.logger.error(...)를 사용하도록 변경했습니다. (current_app은 템플릿 렌더링 시점에는 컨텍스트가 활성화되어 사용 가능하지만, create_app 스코프에서는 app을 직접 사용하는 것이 일관성 있고 안전합니다.)
-datetimeformat 필터의 파싱 로직을 좀 더 다양한 형식을 포괄하고, 오류 발생 시 원본 값을 반환하도록 견고하게 수정했습니다.
-추가 확인 사항:
+    def __repr__(self):
+        return f'<Post {self.title}>'
+models.py 변경 사항 요약:
+
+werkzeug.security에서 generate_password_hash, check_password_hash 임포트.
+Post 모델에 password_hash (비밀번호 해시 저장용, 문자열) 컬럼과 is_password_protected (보호 여부 플래그, 불리언) 컬럼 추가.
+Post 모델의 __init__ 메서드 수정: password와 is_protected 인자를 받아서 처리.
+Post 모델에 set_password(self, password)와 check_password(self, password) 메서드 추가.
+2. templates/edit_post.html 수정
+
+게시글 작성/수정 폼에 "비밀번호로 보호" 체크박스와 비밀번호 입력 필드를 추가합니다.
+
+HTML
+
+{% extends "base.html" %}
+
+{% block title %}{{ '게시글 수정' if post else '새 게시글 작성' }} - 나의 게시판{% endblock %}
+
+{% block head_extra %}
+    <script src="{{ url_for('static', filename='tinymce/tinymce.min.js') }}" referrerpolicy="origin"></script>
+{% endblock %}
+
+{% block content %}
+<div class="container-fluid mt-4">
+    <h2>{{ '게시글 수정' if post else '새 게시글 작성' }}</h2>
+    <form method="POST" action="{{ url_for('edit_post', slug=post.slug) if post else url_for('new_post') }}">
+        <div class="form-group">
+            <label for="title">제목</label>
+            <input type="text" class="form-control" id="title" name="title" value="{{ title or (post.title if post else '') }}" required>
+        </div>
+
+        <div class="form-group">
+            <label for="category_id">카테고리</label>
+            <select class="form-control" id="category_id" name="category_id">
+                <option value="">-- 카테고리 선택 안 함 --</option>
+                {% for category_item in categories %}
+                    <option value="{{ category_item.id }}" {% if selected_category_id and category_item.id == selected_category_id|int %}selected{% endif %}>
+                        {{ category_item.name }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+
+        {# --- 게시글 비밀번호 설정 추가 --- #}
+        <div class="form-group form-check">
+            <input type="checkbox" class="form-check-input" id="is_password_protected" name="is_password_protected" value="y" 
+                   {% if post and post.is_password_protected %}checked{% endif %}
+                   onchange="togglePasswordFields()">
+            <label class="form-check-label" for="is_password_protected">이 글을 비밀번호로 보호합니다.</label>
+        </div>
+
+        <div id="password_fields" style="display: {% if post and post.is_password_protected %}block{% else %}none{% endif %};">
+            <div class="form-group">
+                <label for="post_password">비밀번호 설정/변경</label>
+                <input type="password" class="form-control" id="post_password" name="post_password" placeholder="새 비밀번호 입력 (변경 시에만)">
+                <small class="form-text text-muted">
+                    비밀번호를 설정하거나 변경하려면 여기에 입력하세요. 기존 비밀번호를 유지하려면 비워두세요.
+                    보호를 해제하려면 위 체크박스를 해제하세요.
+                </small>
+            </div>
+            {# 비밀번호 확인 필드는 필요시 추가할 수 있습니다. 여기서는 단순화를 위해 생략. #}
+            {# <div class="form-group">
+                <label for="post_password_confirm">비밀번호 확인</label>
+                <input type="password" class="form-control" id="post_password_confirm" name="post_password_confirm">
+            </div> #}
+        </div>
+        {# --- 게시글 비밀번호 설정 추가 끝 --- #}
+
+        <div class="form-group">
+            <label for="content">내용</label>
+            <textarea class="form-control" id="content" name="content" rows="15">{{ content or (post.content if post else '') }}</textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">저장</button>
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">취소</a>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts_extra %}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    tinymce.init({
+        selector: 'textarea#content',
+        plugins: 'preview importcss searchreplace autolink autosave save directionality code visualblocks visualchars fullscreen image link media template codesample table charmap pagebreak nonbreaking anchor insertdatetime advlist lists wordcount help charmap quickbars emoticons accordion',
+        menubar: 'file edit view insert format tools table help',
+        toolbar: 'undo redo | accordion accordionremove | blocks fontfamily fontsize | bold italic underline strikethrough | align numlist bullist | link image media table | lineheight outdent indent| forecolor backcolor removeformat | charmap emoticons | code fullscreen preview | save print | pagebreak anchor codesample | ltr rtl',
+        height: 600,
+        language: 'ko_KR',
+        automatic_uploads: true,
+        images_upload_url: "{{ url_for('upload_image') }}",
+        file_picker_types: 'image',
+        paste_data_images: true,
+        images_upload_handler: function (blobInfo, progress) {
+            return new Promise((resolve, reject) => {
+                const image_size_mb = blobInfo.blob().size / 1024 / 1024;
+                const client_max_size_mb = 10; // 클라이언트 측 예시 제한
+
+                if (image_size_mb > client_max_size_mb) {
+                    reject({ 
+                        message: '이미지 용량이 너무 큽니다 (' + image_size_mb.toFixed(1) + 'MB). 클라이언트 최대 허용 용량은 ' + client_max_size_mb + 'MB 입니다.', 
+                        remove: true
+                    });
+                    return;
+                }
+
+                const xhr = new XMLHttpRequest();
+                xhr.withCredentials = false;
+                xhr.open('POST', "{{ url_for('upload_image') }}");
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        progress(e.loaded / e.total * 100);
+                    }
+                };
+                xhr.onload = () => {
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        let errorMessage = 'HTTP Error: ' + xhr.status;
+                        try {
+                            const jsonError = JSON.parse(xhr.responseText);
+                            if (jsonError && jsonError.error && jsonError.error.message) {
+                                errorMessage = jsonError.error.message;
+                            }
+                        } catch (e) {
+                            if (xhr.status === 413) {
+                                 errorMessage = '파일이 너무 큽니다. 서버에서 요청을 거부했습니다 (HTTP 413).';
+                            } else if (xhr.responseText && xhr.responseText.length < 300) {
+                                errorMessage = `서버 오류: ${xhr.status} - ${xhr.responseText.substring(0,100)}`;
+                            } else {
+                                errorMessage = `서버에서 예상치 못한 응답을 받았습니다 (HTTP ${xhr.status}).`;
+                            }
+                        }
+                        reject({ message: errorMessage, remove: true });
+                        return;
+                    }
+                    try {
+                        const json = JSON.parse(xhr.responseText);
+                        if (!json || typeof json.location != 'string') {
+                            reject({ message: '서버로부터 잘못된 JSON 응답을 받았습니다: ' + xhr.responseText, remove: true });
+                            return;
+                        }
+                        resolve(json.location);
+                    } catch (e) {
+                        reject({ message: '서버 응답 처리 중 오류 발생 (JSON 파싱 실패): ' + e.message + ' 응답내용: ' + xhr.responseText.substring(0,100), remove: true });
+                    }
+                };
+                xhr.onerror = () => {
+                    reject({ message: '네트워크 오류로 이미지 업로드에 실패했습니다. 서버 연결을 확인해주세요.', remove: true });
+                };
+                const formData = new FormData();
+                formData.append('file', blobInfo.blob(), blobInfo.filename());
+                xhr.send(formData);
+            });
+        }
+        // 기타 TinyMCE 설정은 유지
+    });
+
+    // 비밀번호 필드 표시/숨김 처리 JavaScript
+    function togglePasswordFields() {
+        var checkbox = document.getElementById('is_password_protected');
+        var passwordFieldsDiv = document.getElementById('password_fields');
+        var passwordInput = document.getElementById('post_password');
+        if (checkbox.checked) {
+            passwordFieldsDiv.style.display = 'block';
+        } else {
+            passwordFieldsDiv.style.display = 'none';
+            passwordInput.value = ''; // 보호 해제 시 입력된 비밀번호 값 초기화 (선택 사항)
+        }
+    }
+    // 페이지 로드 시 초기 상태 설정 (수정 모드에서 이미 보호된 글일 경우)
+    // togglePasswordFields(); // DOMContentLoaded 리스너 안으로 옮기거나, 바로 실행해도 됩니다.
+    // script 태그가 body 하단에 있으므로 DOM 로드 후 실행됩니다.
+    // 페이지 로드 시 초기 상태를 바로 반영하기 위해 호출 (또는 위에서 style을 바로 설정)
+    // togglePasswordFields(); // 이미 style 속성으로 초기 상태를 제어하고 있으므로 중복 호출 불필요
+});
+</script>
+{% endblock %}
+edit_post.html 변경 사항 요약:
+
+"이 글을 비밀번호로 보호합니다." (is_password_protected, value="y") 체크박스 추가.
+"비밀번호 설정/변경" (post_password) 입력 필드 추가.
+체크박스 상태에 따라 비밀번호 입력 필드를 보여주거나 숨기는 간단한 JavaScript (togglePasswordFields) 함수 추가.
+글 수정 시, 기존 글이 비밀번호로 보호되어 있다면 체크박스와 비밀번호 필드가 기본적으로 표시되도록 함.
+다음은 app.py 파일의 수정 내용과 새로운 템플릿 파일들입니다. 내용이 길어지므로 다음 답변에서 이어서 드리겠습니다. 먼저 위 두 파일 (models.py, templates/edit_post.html)을 적용해보시고, 데이터베이스를 초기화한 후 (기존 board.db 삭제 후 앱 재시작) 게시글 작성/수정 화면에 비밀번호 설정 UI가 제대로 나타나는지 확인해보시는 것이 좋겠습니다.
+
+확인되시면 app.py와 나머지 템플릿 코드를 드리겠습니다.
+
+
+소스
+
+
+
+
+
+Deep Research
+
+
+Gemini는 인물 등에 관한 정보 제공 시 실수를 할 수 있으니 다시 한번 확인하세요. 개인 정보 보호 및 Gemini
