@@ -1,133 +1,396 @@
-네, 알겠습니다. Flask 웹 애플리케이션의 IP 기반 인증 및 권한 부여 로직을 담당하는 app/auth.py 파일의 최종 전체 코드를 한국어 설명과 함께 다시 제공해 드리겠습니다.
+네, 알겠습니다. Flask 웹 애플리케이션의 주요 로직을 구성하는 다음 파일들의 최종 전체 코드를 한국어 설명과 함께 순서대로 제공해 드리겠습니다.
 
-이 파일은 다음 주요 기능들을 포함합니다:
+요청하신 파일은 다음과 같습니다:
 
-get_current_user_role() 함수: 현재 접속한 사용자의 IP 주소를 기반으로 'admin'(관리자), 'user'(허용된 사용자), 또는 'guest'(그 외) 역할을 결정합니다.
-ip_auth_required() 데코레이터: 특정 역할(예: 'admin')이 필요한 웹 페이지(라우트)에 접근을 제한합니다. 권한이 없는 경우 403 Forbidden 오류를 발생시킵니다.
-inject_user_info_to_templates() 컨텍스트 프로세서: 모든 HTML 템플릿에서 현재 접속한 사용자의 IP(current_user_ip)와 역할(current_user_role) 정보를 쉽게 사용할 수 있도록 해줍니다.
-최종: app/auth.py (전체 코드)
+app/models.py (데이터베이스 모델 정의)
+app/socket_client.py (SAgentM 에이전트 통신 로직)
+app/routes_user.py (사용자 제어판 관련 라우트)
+app/forms.py (웹 입력 폼 정의)
+1. 최종: app/models.py (데이터베이스 모델)
+이 파일은 SQLAlchemy를 사용하여 MSSQL Server 2014 데이터베이스의 테이블(admin_ips, allowed_user_ips, target_pcs)에 매핑되는 Python 클래스(모델)를 정의합니다.
+
 Python
 
-# scontrol_flask_web/app/auth.py
-from functools import wraps
-from flask import request, current_app, abort, g # render_template는 현재 직접 사용하지 않으므로 제거 가능
-from .models import AdminIP, AllowedUserIP # 데이터베이스 모델 임포트
+# scontrol_flask_web/app/models.py
+from . import db  # app/__init__.py 에서 생성한 db SQLAlchemy 객체 임포트
+from sqlalchemy import func # func.now() 와 같은 SQL 함수 사용
+from sqlalchemy.dialects.mssql import DATETIME2 # MSSQL의 DATETIME2 타입 사용 (선택적)
 
-def get_current_user_role():
-    """
-    현재 요청 컨텍스트(g)에 사용자 IP와 역할 정보가 이미 있다면 그것을 사용하고,
-    없다면 요청으로부터 사용자 IP를 확인하여 DB 조회 후 역할을 결정하고 g에 저장합니다.
-    역할은 'admin', 'user', 'guest' 중 하나입니다.
-    """
-    # 현재 요청(g) 내에 역할 정보가 이미 캐시되어 있는지 확인
-    if hasattr(g, 'current_user_role'):
-        return g.current_user_role
+# 참고: MSSQL에서 DATETIME 컬럼의 기본값으로 GETDATE()를 사용하고,
+# last_modified에 대한 업데이트 트리거를 DDL에서 이미 설정했습니다.
+# SQLAlchemy 모델의 default/onupdate 설정은 DBMS 레벨의 기본값/트리거와 함께 동작하거나,
+# 애플리케이션 레벨에서 값을 명시적으로 설정하지 않을 때 SQLAlchemy가 값을 제공하는 역할을 합니다.
+# func.now()는 SQLAlchemy에서 현재 시간을 나타내는 일반적인 방법이며,
+# 실제 DB에는 해당 DB의 현재 시간 함수(예: GETDATE())로 변환되어 실행됩니다.
 
-    user_ip = None
-    # 웹 서버 앞단에 프록시(예: Nginx)가 있는 경우 X-Forwarded-For 헤더를 통해 실제 클라이언트 IP를 가져옵니다.
-    # 이 헤더는 신뢰할 수 있는 프록시에 의해서만 설정되어야 합니다.
-    if request.headers.getlist("X-Forwarded-For"):
-        # X-Forwarded-For 헤더는 콤마로 구분된 여러 IP를 포함할 수 있으므로, 첫 번째 IP를 사용합니다.
-        user_ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
-    else:
-        # 직접 접속 환경에서는 remote_addr을 사용합니다.
-        user_ip = request.remote_addr
+class AdminIP(db.Model):
+    __tablename__ = 'admin_ips' # 실제 DB 테이블 이름
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True) # MSSQL의 IDENTITY(1,1)에 해당
+    ip_address = db.Column(db.String(50), unique=True, nullable=False)
+    description = db.Column(db.String(255), nullable=True)
+    # MSSQL DDL에서 DEFAULT GETDATE()로 설정했으므로, SQLAlchemy default는 보조적
+    created_at = db.Column(db.DateTime, default=func.now()) 
+
+    # 관계 설정 (선택 사항, allowed_user_ips 테이블에서 누가 추가했는지 역참조 시 사용)
+    # users_added_by_this_admin = db.relationship('AllowedUserIP', backref='added_by_admin', lazy='dynamic')
+
+    def __repr__(self):
+        return f'<AdminIP {self.ip_address}>'
+
+class AllowedUserIP(db.Model):
+    __tablename__ = 'allowed_user_ips'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    ip_address = db.Column(db.String(50), unique=True, nullable=False)
+    description = db.Column(db.String(255), nullable=True)
+    added_by_admin_id = db.Column(db.Integer, db.ForeignKey('admin_ips.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(db.DateTime, default=func.now())
+
+    # 관계 설정 (선택 사항, 이 IP를 추가한 관리자 정보를 쉽게 가져오기 위함)
+    admin_adder_ref = db.relationship('AdminIP', backref=db.backref('allowed_ips_managed_by_admin', lazy='select')) # 'select' 또는 'joined'
+
+    def __repr__(self):
+        return f'<AllowedUserIP {self.ip_address}>'
+
+class TargetPC(db.Model):
+    __tablename__ = 'target_pcs'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    pc_name = db.Column(db.String(100), unique=True, nullable=False)
+    address1 = db.Column(db.String(50), nullable=False) # VARCHAR(50)에 해당
+    address2 = db.Column(db.String(50), nullable=True)  # VARCHAR(50)에 해당
+    description = db.Column(db.String(255), nullable=True)
+    # port는 4026으로 고정되므로 모델에 포함 안 함
+    # last_modified는 MSSQL 트리거로 자동 업데이트되지만, SQLAlchemy onupdate도 설정 가능
+    last_modified = db.Column(db.DateTime, default=func.now(), onupdate=func.now()) 
+    created_at = db.Column(db.DateTime, default=func.now())
+
+    @property
+    def is_relay(self):
+        """address2 필드가 채워져 있으면 릴레이 대상인지 여부를 반환합니다."""
+        return bool(self.address2 and self.address2.strip())
+
+    def __repr__(self):
+        return f'<TargetPC {self.pc_name}>'
+
+models.py 설명:
+
+각 클래스(AdminIP, AllowedUserIP, TargetPC)는 MSSQL 데이터베이스의 해당 테이블에 매핑됩니다.
+db.Column을 사용하여 테이블의 컬럼을 정의하며, 타입, 제약 조건(기본 키, 고유 값, Null 허용 여부 등)을 설정합니다.
+db.ForeignKey: AllowedUserIP 테이블의 added_by_admin_id가 AdminIP 테이블의 id를 참조하도록 외래 키 관계를 설정합니다. ondelete='SET NULL'은 참조하는 관리자 IP가 삭제될 경우 이 필드를 NULL로 설정합니다 (DB 스키마에서도 동일하게 설정되어 있어야 함).
+db.relationship: 테이블 간의 관계를 Python 객체 지향적으로 다룰 수 있게 해줍니다. 예를 들어 AllowedUserIP 객체에서 user_ip_obj.admin_adder_ref와 같이 추가한 관리자 정보를 쉽게 가져올 수 있습니다.
+default=func.now(): 새 레코드 생성 시 SQLAlchemy가 현재 시간을 기본값으로 사용하도록 합니다.
+onupdate=func.now(): 레코드 업데이트 시 SQLAlchemy가 last_modified를 현재 시간으로 갱신합니다. (MSSQL 트리거와 함께 동작할 때, DB 레벨 트리거가 우선하거나 중복될 수 있으므로 주의. 보통 DB 레벨 트리거가 더 확실합니다.)
+@property def is_relay: TargetPC 객체가 릴레이 대상인지 쉽게 확인할 수 있는 읽기 전용 속성입니다.
+2. 최종: app/socket_client.py (SAgentM 에이전트 통신 로직)
+이 모듈은 SAgentM.App 에이전트와 TCP/IP 소켓 통신을 수행하여 명령을 보내고 응답을 받는 기능을 담당합니다.
+
+Python
+
+# scontrol_flask_web/app/socket_client.py
+import socket
+import json
+import uuid
+from datetime import datetime, timezone # timezone 클래스를 datetime 모듈에서 직접 임포트
+from flask import current_app # 애플리케이션 로거 사용
+
+AGENT_PORT = 4026  # SAgentM 에이전트의 고정 리스닝 포트
+SOCKET_TIMEOUT = 7.0 # 소켓 연결 및 각 송수신 작업에 대한 타임아웃 (초)
+
+def send_command_to_agent(target_ip, command_packet_dict):
+    """
+    지정된 IP 주소의 SAgentM 에이전트에 명령 패킷(Python 딕셔너리 형태)을 전송하고,
+    에이전트로부터의 응답(Python 딕셔너리 형태)을 반환합니다.
+
+    :param target_ip: 대상 SAgentM 에이전트의 IP 주소입니다.
+    :param command_packet_dict: SControl.Common.CommandPacket C# 클래스 구조와 유사한 Python 딕셔너리입니다.
+                                이 함수 내부에서 PacketId와 TimestampUtc가 없으면 자동 생성됩니다.
+    :return: 응답 처리 결과를 담은 딕셔너리입니다. 
+             {'success': bool, 'message': str, 'raw_response': dict (에이전트 응답 패킷), 'packet_id': str}
+    """
+    # 응답으로 사용할 기본 딕셔너리 구조
+    response_data = {
+        'success': False,
+        'message': 'An unexpected error occurred.', # 기본 오류 메시지
+        'raw_response': None, # 에이전트로부터 받은 실제 응답 패킷 (JSON 역직렬화된 dict)
+        'packet_id': command_packet_dict.get('PacketId') # 원본 요청의 PacketId 유지 시도
+    }
+
+    # 명령 패킷에 필수 정보 추가 (PacketId, TimestampUtc)
+    if 'PacketId' not in command_packet_dict or not command_packet_dict['PacketId']:
+        command_packet_dict['PacketId'] = str(uuid.uuid4())
+    response_data['packet_id'] = command_packet_dict['PacketId'] # 응답 데이터에도 ID 설정
+
+    if 'TimestampUtc' not in command_packet_dict or not command_packet_dict['TimestampUtc']:
+        # ISO 8601 형식의 UTC 시간 문자열 (밀리초 포함, Z는 UTC 의미)
+        # 예: "2025-05-21T10:30:00.123Z"
+        command_packet_dict['TimestampUtc'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     
-    # 요청 컨텍스트(g)에 사용자 IP와 기본 역할(guest) 저장
-    g.user_ip = user_ip
-    g.current_user_role = 'guest' # 기본값
+    json_request_str = "" # 로깅 및 오류 메시지용
+    json_response_raw_str = "" # 로깅 및 오류 메시지용
 
-    if not user_ip: # IP 주소를 얻지 못한 경우 (매우 드문 경우)
-        current_app.logger.warning("사용자 IP 주소를 확인할 수 없습니다.")
-        return g.current_user_role
-
-    # 1. 관리자 IP 목록(DB)에서 확인
-    admin_entry = AdminIP.query.filter_by(ip_address=user_ip).first()
-    if admin_entry:
-        g.current_user_role = 'admin'
-        return g.current_user_role
-
-    # 2. 허용된 사용자 IP 목록(DB)에서 확인
-    allowed_user_entry = AllowedUserIP.query.filter_by(ip_address=user_ip).first()
-    if allowed_user_entry:
-        g.current_user_role = 'user'
-        return g.current_user_role
+    try:
+        json_request_str = json.dumps(command_packet_dict)
         
-    # 어느 목록에도 없으면 'guest' 역할 유지
-    return g.current_user_role
+        # current_app.logger는 Flask 애플리케이션 컨텍스트 내에서 사용해야 합니다.
+        # 이 함수가 컨텍스트 외부에서 호출될 가능성이 있다면 일반 print나 logging 모듈을 사용해야 합니다.
+        # 여기서는 Flask 뷰 함수 내에서 호출된다고 가정합니다.
+        log_prefix = f"[SocketClient][PktID: {response_data['packet_id']}] Target: {target_ip}:{AGENT_PORT}"
+        current_app.logger.debug(f"{log_prefix} - 전송 시도: {json_request_str}")
 
-
-def ip_auth_required(role_required=None):
-    """
-    IP 주소 기반 접근 제어 데코레이터입니다.
-    뷰 함수에 적용하여 특정 역할의 사용자만 접근할 수 있도록 제한합니다.
-
-    :param role_required: 필요한 최소 역할 ('admin', 'user'). 
-                          None이면 'admin' 또는 'user' 역할 중 하나이기만 하면 통과.
-    """
-    def decorator(f):
-        @wraps(f) # 원래 함수의 메타데이터(이름 등)를 유지하기 위해 사용
-        def decorated_function(*args, **kwargs):
-            user_role = get_current_user_role() # 현재 사용자의 역할 가져오기
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SOCKET_TIMEOUT) # 연결 및 모든 소켓 작업에 대한 타임아웃
             
-            # 역할에 따른 접근 제어 로직
-            if role_required == 'admin' and user_role != 'admin':
-                current_app.logger.warning(
-                    f"접근 거부 (관리자 권한 필요): IP {g.user_ip} -> {request.path}"
-                )
-                abort(403) # 403 Forbidden 오류 발생
-            elif role_required == 'user' and user_role not in ['admin', 'user']:
-                current_app.logger.warning(
-                    f"접근 거부 (사용자 권한 필요): IP {g.user_ip} -> {request.path}"
-                )
-                abort(403)
-            elif role_required is None and user_role not in ['admin', 'user']: # 단순히 로그인(IP 허용) 여부만 확인
-                current_app.logger.warning(
-                    f"접근 거부 (허용된 IP 아님): IP {g.user_ip} -> {request.path}"
-                )
-                abort(403)
+            sock.connect((target_ip, AGENT_PORT))
+            current_app.logger.info(f"{log_prefix} - 에이전트 연결 성공.")
+
+            # SAgentM.App은 ReadLineAsync를 사용하므로 메시지 끝에 개행 문자('\n') 추가
+            sock.sendall((json_request_str + '\n').encode('utf-8'))
+            current_app.logger.info(f"{log_prefix} - 명령 전송 완료. 응답 대기 중...")
+
+            # 응답 수신
+            buffer = b''
+            try:
+                while True: # 개행 문자를 찾을 때까지 또는 타임아웃까지 데이터 수신
+                    chunk = sock.recv(1024) # 타임아웃은 settimeout에 의해 제어됨
+                    if not chunk: # 상대방이 연결을 닫았거나 더 이상 보낼 데이터가 없음
+                        current_app.logger.warning(f"{log_prefix} - 에이전트가 연결을 닫았거나 데이터 없음.")
+                        if not buffer: # 버퍼에 아무것도 없으면 빈 응답으로 처리
+                             response_data['message'] = "에이전트로부터 빈 응답 수신 (연결 종료됨)."
+                        break 
+                    buffer += chunk
+                    if b'\n' in buffer: # 메시지 종료 문자 발견
+                        json_response_raw_str, _, buffer_remainder = buffer.partition(b'\n') # 첫 번째 메시지만 처리
+                        json_response_raw_str = json_response_raw_str.decode('utf-8').strip()
+                        # buffer = buffer_remainder # 남은 데이터 처리 로직 (여기서는 단일 응답 가정)
+                        break
+            except socket.timeout: # sock.recv() 에서 타임아웃 발생
+                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})로부터 응답 대기 시간 초과."
+                current_app.logger.error(response_data['message'])
+                return response_data
             
-            # 모든 권한 검사를 통과하면 원래 뷰 함수 실행
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+            current_app.logger.debug(f"{log_prefix} - 수신 원본 응답: {json_response_raw_str}")
 
+            if not json_response_raw_str: # 빈 문자열 응답도 오류로 처리
+                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})로부터 빈 응답을 받았습니다."
+                current_app.logger.error(response_data['message'])
+                return response_data
 
-def inject_user_info_to_templates():
-    """
-    모든 Jinja2 템플릿에서 현재 사용자의 IP 주소와 역할을 사용할 수 있도록 
-    컨텍스트 변수를 주입하는 컨텍스트 프로세서입니다.
-    이 함수는 app/__init__.py의 create_app 함수 내에 app.context_processor로 등록되어야 합니다.
-    """
-    # get_current_user_role() 호출 시 g.user_ip와 g.current_user_role이 설정됨
-    # 이 함수는 각 요청에 대해 템플릿이 렌더링되기 직전에 호출됩니다.
-    current_role = get_current_user_role() 
-    return dict(
-        current_user_ip=getattr(g, 'user_ip', 'IP 확인 불가'), 
-        current_user_role=current_role
-    )
+            # JSON 응답 역직렬화
+            response_packet_from_agent = json.loads(json_response_raw_str)
+            
+            response_data['success'] = True # 통신 자체는 성공
+            response_data['message'] = "에이전트로부터 응답을 성공적으로 수신했습니다."
+            response_data['raw_response'] = response_packet_from_agent # 역직렬화된 Python dict
+            current_app.logger.info(f"{log_prefix} - 응답 수신 성공: {response_packet_from_agent}")
 
-auth.py 주요 내용 설명:
+    except socket.timeout: # sock.connect() 에서 타임아웃 발생
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 연결 시간 초과."
+        current_app.logger.error(response_data['message'])
+    except socket.error as se: # 연결 거부, 호스트 찾을 수 없음 등 소켓 관련 오류
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 통신 중 소켓 오류: {se}"
+        current_app.logger.error(response_data['message'])
+    except json.JSONDecodeError as je: # 에이전트 응답이 유효한 JSON이 아님
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})로부터 받은 응답의 JSON 형식이 잘못되었습니다: {je}. 원본: {json_response_raw_str}"
+        current_app.logger.error(response_data['message'])
+    except Exception as e: # 기타 예기치 않은 오류
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})와 통신 중 예기치 않은 오류 발생: {e}"
+        current_app.logger.error(response_data['message'], exc_info=True) # 스택 트레이스 포함 로깅
+        
+    return response_data
+socket_client.py 설명:
 
-get_current_user_role() 함수:
-현재 요청을 보낸 클라이언트의 IP 주소를 확인합니다 (X-Forwarded-For 헤더 우선 고려, 없으면 request.remote_addr).
-확인된 IP 주소를 admin_ips 테이블과 allowed_user_ips 테이블에서 순서대로 조회합니다.
-조회 결과에 따라 사용자의 역할을 'admin', 'user', 또는 'guest'로 결정하여 Flask의 g 객체 (요청 간 데이터를 저장하는 임시 객체)에 g.user_ip와 g.current_user_role로 저장하고, 역할을 반환합니다. g 객체에 이미 역할 정보가 있다면 DB 조회를 건너뛰고 캐시된 값을 사용합니다.
-ip_auth_required(role_required=None) 데코레이터:
-Flask의 라우트(뷰 함수) 위에 @ip_auth_required('admin')과 같이 사용하여 해당 페이지에 대한 접근 권한을 검사합니다.
-role_required='admin': 오직 'admin' 역할만 접근 허용.
-role_required='user': 'admin' 또는 'user' 역할 접근 허용.
-role_required=None (또는 데코레이터 인자 없이 @ip_auth_required() 사용 시): 'admin' 또는 'user' 역할이면 접근 허용 (즉, 'guest'만 아니면 됨).
-권한이 없으면 abort(403)를 호출하여 "접근 금지" 오류 페이지를 반환합니다.
-inject_user_info_to_templates() 컨텍스트 프로세서:
-이 함수는 app/__init__.py 파일의 create_app 함수 내에서 app.context_processor(inject_user_info_to_templates)와 같이 등록되어야 합니다 (이전 응답에서 이미 등록함).
-등록되면, 모든 Jinja2 템플릿 안에서 {{ current_user_ip }}와 {{ current_user_role }} 변수를 통해 현재 접속한 사용자의 IP와 역할을 바로 사용할 수 있습니다. (예: layout.html의 네비게이션 메뉴 표시 조건 등)
-이 auth.py 파일은 Flask 애플리케이션의 IP 기반 인증/인가 시스템의 핵심입니다. 이 파일이 app 폴더 내에 올바르게 위치하고, app/__init__.py에서 inject_user_info_to_templates 컨텍스트 프로세서가 잘 등록되어 있으며, 각 라우트 함수에 @ip_auth_required() 데코레이터가 필요에 맞게 적용되어 있는지 확인하시면 됩니다.
+send_command_to_agent 함수:
+target_ip와 전송할 명령 내용(command_packet_dict)을 인자로 받습니다.
+command_packet_dict에 PacketId나 TimestampUtc가 없으면 자동으로 생성하여 추가합니다. 타임스탬프는 ISO 8601 형식의 UTC 시간으로 설정합니다.
+명령 딕셔너리를 JSON 문자열로 직렬화하고, 메시지 끝에 개행 문자(\n)를 추가하여 UTF-8로 인코딩한 후 전송합니다. (SAgentM.App의 StreamReader.ReadLineAsync()와 호환)
+TCP 소켓을 생성하고 target_ip와 고정 포트 AGENT_PORT (4026)로 연결합니다. 연결 및 모든 소켓 작업(송신, 수신)에 SOCKET_TIMEOUT을 설정합니다.
+응답을 수신할 때도 개행 문자를 기준으로 메시지를 구분합니다. socket.timeout 예외를 통해 수신 타임아웃을 처리합니다.
+수신된 JSON 문자열을 Python 딕셔너리로 역직렬화합니다.
+통신 과정에서의 각종 오류(타임아웃, 소켓 오류, JSON 형식 오류 등)를 try-except로 처리하고, 결과를 담은 딕셔너리를 반환합니다.
+로깅: current_app.logger를 사용하여 주요 단계 및 오류 상황을 로깅합니다. (Flask 앱 컨텍스트 내에서 실행될 때 유효)
+3. 최종: app/routes_user.py (사용자 제어판 라우트)
+이 파일은 일반 사용자가 PC 목록을 보고 "켜기"/"끄기"(디스플레이 타임아웃 설정) 명령을 내릴 수 있는 웹 페이지를 처리합니다.
 
-만약 이전에 auth.py 관련하여 IndentationError가 발생했다면, 위 코드로 교체하시고 Python의 들여쓰기 규칙(보통 공백 4칸 또는 탭 1개 일관되게 사용)이 잘 지켜졌는지 다시 한번 확인해 보시기 바랍니다.
+Python
 
-다음 단계로 진행할 준비가 되셨으면 알려주세요. 보통 사용자 제어판의 UI(control_panel.html) 및 관련 라우트(routes_user.py)를이어서 구현하게 됩니다.
+# scontrol_flask_web/app/routes_user.py
+from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
+from . import db
+from .models import TargetPC
+from .auth import ip_auth_required # IP 인증 데코레이터
+from .socket_client import send_command_to_agent # 위에서 작성한 소켓 클라이언트 함수
+# SControl.Common의 C# 상수/열거형 이름과 일치시키기 위한 문자열 값 사용
+# from SControl.Common import CommandNames, CommandInstruction, MonitorAction, SetDisplayTimeoutPayload # 직접 임포트 불가
+import json # Payload를 JSON 문자열로 만들기 위해
+import uuid
+from datetime import datetime, timezone
 
-Gemini에게 수정 가능한 문서나 코드를 작성해 달라고 해 보세요.
+user_bp = Blueprint('user', __name__) # 'user' 블루프린트 생성
 
-사용해 보기
+@user_bp.route('/control_panel') # URL은 /user/control_panel 이 됨 (app/__init__.py 에서 url_prefix='/user' 설정)
+@ip_auth_required('user') # 관리자 또는 허용된 사용자만 접근 가능
+def control_panel():
+    """제어 대상 PC 목록을 표시하는 사용자 제어판 페이지를 렌더링합니다."""
+    page = request.args.get('page', 1, type=int)
+    per_page = 20 # 페이지 당 표시할 PC 수
+    try:
+        pagination = TargetPC.query.order_by(TargetPC.pc_name).paginate(page=page, per_page=per_page, error_out=False)
+        pcs_on_current_page = pagination.items
+    except Exception as e:
+        current_app.logger.error(f"DB에서 PC 목록 조회 중 오류: {e}")
+        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
+        pcs_on_current_page = []
+        pagination = None # 페이지네이션 객체가 없을 수 있으므로 None 처리
+
+    title = "원격 제어판"
+    if g.current_user_role == 'admin': # g 객체는 auth.py의 컨텍스트 프로세서에 의해 설정됨
+        title = "원격 제어판 (관리자 모드)"
+        
+    return render_template('user/control_panel.html', 
+                           pcs=pcs_on_current_page, 
+                           pagination=pagination, 
+                           title=title)
+
+@user_bp.route('/send_batch_command', methods=['POST'])
+@ip_auth_required('user')
+def send_batch_command():
+    """선택된 PC들에 대해 일괄적으로 '켜기' 또는 '끄기' 명령을 전송합니다."""
+    selected_pc_ids_str = request.form.getlist('selected_pcs') # 체크박스 값들을 리스트로 받음
+    command_action_str = request.form.get('command_action') # "켜기" 또는 "끄기" 버튼의 value 값
+
+    if not selected_pc_ids_str:
+        flash("제어할 PC를 하나 이상 선택해주세요.", 'warning')
+        return redirect(url_for('user.control_panel'))
+
+    if not command_action_str or command_action_str not in ["켜기", "끄기"]:
+        flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning')
+        return redirect(url_for('user.control_panel'))
+
+    # "명령 실행 암호" 필드가 UI에 있고, 그 값을 검증해야 한다면 여기서 처리
+    # 실행_암호 = request.form.get('monitor_control_password')
+    # if 실행_암호 != 'm12345': # 실제로는 config 등에서 안전하게 관리
+    #     flash("명령 실행 암호가 올바르지 않습니다.", 'error')
+    #     return redirect(url_for('user.control_panel'))
+
+    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
+    target_pcs_to_control = TargetPC.query.filter(TargetPC.id.in_(selected_pc_ids)).all()
+
+    # "켜기" -> 디스플레이 타임아웃 0분 (Never)
+    # "끄기" -> 디스플레이 타임아웃 1분
+    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
+    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
+
+    # SControl.Common.SetDisplayTimeoutPayload 구조에 맞게 페이로드 생성
+    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command}
+
+    command_results = [] # 각 PC별 명령 전송 결과 저장
+
+    for pc in target_pcs_to_control:
+        # SControl.Common.CommandPacket 구조에 맞게 명령 패킷 생성
+        command_packet_to_send = {
+            'PacketId': str(uuid.uuid4()),
+            'TimestampUtc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'CommandName': "SET_DISPLAY_TIMEOUT", # SControl.Common.CommandNames.SetDisplayTimeout
+            'PayloadJson': json.dumps(payload_for_agent), # 페이로드를 JSON 문자열로 직렬화
+            'ResponseAddress': None, # SAgentM에서 Flask 앱으로 직접 응답할 경로 (보통 설정 안함)
+            'ResponsePort': None
+        }
+
+        target_ip_for_command_send = ""
+        if pc.is_relay: # 릴레이 대상인 경우
+            command_packet_to_send['Instruction'] = "RelayToTarget" # SControl.Common.CommandInstruction.RelayToTarget
+            command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc.address2
+            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026 # 고정 포트
+            target_ip_for_command_send = pc.address1 # 첫 번째 홉(릴레이 서버) IP
+        else: # 직접 제어 대상인 경우
+            command_packet_to_send['Instruction'] = "DirectExecute" # SControl.Common.CommandInstruction.DirectExecute
+            target_ip_for_command_send = pc.address1 # 직접 제어 IP
+        
+        log_message_prefix = f"PC '{pc.pc_name}' ({target_ip_for_command_send})"
+        flash(f"{log_message_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
+        current_app.logger.info(f"{log_message_prefix} - 명령 전송 시도: {action_description_log}, 패킷: {command_packet_to_send['PacketId']}")
+        
+        # 실제 명령 전송
+        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
+        
+        if agent_response.get('success'):
+            # 에이전트로부터 응답 패킷이 있고, 그 안의 페이로드도 성공인지 확인
+            raw_agent_response_packet = agent_response.get('raw_response')
+            if raw_agent_response_packet and isinstance(raw_agent_response_packet, dict) and raw_agent_response_packet.get('PayloadJson'):
+                try:
+                    # 에이전트 응답 페이로드(GenericResponsePayload 구조) 역직렬화
+                    agent_response_payload = json.loads(raw_agent_response_packet['PayloadJson'])
+                    if agent_response_payload.get('Success'): # C#의 Success 필드 (대소문자 주의)
+                        flash(f"{log_message_prefix}: 명령 성공 - {agent_response_payload.get('Message', 'OK')}", 'success')
+                        current_app.logger.info(f"{log_message_prefix} - 명령 성공: {agent_response_payload.get('Message')}")
+                    else:
+                        flash(f"{log_message_prefix}: 명령 실패 (에이전트 응답) - {agent_response_payload.get('Message', 'Agent error')}", 'error')
+                        current_app.logger.error(f"{log_message_prefix} - 에이전트 응답 실패: {agent_response_payload.get('Message')}")
+                except Exception as e:
+                    flash(f"{log_message_prefix}: 에이전트 응답 페이로드 처리 오류 - {e}", 'error')
+                    current_app.logger.error(f"{log_message_prefix} - 응답 페이로드 처리 오류: {e}")
+            else: # 통신은 성공했으나, 에이전트 응답 패킷 구조가 예상과 다를 경우
+                flash(f"{log_message_prefix}: 명령 전송 성공 (에이전트 상세 응답 확인 불가)", 'warning')
+                current_app.logger.warning(f"{log_message_prefix} - 명령 전송 성공, 그러나 에이전트 상세 응답 확인 불가. Raw: {raw_agent_response_packet}")
+        else: # 통신 자체 실패 (socket_client.py에서 success=False 반환)
+            flash(f"{log_message_prefix}: 명령 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
+            current_app.logger.error(f"{log_message_prefix} - 명령 전송 실패: {agent_response.get('message')}")
+        
+        command_results.append({'pc_name': pc.pc_name, 'status_message': agent_response.get('message')})
+
+    # 모든 명령 시도 후 제어판 페이지로 돌아감
+    return redirect(url_for('user.control_panel'))
+
+routes_user.py 설명:
+
+user_bp 블루프린트: /user URL 접두사로 사용자 관련 기능을 그룹화합니다.
+control_panel() 라우트 (GET /user/control_panel):
+@ip_auth_required('user') 데코레이터로 'admin' 또는 'user' 역할만 접근을 허용합니다.
+TargetPC 테이블에서 PC 목록을 가져와 페이지네이션 처리 후 control_panel.html 템플릿에 전달합니다.
+send_batch_command() 라우트 (POST /user/send_batch_command):
+@ip_auth_required('user') 데코레이터로 접근을 제한합니다.
+HTML 폼에서 선택된 PC ID 목록 (selected_pcs)과 수행할 작업 (command_action: "켜기" 또는 "끄기")을 받습니다.
+각 선택된 PC에 대해:
+DB에서 PC 정보를 조회하여 직접 제어할지, 릴레이할지 결정합니다.
+SetDisplayTimeout 명령 (TimeoutMinutes: 0 또는 1)을 위한 CommandPacket (Python 딕셔너리 형태)을 구성합니다. Instruction, FinalTargetIpForRelayedCommand 등을 설정합니다.
+socket_client.send_command_to_agent() 함수를 호출하여 실제 명령을 에이전트로 전송합니다.
+전송 결과 및 에이전트로부터 받은 응답을 flash 메시지로 사용자에게 알리고, 서버 로그에도 기록합니다.
+모든 작업 후 control_panel 페이지로 다시 리다이렉트합니다.
+4. 최종: app/forms.py (기존 파일 - 변경 없음)
+이전에 TargetPCForm, AllowedUserIPForm, AdminIPForm을 모두 정의했으므로, 사용자 제어판 기능 추가를 위해 forms.py 파일을 직접 수정할 필요는 없습니다. (만약 제어판에서 추가적인 폼 입력이 필요하다면 여기에 정의합니다.)
+
+Python
+
+# scontrol_flask_web/app/forms.py
+from flask_wtf import FlaskForm
+from wtforms import StringField, TextAreaField, SubmitField
+from wtforms.validators import DataRequired, Length, Optional, IPAddress, ValidationError
+
+class TargetPCForm(FlaskForm):
+    pc_name = StringField('PC 이름', validators=[DataRequired(), Length(min=1, max=100)])
+    address1 = StringField('주소1 (직접 IP 또는 릴레이 서버 IP)', validators=[DataRequired(), IPAddress(message="유효한 IP 주소를 입력하세요.")])
+    address2 = StringField('주소2 (릴레이 최종 목적지 IP - 비워두면 직접 제어)', validators=[Optional(), IPAddress(message="유효한 IP 주소를 입력하세요 (비워둘 수 있음).")])
+    description = TextAreaField('설명', validators=[Optional(), Length(max=255)])
+    submit = SubmitField('저장')
+
+    def validate_address2(self, field):
+        if field.data and not self.address1.data:
+            raise ValidationError('주소1이 비어있으면 주소2를 설정할 수 없습니다.')
+
+class AllowedUserIPForm(FlaskForm):
+    ip_address = StringField('IP 주소', validators=[DataRequired(), IPAddress(message="유효한 IP 주소를 입력하세요.")])
+    description = TextAreaField('설명', validators=[Optional(), Length(max=255)])
+    submit = SubmitField('저장')
+
+class AdminIPForm(FlaskForm):
+    ip_address = StringField('관리자 IP 주소', validators=[DataRequired(), IPAddress(message="유효한 IP 주소를 입력하세요.")])
+    description = TextAreaField('설명', validators=[Optional(), Length(max=255)])
+    submit = SubmitField('저장')
+이제 app/socket_client.py 와 app/routes_user.py 파일을 프로젝트에 새로 추가하고, 이전에 제공된 app/__init__.py에서 user_bp 블루프린트 등록 부분의 주석을 해제하거나 추가하시면 됩니다. (app/templates/user/control_panel.html 템플릿 파일도 필요합니다. 이 파일은 이전 응답에서 제공해 드렸습니다.)
+
+실행 및 테스트:
+
+SAgentM.App.exe (WPF 에이전트) 를 관리자 권한으로 Windows PC에서 실행합니다. (포트 4026으로 리스닝하는지 확인)
+Flask 개발 서버 (python run.py)를 재시작합니다.
+관리자 또는 허용된 사용자 IP로 등록된 PC에서 웹 브라우저로 /user/control_panel 경로에 접속합니다.
+PC 목록이 표시되는지 확인하고, PC를 선택한 후 "일괄 켜기" 또는 "일괄 끄기" 버튼으로 명령 전송을 테스트합니다.
+Flask 애플리케이션의 터미널 로그와 SAgentM.App의 UI 로그를 통해 명령이 정상적으로 전달되고 처리되는지, 응답은 어떻게 오는지 확인합니다.
