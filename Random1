@@ -1,116 +1,408 @@
-네, 알겠습니다. 이어서 pymssql 직접 사용 방식으로 수정해야 할 다음 파일인 app/auth.py의 전체 코드를 제공해 드리겠습니다.
+네, 알겠습니다. 이전 코드에서 SQLAlchemy ORM을 사용했던 부분을 모두 pymssql 직접 호출 방식으로 변경하겠습니다. 이번에는 app/routes_admin.py 파일 전체를 이 방식으로 수정하여 제공해 드리겠습니다.
 
-이 파일의 get_current_user_role() 함수는 이전에는 SQLAlchemy ORM을 사용하여 데이터베이스에서 관리자 IP와 허용된 사용자 IP를 조회했습니다. 이제 이 부분을 app/db_utils.py의 get_db_connection() 함수를 통해 pymssql 연결을 얻고, 직접 SQL 쿼리를 실행하도록 수정합니다.
+이 파일에는 대상 PC 관리, 허용된 사용자 IP 관리, 관리자 IP 관리에 대한 모든 CRUD(생성, 읽기, 수정, 삭제) 로직이 포함됩니다. 모든 데이터베이스 작업은 app/db_utils.py의 get_db_connection()을 통해 pymssql 연결을 얻어와서 직접 SQL 쿼리를 실행하는 방식으로 변경됩니다.
 
-수정: app/auth.py (pymssql 직접 사용)
+주의:
+
+SQL 쿼리 작성 시 SQL 인젝션에 취약하지 않도록 파라미터화된 쿼리(cursor.execute(query, params))를 사용합니다. pymssql은 파라미터 플레이스홀더로 %s 또는 %d 등을 사용합니다.
+db_utils.py의 get_db_connection() 함수에서 as_dict=True로 설정했으므로, DB 조회 결과는 행마다 딕셔너리 형태로 반환됩니다.
+페이지네이션(Pagination)은 Flask-SQLAlchemy의 paginate() 객체 대신 수동으로 구현합니다. (총 아이템 수 조회 -> OFFSET, FETCH 사용)
+수정: app/routes_admin.py (pymssql 직접 사용, 주석 최소화)
 Python
 
-# scontrol_flask_web/app/auth.py
-from functools import wraps
-from flask import request, current_app, abort, g
-from .db_utils import get_db_connection # pymssql 연결을 위한 함수 임포트
+# scontrol_flask_web/app/routes_admin.py
+from flask import Blueprint, render_template, redirect, url_for, flash, request, current_app, g
+from app.db_utils import get_db_connection # pymssql 연결 유틸리티
+from app.forms import TargetPCForm, AllowedUserIPForm, AdminIPForm
+from app.auth import ip_auth_required, get_current_user_role
+import math # 페이지네이션 계산용
 
-def get_current_user_role():
-    if hasattr(g, 'current_user_role'):
-        return g.current_user_role
+admin_bp = Blueprint('admin', __name__)
 
-    user_ip = None
-    if request.headers.getlist("X-Forwarded-For"):
-        user_ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
-    else:
-        user_ip = request.remote_addr
-    
-    g.user_ip = user_ip
-    g.current_user_role = 'guest' # 기본값
-
-    if not user_ip:
-        current_app.logger.warning("사용자 IP 주소를 확인할 수 없습니다 (auth.py).")
-        return g.current_user_role
+# --- 1. 대상 PC 관리 (Target PC Management) ---
+@admin_bp.route('/pcs')
+@ip_auth_required('admin')
+def manage_target_pcs():
+    page = request.args.get('page', 1, type=int)
+    per_page = 10 # 페이지 당 항목 수
+    offset = (page - 1) * per_page
+    pcs_on_current_page = []
+    total_pcs = 0
 
     conn = None
     try:
-        conn = get_db_connection() # DB 연결 가져오기
-        if conn is None: # 연결 실패 시
-             current_app.logger.error(f"DB 연결을 가져올 수 없습니다 (auth.py). IP: {user_ip}")
-             return g.current_user_role # 기본 'guest' 역할 반환
-
+        conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 1. 관리자 IP 확인
-            sql_admin_check = "SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s"
-            cursor.execute(sql_admin_check, (user_ip,))
-            admin_entry = cursor.fetchone()
-            if admin_entry:
-                g.current_user_role = 'admin'
-                return g.current_user_role
-
-            # 2. 허용된 사용자 IP 확인
-            sql_user_check = "SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s"
-            cursor.execute(sql_user_check, (user_ip,))
-            allowed_user_entry = cursor.fetchone()
-            if allowed_user_entry:
-                g.current_user_role = 'user'
-                return g.current_user_role
-        
+            # 총 PC 개수 조회
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
+            total_pcs = cursor.fetchone()['total']
+            
+            # 현재 페이지 PC 목록 조회 (MSSQL OFFSET FETCH 사용)
+            query = """
+                SELECT id, pc_name, address1, address2, description, created_at, last_modified
+                FROM dbo.target_pcs 
+                ORDER BY pc_name 
+                OFFSET %s ROWS FETCH NEXT %s ROWS ONLY
+            """
+            cursor.execute(query, (offset, per_page))
+            pcs_on_current_page = cursor.fetchall()
     except Exception as e:
-        current_app.logger.error(f"IP 역할 확인 중 DB 오류 발생 (auth.py): {e}", exc_info=True)
-        # DB 오류 시 안전하게 'guest' 역할 또는 특정 오류 역할 반환 고려
-    finally:
-        # get_db_connection()이 g 객체를 사용하여 연결을 관리하고
-        # app.teardown_appcontext(close_db_connection)가 등록되어 있으므로,
-        # 여기서 conn.close()를 명시적으로 호출할 필요는 없습니다.
-        # 만약 get_db_connection()이 매번 새 연결을 반환하는 방식이라면 여기서 conn.close() 필요.
-        # 현재 db_utils.py는 g 객체 사용 방식이므로 teardown에서 처리됩니다.
-        pass
+        current_app.logger.error(f"대상 PC 목록 조회 오류: {e}", exc_info=True)
+        flash("대상 PC 목록을 불러오는 중 오류가 발생했습니다.", "error")
+
+    total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
+    pagination = {
+        'page': page, 'per_page': per_page, 'total_items': total_pcs, 
+        'total_pages': total_pages, 'items': pcs_on_current_page,
+        'has_prev': page > 1, 'has_next': page < total_pages,
+        'prev_num': page - 1, 'next_num': page + 1
+    }
+    
+    return render_template('admin/manage_target_pcs.html', 
+                           pcs=pcs_on_current_page, # pagination.items와 동일
+                           pagination=pagination, 
+                           title="대상 PC 관리")
+
+@admin_bp.route('/pcs/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_target_pc():
+    form = TargetPCForm()
+    if form.validate_on_submit():
+        addr2_value = form.address2.data if form.address2.data and form.address2.data.strip() else None
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                sql = """INSERT INTO dbo.target_pcs (pc_name, address1, address2, description, created_at, last_modified) 
+                         VALUES (%s, %s, %s, %s, GETDATE(), GETDATE())"""
+                cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2_value, form.description.data))
+            conn.commit()
+            flash(f"PC '{form.pc_name.data}' 정보가 성공적으로 추가되었습니다.", 'success')
+            return redirect(url_for('admin.manage_target_pcs'))
+        except Exception as e:
+            if conn: conn.rollback()
+            error_message = f"PC 정보 추가 중 오류 발생: {str(e)[:200]}" # 오류 메시지 길이 제한
+            # MSSQL UNIQUE KEY constraint 오류 코드: 2627 또는 2601
+            if isinstance(e, pymssql.IntegrityError) and ('UNIQUE KEY constraint' in str(e) or 'duplicate key' in str(e)):
+                 error_message = f"이미 등록된 PC 이름입니다: {form.pc_name.data}"
+            flash(error_message, 'error')
+            current_app.logger.error(f"Error adding PC '{form.pc_name.data}': {e}", exc_info=True)
             
-    return g.current_user_role
+    return render_template('admin/edit_target_pc.html', form=form, title="새 PC 추가")
+
+@admin_bp.route('/pcs/edit/<int:pc_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_target_pc(pc_id):
+    conn = None
+    pc_to_edit_data = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs WHERE id = %d", (pc_id,))
+            pc_to_edit_data = cursor.fetchone()
+    except Exception as e:
+        current_app.logger.error(f"PC ID {pc_id} 조회 오류: {e}", exc_info=True)
+        flash("PC 정보를 불러오는 중 오류가 발생했습니다.", "error")
+        return redirect(url_for('admin.manage_target_pcs'))
+
+    if not pc_to_edit_data:
+        flash(f"PC ID {pc_id}를 찾을 수 없습니다.", "error")
+        return redirect(url_for('admin.manage_target_pcs'))
+
+    form = TargetPCForm(data=pc_to_edit_data) if request.method == 'GET' else TargetPCForm()
+    
+    if form.validate_on_submit():
+        addr2_value = form.address2.data if form.address2.data and form.address2.data.strip() else None
+        try:
+            # GET 요청 시 채워진 form 객체를 재사용하므로, conn을 다시 얻어야 할 수 있음 (teardown_appcontext 때문)
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+
+            with conn.cursor() as cursor:
+                sql = """UPDATE dbo.target_pcs 
+                         SET pc_name = %s, address1 = %s, address2 = %s, description = %s, last_modified = GETDATE()
+                         WHERE id = %d"""
+                cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2_value, form.description.data, pc_id))
+            conn.commit()
+            flash(f"PC '{form.pc_name.data}' 정보가 성공적으로 수정되었습니다.", 'success')
+            return redirect(url_for('admin.manage_target_pcs'))
+        except Exception as e:
+            if conn: conn.rollback()
+            error_message = f"PC 정보 수정 중 오류 발생: {str(e)[:200]}"
+            if isinstance(e, pymssql.IntegrityError) and ('UNIQUE KEY constraint' in str(e) or 'duplicate key' in str(e)):
+                 error_message = f"수정하려는 PC 이름 '{form.pc_name.data}'가 이미 다른 항목에 등록되어 있습니다."
+            flash(error_message, 'error')
+            current_app.logger.error(f"Error editing PC ID {pc_id}: {e}", exc_info=True)
+
+    return render_template('admin/edit_target_pc.html', form=form, title=f"PC 정보 수정: {pc_to_edit_data['pc_name']}", pc=pc_to_edit_data)
+
+@admin_bp.route('/pcs/delete/<int:pc_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_target_pc(pc_id):
+    conn = None
+    pc_name_to_delete = f"ID {pc_id}"
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # 삭제 전 이름을 가져오기 (선택적)
+            cursor.execute("SELECT pc_name FROM dbo.target_pcs WHERE id = %d", (pc_id,))
+            pc_data = cursor.fetchone()
+            if pc_data: pc_name_to_delete = pc_data['pc_name']
+
+            cursor.execute("DELETE FROM dbo.target_pcs WHERE id = %d", (pc_id,))
+        conn.commit()
+        flash(f"PC '{pc_name_to_delete}' 정보가 성공적으로 삭제되었습니다.", 'success')
+    except Exception as e:
+        if conn: conn.rollback()
+        flash(f"PC 정보 삭제 중 오류 발생: {e}", 'error')
+        current_app.logger.error(f"Error deleting PC ID {pc_id}: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_target_pcs'))
 
 
-def ip_auth_required(role_required=None):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            user_role = get_current_user_role()
+# --- 2. 허용된 사용자 IP 관리 (Allowed User IP Management) ---
+@admin_bp.route('/users')
+@ip_auth_required('admin')
+def manage_user_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10; offset = (page - 1) * per_page
+    items_on_page = []; total_items = 0; conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.allowed_user_ips")
+            total_items = cursor.fetchone()['total']
+            query = """
+                SELECT u.id, u.ip_address, u.description, u.created_at, a.ip_address AS admin_ip
+                FROM dbo.allowed_user_ips u
+                LEFT JOIN dbo.admin_ips a ON u.added_by_admin_id = a.id
+                ORDER BY u.ip_address 
+                OFFSET %s ROWS FETCH NEXT %s ROWS ONLY
+            """
+            cursor.execute(query, (offset, per_page))
+            items_on_page = cursor.fetchall()
+    except Exception as e:
+        current_app.logger.error(f"사용자 IP 목록 조회 오류: {e}", exc_info=True)
+        flash("사용자 IP 목록을 불러오는 중 오류가 발생했습니다.", "error")
+    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 1
+    pagination = {'page': page, 'per_page': per_page, 'total_items': total_items, 'total_pages': total_pages, 
+                  'items': items_on_page, 'has_prev': page > 1, 'has_next': page < total_pages,
+                  'prev_num': page - 1, 'next_num': page + 1}
+    return render_template('admin/manage_user_ips.html', user_ips=items_on_page, pagination=pagination, title="허용된 사용자 IP 관리")
+
+@admin_bp.route('/users/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_user_ip():
+    form = AllowedUserIPForm()
+    if form.validate_on_submit():
+        admin_id = None; conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s", (g.user_ip,))
+                admin_record = cursor.fetchone()
+                if admin_record: admin_id = admin_record['id']
+                
+                sql = "INSERT INTO dbo.allowed_user_ips (ip_address, description, added_by_admin_id, created_at) VALUES (%s, %s, %s, GETDATE())"
+                cursor.execute(sql, (form.ip_address.data, form.description.data, admin_id))
+            conn.commit()
+            flash(f"사용자 IP '{form.ip_address.data}'가 성공적으로 추가되었습니다.", 'success')
+            return redirect(url_for('admin.manage_user_ips'))
+        except Exception as e:
+            if conn: conn.rollback()
+            error_message = f"사용자 IP 추가 중 오류 발생: {str(e)[:200]}"
+            if isinstance(e, pymssql.IntegrityError) and ('UNIQUE KEY constraint' in str(e) or 'duplicate key' in str(e)):
+                 error_message = f"이미 등록된 IP 주소입니다: {form.ip_address.data}"
+            flash(error_message, 'error')
+            current_app.logger.error(f"Error adding user IP '{form.ip_address.data}': {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title="새 사용자 IP 추가")
+
+@admin_bp.route('/users/edit/<int:user_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_user_ip(user_ip_id):
+    conn = None; user_ip_data = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, ip_address, description, added_by_admin_id FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
+            user_ip_data = cursor.fetchone()
+    except Exception as e:
+        current_app.logger.error(f"사용자 IP ID {user_ip_id} 조회 오류: {e}", exc_info=True)
+        flash("사용자 IP 정보를 불러오는 중 오류가 발생했습니다.", "error"); return redirect(url_for('admin.manage_user_ips'))
+    if not user_ip_data: flash(f"사용자 IP ID {user_ip_id}를 찾을 수 없습니다.", "error"); return redirect(url_for('admin.manage_user_ips'))
+
+    form = AllowedUserIPForm(data=user_ip_data) if request.method == 'GET' else AllowedUserIPForm()
+    if form.validate_on_submit():
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor:
+                sql = "UPDATE dbo.allowed_user_ips SET ip_address = %s, description = %s WHERE id = %d"
+                cursor.execute(sql, (form.ip_address.data, form.description.data, user_ip_id))
+            conn.commit()
+            flash(f"사용자 IP '{form.ip_address.data}' 정보가 성공적으로 수정되었습니다.", 'success')
+            return redirect(url_for('admin.manage_user_ips'))
+        except Exception as e:
+            if conn: conn.rollback()
+            error_message = f"사용자 IP 수정 중 오류 발생: {str(e)[:200]}"
+            if isinstance(e, pymssql.IntegrityError) and ('UNIQUE KEY constraint' in str(e) or 'duplicate key' in str(e)):
+                 error_message = f"수정하려는 IP 주소 '{form.ip_address.data}'가 이미 다른 항목에 등록되어 있습니다."
+            flash(error_message, 'error')
+            current_app.logger.error(f"Error editing user IP ID {user_ip_id}: {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title=f"사용자 IP 수정: {user_ip_data['ip_address']}", user_ip_obj=user_ip_data)
+
+@admin_bp.route('/users/delete/<int:user_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_user_ip(user_ip_id):
+    conn = None; ip_address_deleted = f"ID {user_ip_id}"
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ip_address FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
+            user_ip_data = cursor.fetchone(); 
+            if user_ip_data: ip_address_deleted = user_ip_data['ip_address']
+            cursor.execute("DELETE FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
+        conn.commit()
+        flash(f"사용자 IP '{ip_address_deleted}' 정보가 성공적으로 삭제되었습니다.", 'success')
+    except Exception as e:
+        if conn: conn.rollback()
+        flash(f"사용자 IP 삭제 중 오류 발생: {e}", 'error')
+        current_app.logger.error(f"Error deleting user IP ID {user_ip_id}: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_user_ips'))
+
+
+# --- 3. 관리자 IP 관리 (Admin IP Management) ---
+@admin_bp.route('/admins')
+@ip_auth_required('admin')
+def manage_admin_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10; offset = (page - 1) * per_page
+    items_on_page = []; total_items = 0; conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.admin_ips")
+            total_items = cursor.fetchone()['total']
+            query = "SELECT id, ip_address, description, created_at FROM dbo.admin_ips ORDER BY ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+            cursor.execute(query, (offset, per_page))
+            items_on_page = cursor.fetchall()
+    except Exception as e:
+        current_app.logger.error(f"관리자 IP 목록 조회 오류: {e}", exc_info=True)
+        flash("관리자 IP 목록을 불러오는 중 오류가 발생했습니다.", "error")
+    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 1
+    pagination = {'page': page, 'per_page': per_page, 'total_items': total_items, 'total_pages': total_pages, 
+                  'items': items_on_page, 'has_prev': page > 1, 'has_next': page < total_pages,
+                  'prev_num': page - 1, 'next_num': page + 1}
+    return render_template('admin/manage_admin_ips.html', admin_ips=items_on_page, pagination=pagination, title="관리자 IP 관리")
+
+@admin_bp.route('/admins/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_admin_ip():
+    form = AdminIPForm()
+    if form.validate_on_submit():
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                sql = "INSERT INTO dbo.admin_ips (ip_address, description, created_at) VALUES (%s, %s, GETDATE())"
+                cursor.execute(sql, (form.ip_address.data, form.description.data))
+            conn.commit()
+            flash(f"관리자 IP '{form.ip_address.data}'가 성공적으로 추가되었습니다.", 'success')
+            return redirect(url_for('admin.manage_admin_ips'))
+        except Exception as e:
+            if conn: conn.rollback()
+            error_message = f"관리자 IP 추가 중 오류 발생: {str(e)[:200]}"
+            if isinstance(e, pymssql.IntegrityError) and ('UNIQUE KEY constraint' in str(e) or 'duplicate key' in str(e)):
+                 error_message = f"이미 등록된 IP 주소입니다: {form.ip_address.data}"
+            flash(error_message, 'error')
+            current_app.logger.error(f"Error adding admin IP '{form.ip_address.data}': {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title="새 관리자 IP 추가")
+
+@admin_bp.route('/admins/edit/<int:admin_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_admin_ip(admin_ip_id):
+    conn = None; admin_ip_data = None; original_ip = ""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, ip_address, description FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,))
+            admin_ip_data = cursor.fetchone()
+            if admin_ip_data: original_ip = admin_ip_data['ip_address']
+    except Exception as e:
+        current_app.logger.error(f"관리자 IP ID {admin_ip_id} 조회 오류: {e}", exc_info=True)
+        flash("관리자 IP 정보를 불러오는 중 오류가 발생했습니다.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+    if not admin_ip_data: flash(f"관리자 IP ID {admin_ip_id}를 찾을 수 없습니다.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+
+    form = AdminIPForm(data=admin_ip_data) if request.method == 'GET' else AdminIPForm()
+    if form.validate_on_submit():
+        new_ip = form.ip_address.data
+        if original_ip != new_ip:
+            if original_ip == g.user_ip:
+                flash("자신의 현재 접속 IP 주소는 변경할 수 없습니다.", 'error')
+                return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
             
-            if role_required == 'admin' and user_role != 'admin':
-                current_app.logger.warning(f"접근 거부 (관리자 필요): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
-                abort(403)
-            elif role_required == 'user' and user_role not in ['admin', 'user']:
-                current_app.logger.warning(f"접근 거부 (사용자 필요): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
-                abort(403)
-            elif role_required is None and user_role not in ['admin', 'user']:
-                current_app.logger.warning(f"접근 거부 (허용 IP 아님): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
-                abort(403)
+            # 변경하려는 IP가 이미 존재하는지 확인 (자기 자신 제외)
+            try:
+                if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s AND id != %d", (new_ip, admin_ip_id))
+                    if cursor.fetchone():
+                        flash(f"수정하려는 IP 주소 '{new_ip}'가 이미 다른 관리자 항목에 등록되어 있습니다.", 'error')
+                        return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+            except Exception as e:
+                flash(f"IP 중복 확인 중 오류: {e}", "error"); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+        
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor:
+                sql = "UPDATE dbo.admin_ips SET ip_address = %s, description = %s WHERE id = %d"
+                cursor.execute(sql, (new_ip, form.description.data, admin_ip_id))
+            conn.commit()
+            flash(f"관리자 IP '{new_ip}' 정보가 성공적으로 수정되었습니다.", 'success')
+            return redirect(url_for('admin.manage_admin_ips'))
+        except Exception as e:
+            if conn: conn.rollback()
+            flash(f"관리자 IP 수정 중 오류 발생: {str(e)[:200]}", 'error')
+            current_app.logger.error(f"Error editing admin IP ID {admin_ip_id}: {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+
+@admin_bp.route('/admins/delete/<int:admin_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_admin_ip(admin_ip_id):
+    conn = None; ip_address_deleted = f"ID {admin_ip_id}"; total_admins = 0
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ip_address FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,))
+            admin_ip_data = cursor.fetchone()
+            if not admin_ip_data: flash(f"삭제할 관리자 IP ID {admin_ip_id}를 찾을 수 없습니다.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+            ip_address_deleted = admin_ip_data['ip_address']
+
+            if ip_address_deleted == g.user_ip:
+                flash("현재 접속 중인 관리자 자신의 IP는 삭제할 수 없습니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
             
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.admin_ips")
+            total_admins = cursor.fetchone()['total']
+            if total_admins <= 1:
+                flash("최소 1개의 관리자 IP는 남아 있어야 합니다. 마지막 관리자 IP는 삭제할 수 없습니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
+            
+            # 외래 키 제약조건(ON DELETE SET NULL)이 added_by_admin_id를 처리해 줄 것임
+            cursor.execute("DELETE FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,))
+        conn.commit()
+        flash(f"관리자 IP '{ip_address_deleted}' 정보가 성공적으로 삭제되었습니다.", 'success')
+    except Exception as e:
+        if conn: conn.rollback()
+        flash(f"관리자 IP 삭제 중 오류 발생: {e}", 'error')
+        current_app.logger.error(f"Error deleting admin IP ID {admin_ip_id}: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_admin_ips'))
 
+app/routes_admin.py 주요 변경 사항:
 
-def inject_user_info_to_templates():
-    current_role = get_current_user_role() 
-    return dict(
-        current_user_ip=getattr(g, 'user_ip', 'IP 확인 불가'), 
-        current_user_role=current_role
-    )
-app/auth.py 주요 변경 사항:
+pymssql 사용: 모든 데이터베이스 연동 코드가 db_utils.get_db_connection()을 통해 pymssql 연결을 얻고, 커서를 사용하여 직접 SQL 쿼리를 실행하도록 변경되었습니다.
+파라미터화된 쿼리: SQL 인젝션 방지를 위해 cursor.execute(query, (params,)) 형태로 파라미터를 전달합니다. (pymssql은 %s, %d 등 사용)
+트랜잭션 관리: 데이터 변경(INSERT, UPDATE, DELETE) 후 conn.commit()을 호출하고, 오류 발생 시 conn.rollback()을 호출합니다.
+페이지네이션 수동 구현:
+각 manage_... 라우트에서 총 아이템 개수를 먼저 조회합니다.
+OFFSET ... ROWS FETCH NEXT ... ROWS ONLY SQL 구문을 사용하여 현재 페이지에 해당하는 데이터만 가져옵니다. (MSSQL 2012 이상 지원)
+페이지네이션 정보를 담은 딕셔너리(pagination)를 생성하여 템플릿에 전달합니다.
+오류 처리 및 로깅: try-except 블록을 사용하여 DB 작업 중 발생할 수 있는 예외를 처리하고, flash 메시지로 사용자에게 알리며, current_app.logger로 서버 로그를 기록합니다.
+폼 데이터 채우기 (Edit 시): GET 요청으로 수정 페이지 접근 시, DB에서 조회한 데이터를 TargetPCForm(data=pc_to_edit_data)와 같이 WTForms의 data 인자로 전달하여 폼 필드를 채웁니다. (pymssql에서 as_dict=True로 결과를 받았으므로 딕셔너리 형태입니다.)
+이것으로 app/routes_admin.py 파일의 모든 관리자 CRUD 기능이 pymssql 직접 호출 방식으로 수정되었습니다.
+이전에 제공된 HTML 템플릿 파일들(manage_target_pcs.html, edit_target_pc.html, manage_user_ips.html, edit_user_ip.html, manage_admin_ips.html, edit_admin_ip.html)은 이 수정된 라우트와 호환됩니다.
 
-from .db_utils import get_db_connection 추가: pymssql 연결을 가져오기 위한 함수를 임포트합니다.
-SQLAlchemy 모델 임포트 제거: from .models import AdminIP, AllowedUserIP 라인을 삭제하거나 주석 처리합니다 (더 이상 ORM 모델을 사용하지 않음).
-get_current_user_role() 함수 내부 수정:
-conn = get_db_connection(): 데이터베이스 연결을 얻습니다.
-with conn.cursor() as cursor:: pymssql 커서를 사용하여 SQL을 실행합니다. with 문을 사용하면 커서가 자동으로 닫힙니다.
-직접 SQL 쿼리 작성:
-관리자 IP 확인: SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s
-허용된 사용자 IP 확인: SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s
-pymssql은 파라미터 플레이스홀더로 %s를 사용합니다. SQL 인젝션 방지를 위해 cursor.execute(query, (param_tuple,)) 형태로 파라미터를 전달합니다.
-cursor.fetchone(): 조회 결과가 있는지 확인합니다.
-DB 연결 닫기: db_utils.py의 get_db_connection 함수가 Flask의 g 객체를 사용하여 요청별로 연결을 관리하고, app/__init__.py에서 app.teardown_appcontext(db_utils.close_db)를 통해 요청이 끝날 때 자동으로 연결을 닫도록 설정했으므로, 이 함수 내에서 conn.close()를 명시적으로 호출할 필요는 없습니다.
-예외 처리: DB 연결 또는 쿼리 실행 중 발생할 수 있는 예외를 잡아서 로깅합니다.
-참고: dbo.admin_ips와 같이 스키마 이름(dbo)을 명시하는 것은 MSSQL에서 좋은 습관이지만, 기본 스키마가 dbo이고 해당 사용자가 다른 기본 스키마를 사용하지 않는다면 생략해도 동작할 수 있습니다.
-
-이 수정된 app/auth.py 파일을 적용하시면 됩니다.
-
-다음으로는 데이터베이스 연동이 가장 많은 app/routes_admin.py 파일의 모든 SQLAlchemy ORM 코드를 pymssql 직접 호출 방식으로 변경하는 작업을 진행하겠습니다. 이 파일은 변경량이 상당히 많을 것입니다.
-
-계속 진행할까요?
-
+이제 Flask 애플리케이션의 관리자 기능은 pymssql을 사용하여 동작할 준비가 되었습니다.
