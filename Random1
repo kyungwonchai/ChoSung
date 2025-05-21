@@ -1,146 +1,116 @@
-app/__init__.py, run.py).
-pymssql 연결을 위한 유틸리티 추가 (app/db_utils.py).
-데이터베이스를 사용하는 모든 라우트 및 함수들을 pymssql 직접 호출 방식으로 변경.
-가장 먼저, 실행 진입점인 run.py부터 시작하겠습니다.
+네, 알겠습니다. 이어서 pymssql 직접 사용 방식으로 수정해야 할 다음 파일인 app/auth.py의 전체 코드를 제공해 드리겠습니다.
 
-수정: scontrol_flask_web/run.py
+이 파일의 get_current_user_role() 함수는 이전에는 SQLAlchemy ORM을 사용하여 데이터베이스에서 관리자 IP와 허용된 사용자 IP를 조회했습니다. 이제 이 부분을 app/db_utils.py의 get_db_connection() 함수를 통해 pymssql 연결을 얻고, 직접 SQL 쿼리를 실행하도록 수정합니다.
+
+수정: app/auth.py (pymssql 직접 사용)
 Python
 
-# scontrol_flask_web/run.py
-import os
-from app import create_app
+# scontrol_flask_web/app/auth.py
+from functools import wraps
+from flask import request, current_app, abort, g
+from .db_utils import get_db_connection # pymssql 연결을 위한 함수 임포트
 
-config_name = os.getenv('FLASK_CONFIG') or 'default'
-app_instance = create_app(config_name)
+def get_current_user_role():
+    if hasattr(g, 'current_user_role'):
+        return g.current_user_role
 
-if __name__ == '__main__':
-    app_instance.run(host='0.0.0.0', port=5000)
-다음으로 config.py 파일을 수정합니다. (주석 최소화)
+    user_ip = None
+    if request.headers.getlist("X-Forwarded-For"):
+        user_ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
+    else:
+        user_ip = request.remote_addr
+    
+    g.user_ip = user_ip
+    g.current_user_role = 'guest' # 기본값
 
-Python
+    if not user_ip:
+        current_app.logger.warning("사용자 IP 주소를 확인할 수 없습니다 (auth.py).")
+        return g.current_user_role
 
-# scontrol_flask_web/config.py
-import os
-from dotenv import load_dotenv
+    conn = None
+    try:
+        conn = get_db_connection() # DB 연결 가져오기
+        if conn is None: # 연결 실패 시
+             current_app.logger.error(f"DB 연결을 가져올 수 없습니다 (auth.py). IP: {user_ip}")
+             return g.current_user_role # 기본 'guest' 역할 반환
 
-basedir = os.path.abspath(os.path.dirname(__file__))
-load_dotenv(os.path.join(basedir, '.env'))
+        with conn.cursor() as cursor:
+            # 1. 관리자 IP 확인
+            sql_admin_check = "SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s"
+            cursor.execute(sql_admin_check, (user_ip,))
+            admin_entry = cursor.fetchone()
+            if admin_entry:
+                g.current_user_role = 'admin'
+                return g.current_user_role
 
-class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'flask-애플리케이션-비밀키-변경필수!'
-    DB_SERVER = os.environ.get('DB_SERVER_ADDRESS') or '10.22.22.22'
-    DB_PORT = os.environ.get('DB_PORT') or '2222'
-    DB_DATABASE = os.environ.get('DB_NAME') or 'SControlFlaskDB'
-    DB_USER = os.environ.get('DB_USER') or 'aaaaa'
-    DB_PASSWORD = os.environ.get('DB_PASSWORD') or 'bbbbb'
-    ADMIN_IPS = ['127.0.0.1', '::1', '10.22.22.22'] # 예시: 실제 관리자 IP로 수정
-
-    @staticmethod
-    def init_app(app):
+            # 2. 허용된 사용자 IP 확인
+            sql_user_check = "SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s"
+            cursor.execute(sql_user_check, (user_ip,))
+            allowed_user_entry = cursor.fetchone()
+            if allowed_user_entry:
+                g.current_user_role = 'user'
+                return g.current_user_role
+        
+    except Exception as e:
+        current_app.logger.error(f"IP 역할 확인 중 DB 오류 발생 (auth.py): {e}", exc_info=True)
+        # DB 오류 시 안전하게 'guest' 역할 또는 특정 오류 역할 반환 고려
+    finally:
+        # get_db_connection()이 g 객체를 사용하여 연결을 관리하고
+        # app.teardown_appcontext(close_db_connection)가 등록되어 있으므로,
+        # 여기서 conn.close()를 명시적으로 호출할 필요는 없습니다.
+        # 만약 get_db_connection()이 매번 새 연결을 반환하는 방식이라면 여기서 conn.close() 필요.
+        # 현재 db_utils.py는 g 객체 사용 방식이므로 teardown에서 처리됩니다.
         pass
+            
+    return g.current_user_role
 
-class DevelopmentConfig(Config):
-    DEBUG = True
 
-class ProductionConfig(Config):
-    DEBUG = False
+def ip_auth_required(role_required=None):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_role = get_current_user_role()
+            
+            if role_required == 'admin' and user_role != 'admin':
+                current_app.logger.warning(f"접근 거부 (관리자 필요): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
+                abort(403)
+            elif role_required == 'user' and user_role not in ['admin', 'user']:
+                current_app.logger.warning(f"접근 거부 (사용자 필요): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
+                abort(403)
+            elif role_required is None and user_role not in ['admin', 'user']:
+                current_app.logger.warning(f"접근 거부 (허용 IP 아님): IP {getattr(g, 'user_ip', 'N/A')} -> {request.path}")
+                abort(403)
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-config = {
-    'development': DevelopmentConfig,
-    'production': ProductionConfig,
-    'default': DevelopmentConfig
-}
-다음은 app/__init__.py 파일입니다. (주석 최소화)
 
-Python
+def inject_user_info_to_templates():
+    current_role = get_current_user_role() 
+    return dict(
+        current_user_ip=getattr(g, 'user_ip', 'IP 확인 불가'), 
+        current_user_role=current_role
+    )
+app/auth.py 주요 변경 사항:
 
-# scontrol_flask_web/app/__init__.py
-from flask import Flask
-from config import config
-import datetime
-import os
+from .db_utils import get_db_connection 추가: pymssql 연결을 가져오기 위한 함수를 임포트합니다.
+SQLAlchemy 모델 임포트 제거: from .models import AdminIP, AllowedUserIP 라인을 삭제하거나 주석 처리합니다 (더 이상 ORM 모델을 사용하지 않음).
+get_current_user_role() 함수 내부 수정:
+conn = get_db_connection(): 데이터베이스 연결을 얻습니다.
+with conn.cursor() as cursor:: pymssql 커서를 사용하여 SQL을 실행합니다. with 문을 사용하면 커서가 자동으로 닫힙니다.
+직접 SQL 쿼리 작성:
+관리자 IP 확인: SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s
+허용된 사용자 IP 확인: SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s
+pymssql은 파라미터 플레이스홀더로 %s를 사용합니다. SQL 인젝션 방지를 위해 cursor.execute(query, (param_tuple,)) 형태로 파라미터를 전달합니다.
+cursor.fetchone(): 조회 결과가 있는지 확인합니다.
+DB 연결 닫기: db_utils.py의 get_db_connection 함수가 Flask의 g 객체를 사용하여 요청별로 연결을 관리하고, app/__init__.py에서 app.teardown_appcontext(db_utils.close_db)를 통해 요청이 끝날 때 자동으로 연결을 닫도록 설정했으므로, 이 함수 내에서 conn.close()를 명시적으로 호출할 필요는 없습니다.
+예외 처리: DB 연결 또는 쿼리 실행 중 발생할 수 있는 예외를 잡아서 로깅합니다.
+참고: dbo.admin_ips와 같이 스키마 이름(dbo)을 명시하는 것은 MSSQL에서 좋은 습관이지만, 기본 스키마가 dbo이고 해당 사용자가 다른 기본 스키마를 사용하지 않는다면 생략해도 동작할 수 있습니다.
 
-def create_app(config_name='default'):
-    app = Flask(__name__)
-    app.config.from_object(config[config_name])
-    config[config_name].init_app(app)
+이 수정된 app/auth.py 파일을 적용하시면 됩니다.
 
-    from . import db_utils
-    app.teardown_appcontext(db_utils.close_db)
+다음으로는 데이터베이스 연동이 가장 많은 app/routes_admin.py 파일의 모든 SQLAlchemy ORM 코드를 pymssql 직접 호출 방식으로 변경하는 작업을 진행하겠습니다. 이 파일은 변경량이 상당히 많을 것입니다.
 
-    def format_datetime(value, fmt='%Y-%m-%d %H:%M'):
-        if not value: return ""
-        if isinstance(value, str):
-            original_value_for_log = value
-            try:
-                processed_value = value.upper().replace('Z', '')
-                if '.' in processed_value: processed_value = processed_value.split('.')[0]
-                processed_value = processed_value.replace('T', ' ')
-                formats_to_try = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-                parsed_dt = None
-                for dt_format in formats_to_try:
-                    try: parsed_dt = datetime.datetime.strptime(processed_value, dt_format); break
-                    except ValueError: continue
-                if parsed_dt is None:
-                    app.logger.warning(f"날짜 파싱 실패 (format_datetime): '{original_value_for_log}'")
-                    return original_value_for_log
-                value = parsed_dt
-            except Exception as e_parse:
-                app.logger.error(f"날짜 파싱 중 예외 (format_datetime) '{original_value_for_log}': {e_parse}")
-                return original_value_for_log
-        if not isinstance(value, (datetime.datetime, datetime.date)): return value
-        return value.strftime(fmt)
-    app.jinja_env.filters['datetimeformat'] = format_datetime
+계속 진행할까요?
 
-    @app.context_processor
-    def inject_now(): return {'now': datetime.datetime.utcnow()}
-
-    from .auth import inject_user_info_to_templates
-    app.context_processor(inject_user_info_to_templates)
-
-    from .routes_main import main_bp
-    app.register_blueprint(main_bp)
-    from .routes_admin import admin_bp
-    app.register_blueprint(admin_bp, url_prefix='/admin')
-    from .routes_user import user_bp
-    app.register_blueprint(user_bp, url_prefix='/user')
-
-    app.logger.info("Flask application (direct pymssql) created.")
-    if app.debug:
-        app.logger.debug(f"DB Connection (pymssql): Server={app.config.get('DB_SERVER')}:{app.config.get('DB_PORT')}, DB={app.config.get('DB_DATABASE')}")
-    return app
-다음은 app/db_utils.py 파일입니다. (주석 최소화)
-
-Python
-
-# scontrol_flask_web/app/db_utils.py
-import pymssql
-from flask import current_app, g
-
-def get_db_connection():
-    if 'db_conn' not in g or g.db_conn is None or getattr(g.db_conn, '_closed', True):
-        try:
-            g.db_conn = pymssql.connect(
-                server=current_app.config['DB_SERVER'],
-                port=str(current_app.config['DB_PORT']),
-                user=current_app.config['DB_USER'],
-                password=current_app.config['DB_PASSWORD'],
-                database=current_app.config['DB_DATABASE'],
-                as_dict=True, # 결과를 딕셔너리 형태로 받음
-                timeout=5,
-                login_timeout=5
-            )
-        except Exception as e:
-            current_app.logger.error(f"Database connection error (pymssql): {e}", exc_info=True)
-            g.db_conn = None
-            raise
-    return g.db_conn
-
-def close_db_connection(e=None):
-    db_conn = g.pop('db_conn', None)
-    if db_conn is not None and not getattr(db_conn, '_closed', True):
-        try:
-            db_conn.close()
-        except Exception as e:
-            current_app.logger.error(f"Error closing DB connection: {e}", exc_info=True)
-여기까지가 Flask 앱 실행 및 DB 연결 설정에 관련된 핵심 파일들의 수정된 전체 코드입니다. 이 파일들에는 SQLAlchemy 관련 내용이 모두 제거되었고, pymssql을 직접 사용하며 요청별로 DB 연결을 관리하도록 구성되었습니다.
