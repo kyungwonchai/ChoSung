@@ -1,205 +1,355 @@
-알겠습니다. Flask 웹 애플리케이션의 모든 페이지에 대한 기본 레이아웃을 정의하는 app/templates/layout.html 파일의 최종 전체 코드를 한국어 설명과 함께 다시 제공해 드리겠습니다.
+네, 알겠습니다. "달력 예외 관리" 기능이 현재 단일 날짜 선택 방식이라 불편하고, 실제 달력 UI를 보면서 가동/비가동 설정을 하고 싶으시군요. 그리고 달력에는 공휴일(빨간 날)과 주말이 기본적으로 표시되고, 사용자가 설정한 가동/비가동 예외는 동그라미 등으로 구분되어 표시되기를 원하시는군요.
 
-이 파일은 상단 네비게이션 바, 기본 스타일, 그리고 다른 페이지들이 내용을 채워 넣을 수 있는 블록({% block title %}, {% block content %} 등)을 포함합니다. Flash 메시지(알림 메시지)는 이 layout.html에서 직접 표시하지 않고, 각 개별 페이지 템플릿(예: control_panel.html, manage_target_pcs.html 등)이 필요에 따라 원하는 위치에 표시하도록 구성했습니다.
+이 요구사항은 UI와 백엔드 로직 모두에 상당한 변경이 필요합니다. 단계적으로 진행하겠습니다.
 
-최종: app/templates/layout.html
+1단계: 월별 달력 표시 및 기존 예외 정보 통합 (조회 기능 강화)
+
+먼저, 관리 페이지에서 현재 월의 달력을 보여주고, 해당 달력에 주말, 공휴일, 그리고 이미 데이터베이스(work_calendar_exceptions)에 저장된 사용자 지정 예외(가동/비가동)를 시각적으로 표시하는 것부터 시작하겠습니다. 날짜를 클릭해서 바로 상태를 변경하는 기능은 다음 단계에서 추가하겠습니다.
+
+1. 수정: app/routes_admin.py (달력 데이터 생성 로직 추가)
+manage_calendar_exceptions 라우트 함수를 수정하여, 요청된 연도와 월 (기본값은 현재 연도/월)에 대한 달력 데이터를 생성하고, 각 날짜에 대한 정보(주말, 공휴일, 사용자 지정 예외)를 포함하여 템플릿에 전달합니다.
+
+Python
+
+# scontrol_flask_web/app/routes_admin.py
+from flask import Blueprint, render_template, redirect, url_for, flash, request, current_app, g
+from app.db_utils import get_db_connection
+from app.forms import TargetPCForm, AllowedUserIPForm, AdminIPForm, WorkCalendarExceptionForm
+from app.auth import ip_auth_required
+import math
+import pymssql
+from datetime import datetime as dt_datetime, date, timedelta # date, timedelta 추가
+import calendar # Python 표준 달력 모듈
+import holidays # 한국 공휴일 라이브러리
+
+admin_bp = Blueprint('admin', __name__)
+
+# --- 기존 TargetPC, AllowedUserIP, AdminIP 관리 라우트들은 여기에 그대로 존재 ---
+# ... (이전 답변의 코드 내용) ...
+
+# --- ▼▼▼ 수정된 근무일/비근무일 예외 관리 라우트 ▼▼▼ ---
+@admin_bp.route('/calendar_exceptions', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def manage_calendar_exceptions():
+    form = WorkCalendarExceptionForm()
+    conn = None
+
+    # 현재 표시할 연도와 월 결정
+    try:
+        year = request.args.get('year', dt_datetime.now().year, type=int)
+        month = request.args.get('month', dt_datetime.now().month, type=int)
+        # 월 값이 범위를 벗어나면 현재 월로 조정
+        if not (1 <= month <= 12):
+            month = dt_datetime.now().month
+            year = dt_datetime.now().year # 월이 잘못되면 연도도 현재로
+    except ValueError:
+        year = dt_datetime.now().year
+        month = dt_datetime.now().month
+    
+    current_month_date = date(year, month, 1)
+    prev_month_date = current_month_date - timedelta(days=1) # 이전 달의 마지막 날
+    prev_month = date(prev_month_date.year, prev_month_date.month, 1) # 이전 달의 첫 날
+    
+    next_month_date_temp = current_month_date + timedelta(days=31) # 다음 달로 넘어가기 충분한 일 수 더하기
+    next_month = date(next_month_date_temp.year, next_month_date_temp.month, 1)
+
+
+    if form.validate_on_submit(): # POST 요청 (새 예외 추가)
+        exception_date_val = form.exception_date.data
+        is_operational_val = bool(int(form.is_operational.data))
+        description_val = form.description.data if form.description.data and form.description.data.strip() else None
+        
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (exception_date_val.strftime('%Y-%m-%d'),))
+                if cursor.fetchone():
+                    flash(f"오류: 날짜 {exception_date_val.strftime('%Y-%m-%d')} 에 대한 예외가 이미 존재합니다. 기존 항목을 삭제 후 다시 추가하거나, 수정 기능을 이용하세요.", 'error')
+                else:
+                    sql = "INSERT INTO dbo.work_calendar_exceptions (exception_date, is_operational, description) VALUES (%s, %s, %s)"
+                    cursor.execute(sql, (exception_date_val.strftime('%Y-%m-%d'), is_operational_val, description_val))
+                    conn.commit()
+                    flash(f"날짜 {exception_date_val.strftime('%Y-%m-%d')} 에 대한 예외가 성공적으로 추가되었습니다.", 'success')
+            # 성공 후 현재 달력 페이지로 리다이렉트 (추가된 날짜가 포함된 달로)
+            return redirect(url_for('admin.manage_calendar_exceptions', year=exception_date_val.year, month=exception_date_val.month))
+        
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback()
+            flash(f"데이터베이스 오류 (중복): 날짜 {exception_date_val.strftime('%Y-%m-%d')} 추가 중 중복 발생 가능성.", 'error')
+            current_app.logger.error(f"Add CalendarEx IntegrityError for {exception_date_val}: {ie}", exc_info=True)
+        except Exception as e:
+            if conn: conn.rollback()
+            flash(f"예외 날짜 추가 중 오류 발생: {e}", 'error')
+            current_app.logger.error(f"Error adding calendar exception for {exception_date_val}: {e}", exc_info=True)
+
+    # 달력 데이터 생성
+    cal = calendar.Calendar(firstweekday=6) # 일요일(6)부터 시작하는 달력
+    month_days = cal.monthdatescalendar(year, month) # 해당 월의 날짜들을 주 단위로 가져옴 (datetime.date 객체 리스트)
+
+    # 공휴일 정보 로드
+    kr_holidays = holidays.KR(years=year)
+
+    # DB에서 현재 월의 예외 정보 가져오기
+    db_exceptions = {}
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # 현재 표시 월의 첫날과 마지막 날 계산
+            first_day_of_month = date(year, month, 1)
+            # 해당 월의 마지막 날짜 구하기 (다음 달 1일에서 하루 빼기)
+            if month == 12:
+                last_day_of_month = date(year, month, 31)
+            else:
+                last_day_of_month = date(year, month + 1, 1) - timedelta(days=1)
+
+            sql_exceptions = "SELECT exception_date, is_operational, description FROM dbo.work_calendar_exceptions WHERE exception_date BETWEEN %s AND %s"
+            cursor.execute(sql_exceptions, (first_day_of_month.strftime('%Y-%m-%d'), last_day_of_month.strftime('%Y-%m-%d')))
+            for row in cursor.fetchall():
+                db_exceptions[row['exception_date']] = {'is_operational': bool(row['is_operational']), 'description': row['description']}
+    except Exception as e:
+        flash("달력 예외 정보를 불러오는 중 오류가 발생했습니다.", "error")
+        current_app.logger.error(f"Error fetching calendar exceptions for {year}-{month}: {e}", exc_info=True)
+
+    # 템플릿에 전달할 달력 데이터 가공
+    calendar_data = []
+    for week in month_days:
+        week_data = []
+        for day_date in week: # day_date는 datetime.date 객체
+            day_info = {'date': day_date, 'is_today': (day_date == date.today()), 'is_current_month': (day_date.month == month)}
+            
+            # 1. 사용자 지정 예외 확인 (가장 높은 우선순위)
+            user_exception = db_exceptions.get(day_date)
+            if user_exception:
+                day_info['is_operational'] = user_exception['is_operational']
+                day_info['type'] = 'user_exception'
+                day_info['description'] = user_exception['description']
+            else:
+                # 2. 공휴일 확인
+                holiday_name = kr_holidays.get(day_date)
+                if holiday_name:
+                    day_info['is_operational'] = False # 공휴일은 기본 비가동
+                    day_info['type'] = 'public_holiday'
+                    day_info['description'] = holiday_name
+                # 3. 주말 확인 (월요일0 ~ 일요일6)
+                elif day_date.weekday() >= 5: # 토요일 또는 일요일
+                    day_info['is_operational'] = False # 주말은 기본 비가동
+                    day_info['type'] = 'weekend'
+                    day_info['description'] = "주말"
+                else: # 평일
+                    day_info['is_operational'] = True # 평일은 기본 가동
+                    day_info['type'] = 'weekday'
+                    day_info['description'] = "평일"
+            week_data.append(day_info)
+        calendar_data.append(week_data)
+    
+    return render_template('admin/manage_calendar_exceptions.html', 
+                           title="근무일/비근무일 예외 관리", 
+                           form=form, # 예외 추가 폼
+                           calendar_data=calendar_data, # 가공된 달력 데이터
+                           current_year=year,
+                           current_month=month,
+                           prev_month_url_params={'year': prev_month.year, 'month': prev_month.month},
+                           next_month_url_params={'year': next_month.year, 'month': next_month.month},
+                           db_exceptions_list=sorted(db_exceptions.items()) # 하단 목록 표시용 (선택적)
+                          )
+
+@admin_bp.route('/calendar_exceptions/delete/<string:date_str>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_calendar_exception(date_str):
+    # ... (이전 삭제 로직과 동일) ...
+    # 삭제 후, 해당 날짜가 포함된 달의 달력으로 리다이렉트하도록 수정 가능
+    conn = None
+    year_to_redirect, month_to_redirect = dt_datetime.now().year, dt_datetime.now().month
+    try:
+        exception_date_obj = dt_datetime.strptime(date_str, '%Y-%m-%d').date()
+        year_to_redirect, month_to_redirect = exception_date_obj.year, exception_date_obj.month # 리다이렉트할 연월 저장
+        
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            sql = "DELETE FROM dbo.work_calendar_exceptions WHERE exception_date = %s"
+            cursor.execute(sql, (exception_date_obj.strftime('%Y-%m-%d'),))
+            rows_deleted = cursor.rowcount
+            conn.commit()
+            if rows_deleted > 0: flash(f"날짜 {date_str} 예외 삭제 성공.", 'success')
+            else: flash(f"날짜 {date_str} 예외 없음.", 'warning')
+    except ValueError: flash(f"잘못된 날짜 형식: {date_str}", 'error'); current_app.logger.warning(f"Invalid date format for delete: {date_str}")
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"예외 날짜 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete CalendarEx for {date_str} Error: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_calendar_exceptions', year=year_to_redirect, month=month_to_redirect))
+
+routes_admin.py 주요 변경 사항:
+
+calendar, holidays, date, timedelta 등을 임포트합니다.
+manage_calendar_exceptions() 함수 대폭 수정:
+GET 파라미터로 year와 month를 받아 해당 월의 달력을 표시합니다. 기본값은 현재 연도/월입니다.
+이전/다음 달로 이동하기 위한 prev_month와 next_month 정보를 계산합니다.
+calendar.Calendar().monthdatescalendar()를 사용하여 해당 월의 날짜들을 주 단위로 가져옵니다.
+holidays.KR()을 사용하여 해당 연도의 한국 공휴일 정보를 가져옵니다.
+work_calendar_exceptions DB 테이블에서 현재 표시 중인 월의 예외 정보를 미리 가져와 db_exceptions 딕셔너리에 저장합니다.
+calendar_data라는 리스트를 생성합니다. 각 요소는 한 주(week)를 나타내고, 그 안에는 각 날짜(day)에 대한 정보 (날짜 객체, 오늘 여부, 현재 달 여부, 최종 운영 상태(is_operational), 날짜 유형(type), 설명(description))를 담은 딕셔너리가 포함됩니다.
+운영 상태 판단 우선순위: 1. 사용자 지정 예외 -> 2. 공휴일 -> 3. 주말 -> 4. 평일
+가공된 calendar_data와 현재 연도/월, 이전/다음 달 이동을 위한 파라미터를 템플릿에 전달합니다.
+예외 추가(POST) 로직은 유지하되, 성공 시 추가된 날짜가 포함된 달의 달력으로 리다이렉트합니다.
+delete_calendar_exception() 함수 수정: 예외 삭제 후, 해당 날짜가 포함된 달의 달력으로 리다이렉트하도록 수정했습니다.
+2. 수정: app/templates/admin/manage_calendar_exceptions.html
+이 템플릿은 이제 월별 달력을 표시하고, 각 날짜에 주말/공휴일/사용자 지정 예외 상태를 시각적으로 보여줍니다. 예외 추가 폼은 그대로 유지됩니다.
+
 HTML
 
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}SControl Web{% endblock %} - Flask</title> {# 기본 제목에 "- Flask" 추가 (선택적) #}
-    <style>
-        body { 
-            font-family: 'Malgun Gothic', '맑은 고딕', sans-serif; 
-            margin: 0; 
-            padding: 0;
-            background-color: #f4f4f8; 
-            color: #333; 
-            font-size: 14px;
-        }
-        header {
-            background-color: #2c3e50;
-            color: white;
-            padding: 10px 20px;
-            text-align: center;
-        }
-        header h1 {
-            margin: 0;
-            font-size: 1.8em;
-        }
-        nav { 
-            background-color: #34495e; 
-            padding: 12px 0; 
-            text-align: center; 
-            margin-bottom: 20px; 
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        nav a { 
-            color: #ecf0f1; 
-            margin: 0 15px; 
-            text-decoration: none; 
-            font-weight: 500; /* 약간 얇게 */
-            padding: 8px 12px;
-            border-radius: 4px;
-            transition: background-color 0.3s ease;
-        }
-        nav a:hover { 
-            background-color: #4e667f;
-            text-decoration: none; 
-        }
-        nav .user-info { /* 네비게이션 바 우측 사용자 정보 스타일 */
-            color: #bdc3c7; 
-            font-size: 0.9em;
-            float: right; /* 오른쪽 정렬 */
-            margin-right: 20px;
-            padding-top: 3px; /* 링크와 세로 중앙 정렬을 위해 약간 조정 */
-        }
+{% extends "layout.html" %}
 
-        .container { 
-            width: 90%;
-            max-width: 1200px; /* 최대 너비 설정 */
-            margin: 20px auto; /* 좌우 자동 마진으로 중앙 정렬 */
-            background-color: white; 
-            padding: 25px; 
-            border-radius: 8px; 
-            box-shadow: 0 2px 15px rgba(0,0,0,0.1); 
-        }
-        h1, h2, h3 { color: #2c3e50; margin-top:0; }
-        h1 { font-size: 1.7em; margin-bottom: 20px; border-bottom: 2px solid #eee; padding-bottom: 10px;}
-        h2 { font-size: 1.4em; margin-top: 30px; margin-bottom:15px; border-bottom: 1px solid #eee; padding-bottom: 8px;}
-        
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        th, td { border: 1px solid #e0e0e0; padding: 10px 12px; text-align: left; vertical-align: middle;}
-        th { background-color: #f5f7fa; font-weight: 600; color: #333;}
-        tr:nth-child(even) { background-color: #fdfdfd; }
-        tr:hover { background-color: #f0f5fa; }
-        
-        /* Flash 메시지 리스트 스타일 (개별 페이지 템플릿에서 사용) */
-        ul.flash-messages { 
-            list-style-type: none; 
-            padding-left: 0;       
-            margin-top: 20px;
-            margin-bottom: 0; /* 다른 요소와의 간격은 flash-messages-container에서 조절 */
-        }
-        .flash-messages li { 
-            padding: 12px 15px; 
-            margin-bottom: 10px; 
-            border-radius: 4px; 
-            border-width: 1px;
-            border-style: solid;
-            font-size: 0.95em;
-        }
-        .flash-messages li:last-child { margin-bottom: 0; }
-        .flash-messages .success { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
-        .flash-messages .error { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
-        .flash-messages .warning { background-color: #fff3cd; color: #856404; border-color: #ffeeba; }
-        .flash-messages .info { background-color: #d1ecf1; color: #0c5460; border-color: #bee5eb; }
+{% block title %}{{ title }}{% endblock %}
 
-        .form-group { margin-bottom: 18px; }
-        .form-group label { display: block; margin-bottom: 6px; font-weight: 500; color: #555;}
-        .form-group input[type="text"], 
-        .form-group input[type="number"], 
-        .form-group input[type="password"], 
-        .form-group input[type="date"], /* DateField 스타일 추가 */
-        .form-group textarea,
-        .form-group select { /* SelectField 스타일 추가 */
-            width: calc(100% - 24px); /* padding 고려 */
-            padding: 10px; 
-            border: 1px solid #ccc; 
-            border-radius: 4px;
-            font-size: 1em;
-            box-sizing: border-box; /* padding과 border가 width에 포함되도록 */
-        }
-        .form-group input[type="text"]:focus, 
-        .form-group input[type="number"]:focus, 
-        .form-group input[type="password"]:focus,
-        .form-group input[type="date"]:focus,
-        .form-group textarea:focus,
-        .form-group select:focus {
-            border-color: #007bff;
-            box-shadow: 0 0 0 0.2rem rgba(0,123,255,.25);
-            outline: none;
-        }
-        .form-group textarea { resize: vertical; min-height: 80px; }
-        .form-group .errors li { color: red; font-size: 0.85em; list-style-position: inside; padding-left:0;}
-        .form-group .errors { padding-left: 0; margin-top: 4px;}
-
-
-        .btn { padding: 10px 18px; color: white; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 0.95em; font-weight: 500; transition: background-color 0.2s ease-in-out; }
-        .btn-primary { background-color: #007bff; }
-        .btn-primary:hover { background-color: #0056b3; }
-        .btn-danger { background-color: #dc3545; }
-        .btn-danger:hover { background-color: #c82333; }
-        .btn-secondary { background-color: #6c757d; color: white; }
-        .btn-secondary:hover { background-color: #545b62; }
-        .btn-sm { padding: 6px 12px; font-size: 0.8em;}
-        .action-links a, .action-links input[type="submit"], .command-buttons button { margin-right: 8px; margin-bottom: 8px;}
-        .command-buttons { margin-top: 15px; }
-
-        .pagination { margin-top: 25px; text-align: center; }
-        .pagination a, .pagination span.disabled, .pagination strong { margin: 0 4px; padding: 8px 12px; border: 1px solid #ddd; text-decoration: none; color: #007bff; border-radius: 4px; }
-        .pagination span.disabled { color: #aaa; border-color: #ddd; }
-        .pagination strong { font-weight: bold; background-color: #007bff; color: white; border-color: #007bff;}
-
-        footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #777; font-size: 0.9em; }
-    </style>
-</head>
-<body>
-    <header>
-        <h1>SControl 웹 시스템</h1>
-    </header>
-    <nav>
-        <a href="{{ url_for('main.index') }}">홈</a>
-        {% if current_user_role == 'admin' %}
-            <a href="{{ url_for('admin.manage_target_pcs') }}">PC 관리</a>
-            <a href="{{ url_for('admin.manage_user_ips') }}">사용자 IP 관리</a>
-            <a href="{{ url_for('admin.manage_admin_ips') }}">관리자 IP 관리</a>
-            <a href="{{ url_for('admin.manage_calendar_exceptions') }}">달력 예외 관리</a> 
-        {% endif %}
-        {% if current_user_role in ['admin', 'user'] %}
-             <a href="{{ url_for('user.control_panel') }}">원격 제어판</a>
-        {% endif %}
-        {# 오른쪽 정렬된 사용자 정보 #}
-        <span class="user-info">(접속 IP: {{ current_user_ip }} | 역할: {{ current_user_role }})</span>
-    </nav>
-
-    <div class="container">
-        {# layout.html에서는 전역 flash 메시지를 표시하지 않습니다. #}
-        {# 각 개별 페이지 템플릿(예: control_panel.html)이 content 블록 내 원하는 위치에 flash 메시지를 표시합니다. #}
-        
-        {% block content %}{# 개별 페이지의 메인 콘텐츠가 여기에 렌더링됩니다. #}{% endblock %}
-
+{% block content %}
+    <h1>{{ title }} ({{ current_year }}년 {{ current_month }}월)</h1>
+    <p>사용자 지정 근무일 또는 비근무일을 설정하여 자동 스케줄링에 예외를 적용합니다.</p>
+    
+    {# 달력 네비게이션 #}
+    <div style="margin-bottom: 20px; text-align: center;">
+        <a href="{{ url_for('admin.manage_calendar_exceptions', year=prev_month_url_params.year, month=prev_month_url_params.month) }}" class="btn btn-sm btn-secondary">&laquo; 이전 달</a>
+        <span style="font-size: 1.2em; margin: 0 20px; font-weight: bold;">{{ current_year }}년 {{ current_month }}월</span>
+        <a href="{{ url_for('admin.manage_calendar_exceptions', year=next_month_url_params.year, month=next_month_url_params.month) }}" class="btn btn-sm btn-secondary">다음 달 &raquo;</a>
     </div>
 
-    <footer>
-        <p>&copy; {{ now.year if now else "" }} SControl System. All rights reserved.</p>
-    </footer>
+    {# 달력 테이블 #}
+    <table class="calendar-table" style="table-layout: fixed;">
+        <thead>
+            <tr>
+                <th style="width: 14.28%; color: red; text-align:center;">일 (Sun)</th>
+                <th style="width: 14.28%; text-align:center;">월 (Mon)</th>
+                <th style="width: 14.28%; text-align:center;">화 (Tue)</th>
+                <th style="width: 14.28%; text-align:center;">수 (Wed)</th>
+                <th style="width: 14.28%; text-align:center;">목 (Thu)</th>
+                <th style="width: 14.28%; text-align:center;">금 (Fri)</th>
+                <th style="width: 14.28%; color: blue; text-align:center;">토 (Sat)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for week in calendar_data %}
+            <tr>
+                {% for day in week %}
+                <td style="height: 100px; vertical-align: top; 
+                           {% if not day.is_current_month %}background-color: #f0f0f0; color: #aaa;{% endif %}
+                           {% if day.is_today %}border: 2px solid #007bff;{% endif %}
+                           position: relative; /* 자식 요소의 absolute 위치 기준점 */
+                           padding: 5px;">
+                    <div style="text-align: right; font-weight: bold; 
+                                {% if day.date.weekday() == 6 %}color: red;{% elif day.date.weekday() == 5 %}color: blue;{% endif %}">
+                        {{ day.date.day }}
+                    </div>
+                    
+                    {# 날짜 유형 및 운영 상태 표시 #}
+                    {% if day.is_current_month %} {# 현재 달의 날짜에만 상세 정보 표시 #}
+                        <div style="font-size: 0.8em; margin-top: 5px;">
+                            {% if day.type == 'user_exception' %}
+                                <span title="{{ day.description if day.description else '사용자 지정' }}" 
+                                      style="padding:2px 4px; border-radius:3px; color:white;
+                                             background-color: {% if day.is_operational %}darkolivegreen{% else %}crimson{% endif %};">
+                                    ★ {{ '가동' if day.is_operational else '비가동' }} (지정)
+                                </span><br>
+                                <span style="font-size:0.9em; color:#555;">{{ day.description|truncate(30) if day.description }}</span>
 
-    {# 개별 페이지에서 필요한 JavaScript 파일들을 여기에 추가할 수 있습니다. #}
-    {% block scripts %}{% endblock %}
-</body>
-</html>
-layout.html 주요 특징 및 변경 사항:
+                            {% elif day.type == 'public_holiday' %}
+                                <span title="{{ day.description }}" style="color: red;">{{ day.description|truncate(15) }}</span><br>
+                                <span style="color:red; font-weight:bold;">(비가동)</span>
+                            {% elif day.type == 'weekend' %}
+                                <span style="color: {% if day.date.weekday() == 6 %}red{% else %}blue{% endif %};">주말</span><br>
+                                <span style="color:{% if day.date.weekday() == 6 %}red{% else %}blue{% endif %}; font-weight:bold;">(비가동)</span>
+                            {% else %} {# weekday #}
+                                <span style="color: green; font-weight:bold;">(가동)</span>
+                            {% endif %}
+                        </div>
+                        {# 여기에 해당 날짜에 대한 예외 추가/삭제 버튼을 JavaScript로 구현하거나 링크로 연결 가능 (다음 단계) #}
+                        <div style="position: absolute; bottom: 5px; right: 5px;">
+                            {% if day.type == 'user_exception' %}
+                                <form method="POST" action="{{ url_for('admin.delete_calendar_exception', date_str=day.date.strftime('%Y-%m-%d')) }}" style="display:inline;" onsubmit="return confirm('날짜 [{{ day.date.strftime('%Y-%m-%d') }}]의 예외 설정을 삭제하시겠습니까?');">
+                                    <input type="submit" value="지정해제" class="btn btn-secondary btn-sm" style="padding:2px 4px; font-size:0.75em;">
+                                </form>
+                            {% else %}
+                                {# 현재는 폼을 통해 아래에서 추가. 향후 이 버튼으로 추가/수정 모달 띄우기 가능 #}
+                                {# <a href="#add_exception_form" onclick="setFormDate('{{ day.date.strftime('%Y-%m-%d') }}')" class="btn btn-info btn-sm" style="padding:2px 4px; font-size:0.75em;">예외지정</a> #}
+                            {% endif %}
+                        </div>
+                    {% endif %}
+                </td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
 
-기본 HTML 구조: 모든 페이지에서 공통으로 사용될 HTML, HEAD, BODY 구조를 제공합니다.
-CSS 스타일: 기본적인 CSS 스타일을 <style> 태그 내에 포함시켰습니다. 프로젝트가 커지면 별도의 CSS 파일로 분리하는 것이 좋습니다.
-테이블, 버튼, 폼 요소, 페이지네이션 등에 대한 스타일이 포함되어 있습니다.
-Flash 메시지 스타일 (ul.flash-messages li 등)은 유지되어, 개별 페이지에서 flash 메시지를 표시할 때 일관된 모양을 제공합니다.
-이전에 추가했던 .flash-messages-container-fixed 관련 CSS는 제거했습니다.
-네비게이션 바:
-main.index (홈), admin.* (관리자 메뉴), user.control_panel (사용자 제어판) 링크를 포함합니다.
-current_user_role 컨텍스트 변수 (auth.py의 inject_user_info_to_templates에서 주입됨)를 사용하여 현재 접속한 사용자의 역할에 따라 다른 메뉴를 보여줍니다.
-"달력 예외 관리" 링크를 관리자 메뉴에 추가했습니다.
-접속 IP와 역할 정보를 네비게이션 바 오른쪽에 표시하도록 .user-info 클래스와 함께 float: right 스타일을 적용했습니다. (간단한 예시이며, CSS를 더 다듬을 수 있습니다.)
-{% block title %}: 각 페이지에서 브라우저 탭 제목을 설정할 수 있도록 합니다.
-{% block content %}: 각 페이지의 주요 내용이 이 블록을 채워서 표시됩니다.
-Flash 메시지 표시 부분 제거: 이 layout.html에서는 전역적으로 flash 메시지를 표시하는 코드를 제거했습니다. 각 하위 템플릿(예: control_panel.html, manage_target_pcs.html 등)이 자신이 원하는 위치(예: 표 아래)에 get_flashed_messages()를 사용하여 메시지를 표시하도록 합니다.
-푸터: 간단한 저작권 정보를 표시합니다. now.year는 app/__init__.py의 inject_now 컨텍스트 프로세서를 통해 현재 연도를 전달받아 표시합니다.
-{% block scripts %}: 각 페이지에서 필요한 JavaScript 파일을 추가할 수 있도록 합니다.
-이 layout.html 파일을 프로젝트의 app/templates/ 폴더에 저장하거나 업데이트하시면 됩니다. 이제 각 페이지 템플릿(예: control_panel.html)에서 {% extends "layout.html" %}를 사용하고, {% block content %} 내에 페이지별 내용을 작성하며, 필요한 위치에 flash 메시지 로직을 직접 포함시키면 됩니다.
+    <hr style="margin: 30px 0;">
 
-다음으로 어떤 부분을 진행할까요?
+    <h2>새 예외 날짜 추가/수정</h2>
+    <p style="font-size:0.9em; color: #555;">특정 날짜를 가동일 또는 비가동일로 지정합니다. 이미 지정된 날짜는 기존 설정이 덮어쓰여지지 않고 오류 메시지가 표시됩니다. (수정은 기존 항목 삭제 후 재등록)</p>
+    <form method="POST" action="{{ url_for('admin.manage_calendar_exceptions', year=current_year, month=current_month) }}" novalidate>
+        {{ form.hidden_tag() }}
+        <div class="form-group">
+            {{ form.exception_date.label }}<br>
+            {{ form.exception_date(class="form-control", type="date") }}
+            {% if form.exception_date.errors %}
+                <ul class="errors">{% for error in form.exception_date.errors %}<li>{{ error }}</li>{% endfor %}</ul>
+            {% endif %}
+        </div>
+        <div class="form-group">
+            {{ form.is_operational.label }}<br>
+            {{ form.is_operational(class="form-control") }}
+            {% if form.is_operational.errors %}
+                <ul class="errors">{% for error in form.is_operational.errors %}<li>{{ error }}</li>{% endfor %}</ul>
+            {% endif %}
+        </div>
+        <div class="form-group">
+            {{ form.description.label }}<br>
+            {{ form.description(class="form-control", rows="3") }}
+            {% if form.description.errors %}
+                <ul class="errors">{% for error in form.description.errors %}<li>{{ error }}</li>{% endfor %}</ul>
+            {% endif %}
+        </div>
+        <div class="form-group">
+            {{ form.submit(class="btn btn-primary", value="예외 날짜 설정 저장") }}
+        </div>
+    </form>
+    
+    {# 기존처럼 하단에 등록된 예외 목록을 테이블로 한 번 더 보여줄 수 있음 (선택적) #}
+    {# {% if db_exceptions_list %} ... 테이블 ... {% endif %} #}
+
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+    // 만약 달력 날짜 클릭 시 폼의 날짜를 자동으로 채우고 싶다면 JavaScript 추가
+    // function setFormDate(dateStr) {
+    //     document.getElementById("exception_date").value = dateStr;
+    // }
+</script>
+{% endblock %}
+
+manage_calendar_exceptions.html 주요 변경 사항:
+
+달력 네비게이션: 이전 달/다음 달로 이동할 수 있는 링크를 추가했습니다.
+달력 테이블: calendar_data를 사용하여 월별 달력을 테이블 형태로 그립니다.
+각 날짜 셀에 날짜 번호를 표시합니다.
+현재 달이 아닌 날짜는 흐리게 표시합니다.
+오늘 날짜는 테두리로 강조합니다.
+토요일은 파란색, 일요일은 빨간색으로 표시합니다.
+운영 상태 표시:
+사용자 지정 예외: "★ 가동 (지정)" 또는 "★ 비가동 (지정)"으로 표시하고 배경색을 다르게 합니다. 설명도 툴팁이나 텍스트로 표시.
+공휴일: 공휴일 이름을 빨간색으로 표시하고 "(비가동)"으로 표시.
+주말: "주말"과 함께 "(비가동)"으로 표시.
+평일: "(가동)"으로 표시.
+예외 지정 해제: 사용자 지정 예외가 있는 날짜에는 "지정해제" 버튼(삭제 폼)을 표시하여 해당 예외를 삭제할 수 있도록 합니다.
+예외 추가 폼: 이전과 동일하게 유지되지만, 폼 제출 후 현재 보고 있는 달력으로 리다이렉션됩니다. 폼 상단에 설명 문구를 추가하여 중복 등록 시의 동작을 안내합니다.
+다음 단계 및 고려사항:
+
+네비게이션 링크 추가: app/templates/layout.html의 관리자 메뉴에 "달력 예외 관리" 페이지로 가는 링크({{ url_for('admin.manage_calendar_exceptions') }})가 이미 추가되어 있습니다.
+테스트:
+Flask 앱을 실행하고 /admin/calendar_exceptions 페이지로 이동합니다.
+달력이 정상적으로 표시되는지, 주말/공휴일 표시가 올바른지 확인합니다.
+"새 예외 날짜 추가" 폼을 사용하여 특정 날짜를 가동일 또는 비가동일로 설정해보고, 달력에 해당 내용(★ 표시)이 반영되는지, 그리고 DB에도 저장되는지 확인합니다.
+"지정해제" 버튼으로 예외를 삭제하는 기능도 테스트합니다.
+이전/다음 달 네비게이션이 잘 동작하는지 확인합니다.
+(향후 개선) 달력에서 직접 상태 변경: 현재는 예외를 추가하려면 하단의 폼을 사용해야 합니다. 향후에는 달력의 날짜를 클릭하면 바로 해당 날짜의 상태를 변경(가동<->비가동 토글 또는 선택)하고 DB에 저장하는 JavaScript 기반의 인터랙티브한 기능을 추가할 수 있습니다 (예: AJAX 사용).
+(향후 개선) 예외 수정 기능: 현재는 수정 기능이 없고 삭제 후 재등록 방식입니다. 필요하다면 수정 기능도 추가할 수 있습니다.
+위 코드들을 적용해보시고, 달력 UI가 잘 표시되고 예외 추가/삭제 기능이 정상적으로 동작하는지 확인해주세요.
 
