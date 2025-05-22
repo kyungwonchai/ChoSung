@@ -1,148 +1,52 @@
-네, 스케줄러가 예상대로 실행되었다니 다행입니다! misfire_grace_time과 "Working outside of application context" 오류에 대해 설명드리고, 관련 코드를 수정해 드리겠습니다.
+, "ValueError: This list of positional arguments is longer than the target callable can handle (allowed 0, given in args: 1)" 오류 메시지는 APScheduler가 특정 함수를 실행하려고 할 때, 그 함수가 실제로는 아무 인자(argument)도 받지 않도록 정의되어 있는데 스케줄러가 1개의 인자를 전달하려고 해서 발생하는 문제입니다.
 
-1. misfire_grace_time 설명
-APScheduler에서 작업을 추가할 때 misfire_grace_time 옵션은 다음과 같은 의미를 가집니다:
+이전에 app/__init__.py 파일에서 스케줄된 작업(scheduled_task_monitor_on, scheduled_task_monitor_off)을 등록할 때 Flask의 app 인스턴스를 전달하도록 args=[current_flask_app] 옵션을 사용했습니다.
 
-정의: 스케줄러가 어떤 이유로든 (예: 애플리케이션 재시작, 시스템 부하 등) 작업이 예정된 정확한 시간에 실행시키지 못했을 경우, 해당 작업을 얼마나 늦게까지 실행을 시도할지를 초 단위로 설정하는 값입니다.
-동작:
-만약 작업이 예정된 시간보다 늦게 트리거되었지만, 그 지연 시간이 misfire_grace_time 이내라면 작업은 실행됩니다.
-만약 지연 시간이 misfire_grace_time을 초과하면, 해당 작업 실행은 "misfired" (실행 시점 놓침)로 간주되어 일반적으로 실행되지 않습니다 (스케줄러의 coalesce 설정 등에 따라 동작이 달라질 수 있음).
-예시: misfire_grace_time=3600 (초)로 설정하면, 원래 실행 시간으로부터 최대 1시간까지 지연된 작업도 실행을 시도합니다. 이 값을 None으로 설정하면 (또는 executor 기본값에 따라) 가능한 한 빨리 실행하려고 합니다.
-요약하면, misfire_grace_time은 스케줄된 작업이 일시적인 문제로 제때 실행되지 못했을 때, 어느 정도의 유예 기간을 두고 실행을 재시도할지를 결정하는 중요한 설정입니다.
-
-2. "Working outside of application context" 오류 해결
-이 오류는 Flask와 관련된 코드 (특히 current_app 프록시 객체, 애플리케이션 설정값 current_app.config, 데이터베이스 연결 g.db_conn, 또는 Flask 확장 기능 등)가 활성화된 Flask 애플리케이션 컨텍스트 외부에서 실행될 때 발생합니다.
-
-APScheduler에 의해 실행되는 작업(scheduler_tasks.py의 함수들)은 Flask의 일반적인 HTTP 요청 처리 흐름과 분리된 별도의 스레드에서 실행되기 때문에, 기본적으로 Flask 애플리케이션 컨텍스트를 가지지 않습니다. 따라서 이 작업 함수들 내에서 current_app 등을 직접 사용하려고 하면 위 오류가 발생합니다.
-
-해결 방법: 스케줄된 작업 함수 내부에서 Flask 애플리케이션 컨텍스트를 명시적으로 만들어주어야 합니다. Flask-APScheduler는 이를 자동으로 처리해주려고 시도하지만, 때로는 명시적인 컨텍스트 설정이 필요합니다. 가장 확실한 방법은 스케줄러 작업 등록 시 Flask app 인스턴스를 전달하고, 작업 함수 내에서 with app.app_context():를 사용하는 것입니다.
-
-수정 대상 파일:
-
-app/__init__.py: 스케줄러 작업 등록 시 Flask app 인스턴스를 인자로 전달하도록 수정합니다.
-app/scheduler_tasks.py: 스케줄된 작업 함수들이 app 인스턴스를 인자로 받고, with app.app_context(): 블록 내에서 실행되도록 수정합니다.
-수정: app/__init__.py (스케줄러 작업에 app 인스턴스 전달)
 Python
 
-# scontrol_flask_web/app/__init__.py
-from flask import Flask, current_app
-from config import config
-import datetime
-import os
-from flask_apscheduler import APScheduler 
+# app/__init__.py 의 일부
+scheduler.add_job(id='scheduled_task_monitor_on_daily', 
+                  func=scheduler_tasks.scheduled_task_monitor_on,
+                  args=[current_flask_app], # <--- 여기서 app 인스턴스를 전달합니다.
+                  trigger='cron', hour=6, minute=0, ...)
+따라서 app/scheduler_tasks.py 파일에 있는 scheduled_task_monitor_on과 scheduled_task_monitor_off 함수들은 반드시 이 app 인스턴스를 받을 수 있도록 첫 번째 인자(예: app_instance)를 가져야 합니다.
 
-scheduler = APScheduler()
+가장 가능성이 높은 원인:
 
-def create_app(config_name='default'):
-    app = Flask(__name__)
-    app.config.from_object(config[config_name])
-    config[config_name].init_app(app)
+사용자님의 app/scheduler_tasks.py 파일에 있는 scheduled_task_monitor_on 및/또는 scheduled_task_monitor_off 함수의 정의 부분이 Flask app 인스턴스를 인자로 받도록 수정되지 않았거나, 수정되었더라도 변경사항이 제대로 저장/반영되지 않았을 수 있습니다.
 
-    from . import db_utils 
-    app.teardown_appcontext(db_utils.close_db)
+해결 방법:
 
-    # --- Jinja2 필터 및 컨텍스트 프로세서 (이전과 동일) ---
-    def format_datetime(value, fmt='%Y-%m-%d %H:%M'):
-        if not value: return ""
-        if isinstance(value, str): 
-            original_value_for_log = value 
-            try: 
-                processed_value = value.upper().replace('Z', '')
-                if '.' in processed_value: processed_value = processed_value.split('.')[0]
-                processed_value = processed_value.replace('T', ' ')
-                formats_to_try = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-                parsed_dt = None
-                for dt_format in formats_to_try:
-                    try: parsed_dt = datetime.datetime.strptime(processed_value, dt_format); break
-                    except ValueError: continue
-                if parsed_dt is None: app.logger.warning(f"날짜 파싱 실패 (format_datetime): '{original_value_for_log}'"); return original_value_for_log 
-                value = parsed_dt
-            except Exception as e_parse: app.logger.error(f"날짜 파싱 중 예외 (format_datetime) '{original_value_for_log}': {e_parse}"); return original_value_for_log 
-        if not isinstance(value, (datetime.datetime, datetime.date)): return value 
-        return value.strftime(fmt)
-    app.jinja_env.filters['datetimeformat'] = format_datetime
-    @app.context_processor
-    def inject_now(): return {'now': datetime.datetime.utcnow()}
-    from .auth import inject_user_info_to_templates
-    app.context_processor(inject_user_info_to_templates)
+app/scheduler_tasks.py 파일 확인 및 수정: 해당 파일의 함수 정의가 app_instance 인자를 받도록 되어 있는지 다시 한번 꼼꼼히 확인하고, 아니라면 수정합니다.
+Python 캐시 파일 삭제 및 Flask 서버 완전 재시작:
+프로젝트 폴더 및 하위 app 폴더 내에 있는 __pycache__ 폴더들을 모두 삭제합니다. 이 폴더들은 컴파일된 Python 파일(.pyc)을 저장하며, 간혹 이전 버전의 코드가 계속 실행되는 원인이 될 수 있습니다.
+Flask 개발 서버를 완전히 중지했다가 다시 시작합니다.
+아래에 app/scheduler_tasks.py 파일의 수정된 전체 코드와, 이와 관련된 app/__init__.py 파일의 스케줄러 작업 등록 부분을 다시 제공해 드립니다. 이 코드를 사용자님의 파일과 정확히 비교/대체해 보십시오.
 
-    # --- 블루프린트 등록 (이전과 동일) ---
-    from .routes_main import main_bp
-    app.register_blueprint(main_bp) 
-    from .routes_admin import admin_bp
-    app.register_blueprint(admin_bp, url_prefix='/admin') 
-    from .routes_user import user_bp
-    app.register_blueprint(user_bp, url_prefix='/user') 
-
-    # --- APScheduler 초기화 및 작업 등록 ---
-    if not scheduler.running:
-        scheduler.init_app(app) # Flask 앱에 스케줄러 확장 기능 초기화
-        
-        from . import scheduler_tasks # 스케줄 작업 함수들이 있는 모듈 임포트
-
-        if app.debug:
-            if scheduler.get_job('scheduled_task_monitor_on_daily'): scheduler.remove_job('scheduled_task_monitor_on_daily')
-            if scheduler.get_job('scheduled_task_monitor_off_daily'): scheduler.remove_job('scheduled_task_monitor_off_daily')
-            app.logger.info("기존 스케줄러 작업들 (ID 기준) 제거 시도됨 (디버그 모드).")
-
-        # ▼▼▼ 작업 등록 시 'args'를 사용하여 app 인스턴스 전달 ▼▼▼
-        current_flask_app = app # 현재 create_app 스코프의 app 객체를 명시적으로 사용
-
-        scheduler.add_job(id='scheduled_task_monitor_on_daily', 
-                          func=scheduler_tasks.scheduled_task_monitor_on,
-                          args=[current_flask_app], # app 인스턴스를 작업 함수에 인자로 전달
-                          trigger='cron', hour=6, minute=0, misfire_grace_time=3600)
-        app.logger.info("스케줄 작업 '모니터 켜기' 매일 06:00 등록됨.")
-
-        scheduler.add_job(id='scheduled_task_monitor_off_daily', 
-                          func=scheduler_tasks.scheduled_task_monitor_off,
-                          args=[current_flask_app], # app 인스턴스를 작업 함수에 인자로 전달
-                          trigger='cron', hour=7, minute=0, misfire_grace_time=3600)
-        app.logger.info("스케줄 작업 '모니터 끄기' 매일 07:00 등록됨.")
-        # ▲▲▲ 작업 등록 시 'args'를 사용하여 app 인스턴스 전달 ▲▲▲
-        
-        # 테스트용 인터벌 트리거 (필요시 주석 해제 후 사용)
-        # scheduler.add_job(id='scheduled_task_monitor_on_test', func=scheduler_tasks.scheduled_task_monitor_on, args=[current_flask_app], trigger='interval', minutes=1, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=10))
-        # scheduler.add_job(id='scheduled_task_monitor_off_test', func=scheduler_tasks.scheduled_task_monitor_off, args=[current_flask_app], trigger='interval', minutes=1, seconds=30, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=20))
-
-        try:
-            scheduler.start() 
-            app.logger.info("APScheduler 시작됨.")
-        except Exception as e:
-            app.logger.error(f"APScheduler 시작 실패: {e}", exc_info=True)
-
-    app.logger.info("Flask application (with APScheduler) 생성 및 설정 완료.")
-    if app.debug:
-        app.logger.debug(f"DB 연결 (pymssql): Server={app.config.get('DB_SERVER')}:{app.config.get('DB_PORT')}, DB={app.config.get('DB_DATABASE')}")
-
-    return app
-app/__init__.py 주요 변경 사항:
-
-작업 등록 시 args=[current_flask_app]를 추가하여, create_app 함수 내에서 생성된 Flask app 인스턴스를 스케줄된 작업 함수(scheduled_task_monitor_on, scheduled_task_monitor_off)에 인자로 전달합니다.
-수정: app/scheduler_tasks.py (작업 함수에서 app 인스턴스 사용)
-스케줄된 작업 함수들이 첫 번째 인자로 Flask app 인스턴스를 받도록 수정하고, 이 인스턴스를 사용하여 app_context를 만듭니다.
+1. 수정/확인: app/scheduler_tasks.py (전체 코드)
+scheduled_task_monitor_on과 scheduled_task_monitor_off 함수, 그리고 이들이 호출하는 헬퍼 함수들이 app_instance 인자를 올바르게 처리하도록 합니다.
 
 Python
 
 # scontrol_flask_web/app/scheduler_tasks.py
 from datetime import date
 import holidays
-# from flask import current_app # current_app 대신 전달받은 app 인스턴스 사용
+# from flask import current_app # 직접 current_app 대신 전달받은 app_instance 사용 권장
 from .db_utils import get_db_connection
 from .socket_client import send_command_to_agent
 import json
 import uuid
 from datetime import datetime as dt, timezone
 
-# is_operational_day 와 _send_display_timeout_to_all_pcs 함수는 이제 app 인스턴스를 인자로 받음
-# 또는, 이 함수들은 항상 app_context 내에서 호출되므로 current_app을 계속 사용해도 무방할 수 있음
-# 여기서는 명시적으로 app을 전달받는 것으로 수정하여 컨텍스트 문제를 확실히 회피
+# is_operational_day 와 _send_display_timeout_to_all_pcs 함수는
+# app_instance를 통해 logger나 config에 접근하도록 수정합니다.
+# get_db_connection 과 send_command_to_agent는 내부적으로 current_app을 사용하는데,
+# 이들은 app_context 내에서 호출되므로 문제가 없습니다.
 
-def is_operational_day(target_date, app_instance): # app_instance 인자 추가
+def is_operational_day(target_date, app_instance): # app_instance를 통해 로거 사용
     conn = None
     try:
-        # get_db_connection()은 내부적으로 current_app을 사용하므로,
-        # 이 함수가 app_context 내에서 호출됨을 보장해야 함.
+        # 이 함수는 app_context 내에서 호출되므로 get_db_connection()은 current_app 사용 가능
         conn = get_db_connection() 
         if not conn:
             app_instance.logger.error("is_operational_day: DB 연결 실패. 기본 가동일 처리.")
@@ -157,7 +61,7 @@ def is_operational_day(target_date, app_instance): # app_instance 인자 추가
                 app_instance.logger.info(f"{target_date}는 사용자 지정 예외일: {'가동일' if is_op else '비가동일'}")
                 return is_op
 
-        if target_date.weekday() >= 5:
+        if target_date.weekday() >= 5: # 토(5), 일(6)
             app_instance.logger.info(f"{target_date}는 주말(비가동일).")
             return False
 
@@ -170,9 +74,9 @@ def is_operational_day(target_date, app_instance): # app_instance 인자 추가
         return True
     except Exception as e:
         app_instance.logger.error(f"is_operational_day 함수 오류: {e}", exc_info=True)
-        return True 
+        return True # 오류 발생 시 기본적으로 가동일로 처리 (안전을 위해)
 
-def _send_display_timeout_to_all_pcs(timeout_minutes, action_description, app_instance): # app_instance 인자 추가
+def _send_display_timeout_to_all_pcs(timeout_minutes, action_description, app_instance): # app_instance를 통해 로거 사용
     conn = None
     pcs_to_control = []
     try:
@@ -213,9 +117,9 @@ def _send_display_timeout_to_all_pcs(timeout_minutes, action_description, app_in
         app_instance.logger.info(f"{log_prefix} - '{action_description}' 명령 전송 시도. PktID: {command_packet['PacketId']}")
         try:
             # send_command_to_agent는 내부적으로 current_app.logger 사용
+            # 이 함수(_send_display_timeout_to_all_pcs)가 app_context 내에서 호출되므로 문제 없음
             agent_response = send_command_to_agent(target_ip_for_command, command_packet) 
             if agent_response.get('success'):
-                # ... (이하 응답 처리 로직은 app_instance.logger 또는 current_app.logger 사용) ...
                 raw_resp_packet = agent_response.get('raw_response')
                 if raw_resp_packet and isinstance(raw_resp_packet, dict) and raw_resp_packet.get('PayloadJson'):
                     resp_payload = json.loads(raw_resp_packet['PayloadJson'])
@@ -227,19 +131,18 @@ def _send_display_timeout_to_all_pcs(timeout_minutes, action_description, app_in
             app_instance.logger.error(f"{log_prefix} - 명령 전송 중 예외: {e_send}", exc_info=True)
 
 # --- APScheduler가 호출할 실제 작업 함수들 ---
-def scheduled_task_monitor_on(app_instance): # Flask app 인스턴스를 인자로 받음
+# ▼▼▼ 이 함수들의 시그니처에 app_instance 인자가 있는지 확인! ▼▼▼
+def scheduled_task_monitor_on(app_instance): 
     with app_instance.app_context(): # 전달받은 app 인스턴스로 app_context 생성
         today = date.today()
         app_instance.logger.info(f"[Scheduler] 모니터 켜기 작업 (06:00 예정), 오늘: {today}")
-        # is_operational_day와 _send_display_timeout_to_all_pcs도 app_context 내에서 호출되므로
-        # 내부의 get_db_connection, send_command_to_agent (current_app 사용) 등이 정상 동작
         if is_operational_day(today, app_instance): # app_instance 전달
             app_instance.logger.info(f"[Scheduler] 가동일: '모니터 켜기(타임아웃 해제)' 명령 전송.")
             _send_display_timeout_to_all_pcs(0, "디스플레이 항상 켜기 설정 (타임아웃 0분)", app_instance) # app_instance 전달
         else:
             app_instance.logger.info(f"[Scheduler] 비가동일: '모니터 켜기' 명령 미실행.")
 
-def scheduled_task_monitor_off(app_instance): # Flask app 인스턴스를 인자로 받음
+def scheduled_task_monitor_off(app_instance): 
     with app_instance.app_context(): # 전달받은 app 인스턴스로 app_context 생성
         today = date.today()
         app_instance.logger.info(f"[Scheduler] 모니터 끄기 작업 (07:00 예정), 오늘: {today}")
@@ -248,10 +151,61 @@ def scheduled_task_monitor_off(app_instance): # Flask app 인스턴스를 인자
             _send_display_timeout_to_all_pcs(1, "디스플레이 1분 후 자동 꺼짐 설정", app_instance) # app_instance 전달
         else:
             app_instance.logger.info(f"[Scheduler] 가동일: '모니터 끄기' 명령 미실행.")
+# ▲▲▲ 이 함수들의 시그니처에 app_instance 인자가 있는지 확인! ▲▲▲
+app/scheduler_tasks.py 핵심 확인 사항:
 
-app/scheduler_tasks.py 주요 변경 사항:
+scheduled_task_monitor_on 함수와 scheduled_task_monitor_off 함수의 정의가 반드시 app_instance라는 이름의 첫 번째 인자를 포함해야 합니다. 예: def scheduled_task_monitor_on(app_instance):
+이 app_instance를 사용하여 함수 내에서 app_instance.logger 등으로 Flask 앱 객체에 접근합니다.
+with app_instance.app_context(): 블록을 사용하여, 해당 함수들이 Flask 애플리케이션 컨텍스트 내에서 실행되도록 합니다. 이렇게 하면 get_db_connection()이나 send_command_to_agent() 내부에서 current_app을 사용해도 문제가 없습니다.
+2. 수정/확인: app/__init__.py (스케줄러 작업 등록 부분)
+이 파일에서 scheduler.add_job을 호출할 때 args=[current_flask_app] 부분이 올바르게 설정되어 있는지 확인합니다. (이전 답변 #53의 코드와 동일해야 합니다.)
 
-scheduled_task_monitor_on과 scheduled_task_monitor_off 함수가 첫 번째 인자로 app_instance (Flask app 객체)를 받도록 수정했습니다.
-이 함수들 내부에서 with app_instance.app_context():를 사용하여 명시적으로 애플리케이션 컨텍스트를 활성화합니다. 이렇게 하면 이 블록 내에서 current_app 프록시 객체 (예: get_db_connection 내부에서 사용)와 app_instance.logger (또는 current_app.logger), app_instance.config 등을 안전하게 사용할 수 있습니다.
-헬퍼 함수인 is_operational_day와 _send_display_timeout_to_all_pcs도 app_instance를 인자로 받도록 수정하여, 이 함수들 내부에서 로깅 등에 app_instance.logger를 명시적으로 사용할 수 있게 했습니다. (또는, 이 헬퍼 함수들이 항상 with app_instance.app_context(): 블록 내에서만 호출된다면, 내부에서 current_app을 계속 사용해도 이론적으로는 괜찮습니다. 하지만 명시적으로 app_instance를 넘기는 것이 컨텍스트 문제를 더 확실히 방지할 수 있습니다.)
-위와 같이 app/__init__.py와 app/scheduler_tasks.py 파일을 수정하시면, APScheduler 작업이 실행될 때 Flask 애플리케이션 컨텍스트가 올바르게 설정되어 "Working outside of application context" 오류가 해결될 것입니다.
+Python
+
+# scontrol_flask_web/app/__init__.py
+# ... (다른 부분은 이전 답변 #53과 동일) ...
+
+    # --- APScheduler 초기화 및 작업 등록 ---
+    if not scheduler.running:
+        scheduler.init_app(app)
+        
+        from . import scheduler_tasks 
+
+        if app.debug:
+            if scheduler.get_job('scheduled_task_monitor_on_daily'): scheduler.remove_job('scheduled_task_monitor_on_daily')
+            if scheduler.get_job('scheduled_task_monitor_off_daily'): scheduler.remove_job('scheduled_task_monitor_off_daily')
+            app.logger.info("기존 스케줄러 작업들 (ID 기준) 제거 시도됨 (디버그 모드).")
+
+        current_flask_app = app # 현재 create_app 스코프의 app 객체
+
+        # ▼▼▼ 여기에 args=[current_flask_app] 부분이 있는지 확인! ▼▼▼
+        scheduler.add_job(id='scheduled_task_monitor_on_daily', 
+                          func=scheduler_tasks.scheduled_task_monitor_on,
+                          args=[current_flask_app], # app 인스턴스를 작업 함수에 인자로 전달
+                          trigger='cron', hour=6, minute=0, misfire_grace_time=3600)
+        app.logger.info("스케줄 작업 '모니터 켜기' 매일 06:00 등록됨.")
+
+        scheduler.add_job(id='scheduled_task_monitor_off_daily', 
+                          func=scheduler_tasks.scheduled_task_monitor_off,
+                          args=[current_flask_app], # app 인스턴스를 작업 함수에 인자로 전달
+                          trigger='cron', hour=7, minute=0, misfire_grace_time=3600)
+        app.logger.info("스케줄 작업 '모니터 끄기' 매일 07:00 등록됨.")
+        # ▲▲▲ 여기에 args=[current_flask_app] 부분이 있는지 확인! ▲▲▲
+        
+        # 테스트용 인터벌 트리거 (주석 처리)
+        # scheduler.add_job(id='scheduled_task_monitor_on_test', func=scheduler_tasks.scheduled_task_monitor_on, args=[current_flask_app], trigger='interval', minutes=1, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=10))
+        # scheduler.add_job(id='scheduled_task_monitor_off_test', func=scheduler_tasks.scheduled_task_monitor_off, args=[current_flask_app], trigger='interval', minutes=1, seconds=30, next_run_time=datetime.datetime.now() + datetime.timedelta(seconds=20))
+
+        try:
+            scheduler.start() 
+            app.logger.info("APScheduler 시작됨.")
+        except Exception as e:
+            app.logger.error(f"APScheduler 시작 실패: {e}", exc_info=True)
+
+    # ... (나머지 create_app 함수 내용은 이전 답변 #53과 동일) ...
+    return app
+조치:
+
+사용자님의 app/scheduler_tasks.py 파일의 scheduled_task_monitor_on 과 scheduled_task_monitor_off 함수 정의에 app_instance 파라미터가 포함되어 있는지 확인하고, 없다면 위 코드처럼 추가합니다.
+app/__init__.py 파일에서 scheduler.add_job 호출 시 args=[current_flask_app] 부분이 올바르게 포함되어 있는지 확인합니다.
+프로젝트 내의 모든 __pycache__ 폴더와 그 안의 .pyc 파일들을 삭제합니다.
