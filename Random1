@@ -1,61 +1,186 @@
-네, "IAgentCoreService를 찾을 수 없다"는 오류가 발생하시는군요. IAgentCoreService는 AgentCoreService 클래스가 구현해야 하는 인터페이스입니다. 이 인터페이스는 AgentCoreService가 어떤 공개 메서드와 속성을 가져야 하는지 정의하는 역할을 합니다.
+네, "에이전트에는 잘되었다고 뜨고 실제로 동작이 잘 되는데, 웹에서는 분홍색으로 '전송 실패 - 에이전트 응답 JSON 형식 오류'" 이 문제는 Flask 웹 앱이 SAgentM.App으로부터 응답은 받았지만, 그 응답 내용 중 특정 부분(아마도 PayloadJson 필드)이 올바른 JSON 형식이 아니어서 Python의 json.loads() 함수가 이를 해석(파싱)하지 못하고 오류를 발생시키는 것으로 보입니다.
 
-MainViewModel.cs 등 다른 클래스에서 AgentCoreService를 직접 참조하는 대신 이 IAgentCoreService 인터페이스를 통해 참조하면 코드의 유연성과 테스트 용이성이 높아집니다.
+SAgentM.App의 powercfg 실행 결과 메시지(예: "AC ExitCode: 1, DC ExitCode: 1")가 GenericResponsePayload의 Message 필드에 포함될 때, 이 메시지 안의 특수 문자(예: 개행 문자 \n 또는 \r\n)가 PayloadJson 문자열을 만들고, 다시 이 PayloadJson 문자열을 포함하는 전체 응답 CommandPacket JSON을 만드는 과정에서 문제가 생겼을 수 있습니다. (하지만 Newtonsoft.Json과 Python의 json 모듈은 일반적으로 이런 경우를 잘 처리합니다.)
 
-이전에 AgentCoreService.cs 파일을 제공할 때 인터페이스 정의를 파일 상단에 함께 포함시켜 드렸거나, 별도 파일로 만들도록 안내해 드렸어야 했는데, 그 부분이 명확하지 않았던 것 같습니다. 죄송합니다.
+문제 해결을 위해, Flask 앱의 app/routes_user.py 파일에서 에이전트로부터 받은 PayloadJson 문자열을 실제로 파싱하기 직전에 로그로 출력하여 어떤 내용인지 확인하는 코드를 추가하겠습니다.
 
-IAgentCoreService 인터페이스를 위한 별도의 파일을 만들어 주시는 것이 좋습니다.
+수정: app/routes_user.py (디버깅 로그 추가)
+send_batch_command 함수 내에서, 에이전트로부터 받은 응답의 PayloadJson을 파싱하기 전에 해당 문자열을 로그로 출력하도록 수정합니다.
 
-신규/수정: SAgentM.App/Services/IAgentCoreService.cs (인터페이스 파일)
-SAgentM.App 프로젝트의 Services 폴더에 IAgentCoreService.cs라는 이름으로 새 C# 인터페이스 파일을 만드시고 다음 내용을 작성해주세요.
+Python
 
-C#
+# scontrol_flask_web/app/routes_user.py
+from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
+from app.db_utils import get_db_connection
+from app.auth import ip_auth_required
+from app.socket_client import send_command_to_agent
+import json
+import uuid
+from datetime import datetime, timezone
+import math
 
-// SAgentM.App/Services/IAgentCoreService.cs
-namespace SAgentM.App.Services
-{
-    /// <summary>
-    /// 에이전트의 핵심 기능을 위한 인터페이스를 정의합니다.
-    /// 이 인터페이스는 소켓 리스닝 시작/중지 및 실행 상태 확인 기능을 제공합니다.
-    /// </summary>
-    public interface IAgentCoreService
-    {
-        /// <summary>
-        /// 에이전트 핵심 서비스(소켓 리스너 등)를 시작합니다.
-        /// </summary>
-        void Start();
+user_bp = Blueprint('user', __name__)
 
-        /// <summary>
-        /// 에이전트 핵심 서비스를 중지하고 관련 리소스를 정리합니다.
-        /// </summary>
-        void Stop();
+@user_bp.route('/control_panel')
+@ip_auth_required('user')
+def control_panel():
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    offset = (page - 1) * per_page
+    pcs_on_current_page = []
+    total_pcs = 0
+    conn = None
+    pagination_data = {'page': page, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 
+                       'items': [], 'has_prev': False, 'has_next': False, 
+                       'prev_num': 1, 'next_num': 1} # 기본값 설정
 
-        /// <summary>
-        /// 에이전트 서비스가 현재 실행 중인지 여부를 가져옵니다.
-        /// </summary>
-        bool IsRunning { get; }
-    }
-}
-확인: SAgentM.App/Services/AgentCoreService.cs (클래스 선언부)
-그리고 AgentCoreService.cs 파일의 클래스 선언부가 이 IAgentCoreService 인터페이스를 구현하도록 되어 있는지 확인합니다. (이전 #39 응답에서 제공된 AgentCoreService.cs 코드에는 이미 이렇게 되어 있습니다.)
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
+            total_pcs_result = cursor.fetchone()
+            if total_pcs_result:
+                total_pcs = total_pcs_result['total']
+            
+            if total_pcs > 0:
+                query = """
+                    SELECT id, pc_name, address1, address2, description 
+                    FROM dbo.target_pcs 
+                    ORDER BY pc_name 
+                    OFFSET %s ROWS FETCH NEXT %s ROWS ONLY
+                """
+                cursor.execute(query, (offset, per_page))
+                pcs_on_current_page = cursor.fetchall()
+            
+            total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
+            pagination_data.update({
+                'total_items': total_pcs, 'total_pages': total_pages, 
+                'items': pcs_on_current_page, 'has_prev': page > 1, 'has_next': page < total_pages,
+                'prev_num': page - 1, 'next_num': page + 1
+            })
 
-C#
+    except Exception as e:
+        current_app.logger.error(f"제어판 PC 목록 조회 오류: {e}", exc_info=True)
+        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
+        # pcs_on_current_page와 total_pcs는 이미 기본값으로 설정됨
+        
+    title = "원격 제어판"
+    if g.current_user_role == 'admin':
+        title = "원격 제어판 (관리자 모드)"
+        
+    return render_template('user/control_panel.html', 
+                           pcs=pcs_on_current_page, 
+                           pagination=pagination_data, 
+                           title=title)
 
-// SAgentM.App/Services/AgentCoreService.cs
-// ... (다른 using 문들은 그대로) ...
+@user_bp.route('/send_batch_command', methods=['POST'])
+@ip_auth_required('user')
+def send_batch_command():
+    selected_pc_ids_str = request.form.getlist('selected_pcs')
+    command_action_str = request.form.get('command_action')
 
-namespace SAgentM.App.Services
-{
-    // public interface IAgentCoreService { ... } // 만약 AgentCoreService.cs 파일 안에 있었다면 이 부분은 삭제하고 위 새 파일로 옮깁니다.
+    if not selected_pc_ids_str:
+        flash("제어할 PC를 하나 이상 선택해주세요.", 'warning')
+        return redirect(url_for('user.control_panel'))
+    if not command_action_str or command_action_str not in ["켜기", "끄기"]:
+        flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning')
+        return redirect(url_for('user.control_panel'))
 
-    public class AgentCoreService : IAgentCoreService // <<--- IAgentCoreService를 구현하는지 확인
-    {
-        // ... (AgentCoreService의 나머지 전체 코드는 이전과 동일) ...
-    }
-}
-조치 사항:
+    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
+    
+    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
+    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
+    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command}
 
-SAgentM.App 프로젝트의 Services 폴더에 IAgentCoreService.cs 파일을 새로 만들고 위에 제공된 인터페이스 코드를 붙여넣습니다.
-AgentCoreService.cs 파일의 클래스 선언이 public class AgentCoreService : IAgentCoreService 와 같이 되어 있는지 확인합니다.
-MainViewModel.cs 또는 MainWindow.xaml.cs와 같이 IAgentCoreService 타입을 사용하는 다른 파일들 상단에 using SAgentM.App.Services; 지시문이 있는지 확인합니다.
-이렇게 조치하시면 IAgentCoreService를 찾을 수 없다는 오류가 해결될 것입니다.
+    conn = None
+    target_pcs_to_control = []
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if selected_pc_ids:
+                placeholders = ', '.join(['%s'] * len(selected_pc_ids))
+                sql_select_pcs = f"SELECT id, pc_name, address1, address2 FROM dbo.target_pcs WHERE id IN ({placeholders})"
+                cursor.execute(sql_select_pcs, tuple(selected_pc_ids))
+                target_pcs_to_control = cursor.fetchall()
+    except Exception as e:
+        current_app.logger.error(f"명령 대상 PC 정보 조회 오류: {e}", exc_info=True)
+        flash("명령 대상 PC 정보를 DB에서 조회하는 중 오류가 발생했습니다.", "error")
+        return redirect(url_for('user.control_panel'))
+
+    if not target_pcs_to_control:
+        flash("선택된 PC 정보를 찾을 수 없습니다.", "warning")
+        return redirect(url_for('user.control_panel'))
+
+    for pc_data in target_pcs_to_control:
+        command_packet_to_send = {
+            'PacketId': str(uuid.uuid4()),
+            'TimestampUtc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'CommandName': "SET_DISPLAY_TIMEOUT", 
+            'PayloadJson': json.dumps(payload_for_agent),
+            'ResponseAddress': None, 'ResponsePort': None
+        }
+        target_ip_for_command_send = ""
+        is_relay = bool(pc_data.get('address2') and pc_data['address2'].strip()) # .get 추가
+
+        if is_relay:
+            command_packet_to_send['Instruction'] = "RelayToTarget"
+            command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc_data['address2']
+            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026
+            target_ip_for_command_send = pc_data['address1']
+        else:
+            command_packet_to_send['Instruction'] = "DirectExecute"
+            target_ip_for_command_send = pc_data['address1']
+        
+        log_msg_prefix = f"PC '{pc_data['pc_name']}' ({target_ip_for_command_send})"
+        flash(f"{log_msg_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
+        current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_description_log}, PktID: {command_packet_to_send['PacketId']}")
+        
+        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
+        
+        if agent_response.get('success'):
+            raw_resp_packet = agent_response.get('raw_response')
+            if raw_resp_packet and isinstance(raw_resp_packet, dict) and raw_resp_packet.get('PayloadJson'):
+                payload_json_str_from_agent = raw_resp_packet.get('PayloadJson')
+                
+                # **** 디버깅 로그 추가 ****
+                current_app.logger.info(f"{log_msg_prefix} - 에이전트로부터 받은 PayloadJson 문자열: >>>{payload_json_str_from_agent}<<<")
+                # **** 디버깅 로그 추가 끝 ****
+                
+                try:
+                    resp_payload = json.loads(payload_json_str_from_agent) # 여기서 오류 발생 가능성
+                    if resp_payload.get('Success'): # C#의 Success 필드
+                        flash(f"{log_msg_prefix}: 성공 - {resp_payload.get('Message', 'OK')}", 'success')
+                    else:
+                        flash(f"{log_msg_prefix}: 실패 (에이전트 응답) - {resp_payload.get('Message', 'Agent error')}", 'error')
+                except Exception as e:
+                    flash(f"{log_msg_prefix}: 에이전트 응답 페이로드 처리 오류 - {e}", 'error') # "JSON 형식 오류" 메시지가 여기서 발생
+                    current_app.logger.error(f"{log_msg_prefix} - 응답 페이로드 처리 오류 (json.loads 시도 중): {e}. 원본 PayloadJson: {payload_json_str_from_agent}", exc_info=True)
+            else: 
+                flash(f"{log_msg_prefix}: 전송 성공 (에이전트 상세 응답 확인 불가)", 'warning')
+        else: 
+            flash(f"{log_msg_prefix}: 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
+
+    return redirect(url_for('user.control_panel'))
+app/routes_user.py의 주요 변경 사항:
+
+control_panel() 함수:
+total_pcs_result = cursor.fetchone() 이후 if total_pcs_result: 체크를 추가하여 total_pcs_result가 None일 경우(테이블이 비었거나 오류로 아무것도 반환 안될 때)를 대비했습니다.
+pagination_data에 대한 기본값을 설정하여 DB 오류 시에도 템플릿 렌더링이 가능하도록 했습니다.
+send_batch_command() 함수:
+pc_data.get('address2'): Workspaceall()이 딕셔너리 리스트를 반환하므로, 키 접근 시 AttributeError 대신 KeyError가 발생할 수 있습니다. .get('address2')를 사용하여 키가 없는 경우 None을 반환하도록 하여 is_relay 결정 부분을 좀 더 안전하게 만들었습니다.
+디버깅 로그 추가: json.loads(payload_json_str_from_agent)를 호출하기 직전에 payload_json_str_from_agent 변수의 내용을 Flask 개발 서버 터미널 로그에 출력하도록 current_app.logger.info(...) 라인을 추가했습니다.
+예외 로깅 강화: json.loads에서 예외 발생 시, 원본 payload_json_str_from_agent 문자열도 함께 로깅하도록 하여 문제 파악을 용이하게 했습니다.
+테스트 및 확인 요청:
+
+위 수정된 app/routes_user.py 코드를 프로젝트에 적용합니다.
+Flask 개발 서버를 재시작합니다.
+SControlM 웹 UI에서 "끄기" 명령을 다시 실행하여 오류를 재현합니다.
+오류 발생 후, Flask 개발 서버의 터미널 로그를 확인합니다. 다음과 같은 로그를 찾아주세요:
+[INFO] PC 'PC이름' (대상IP) - 에이전트로부터 받은 PayloadJson 문자열: >>>{"Success":false,"Message":"Failed to set display timeout. AC ExitCode: 1, DC ExitCode: 1.\nAC Err: 오류메시지\nDC Err: 오류메시지","ErrorCode":null,"Data":null}<<<
+(실제 로그는 위와 정확히 같지 않을 수 있습니다. >>> 와 <<< 사이의 내용이 중요합니다.)
+터미널에 출력된 >>>와 <<< 사이의 PayloadJson 문자열 전체를 복사해서 저에게 알려주시면, 해당 문자열이 왜 JSON 형식 오류를 유발하는지 분석하는 데 결정적인 도움이 됩니다.
+예상되는 문제 원인 (만약 PayloadJson 문자열이 이상하다면):
+
+SAgentM.App의 AgentCoreService.cs에서 GenericResponsePayload의 Message 필드에 powercfg.exe의 오류 출력(errorAc, errorDc)을 담을 때, 이 오류 출력 문자열 자체에 JSON 형식을 깨뜨리는 특수 문자(예: 제어 문자, 잘못된 이스케이프 처리 등)가 포함되었을 수 있습니다. Newtonsoft.Json은 대부분 잘 처리하지만, 아주 드문 경우 문제가 생길 수 있습니다.
+로그를 확인해서 알려주시면 다음 단계를 진행하겠습니다!
+
