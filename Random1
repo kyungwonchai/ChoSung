@@ -1,356 +1,182 @@
-, 사용자님 말씀이 맞습니다. 제가 에이전트(SAgentM.App) 쪽 코드는 여러 번 수정했지만, 웹 애플리케이션(Flask SControlM)에서 에이전트의 응답을 처리하는 부분을 충분히 점검하지 못했을 수 있습니다. 특히 powercfg 명령어 실행 실패 시 반환되는 메시지에 포함된 특수 문자나 줄바꿈 등이 문제가 될 수 있습니다.
+네, 사용자님 말씀처럼 에이전트(SAgentM.App)는 정상적으로 동작하고 응답까지 생성해서 보냈는데, Flask 웹 앱(SControlM)에서 그 응답을 올바르게 처리하지 못해 "JSON 형식 오류"가 발생하고 있을 가능성도 충분히 있습니다. 특히 powercfg 명령어 실행 결과처럼 여러 줄일 수 있거나 특수 문자가 포함될 수 있는 메시지를 PayloadJson 내부에 담아 전달할 때 문제가 생길 수 있습니다.
 
-문제의 핵심: SAgentM.App이 보낸 응답 (CommandPacket) 안의 PayloadJson 문자열이 Flask 측 Python의 json.loads() 함수에 의해 올바른 JSON 형식으로 인식되지 못하고 있습니다. 이는 PayloadJson 내부의 Message 필드에 powercfg 오류 출력(여러 줄일 수 있음)이 포함될 때 발생할 가능성이 높습니다.
+가장 의심되는 부분:
 
-해결 방안:
+SAgentM.App (AgentCoreService.cs): GenericResponsePayload 객체를 JsonConvert.SerializeObject()를 통해 PayloadJson 문자열로 만들 때, 이 문자열이 Python의 json.loads()에서 문제를 일으키는 미묘한 형식 차이가 있을 수 있습니다. (예: 이스케이프 처리 방식, 특정 제어 문자 등)
+Flask 웹 앱 (app/routes_user.py): SAgentM.App으로부터 받은 PayloadJson 문자열을 json.loads()로 다시 파싱할 때, 이 문자열이 Python 기준에서 유효한 JSON이 아닐 경우 오류가 발생합니다.
+문제 해결을 위한 접근:
 
-SAgentM.App (AgentCoreService.cs) 수정: powercfg 오류 메시지를 GenericResponsePayload의 Message에 담을 때, JSON 문자열로 변환 시 문제를 일으킬 수 있는 개행 문자 (\r\n 또는 \n)를 공백 등으로 변환하여 PayloadJson 문자열 자체가 더 단순하고 안전한 형태가 되도록 합니다.
-Flask 앱 (app/routes_user.py) 확인: PayloadJson을 파싱하기 전에 정확히 어떤 문자열이 수신되는지 로깅하는 코드는 이미 추가했었습니다. 이 로그를 통해 실제 문제를 확인할 수 있습니다.
-먼저, SAgentM.App/Services/AgentCoreService.cs 파일을 수정하여 응답 메시지를 좀 더 안전하게 만들겠습니다.
+Flask 앱 (app/routes_user.py)에서 정확히 어떤 PayloadJson 문자열을 받았는지 로깅하여 확인합니다. (이전 답변에서 이 로깅 코드를 이미 추가했습니다.)
+SAgentM.App (AgentCoreService.cs)에서 보내는 PayloadJson의 Message 부분을 최대한 단순화하여 테스트해봅니다. 이렇게 하면 powercfg의 복잡한 오류 메시지 내용 때문에 JSON 파싱 오류가 나는 것인지 확인할 수 있습니다.
+먼저, Flask 앱의 app/routes_user.py 파일에서 PayloadJson을 파싱하는 부분의 로깅을 다시 한번 확인하고, Python의 JSONDecodeError 발생 시 좀 더 상세한 정보를 로깅하도록 수정하겠습니다.
 
-수정: SAgentM.App/Services/AgentCoreService.cs (전체 코드)
-ExecuteDirectCommandAsync 메서드 내에서 SetDisplayTimeout 명령 처리 시, powercfg 오류 메시지를 생성할 때 개행 문자를 공백으로 치환하는 로직을 추가합니다.
+1. 수정: app/routes_user.py (JSON 파싱 오류 로깅 강화)
+send_batch_command 함수 내에서 에이전트 응답의 PayloadJson을 파싱하는 try-except 블록을 다음과 같이 수정합니다.
 
-C#
+Python
 
-// SAgentM.App/Services/AgentCoreService.cs
-using Newtonsoft.Json;
-using SControl.Common;
-using System;
-using System.Configuration;
-using System.Diagnostics;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using System.ComponentModel; // Win32Exception
+# scontrol_flask_web/app/routes_user.py
+from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
+from app.db_utils import get_db_connection
+from app.auth import ip_auth_required
+from app.socket_client import send_command_to_agent
+import json
+import uuid
+from datetime import datetime, timezone
+import math
 
-namespace SAgentM.App.Services
-{
-    public interface IAgentCoreService { void Start(); void Stop(); bool IsRunning { get; } }
+user_bp = Blueprint('user', __name__)
 
-    public class AgentCoreService : IAgentCoreService
-    {
-        private readonly ILoggingService _loggingService;
-        private readonly int _port;
-        private TcpListener _listener;
-        private Thread _listenThread;
-        private volatile bool _isRunning;
-        private CancellationTokenSource _cancellationTokenSource;
+# control_panel 함수는 이전 답변과 동일하게 유지 (DB 조회 로직 등)
+@user_bp.route('/control_panel')
+@ip_auth_required('user')
+def control_panel():
+    page = request.args.get('page', 1, type=int)
+    per_page = 20
+    offset = (page - 1) * per_page
+    pcs_on_current_page = []
+    total_pcs = 0
+    conn = None
+    pagination_data = {'page': page, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 
+                       'items': [], 'has_prev': False, 'has_next': False, 
+                       'prev_num': 1, 'next_num': 1} 
 
-        public bool IsRunning => _isRunning;
-
-        public AgentCoreService(ILoggingService loggingService)
-        {
-            _loggingService = loggingService ?? throw new ArgumentNullException(nameof(loggingService));
-            if (!int.TryParse(ConfigurationManager.AppSettings["ListenPort"], out _port))
-            {
-                _port = 4026;
-                _loggingService.UiWarn($"ListenPort 설정 누락/오류. 기본값 {_port} 사용.");
-            }
-        }
-
-        public void Start()
-        {
-            if (_isRunning) { _loggingService.UiWarn("AgentCoreService 이미 실행 중."); return; }
-            _isRunning = true;
-            _cancellationTokenSource = new CancellationTokenSource();
-            _listenThread = new Thread(ListenLoop) { IsBackground = true, Name = "AgentListenThread" };
-            _listenThread.Start();
-            _loggingService.UiInfo($"AgentCoreService 시작됨. 포트: {_port}");
-        }
-
-        public void Stop()
-        {
-            if (!_isRunning) { _loggingService.UiWarn("AgentCoreService 이미 중지됨."); return; }
-            _loggingService.UiInfo("AgentCoreService 중지 요청 중...");
-            _isRunning = false;
-            _cancellationTokenSource?.Cancel();
-            _listener?.Stop();
-            if (_listenThread != null && _listenThread.IsAlive)
-            {
-                if (!_listenThread.Join(TimeSpan.FromSeconds(5))) { _loggingService.UiWarn("리스닝 스레드 시간 내 종료 안됨."); }
-            }
-            _cancellationTokenSource?.Dispose(); _cancellationTokenSource = null;
-            _loggingService.UiInfo("AgentCoreService 중지됨.");
-        }
-
-        private void ListenLoop()
-        {
-            try
-            {
-                _listener = new TcpListener(IPAddress.Any, _port);
-                _listener.Start();
-                _loggingService.UiInfo($"포트 {_port}에서 클라이언트 연결 대기 중...");
-                while (_isRunning)
-                {
-                    try
-                    {
-                        TcpClient client = _listener.AcceptTcpClient();
-                        if (!_isRunning) { client.Close(); break; }
-                        string clientIp = client.Client.RemoteEndPoint?.ToString() ?? "Unknown IP";
-                        _loggingService.UiInfo($"클라이언트 연결됨: {clientIp}");
-                        var currentToken = _cancellationTokenSource?.Token ?? CancellationToken.None;
-                        Task.Run(() => HandleClientAsync(client, clientIp, currentToken), currentToken);
-                    }
-                    catch (SocketException se) { if (!_isRunning && (se.SocketErrorCode == SocketError.Interrupted || se.SocketErrorCode == SocketError.OperationAborted)) { _loggingService.UiInfo("리스너 소켓 정상 중단됨."); break; } _loggingService.UiError("클라이언트 연결 수락 중 소켓 오류.", se); if (!_isRunning) break; Thread.Sleep(100); }
-                    catch (InvalidOperationException ioe) when (!_isRunning) { _loggingService.UiInfo($"리스너 중지 후 InvalidOperationException (무시): {ioe.Message}"); break; }
-                    catch (Exception ex) { _loggingService.UiError("클라이언트 연결 수락 중 예기치 않은 오류.", ex); if (!_isRunning) break; Thread.Sleep(100); }
-                }
-            }
-            catch (Exception ex) { _loggingService.UiError("ListenLoop 심각한 오류. 리스너 중단.", ex); }
-            finally { if (_listener != null && _listener.Server.IsBound) { _listener.Stop(); } _loggingService.UiInfo("ListenLoop 종료됨."); }
-        }
-
-        private async Task HandleClientAsync(TcpClient client, string clientIpInfo, CancellationToken token)
-        {
-            CommandPacket receivedRequestPacket = null; CommandPacket sentResponsePacket = null;
-            try
-            {
-                _loggingService.UiDebug($"[{clientIpInfo}] 처리 시작.");
-                using (client) using (NetworkStream stream = client.GetStream())
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 1024, true))
-                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true) { AutoFlush = true })
-                {
-                    while (_isRunning && client.Connected && !token.IsCancellationRequested)
-                    {
-                        string requestJson = null;
-                        try
-                        {
-                            var readTask = reader.ReadLineAsync();
-                            if (await Task.WhenAny(readTask, Task.Delay(Timeout.Infinite, token)) == readTask) { if (token.IsCancellationRequested) token.ThrowIfCancellationRequested(); requestJson = await readTask; }
-                            else { token.ThrowIfCancellationRequested(); }
-                            if (requestJson == null) { _loggingService.UiInfo($"[{clientIpInfo}] 연결 종료됨."); break; }
-                            _loggingService.UiReceived($"[{clientIpInfo}] 수신: {requestJson}");
-                            CommandPacket requestPacket = null;
-                            try { requestPacket = JsonConvert.DeserializeObject<CommandPacket>(requestJson); receivedRequestPacket = requestPacket; }
-                            catch (JsonException jsonEx) { _loggingService.UiError($"[{clientIpInfo}] JSON 역직렬화 실패: {requestJson}", jsonEx); await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Invalid JSON: {jsonEx.Message}"))); continue; }
-                            if (requestPacket != null)
-                            {
-                                CommandPacket responsePacket = await ProcessCommandAsync(requestPacket, clientIpInfo, token);
-                                sentResponsePacket = responsePacket;
-                                if (responsePacket != null)
-                                {
-                                    string responseJson = JsonConvert.SerializeObject(responsePacket);
-                                    if (token.IsCancellationRequested) token.ThrowIfCancellationRequested();
-                                    await writer.WriteLineAsync(responseJson);
-                                    _loggingService.UiSent($"[{clientIpInfo}] 응답: {responseJson}");
-                                    HandleMonitorOffPostProcessing(receivedRequestPacket, sentResponsePacket, clientIpInfo);
-                                }
-                            }
-                        }
-                        catch (IOException ioEx) { _loggingService.UiWarn($"[{clientIpInfo}] IO오류: {ioEx.Message}"); break; }
-                        catch (ObjectDisposedException odEx) { _loggingService.UiWarn($"[{clientIpInfo}] 객체해제오류: {odEx.Message}"); break; }
-                        catch (OperationCanceledException) { _loggingService.UiInfo($"[{clientIpInfo}] 처리 작업 취소됨."); break; }
-                        catch (Exception ex) { _loggingService.UiError($"[{clientIpInfo}] 클라이언트 처리 중 오류.", ex); if (client.Connected && stream.CanWrite) { try { await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(receivedRequestPacket, $"Server error: {ex.Message}"))); } catch (Exception writeEx){ _loggingService.UiError($"[{clientIpInfo}] 오류 응답 전송 실패.", writeEx); }}}
-                    }
-                }
-            }
-            catch (OperationCanceledException) { _loggingService.UiInfo($"[{clientIpInfo}] HandleClientAsync 작업 취소됨."); }
-            catch (Exception ex) { _loggingService.UiError($"[{clientIpInfo}] HandleClientAsync 외부 오류.", ex); }
-            finally { _loggingService.UiInfo($"[{clientIpInfo}] 처리 종료."); }
-        }
-
-        private void HandleMonitorOffPostProcessing(CommandPacket request, CommandPacket response, string clientIp)
-        {
-            if (request?.Instruction == CommandInstruction.DirectExecute && request.CommandName == CommandNames.MonitorControl)
-            {
-                MonitorControlPayload originalPayload = null;
-                try { if(!string.IsNullOrEmpty(request.PayloadJson)) originalPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(request.PayloadJson); } catch {}
-                if (originalPayload?.Action == MonitorAction.Off)
-                {
-                    bool earlyConfirmSuccess = false;
-                    if (response?.PayloadJson != null) { try { var genericResp = JsonConvert.DeserializeObject<GenericResponsePayload>(response.PayloadJson); if(genericResp != null) earlyConfirmSuccess = genericResp.Success; } catch {} }
-                    if(earlyConfirmSuccess) { _loggingService.UiInfo($"[{clientIp}] 조기 응답 후 실제 모니터 끄기. ID: {request.PacketId}"); Task.Run(() => { try { LocalDeviceControl.SetMonitorState(MonitorAction.Off); _loggingService.UiInfo($"[{clientIp}] 실제 모니터 끄기 완료. ID: {request.PacketId}"); } catch (Exception ex) { _loggingService.UiError($"[{clientIp}] 백그라운드 모니터 끄기 오류. ID: {request.PacketId}", ex); }}); }
-                    else { _loggingService.UiWarn($"[{clientIp}] 모니터 끄기 조기 확인 실패/페이로드 없어 실제 끄기 스킵. ID: {request.PacketId}"); }
-                }
-            }
-        }
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
+            total_pcs_result = cursor.fetchone()
+            if total_pcs_result: total_pcs = total_pcs_result['total']
+            if total_pcs > 0:
+                query = "SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs ORDER BY pc_name OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+                cursor.execute(query, (offset, per_page))
+                pcs_on_current_page = cursor.fetchall()
+            total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
+            pagination_data.update({'total_items': total_pcs, 'total_pages': total_pages, 'items': pcs_on_current_page, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_num': page - 1, 'next_num': page + 1})
+    except Exception as e:
+        current_app.logger.error(f"제어판 PC 목록 조회 오류: {e}", exc_info=True)
+        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
         
-        private async Task<CommandPacket> ProcessCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                switch (requestPacket.Instruction)
-                {
-                    case CommandInstruction.DirectExecute: return await ExecuteDirectCommandAsync(requestPacket, clientIp, token);
-                    case CommandInstruction.RelayToTarget: return await RelayCommandAsync(requestPacket, clientIp, token);
-                    default: return CreateErrorResponse(requestPacket, $"Unknown instruction: {requestPacket.Instruction}");
-                }
-            }
-            catch (OperationCanceledException) { return CreateErrorResponse(requestPacket, "Processing canceled."); }
-            catch (Exception ex) { return CreateErrorResponse(requestPacket, $"Error processing '{requestPacket.CommandName}': {ex.Message}"); }
+    title = "원격 제어판"; 
+    if g.current_user_role == 'admin': title = "원격 제어판 (관리자 모드)"
+    return render_template('user/control_panel.html', pcs=pcs_on_current_page, pagination=pagination_data, title=title)
+
+@user_bp.route('/send_batch_command', methods=['POST'])
+@ip_auth_required('user')
+def send_batch_command():
+    selected_pc_ids_str = request.form.getlist('selected_pcs')
+    command_action_str = request.form.get('command_action')
+
+    if not selected_pc_ids_str: flash("제어할 PC를 하나 이상 선택해주세요.", 'warning'); return redirect(url_for('user.control_panel'))
+    if not command_action_str or command_action_str not in ["켜기", "끄기"]: flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning'); return redirect(url_for('user.control_panel'))
+
+    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
+    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
+    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
+    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command}
+
+    conn = None; target_pcs_to_control = []
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            if selected_pc_ids:
+                placeholders = ', '.join(['%s'] * len(selected_pc_ids))
+                sql_select_pcs = f"SELECT id, pc_name, address1, address2 FROM dbo.target_pcs WHERE id IN ({placeholders})"
+                cursor.execute(sql_select_pcs, tuple(selected_pc_ids))
+                target_pcs_to_control = cursor.fetchall()
+    except Exception as e:
+        current_app.logger.error(f"명령 대상 PC 정보 조회 오류: {e}", exc_info=True); flash("명령 대상 PC 정보를 DB에서 조회하는 중 오류가 발생했습니다.", "error"); return redirect(url_for('user.control_panel'))
+    if not target_pcs_to_control: flash("선택된 PC 정보를 찾을 수 없습니다.", "warning"); return redirect(url_for('user.control_panel'))
+
+    for pc_data in target_pcs_to_control:
+        command_packet_to_send = {
+            'PacketId': str(uuid.uuid4()),
+            'TimestampUtc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'CommandName': "SET_DISPLAY_TIMEOUT", 'PayloadJson': json.dumps(payload_for_agent),
+            'ResponseAddress': None, 'ResponsePort': None
         }
+        target_ip_for_command_send = ""; is_relay = bool(pc_data.get('address2') and pc_data['address2'].strip())
+        if is_relay:
+            command_packet_to_send['Instruction'] = "RelayToTarget"; command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc_data['address2']
+            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026; target_ip_for_command_send = pc_data['address1']
+        else:
+            command_packet_to_send['Instruction'] = "DirectExecute"; target_ip_for_command_send = pc_data['address1']
+        
+        log_msg_prefix = f"PC '{pc_data['pc_name']}' ({target_ip_for_command_send})"
+        flash(f"{log_msg_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
+        current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_description_log}, PktID: {command_packet_to_send['PacketId']}")
+        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
+        
+        if agent_response.get('success'):
+            raw_resp_packet = agent_response.get('raw_response')
+            if raw_resp_packet and isinstance(raw_resp_packet, dict) and 'PayloadJson' in raw_resp_packet: # PayloadJson 키 존재 여부 확인
+                payload_json_str_from_agent = raw_resp_packet.get('PayloadJson')
+                current_app.logger.info(f"{log_msg_prefix} - 수신된 PayloadJson 문자열: >>>{payload_json_str_from_agent}<<<")
+                if payload_json_str_from_agent is not None: # None이 아닌 경우에만 파싱 시도
+                    try:
+                        resp_payload = json.loads(payload_json_str_from_agent) 
+                        if resp_payload.get('Success'):
+                            flash(f"{log_msg_prefix}: 성공 - {resp_payload.get('Message', 'OK')}", 'success')
+                        else:
+                            flash(f"{log_msg_prefix}: 실패 (에이전트 응답) - {resp_payload.get('Message', 'Agent error')}", 'error')
+                    except json.JSONDecodeError as je: # <<--- JSONDecodeError 명시적 처리
+                        flash(f"{log_msg_prefix}: 에이전트 응답 페이로드 JSON 형식 오류 - {je.msg} (at pos {je.pos})", 'error')
+                        current_app.logger.error(f"{log_msg_prefix} - PayloadJson 파싱 오류: {je.msg} at pos {je.pos}. 원본: {payload_json_str_from_agent}", exc_info=True)
+                    except Exception as e: # 기타 예외
+                        flash(f"{log_msg_prefix}: 에이전트 응답 페이로드 처리 중 알 수 없는 오류 - {e}", 'error')
+                        current_app.logger.error(f"{log_msg_prefix} - PayloadJson 처리 중 알 수 없는 오류: {e}. 원본: {payload_json_str_from_agent}", exc_info=True)
+                else: # PayloadJson이 None인 경우
+                    flash(f"{log_msg_prefix}: 에이전트 응답에 PayloadJson이 없습니다.", 'warning')
+                    current_app.logger.warning(f"{log_msg_prefix} - 에이전트 응답에 PayloadJson이 null입니다. RawPkt: {raw_resp_packet}")
+            else: 
+                flash(f"{log_msg_prefix}: 전송 성공 (에이전트 상세 응답/페이로드 없음)", 'warning')
+                current_app.logger.warning(f"{log_msg_prefix} - 전송 성공, 그러나 에이전트 상세 응답/페이로드 없음. RawPkt: {raw_resp_packet}")
+        else: 
+            flash(f"{log_msg_prefix}: 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
 
-        private async Task<CommandPacket> ExecuteDirectCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
-        {
-            bool success = false; string message = "Execution failed."; 
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                switch (requestPacket.CommandName)
-                {
-                    case CommandNames.MonitorControl:
-                        if (string.IsNullOrEmpty(requestPacket.PayloadJson)) throw new ArgumentNullException("PayloadJson", "MonitorControl payload missing.");
-                        MonitorControlPayload monitorPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
-                        if (monitorPayload == null) throw new ArgumentException("Cannot deserialize MonitorControlPayload.");
-                        if (monitorPayload.Action == MonitorAction.Off) { success = true; message = $"Monitor Off acknowledged. Will turn off shortly."; }
-                        else { LocalDeviceControl.SetMonitorState(monitorPayload.Action); success = true; message = $"Monitor state set to {monitorPayload.Action}."; }
-                        _loggingService.UiInfo($"[{clientIp}] {message} (Cmd: MonitorControl, Action: {monitorPayload.Action})");
-                        break;
-                    
-                    case CommandNames.SetDisplayTimeout: 
-                        if (string.IsNullOrEmpty(requestPacket.PayloadJson)) throw new ArgumentNullException("PayloadJson", "SetDisplayTimeout payload missing.");
-                        SetDisplayTimeoutPayload timeoutPayload = JsonConvert.DeserializeObject<SetDisplayTimeoutPayload>(requestPacket.PayloadJson);
-                        if (timeoutPayload == null) throw new ArgumentException("Cannot deserialize SetDisplayTimeoutPayload.");
-                        
-                        int timeoutSeconds = timeoutPayload.TimeoutMinutes * 60;
-                        _loggingService.UiInfo($"[{clientIp}] 디스플레이 타임아웃 설정 시도: {timeoutPayload.TimeoutMinutes}분 ({timeoutSeconds}초)");
-                        
-                        string outputAc, errorAc, outputDc, errorDc; int exitCodeAc, exitCodeDc;
-                        string acArgs = $"/SETACVALUEINDEX SCHEME_CURRENT SUB_VIDEO VIDEOIDLE {timeoutSeconds}";
-                        string dcArgs = $"/SETDCVALUEINDEX SCHEME_CURRENT SUB_VIDEO VIDEOIDLE {timeoutSeconds}";
+    return redirect(url_for('user.control_panel'))
+app/routes_user.py 주요 변경 사항:
 
-                        RunPowerCfgCommand(acArgs, out outputAc, out errorAc, out exitCodeAc);
-                        RunPowerCfgCommand(dcArgs, out outputDc, out errorDc, out exitCodeDc);
-                        
-                        if (exitCodeAc == 0 && exitCodeDc == 0) { success = true; message = $"Display timeout set to {timeoutPayload.TimeoutMinutes} min ({timeoutSeconds} sec) for AC/DC."; }
-                        else 
-                        { 
-                            success = false; 
-                            // **** 메시지에서 개행 문자 처리 ****
-                            string acErrorClean = string.IsNullOrEmpty(errorAc) ? "" : errorAc.Trim().Replace("\r\n", " ").Replace("\n", " ");
-                            string dcErrorClean = string.IsNullOrEmpty(errorDc) ? "" : errorDc.Trim().Replace("\r\n", " ").Replace("\n", " ");
-                            message = $"Failed display timeout. AC Exit:{exitCodeAc}, DC Exit:{exitCodeDc}."; 
-                            if (!string.IsNullOrEmpty(acErrorClean)) message += $" AC Err: {acErrorClean}"; 
-                            if (!string.IsNullOrEmpty(dcErrorClean)) message += $" DC Err: {dcErrorClean}"; 
-                        }
-                        _loggingService.UiInfo($"[{clientIp}] {message}");
-                        break;
-                        
-                    default: message = $"Unknown direct command: {requestPacket.CommandName}"; success = false; break;
-                }
-            }
-            catch (OperationCanceledException opEx) { message = $"Cmd {requestPacket.CommandName} canceled: {opEx.Message}"; success = false; _loggingService.UiWarn($"[{clientIp}] {message}");}
-            catch (ArgumentNullException argEx) { message = $"Cmd {requestPacket.CommandName} arg error: {argEx.ParamName} - {argEx.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", argEx); }
-            catch (ArgumentException argEx2) { message = $"Cmd {requestPacket.CommandName} arg error: {argEx2.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", argEx2); }
-            catch (JsonException jsonEx) { message = $"Cmd {requestPacket.CommandName} JSON payload error: {jsonEx.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", jsonEx); }
-            catch (Exception ex) { message = $"Error executing {requestPacket.CommandName}: {ex.Message}"; success = false; _loggingService.UiError($"[{clientIp}] ExecuteDirectCmd Error: {message}", ex); }
-            
-            return CreateExecutionResponse(requestPacket, success, message);
-        }
+send_batch_command 함수 내에서 raw_resp_packet.get('PayloadJson') 호출 전에 raw_resp_packet이 None이 아니고 PayloadJson 키를 가지고 있는지 확인하는 조건을 추가했습니다 ('PayloadJson' in raw_resp_packet).
+payload_json_str_from_agent가 None이 아닌 경우에만 json.loads()를 시도하도록 변경했습니다.
+json.loads()에서 발생하는 json.JSONDecodeError를 명시적으로 except 블록에서 잡아서, 오류 메시지(je.msg)와 오류 위치(je.pos)를 로그와 flash 메시지에 포함하도록 하여 디버깅에 더 용이하게 했습니다.
+2. (테스트용) SAgentM.App/Services/AgentCoreService.cs의 응답 메시지 단순화
+Flask 쪽 로그를 통해 원본 PayloadJson 문자열을 확인하는 것이 우선이지만, 동시에 SAgentM.App에서 보내는 메시지 자체를 매우 단순하게 만들어 테스트해볼 수 있습니다. 이렇게 하면 powercfg의 복잡한 오류 출력이 JSON 문제를 일으키는지 아닌지 판단하는 데 도움이 됩니다.
 
-        private void RunPowerCfgCommand(string arguments, out string output, out string error, out int exitCode)
-        {
-            output = string.Empty; error = string.Empty; exitCode = -1;
-            try
-            {
-                _loggingService.UiDebug($"Executing: powercfg.exe {arguments}");
-                ProcessStartInfo startInfo = new ProcessStartInfo("powercfg.exe") { Arguments = arguments, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, Verb = "runas" };
-                using (Process process = Process.Start(startInfo))
-                {
-                    if (process == null) { error = "Failed to start powercfg.exe."; exitCode = -100; _loggingService.UiError(error); return; }
-                    output = process.StandardOutput.ReadToEnd(); error = process.StandardError.ReadToEnd(); 
-                    if (!process.WaitForExit(7000)) { process.Kill(); error += $"\npowercfg '{arguments}' timeout (7s)."; exitCode = -99;  _loggingService.UiWarn(error); }
-                    else { exitCode = process.ExitCode; }
-                    if(!string.IsNullOrWhiteSpace(output)) _loggingService.UiDebug($"powercfg output: {output.Trim()}");
-                    if(!string.IsNullOrWhiteSpace(error) && exitCode != 0) _loggingService.UiWarn($"powercfg error output: {error.Trim()}");
-                }
-            } 
-            catch (Win32Exception w32Ex) { error = $"powercfg Win32Ex (UAC denied?): {w32Ex.Message}"; exitCode = w32Ex.NativeErrorCode; _loggingService.UiError(error, w32Ex); } 
-            catch (Exception ex) { error = $"powercfg Ex: {ex.Message}"; exitCode = -2; _loggingService.UiError(error, ex); }
-        }
+SAgentM.App/Services/AgentCoreService.cs의 ExecuteDirectCommandAsync 메서드에서 SetDisplayTimeout 부분만 임시로 다음과 같이 수정하여 테스트해볼 수 있습니다.
 
-        private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
-        {
-            _loggingService.UiInfo($"[{clientIp}] 릴레이: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
-            if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue)
-            { return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP/Port missing."); }
-
-            var packetForFinalTarget = new CommandPacket {
-                Instruction = CommandInstruction.DirectExecute, CommandName = originalRelayRequest.CommandName,
-                PayloadJson = originalRelayRequest.PayloadJson, ResponseAddress = originalRelayRequest.ResponseAddress, 
-                ResponsePort = originalRelayRequest.ResponsePort, PacketId = Guid.NewGuid()
-            };
-            string relayStatusMessage = $"Relay: {packetForFinalTarget.CommandName} to {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}.";
-            bool relayCommSuccess = false; CommandPacket responseFromFinalTarget = null;
-            try
-            {
-                token.ThrowIfCancellationRequested();
-                using (var targetClient = new TcpClient())
-                {
-                    var connectTask = targetClient.ConnectAsync(originalRelayRequest.FinalTargetIpForRelayedCommand, originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
-                    if (await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5), token)) != connectTask || token.IsCancellationRequested)
-                    { token.ThrowIfCancellationRequested(); targetClient.Close(); throw new TimeoutException("Relay target connection timed out."); }
-                    await connectTask; 
-                    _loggingService.UiDebug($"[{clientIp}] 릴레이 대상 연결 성공.");
-                    using (NetworkStream relayStream = targetClient.GetStream())
-                    using (StreamWriter relayWriter = new StreamWriter(relayStream, Encoding.UTF8){AutoFlush=true})
-                    using (StreamReader relayReader = new StreamReader(relayStream, Encoding.UTF8)){
-                        string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget);
-                        if(token.IsCancellationRequested) token.ThrowIfCancellationRequested(); await relayWriter.WriteLineAsync(jsonToRelay);
-                        _loggingService.UiDebug($"[{clientIp}] 릴레이 데이터 전송: {jsonToRelay}");
-                        var targetResponseTask = relayReader.ReadLineAsync();
-                        if (await Task.WhenAny(targetResponseTask, Task.Delay(TimeSpan.FromSeconds(10), token)) == targetResponseTask && !token.IsCancellationRequested){
-                            string targetJson = await targetResponseTask; if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
-                            if (!string.IsNullOrEmpty(targetJson)){ _loggingService.UiInfo($"[{clientIp}] 릴레이 대상 응답: {targetJson}"); responseFromFinalTarget = JsonConvert.DeserializeObject<CommandPacket>(targetJson); relayCommSuccess = true; }
-                            else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 빈 응답."); relayStatusMessage = "Relay sent, empty response from final target."; }
-                        } else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 응답 시간 초과/취소."); relayStatusMessage = "Relay sent, no response/timeout/canceled from final target."; }
-                    }
-                }
-            }
-            catch (OperationCanceledException) { relayStatusMessage = $"Relay of {originalRelayRequest.CommandName} canceled."; _loggingService.UiInfo($"[{clientIp}] {relayStatusMessage}"); }
-            catch (TimeoutException tex) { relayStatusMessage = $"Relay failed: Timeout - {tex.Message}"; _loggingService.UiWarn($"[{clientIp}] {relayStatusMessage}"); }
-            catch (SocketException se) { relayStatusMessage = $"Relay failed: Socket error - {se.Message}"; _loggingService.UiError($"[{clientIp}] {relayStatusMessage}", se); }
-            catch (Exception ex) { relayStatusMessage = $"Relay failed: Unexpected error - {ex.Message}"; _loggingService.UiError($"[{clientIp}] {relayStatusMessage}", ex); }
-            
-            if (responseFromFinalTarget != null) { responseFromFinalTarget.PacketId = originalRelayRequest.PacketId; return responseFromFinalTarget; }
-            else { return CreateExecutionResponse(originalRelayRequest, relayCommSuccess, relayStatusMessage); }
-        }
-
-        private CommandPacket CreateExecutionResponse(CommandPacket req, bool success, string msg, object data = null)
-        {
-            Guid pId = req?.PacketId ?? Guid.NewGuid(); string cmdName = req?.CommandName ?? "UNKNOWN";
-            return new CommandPacket { PacketId = pId, Instruction = CommandInstruction.DirectExecute, CommandName = $"{cmdName}_Response", PayloadJson = JsonConvert.SerializeObject(new GenericResponsePayload { Success = success, Message = msg, Data = data }), ResponseAddress = req?.ResponseAddress, ResponsePort = req?.ResponsePort };
-        }
-        private CommandPacket CreateErrorResponse(CommandPacket req, string errorMsg)
-        {
-            Guid pId = req?.PacketId ?? Guid.NewGuid(); string cmdName = req?.CommandName ?? "UNKNOWN";
-            _loggingService.UiError($"Error response for PktID {pId} (Cmd: {cmdName}): {errorMsg}");
-            return new CommandPacket { PacketId = pId, Instruction = CommandInstruction.DirectExecute, CommandName = $"{cmdName}_ErrorResponse", PayloadJson = JsonConvert.SerializeObject(new GenericResponsePayload { Success = false, Message = errorMsg }), ResponseAddress = req?.ResponseAddress, ResponsePort = req?.ResponsePort };
-        }
-    }
-}
-주요 변경 사항:
-
-ExecuteDirectCommandAsync 내 SetDisplayTimeout 처리 시 message 생성:
-
-powercfg.exe 실행 후 errorAc.Trim()과 errorDc.Trim()에서 반환된 오류 문자열에 포함될 수 있는 개행 문자(\r\n 또는 \n)를 공백()으로 치환합니다:
 C#
 
-string acErrorClean = string.IsNullOrEmpty(errorAc) ? "" : errorAc.Trim().Replace("\r\n", " ").Replace("\n", " ");
-string dcErrorClean = string.IsNullOrEmpty(errorDc) ? "" : errorDc.Trim().Replace("\r\n", " ").Replace("\n", " ");
-message = $"Failed display timeout. AC Exit:{exitCodeAc}, DC Exit:{exitCodeDc}."; 
-if (!string.IsNullOrEmpty(acErrorClean)) message += $" AC Err: {acErrorClean}"; 
-if (!string.IsNullOrEmpty(dcErrorClean)) message += $" DC Err: {dcErrorClean}"; 
-이렇게 하면 GenericResponsePayload의 Message 필드에 여러 줄 문자열이 아닌 한 줄 문자열이 들어가게 되어, 이 Message를 포함하는 PayloadJson이 생성될 때, 그리고 이 PayloadJson을 포함하는 최종 CommandPacket JSON이 생성될 때 발생할 수 있는 복잡한 이스케이프 문제를 줄일 수 있습니다. Newtonsoft.Json은 개행 문자를 \n으로 잘 이스케이프하지만, 때로는 이중으로 JSON 문자열을 다루는 과정에서 문제가 단순화될 수 있습니다.
-예외 처리 세분화: ExecuteDirectCommandAsync 내에서 ArgumentNullException, ArgumentException, JsonException을 명시적으로 catch하여 좀 더 구체적인 오류 메시지와 로깅을 제공하도록 수정했습니다.
+// SAgentM.App/Services/AgentCoreService.cs - ExecuteDirectCommandAsync 메서드 내
+// ...
+case CommandNames.SetDisplayTimeout: 
+    // ... (payload 역직렬화 로직은 그대로 둡니다) ...
+    if (timeoutPayload == null) { /* ... 기존 오류 처리 ... */ break; }
+    
+    _loggingService.UiInfo($"[{clientIp}] (테스트 모드) 디스플레이 타임아웃 설정 시도: {timeoutPayload.TimeoutMinutes}분");
+    
+    // 실제 powercfg 호출 대신, 항상 고정된 단순 메시지로 응답 테스트
+    success = true; // 또는 false로 테스트
+    message = "Test response for SetDisplayTimeout, no special chars or newlines.";
+    
+    // string outputAc, errorAc, outputDc, errorDc; int exitCodeAc, exitCodeDc;
+    // RunPowerCfgCommand(acArgs, out outputAc, out errorAc, out exitCodeAc);
+    // RunPowerCfgCommand(dcArgs, out outputDc, out errorDc, out exitCodeDc);
+    // if (exitCodeAc == 0 && exitCodeDc == 0) { ... } else { ... }
+    
+    responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
+    break;
+// ...
+위 테스트용 수정의 의미:
 
-추가 확인 및 테스트 요청:
+powercfg를 실제로 호출하는 부분을 주석 처리하고, 대신 항상 success = true (또는 false)와 함께 아주 단순한 message 문자열로 응답을 만듭니다.
+만약 이 단순화된 메시지로는 Flask에서 JSON 파싱 오류가 발생하지 않는다면, 문제는 원래의 powercfg 오류 메시지 문자열에 포함된 특정 내용(개행, 특수문자 등)이 원인일 가능성이 높습니다.
+만약 이 단순화된 메시지로도 Flask에서 동일한 JSON 파싱 오류가 발생한다면, 문제는 메시지 내용보다는 전체적인 JSON 직렬화/역직렬화 과정이나 소켓 통신으로 전달되는 데이터 자체에 다른 문제가 있을 수 있습니다 (예: 인코딩, 데이터 잘림 등).
+테스트 순서:
 
-Flask 앱 로그 (routes_user.py):
-위 수정된 AgentCoreService.cs를 SAgentM.App에 적용하고 다시 실행한 후, Flask 앱에서 "끄기" 명령을 보냈을 때, Flask 개발 서버 터미널 로그에 찍히는 다음 로그를 다시 한번 확인해주세요.
-
-[INFO] PC 'PC이름' (대상IP) - 에이전트로부터 받은 PayloadJson 문자열: >>>{"Success":false,"Message":"... 여기에 실제 메시지 ...","ErrorCode":null,"Data":null}<<<
-이 >>>...<<< 사이의 문자열이 이제 개행 문자 없이 한 줄로 표시되는지, 그리고 여전히 Python의 json.loads()에서 오류가 발생하는지 확인이 필요합니다.
-
-"unexpected utf-8 bom" 오류:
-만약 이 오류가 SAgentM.App이 Flask로부터 요청을 받을 때 발생한다면, AgentCoreService.cs의 HandleClientAsync 메서드에서 requestJson = await readTask; 라인 직후에 _loggingService.UiReceived($"[{clientIpInfo}] 수신 원본(Bytes): {Encoding.UTF8.GetBytes(requestJson).Take(10).ToArray()}"); 와 같이 수신된 바이트의 앞부분을 확인하여 실제 BOM 문자가 있는지 조사해볼 수 있습니다. 하지만 Python에서 encode('utf-8')은 BOM을 붙이지 않으므로 이 가능성은 낮습니다.
-
-가장 중요한 것은 powercfg 실행 실패가 관리자 권한 문제인지, 아니면 powercfg 명령어 자체의 문제인지 명확히 하는 것입니다. 만약 관리자 권한으로 직접 명령 프롬프트에서 powercfg /SETACVALUEINDEX ... 명령이 성공한다면, SAgentM.App.exe가 관리자 권한을 제대로 얻지 못한 것입니다.
-
-위 코드를 적용해보시고, Flask 앱 로그에 찍히는 PayloadJson 문자열과 함께 결과를 알려주세요.
+먼저, 수정된 app/routes_user.py만 Flask 앱에 적용하고, SAgentM.App은 이전 버전(개행 문자 제거 로직이 들어간 버전)을 그대로 사용합니다.
+"끄기" 명령을 실행하여 오류를 재현합니다.
+Flask 개발 서버 터미널 로그에 찍힌 에이전트로부터 받은 PayloadJson 문자열: >>>...<<< 내용 전체를 복사해서 저에게 알려주세요. 이것이 가장 중요합니다.
+만약 위 3번 로그를 통해 원인 파악이 어렵거나, PayloadJson 문자열이 너무 복잡하여 분석이 힘들다면, 그때 SAgentM.App의 AgentCoreService.cs를 위 테스트용 코드(응답 메시지 단순화) 로 수정하여 다시 테스트해보고 그 결과를 알려주세요.
+사용자님의 로그 정보가 있으면 정확한 원인 진단에 큰 도움이 됩니다!
 
