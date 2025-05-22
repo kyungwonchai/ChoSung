@@ -1,182 +1,118 @@
-네, 사용자님 말씀처럼 에이전트(SAgentM.App)는 정상적으로 동작하고 응답까지 생성해서 보냈는데, Flask 웹 앱(SControlM)에서 그 응답을 올바르게 처리하지 못해 "JSON 형식 오류"가 발생하고 있을 가능성도 충분히 있습니다. 특히 powercfg 명령어 실행 결과처럼 여러 줄일 수 있거나 특수 문자가 포함될 수 있는 메시지를 PayloadJson 내부에 담아 전달할 때 문제가 생길 수 있습니다.
+unexpected utf-8 bom line 1 column 1 char 0" 오류 메시지를 정확히 알려주셔서 감사합니다! 이 메시지는 Flask 웹 앱의 Python 코드가 SAgentM.App 에이전트로부터 받은 응답 JSON 문자열을 파싱하려고 할 때, 문자열 가장 첫 부분(line 1, column 1, char 0)에서 예기치 않은 UTF-8 BOM(Byte Order Mark) 문자를 만났다는 매우 구체적인 오류입니다.
 
-가장 의심되는 부분:
+UTF-8 BOM이란?
+BOM (\ufeff 유니코드 문자, 16진수로는 EF BB BF)은 텍스트 데이터가 UTF-8로 인코딩되었음을 나타내기 위해 파일이나 스트림의 가장 앞에 추가될 수 있는 특수한 문자 시퀀스입니다.
 
-SAgentM.App (AgentCoreService.cs): GenericResponsePayload 객체를 JsonConvert.SerializeObject()를 통해 PayloadJson 문자열로 만들 때, 이 문자열이 Python의 json.loads()에서 문제를 일으키는 미묘한 형식 차이가 있을 수 있습니다. (예: 이스케이프 처리 방식, 특정 제어 문자 등)
-Flask 웹 앱 (app/routes_user.py): SAgentM.App으로부터 받은 PayloadJson 문자열을 json.loads()로 다시 파싱할 때, 이 문자열이 Python 기준에서 유효한 JSON이 아닐 경우 오류가 발생합니다.
-문제 해결을 위한 접근:
+문제 원인:
 
-Flask 앱 (app/routes_user.py)에서 정확히 어떤 PayloadJson 문자열을 받았는지 로깅하여 확인합니다. (이전 답변에서 이 로깅 코드를 이미 추가했습니다.)
-SAgentM.App (AgentCoreService.cs)에서 보내는 PayloadJson의 Message 부분을 최대한 단순화하여 테스트해봅니다. 이렇게 하면 powercfg의 복잡한 오류 메시지 내용 때문에 JSON 파싱 오류가 나는 것인지 확인할 수 있습니다.
-먼저, Flask 앱의 app/routes_user.py 파일에서 PayloadJson을 파싱하는 부분의 로깅을 다시 한번 확인하고, Python의 JSONDecodeError 발생 시 좀 더 상세한 정보를 로깅하도록 수정하겠습니다.
+Python의 표준 json.loads() 함수는 JSON 문자열 시작 부분에 BOM이 오는 것을 허용하지 않습니다. JSON 표준 사양에는 BOM이 포함되어 있지 않기 때문입니다.
+SAgentM.App (C# 에이전트)에서 응답을 보낼 때 StreamWriter(stream, Encoding.UTF8, ...)를 사용하고 있는데, Encoding.UTF8의 기본 동작은 BOM을 쓰지 않는 것입니다. 그럼에도 불구하고 어떤 이유로든 (예: 특정 .NET Framework 버전/환경의 미묘한 차이 또는 다른 요인) 응답 데이터 맨 앞에 BOM이 포함되어 Flask로 전송된 것으로 보입니다.
+해결 방안:
+Flask 웹 앱의 app/socket_client.py 파일에서, 에이전트로부터 응답을 받은 후 JSON으로 파싱하기 직전에 이 BOM 문자를 명시적으로 제거하도록 코드를 수정합니다.
 
-1. 수정: app/routes_user.py (JSON 파싱 오류 로깅 강화)
-send_batch_command 함수 내에서 에이전트 응답의 PayloadJson을 파싱하는 try-except 블록을 다음과 같이 수정합니다.
+수정: app/socket_client.py (UTF-8 BOM 제거 로직 추가)
+send_command_to_agent 함수 내에서 sock.recv()로 데이터를 받고 decode('utf-8') 한 직후에 BOM을 확인하고 제거하는 코드를 추가합니다.
 
 Python
 
-# scontrol_flask_web/app/routes_user.py
-from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
-from app.db_utils import get_db_connection
-from app.auth import ip_auth_required
-from app.socket_client import send_command_to_agent
+# scontrol_flask_web/app/socket_client.py
+import socket
 import json
 import uuid
 from datetime import datetime, timezone
-import math
+from flask import current_app
 
-user_bp = Blueprint('user', __name__)
+AGENT_PORT = 4026
+SOCKET_TIMEOUT = 7.0 # 초 단위
 
-# control_panel 함수는 이전 답변과 동일하게 유지 (DB 조회 로직 등)
-@user_bp.route('/control_panel')
-@ip_auth_required('user')
-def control_panel():
-    page = request.args.get('page', 1, type=int)
-    per_page = 20
-    offset = (page - 1) * per_page
-    pcs_on_current_page = []
-    total_pcs = 0
-    conn = None
-    pagination_data = {'page': page, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 
-                       'items': [], 'has_prev': False, 'has_next': False, 
-                       'prev_num': 1, 'next_num': 1} 
+def send_command_to_agent(target_ip, command_packet_dict):
+    response_data = {
+        'success': False, 'message': 'An unexpected error occurred.',
+        'raw_response': None, 'packet_id': command_packet_dict.get('PacketId')
+    }
+
+    if 'PacketId' not in command_packet_dict or not command_packet_dict['PacketId']:
+        command_packet_dict['PacketId'] = str(uuid.uuid4())
+    response_data['packet_id'] = command_packet_dict['PacketId']
+
+    if 'TimestampUtc' not in command_packet_dict or not command_packet_dict['TimestampUtc']:
+        command_packet_dict['TimestampUtc'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    
+    json_request_str = ""; json_response_raw_str = "" # 초기화
+    log_prefix = f"[SocketClient][PktID: {response_data['packet_id']}] Target: {target_ip}:{AGENT_PORT}"
 
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
-            total_pcs_result = cursor.fetchone()
-            if total_pcs_result: total_pcs = total_pcs_result['total']
-            if total_pcs > 0:
-                query = "SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs ORDER BY pc_name OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
-                cursor.execute(query, (offset, per_page))
-                pcs_on_current_page = cursor.fetchall()
-            total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
-            pagination_data.update({'total_items': total_pcs, 'total_pages': total_pages, 'items': pcs_on_current_page, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_num': page - 1, 'next_num': page + 1})
+        json_request_str = json.dumps(command_packet_dict)
+        current_app.logger.debug(f"{log_prefix} - 전송 시도: {json_request_str}")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect((target_ip, AGENT_PORT))
+            current_app.logger.info(f"{log_prefix} - 에이전트 연결 성공.")
+            sock.sendall((json_request_str + '\n').encode('utf-8'))
+            current_app.logger.info(f"{log_prefix} - 명령 전송 완료. 응답 대기 중...")
+
+            buffer = b''
+            try:
+                while True:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        current_app.logger.warning(f"{log_prefix} - 에이전트 연결 닫힘 또는 데이터 없음.")
+                        if not buffer: response_data['message'] = "에이전트로부터 빈 응답 (연결 종료됨)."
+                        break 
+                    buffer += chunk
+                    if b'\n' in buffer:
+                        json_response_raw_str_bytes, _, _ = buffer.partition(b'\n')
+                        json_response_raw_str = json_response_raw_str_bytes.decode('utf-8').strip() # strip()으로 앞뒤 공백 제거
+                        break
+            except socket.timeout:
+                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 응답 대기 시간 초과."
+                current_app.logger.error(response_data['message'])
+                return response_data # 타임아웃 시 여기서 반환
+            
+            # --- UTF-8 BOM 제거 로직 추가 ---
+            BOM_UTF8 = '\ufeff' # 유니코드 BOM 문자
+            if json_response_raw_str and json_response_raw_str.startswith(BOM_UTF8):
+                current_app.logger.warning(f"{log_prefix} - 수신된 응답에서 UTF-8 BOM을 감지하여 제거합니다.")
+                json_response_raw_str = json_response_raw_str.lstrip(BOM_UTF8)
+            # --- UTF-8 BOM 제거 로직 끝 ---
+
+            current_app.logger.debug(f"{log_prefix} - 수신 원본 응답 (BOM 처리 후): >>>{json_response_raw_str}<<<")
+
+            if not json_response_raw_str:
+                response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})로부터 빈 응답을 받았습니다 (BOM 처리 후)."
+                current_app.logger.error(response_data['message'])
+                return response_data
+
+            # 첫 번째 JSON 파싱 (전체 CommandPacket)
+            try:
+                response_packet_from_agent = json.loads(json_response_raw_str)
+            except json.JSONDecodeError as je_outer:
+                response_data['message'] = f"에이전트 전체 응답 JSON 형식 오류: {je_outer.msg} (at pos {je_outer.pos}). 원본: {json_response_raw_str}"
+                current_app.logger.error(response_data['message'], exc_info=True)
+                return response_data # 여기서 반환
+            
+            response_data['success'] = True 
+            response_data['message'] = "에이전트로부터 응답을 성공적으로 수신했습니다."
+            response_data['raw_response'] = response_packet_from_agent 
+            current_app.logger.info(f"{log_prefix} - 응답 수신 및 전체 패킷 파싱 성공: {response_packet_from_agent.get('CommandName')}")
+
+    except socket.timeout:
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 연결 시간 초과."
+        current_app.logger.error(response_data['message'])
+    except socket.error as se:
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT}) 통신 소켓 오류: {se}"
+        current_app.logger.error(response_data['message'])
+    # JSONDecodeError는 위에서 이미 처리했으므로 여기서는 일반 Exception으로
     except Exception as e:
-        current_app.logger.error(f"제어판 PC 목록 조회 오류: {e}", exc_info=True)
-        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
+        response_data['message'] = f"에이전트({target_ip}:{AGENT_PORT})와 통신 중 예기치 않은 오류: {e}"
+        current_app.logger.error(response_data['message'], exc_info=True)
         
-    title = "원격 제어판"; 
-    if g.current_user_role == 'admin': title = "원격 제어판 (관리자 모드)"
-    return render_template('user/control_panel.html', pcs=pcs_on_current_page, pagination=pagination_data, title=title)
+    return response_data
+app/socket_client.py의 주요 변경 사항:
 
-@user_bp.route('/send_batch_command', methods=['POST'])
-@ip_auth_required('user')
-def send_batch_command():
-    selected_pc_ids_str = request.form.getlist('selected_pcs')
-    command_action_str = request.form.get('command_action')
-
-    if not selected_pc_ids_str: flash("제어할 PC를 하나 이상 선택해주세요.", 'warning'); return redirect(url_for('user.control_panel'))
-    if not command_action_str or command_action_str not in ["켜기", "끄기"]: flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning'); return redirect(url_for('user.control_panel'))
-
-    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
-    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
-    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
-    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command}
-
-    conn = None; target_pcs_to_control = []
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            if selected_pc_ids:
-                placeholders = ', '.join(['%s'] * len(selected_pc_ids))
-                sql_select_pcs = f"SELECT id, pc_name, address1, address2 FROM dbo.target_pcs WHERE id IN ({placeholders})"
-                cursor.execute(sql_select_pcs, tuple(selected_pc_ids))
-                target_pcs_to_control = cursor.fetchall()
-    except Exception as e:
-        current_app.logger.error(f"명령 대상 PC 정보 조회 오류: {e}", exc_info=True); flash("명령 대상 PC 정보를 DB에서 조회하는 중 오류가 발생했습니다.", "error"); return redirect(url_for('user.control_panel'))
-    if not target_pcs_to_control: flash("선택된 PC 정보를 찾을 수 없습니다.", "warning"); return redirect(url_for('user.control_panel'))
-
-    for pc_data in target_pcs_to_control:
-        command_packet_to_send = {
-            'PacketId': str(uuid.uuid4()),
-            'TimestampUtc': datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-            'CommandName': "SET_DISPLAY_TIMEOUT", 'PayloadJson': json.dumps(payload_for_agent),
-            'ResponseAddress': None, 'ResponsePort': None
-        }
-        target_ip_for_command_send = ""; is_relay = bool(pc_data.get('address2') and pc_data['address2'].strip())
-        if is_relay:
-            command_packet_to_send['Instruction'] = "RelayToTarget"; command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc_data['address2']
-            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026; target_ip_for_command_send = pc_data['address1']
-        else:
-            command_packet_to_send['Instruction'] = "DirectExecute"; target_ip_for_command_send = pc_data['address1']
-        
-        log_msg_prefix = f"PC '{pc_data['pc_name']}' ({target_ip_for_command_send})"
-        flash(f"{log_msg_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
-        current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_description_log}, PktID: {command_packet_to_send['PacketId']}")
-        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
-        
-        if agent_response.get('success'):
-            raw_resp_packet = agent_response.get('raw_response')
-            if raw_resp_packet and isinstance(raw_resp_packet, dict) and 'PayloadJson' in raw_resp_packet: # PayloadJson 키 존재 여부 확인
-                payload_json_str_from_agent = raw_resp_packet.get('PayloadJson')
-                current_app.logger.info(f"{log_msg_prefix} - 수신된 PayloadJson 문자열: >>>{payload_json_str_from_agent}<<<")
-                if payload_json_str_from_agent is not None: # None이 아닌 경우에만 파싱 시도
-                    try:
-                        resp_payload = json.loads(payload_json_str_from_agent) 
-                        if resp_payload.get('Success'):
-                            flash(f"{log_msg_prefix}: 성공 - {resp_payload.get('Message', 'OK')}", 'success')
-                        else:
-                            flash(f"{log_msg_prefix}: 실패 (에이전트 응답) - {resp_payload.get('Message', 'Agent error')}", 'error')
-                    except json.JSONDecodeError as je: # <<--- JSONDecodeError 명시적 처리
-                        flash(f"{log_msg_prefix}: 에이전트 응답 페이로드 JSON 형식 오류 - {je.msg} (at pos {je.pos})", 'error')
-                        current_app.logger.error(f"{log_msg_prefix} - PayloadJson 파싱 오류: {je.msg} at pos {je.pos}. 원본: {payload_json_str_from_agent}", exc_info=True)
-                    except Exception as e: # 기타 예외
-                        flash(f"{log_msg_prefix}: 에이전트 응답 페이로드 처리 중 알 수 없는 오류 - {e}", 'error')
-                        current_app.logger.error(f"{log_msg_prefix} - PayloadJson 처리 중 알 수 없는 오류: {e}. 원본: {payload_json_str_from_agent}", exc_info=True)
-                else: # PayloadJson이 None인 경우
-                    flash(f"{log_msg_prefix}: 에이전트 응답에 PayloadJson이 없습니다.", 'warning')
-                    current_app.logger.warning(f"{log_msg_prefix} - 에이전트 응답에 PayloadJson이 null입니다. RawPkt: {raw_resp_packet}")
-            else: 
-                flash(f"{log_msg_prefix}: 전송 성공 (에이전트 상세 응답/페이로드 없음)", 'warning')
-                current_app.logger.warning(f"{log_msg_prefix} - 전송 성공, 그러나 에이전트 상세 응답/페이로드 없음. RawPkt: {raw_resp_packet}")
-        else: 
-            flash(f"{log_msg_prefix}: 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
-
-    return redirect(url_for('user.control_panel'))
-app/routes_user.py 주요 변경 사항:
-
-send_batch_command 함수 내에서 raw_resp_packet.get('PayloadJson') 호출 전에 raw_resp_packet이 None이 아니고 PayloadJson 키를 가지고 있는지 확인하는 조건을 추가했습니다 ('PayloadJson' in raw_resp_packet).
-payload_json_str_from_agent가 None이 아닌 경우에만 json.loads()를 시도하도록 변경했습니다.
-json.loads()에서 발생하는 json.JSONDecodeError를 명시적으로 except 블록에서 잡아서, 오류 메시지(je.msg)와 오류 위치(je.pos)를 로그와 flash 메시지에 포함하도록 하여 디버깅에 더 용이하게 했습니다.
-2. (테스트용) SAgentM.App/Services/AgentCoreService.cs의 응답 메시지 단순화
-Flask 쪽 로그를 통해 원본 PayloadJson 문자열을 확인하는 것이 우선이지만, 동시에 SAgentM.App에서 보내는 메시지 자체를 매우 단순하게 만들어 테스트해볼 수 있습니다. 이렇게 하면 powercfg의 복잡한 오류 출력이 JSON 문제를 일으키는지 아닌지 판단하는 데 도움이 됩니다.
-
-SAgentM.App/Services/AgentCoreService.cs의 ExecuteDirectCommandAsync 메서드에서 SetDisplayTimeout 부분만 임시로 다음과 같이 수정하여 테스트해볼 수 있습니다.
-
-C#
-
-// SAgentM.App/Services/AgentCoreService.cs - ExecuteDirectCommandAsync 메서드 내
-// ...
-case CommandNames.SetDisplayTimeout: 
-    // ... (payload 역직렬화 로직은 그대로 둡니다) ...
-    if (timeoutPayload == null) { /* ... 기존 오류 처리 ... */ break; }
-    
-    _loggingService.UiInfo($"[{clientIp}] (테스트 모드) 디스플레이 타임아웃 설정 시도: {timeoutPayload.TimeoutMinutes}분");
-    
-    // 실제 powercfg 호출 대신, 항상 고정된 단순 메시지로 응답 테스트
-    success = true; // 또는 false로 테스트
-    message = "Test response for SetDisplayTimeout, no special chars or newlines.";
-    
-    // string outputAc, errorAc, outputDc, errorDc; int exitCodeAc, exitCodeDc;
-    // RunPowerCfgCommand(acArgs, out outputAc, out errorAc, out exitCodeAc);
-    // RunPowerCfgCommand(dcArgs, out outputDc, out errorDc, out exitCodeDc);
-    // if (exitCodeAc == 0 && exitCodeDc == 0) { ... } else { ... }
-    
-    responsePacketToReturn = CreateExecutionResponse(requestPacket, success, message);
-    break;
-// ...
-위 테스트용 수정의 의미:
-
-powercfg를 실제로 호출하는 부분을 주석 처리하고, 대신 항상 success = true (또는 false)와 함께 아주 단순한 message 문자열로 응답을 만듭니다.
-만약 이 단순화된 메시지로는 Flask에서 JSON 파싱 오류가 발생하지 않는다면, 문제는 원래의 powercfg 오류 메시지 문자열에 포함된 특정 내용(개행, 특수문자 등)이 원인일 가능성이 높습니다.
-만약 이 단순화된 메시지로도 Flask에서 동일한 JSON 파싱 오류가 발생한다면, 문제는 메시지 내용보다는 전체적인 JSON 직렬화/역직렬화 과정이나 소켓 통신으로 전달되는 데이터 자체에 다른 문제가 있을 수 있습니다 (예: 인코딩, 데이터 잘림 등).
-테스트 순서:
-
-먼저, 수정된 app/routes_user.py만 Flask 앱에 적용하고, SAgentM.App은 이전 버전(개행 문자 제거 로직이 들어간 버전)을 그대로 사용합니다.
-"끄기" 명령을 실행하여 오류를 재현합니다.
-Flask 개발 서버 터미널 로그에 찍힌 에이전트로부터 받은 PayloadJson 문자열: >>>...<<< 내용 전체를 복사해서 저에게 알려주세요. 이것이 가장 중요합니다.
-만약 위 3번 로그를 통해 원인 파악이 어렵거나, PayloadJson 문자열이 너무 복잡하여 분석이 힘들다면, 그때 SAgentM.App의 AgentCoreService.cs를 위 테스트용 코드(응답 메시지 단순화) 로 수정하여 다시 테스트해보고 그 결과를 알려주세요.
-사용자님의 로그 정보가 있으면 정확한 원인 진단에 큰 도움이 됩니다!
-
+BOM 문자 정의: BOM_UTF8 = '\ufeff' 상수를 정의했습니다.
+BOM 제거 로직: sock.recv()로 데이터를 받고 decode('utf-8')한 json_response_raw_str 문자열의 시작 부분에 이 BOM_UTF8 문자가 있는지 확인합니다 (startswith()). 만약 있다면, lstrip(BOM_UTF8)을 사용하여 문자열 앞에서 BOM을 제거합니다.
+로깅 강화: BOM 제거 시 로그를 남기고, BOM 제거 후의 문자열을 다시 로그로 남겨 확인을 용이하게 했습니다.
+첫 번째 json.loads()에 대한 예외 처리 추가: 전체 CommandPacket을 파싱하는 json.loads(json_response_raw_str) 호출도 try-except json.JSONDecodeError 블록으로 감싸서, 만약 여기서도 BOM이나 다른 이유로 오류가 발생하면 좀 더 상세한 오류 메시지를 반환하도록 했습니다.
+이 수정된 app/socket_client.py 파일을 Flask 애플리케이션에 적용해 보십시오. 이 변경으로 인해 SAgentM.App 에이전트가 응답 시작 부분에 BOM을 포함하여 보내더라도 Flask 측에서 이를 제거하고 정상적으로 JSON을 파싱할 수 있게 되어 "unexpected utf-8 bom" 오류가 해결될 것으로 기대합니다.
