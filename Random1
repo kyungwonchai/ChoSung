@@ -1,52 +1,157 @@
-buntu에서 특정 NTP 서버로 자동 시간 동기화를 설정하는 방법은 systemd-timesyncd 서비스를 사용하는 것입니다. 다음 단계를 따르세요.
+, "작업 등록 또는 시작 실패: list of positional arguments is longer than the target callable can handle..." 오류와 함께, Flask 앱 자체는 시작되지만 예약된 작업이 동작하지 않는 문제 상황이군요. 😥
 
-1. systemd-timesyncd 상태 확인
-먼저, systemd-timesyncd 서비스가 실행 중인지 확인합니다.
+이 오류는 APScheduler가 특정 함수를 실행하려고 할 때, 스케줄러가 전달하는 인자(arguments)의 개수와 해당 함수가 실제로 받도록 정의된 인자의 개수가 일치하지 않기 때문에 발생합니다.
 
-Bash
+가장 가능성이 높은 원인 및 해결 파일: app/scheduler_tasks.py
 
-timedatectl status
-출력 결과에서 NTP service: active 또는 유사한 메시지를 확인해야 합니다. 만약 NTP service: inactive 라면 다음 명령어로 활성화합니다.
+이전에 app/__init__.py에서 스케줄된 작업 함수들(scheduled_task_monitor_on, scheduled_task_monitor_off)에 Flask app 인스턴스를 전달하도록 args=[current_flask_app_for_scheduler] 설정을 추가했습니다.
 
-Bash
+이것은 app/scheduler_tasks.py 파일에 있는 해당 함수들이 반드시 첫 번째 인자로 Flask app 인스턴스를 받아야 한다는 의미입니다.
 
-sudo timedatectl set-ntp true
-2. NTP 서버 설정 파일 수정
-timesyncd의 설정 파일은 /etc/systemd/timesyncd.conf 입니다. 이 파일을 수정하여 원하는 NTP 서버를 지정합니다.
+다음 두 가지를 확인하고 수정해야 합니다:
 
-텍스트 편집기 (예: nano 또는 vim)를 사용하여 파일을 엽니다.
+app/scheduler_tasks.py 파일의 함수 정의:
 
-Bash
+scheduled_task_monitor_on 함수와 scheduled_task_monitor_off 함수의 정의가 app_instance (또는 다른 이름의) 첫 번째 인자를 포함하고 있는지 확인합니다.
+이 함수들이 내부적으로 호출하는 다른 헬퍼 함수들(예: is_operational_day, _send_display_timeout_to_all_pcs)도 app_instance를 필요로 한다면, 이 인자를 계속 전달해야 합니다.
+Flask 앱 컨텍스트 사용:
 
-sudo nano /etc/systemd/timesyncd.conf
-파일 내용에서 [Time] 섹션을 찾습니다. NTP= 라인의 주석 처리(#)를 제거하거나 새로 추가하고, 원하는 NTP 서버 주소를 입력합니다. 여러 서버를 지정하려면 공백으로 구분합니다. 예를 들어, 한국 공용 NTP 서버인 time.bora.net을 사용하려면 다음과 같이 수정합니다.
+스케줄된 작업 함수들 내부에서 Flask의 기능(로거, 설정, DB 연결 등)을 사용하려면, 전달받은 app_instance를 사용하여 with app_instance.app_context(): 블록 안에서 해당 로직이 실행되도록 해야 합니다.
+수정: app/scheduler_tasks.py (전체 최종 코드)
+이전 답변(#54)에서 이미 app_instance 인자를 받도록 수정된 버전을 드렸습니다. 그 버전이 정확히 적용되었는지 다시 한번 확인하시거나, 아래 코드로 완전히 교체해 주십시오. 이 코드는 각 스케줄된 함수가 app_instance를 받고, 이를 사용하여 앱 컨텍스트를 설정하며, 내부 헬퍼 함수에도 필요에 따라 app_instance를 전달합니다.
 
-Ini, TOML
+Python
 
-[Time]
-NTP=time.bora.net
-#FallbackNTP=0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org 2.ubuntu.pool.ntp.org 3.ubuntu.pool.ntp.org
-#RootDistanceMaxSec=5
-#PollIntervalMinSec=32
-#PollIntervalMaxSec=2048
-FallbackNTP=는 주 NTP 서버에 접속할 수 없을 때 사용할 대체 서버 목록입니다. 필요에 따라 이 부분도 수정할 수 있습니다.
+# scontrol_flask_web/app/scheduler_tasks.py
+from datetime import date
+import holidays
+# from flask import current_app # app_instance를 통해 접근하므로 직접 임포트 불필요
+from .db_utils import get_db_connection
+from .socket_client import send_command_to_agent
+import json
+import uuid
+from datetime import datetime as dt, timezone # dt로 별칭, timezone 사용
 
-파일을 저장하고 편집기를 종료합니다. (nano의 경우 Ctrl+O, Enter, Ctrl+X)
+def is_operational_day(target_date, app_instance): # app_instance 인자 사용
+    conn = None
+    try:
+        # get_db_connection()은 current_app을 사용하므로, 이 함수가 app_context 내에서 호출됨을 보장
+        conn = get_db_connection() 
+        if not conn:
+            app_instance.logger.error(f"[Scheduler][{target_date}] is_operational_day: DB 연결 실패. 기본 가동일로 처리.")
+            return True 
 
-3. systemd-timesyncd 서비스 재시작
-설정 변경 사항을 적용하려면 systemd-timesyncd 서비스를 재시작해야 합니다.
+        with conn.cursor() as cursor:
+            sql = "SELECT is_operational FROM dbo.work_calendar_exceptions WHERE exception_date = %s"
+            cursor.execute(sql, (target_date.strftime('%Y-%m-%d'),))
+            exception_day = cursor.fetchone()
+            if exception_day:
+                is_op = bool(exception_day['is_operational'])
+                app_instance.logger.info(f"[Scheduler][{target_date}] 사용자 지정 예외일: {'가동일' if is_op else '비가동일'}")
+                return is_op
 
-Bash
+        if target_date.weekday() >= 5: # 토(5), 일(6)
+            app_instance.logger.info(f"[Scheduler][{target_date}] 주말(비가동일).")
+            return False
 
-sudo systemctl restart systemd-timesyncd
-4. 동기화 상태 확인
-잠시 후, 다시 timedatectl status 명령어를 실행하여 지정한 NTP 서버와 동기화되었는지 확인합니다.
+        # 해당 연도의 한국 공휴일 정보 (매번 생성해도 되나, 최적화 가능)
+        kr_holidays = holidays.KR(years=target_date.year, observed=True) # observed=True로 대체공휴일 포함
+        if target_date in kr_holidays:
+            app_instance.logger.info(f"[Scheduler][{target_date}] 공휴일('{kr_holidays.get(target_date)}'). (비가동일)")
+            return False
+            
+        app_instance.logger.info(f"[Scheduler][{target_date}] 평일(가동일).")
+        return True
+    except Exception as e:
+        app_instance.logger.error(f"[Scheduler][{target_date}] is_operational_day 함수 오류: {e}", exc_info=True)
+        return True # 오류 시 기본적으로 가동일로 처리
 
-Bash
+def _send_display_timeout_to_all_pcs(timeout_minutes, action_description, app_instance): # app_instance 인자 사용
+    conn = None
+    pcs_to_control = []
+    try:
+        conn = get_db_connection() 
+        if not conn:
+            app_instance.logger.error(f"[Scheduler] _send_display_timeout_to_all_pcs: DB 연결 실패.")
+            return
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, pc_name, address1, address2 FROM dbo.target_pcs")
+            pcs_to_control = cursor.fetchall()
+    except Exception as e:
+        app_instance.logger.error(f"[Scheduler] PC 목록 조회 오류: {e}", exc_info=True)
+        return 
 
-timedatectl status
-출력에서 NTP server synced: yes 와 함께 Server: 항목에 지정한 서버 주소 (예: time.bora.net)가 표시되어야 합니다.
+    if not pcs_to_control:
+        app_instance.logger.info("[Scheduler] 제어할 PC 없음.")
+        return
 
-더 자세한 동기화 정보를 보려면 다음 명령어를 사용할 수 있습니다.
+    app_instance.logger.info(f"[Scheduler] '{action_description}'을(를) {len(pcs_to_control)}대 PC에 전송 시작.")
+    payload_obj = {'TimeoutMinutes': timeout_minutes}
+    common_command_name = "SET_DISPLAY_TIMEOUT" 
 
-Bash
+    for pc_data in pcs_to_control:
+        command_packet = {
+            'PacketId': str(uuid.uuid4()),
+            'TimestampUtc': dt.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            'CommandName': common_command_name, 'PayloadJson': json.dumps(payload_obj),
+            'ResponseAddress': None, 'ResponsePort': None
+        }
+        target_ip_for_command = ""; is_relay = bool(pc_data.get('address2') and pc_data['address2'].strip())
+        if is_relay:
+            command_packet['Instruction'] = "RelayToTarget"; command_packet['FinalTargetIpForRelayedCommand'] = pc_data['address2']
+            command_packet['FinalTargetPortForRelayedCommand'] = 4026; target_ip_for_command = pc_data['address1']
+        else:
+            command_packet['Instruction'] = "DirectExecute"; target_ip_for_command = pc_data['address1']
+
+        log_prefix = f"[Scheduler][PC: {pc_data.get('pc_name','N/A')}({target_ip_for_command})]"
+        app_instance.logger.info(f"{log_prefix} - '{action_description}' 명령 전송 시도. PktID: {command_packet['PacketId']}")
+        try:
+            # send_command_to_agent는 내부적으로 current_app.logger 사용. app_context 내에서 호출되므로 OK.
+            agent_response = send_command_to_agent(target_ip_for_command, command_packet) 
+            if agent_response.get('success'):
+                raw_resp_packet = agent_response.get('raw_response')
+                if raw_resp_packet and isinstance(raw_resp_packet, dict) and raw_resp_packet.get('PayloadJson'):
+                    resp_payload = json.loads(raw_resp_packet['PayloadJson'])
+                    if resp_payload.get('Success'): app_instance.logger.info(f"{log_prefix} - 명령 성공: {resp_payload.get('Message', 'OK')}")
+                    else: app_instance.logger.error(f"{log_prefix} - 명령 실패 (에이전트): {resp_payload.get('Message', 'Agent error')}")
+                else: app_instance.logger.warning(f"{log_prefix} - 전송 성공, 상세 응답 확인 불가. Raw: {raw_resp_packet}")
+            else: app_instance.logger.error(f"{log_prefix} - 전송 실패: {agent_response.get('message', 'Socket error')}")
+        except Exception as e_send:
+            app_instance.logger.error(f"{log_prefix} - 명령 전송 중 예외: {e_send}", exc_info=True)
+
+# --- APScheduler가 호출할 실제 작업 함수들 ---
+def scheduled_task_monitor_on(app_instance): # Flask app 인스턴스를 인자로 받음
+    with app_instance.app_context(): # 전달받은 app 인스턴스로 app_context 생성
+        today = date.today()
+        app_instance.logger.info(f"[Scheduler] 모니터 켜기 작업 (06:00 예정) 시작, 오늘: {today}")
+        if is_operational_day(today, app_instance): # app_instance 전달
+            app_instance.logger.info(f"[Scheduler] 가동일: '모니터 켜기(타임아웃 해제)' 명령 전송.")
+            _send_display_timeout_to_all_pcs(0, "디스플레이 항상 켜기 설정 (타임아웃 0분)", app_instance) # app_instance 전달
+        else:
+            app_instance.logger.info(f"[Scheduler] 비가동일: '모니터 켜기' 명령 미실행.")
+        app_instance.logger.info(f"[Scheduler] 모니터 켜기 작업 완료.")
+
+
+def scheduled_task_monitor_off(app_instance): # Flask app 인스턴스를 인자로 받음
+    with app_instance.app_context(): # 전달받은 app 인스턴스로 app_context 생성
+        today = date.today()
+        app_instance.logger.info(f"[Scheduler] 모니터 끄기 작업 (07:00 예정) 시작, 오늘: {today}")
+        if not is_operational_day(today, app_instance): # app_instance 전달
+            app_instance.logger.info(f"[Scheduler] 비가동일: '모니터 끄기(1분 후 타임아웃)' 명령 전송.")
+            _send_display_timeout_to_all_pcs(1, "디스플레이 1분 후 자동 꺼짐 설정", app_instance) # app_instance 전달
+        else:
+            app_instance.logger.info(f"[Scheduler] 가동일: '모니터 끄기' 명령 미실행.")
+        app_instance.logger.info(f"[Scheduler] 모니터 끄기 작업 완료.")
+app/scheduler_tasks.py 주요 확인/수정 사항:
+
+함수 시그니처: scheduled_task_monitor_on과 scheduled_task_monitor_off 함수가 첫 번째 인자로 app_instance를 받도록 정의되어 있는지 확인합니다.
+app_instance 사용: 함수 내에서 Flask 앱 객체의 로거(app_instance.logger)나 설정(app_instance.config)에 접근할 때 이 app_instance를 사용합니다.
+with app_instance.app_context():: 각 스케줄된 작업 함수의 시작 부분에 이 코드를 사용하여, 함수 본문이 실행되는 동안 Flask 애플리케이션 컨텍스트가 활성화되도록 합니다. 이렇게 하면 get_db_connection()이나 send_command_to_agent() 내부에서 current_app을 사용하는 부분이 정상적으로 동작합니다.
+헬퍼 함수에 app_instance 전달: is_operational_day와 _send_display_timeout_to_all_pcs 함수도 app_instance를 인자로 받도록 수정하여, 이들 내부에서도 app_instance.logger를 사용하거나, 또는 이들이 호출하는 다른 함수(예: get_db_connection)가 current_app을 올바르게 참조할 수 있도록 합니다.
+app/__init__.py 파일은 이전 답변(#54)에서 제공한 코드가 이미 args=[current_flask_app_for_scheduler]를 사용하여 app 인스턴스를 전달하도록 되어 있으므로, 해당 파일은 수정할 필요가 없을 것입니다. (다시 한번 확인차 app/__init__.py의 scheduler.add_job 부분을 확인해주세요.)
+
+조치:
+
+위 app/scheduler_tasks.py 코드로 사용자님의 파일을 완전히 교체하거나 주의 깊게 비교 수정합니다.
+프로젝트 내 모든 __pycache__ 폴더를 삭제합니다.
+Flask 개발 서버를 완전히 종료했다가 다시 시작합니다. (python run.py)
