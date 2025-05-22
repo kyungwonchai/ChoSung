@@ -1,245 +1,305 @@
- 알겠습니다. 두 가지 문제를 해결해 드리겠습니다.
-
-routes_user.py 최종 코드 제공 (pymssql 직접 사용 방식)
-달력 예외 추가 시 "specified as_dict=True and there are columns with no names:[0]" 오류 해결
-1. app/routes_admin.py의 달력 예외 추가 오류 수정
-오류 메시지 "specified as_dict=True and there are columns with no names:[0]"는 pymssql 커서가 결과를 딕셔너리 형태로 반환하도록 as_dict=True로 설정되어 있을 때, SQL 쿼리 결과의 특정 컬럼에 이름이 제대로 부여되지 않아 발생하는 문제입니다.
-
-manage_calendar_exceptions 함수의 POST (예외 추가) 로직 중 날짜 중복 확인 쿼리 부분을 수정해야 합니다.
-
-수정 대상: app/routes_admin.py 파일의 manage_calendar_exceptions 함수 내 POST 처리 부분
-
-기존 코드:
-
-Python
-
-                # 날짜 중복 확인 (PK 위반 방지)
-                cursor.execute("SELECT 1 FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (exception_date_val.strftime('%Y-%m-%d'),))
-                if cursor.fetchone():
-                    flash(f"오류: 날짜 {exception_date_val.strftime('%Y-%m-%d')} 에 대한 예외가 이미 존재합니다.", 'error')
-수정 후 코드 (컬럼에 별칭 부여):
-
-Python
-
-                # 날짜 중복 확인 (PK 위반 방지)
-                cursor.execute("SELECT 1 AS existing_check FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (exception_date_val.strftime('%Y-%m-%d'),))
-                if cursor.fetchone(): # 결과가 있다면 existing_check 키가 있는 딕셔너리가 반환됨
-                    flash(f"오류: 날짜 {exception_date_val.strftime('%Y-%m-%d')} 에 대한 예외가 이미 존재합니다. 삭제 후 다시 추가하거나 수정 기능을 이용하세요.", 'error')
-이유: SELECT 1과 같이 상수 값을 선택하면 결과 컬럼에 이름이 자동으로 부여되지 않을 수 있습니다. SELECT 1 AS existing_check와 같이 명시적으로 컬럼 별칭(alias)을 지정하면 pymssql이 딕셔너리 키로 사용할 수 있게 되어 오류가 해결됩니다.
-
-이 수정 사항이 반영된 routes_admin.py 전체 코드는 이전 답변(#49)을 참고하여 해당 부분만 수정해 주시면 됩니다. 만약 전체 파일이 다시 필요하시면 요청해주세요.
-
-2. 최종: app/routes_user.py (전체 코드, pymssql 직접 사용)
-사용자 제어판 관련 라우트입니다. PC 목록 조회 부분을 pymssql 직접 호출 방식으로 수정하고, 명령 전송 로직은 이전과 동일하게 socket_client.py를 사용합니다.
-
-Python
-
-# scontrol_flask_web/app/routes_user.py
-from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, g
-from app.db_utils import get_db_connection # pymssql 연결 유틸리티
-from app.auth import ip_auth_required
-from app.socket_client import send_command_to_agent
-import json
-import uuid
-from datetime import datetime as dt_datetime, timezone # dt_datetime으로 별칭 사용
+# scontrol_flask_web/app/routes_admin.py
+from flask import Blueprint, render_template, redirect, url_for, flash, request, current_app, g
+from app.db_utils import get_db_connection
+from app.forms import TargetPCForm, AllowedUserIPForm, AdminIPForm, WorkCalendarExceptionForm
+from app.auth import ip_auth_required, get_current_user_role
 import math
+import pymssql
+from datetime import datetime as dt_datetime, date, timedelta 
+import calendar 
+import holidays 
 
-user_bp = Blueprint('user', __name__)
+admin_bp = Blueprint('admin', __name__)
 
-@user_bp.route('/control_panel')
-@ip_auth_required('user') # 관리자 또는 허용된 사용자만 접근 가능
-def control_panel():
-    page = request.args.get('page', 1, type=int)
-    per_page = 20 
-    offset = (page - 1) * per_page
-    pcs_on_current_page = []
-    total_pcs = 0
+def _get_pagination_data(query_count, query_data, page, per_page, params_count=None, params_data=None):
+    total_items = 0; items_on_page = []
     conn = None
-    # 페이지네이션 데이터 기본값 초기화
-    pagination_data = {
-        'page': page, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 
-        'items': [], 'has_prev': False, 'has_next': False, 
-        'prev_num': 1, 'next_num': 1
-    }
-
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            # 총 PC 개수 조회
-            cursor.execute("SELECT COUNT(*) AS total FROM dbo.target_pcs")
-            total_pcs_result = cursor.fetchone()
-            if total_pcs_result:
-                total_pcs = total_pcs_result.get('total', 0) # .get()으로 안전하게 접근
-            
-            if total_pcs > 0:
-                # 현재 페이지 PC 목록 조회 (MSSQL OFFSET FETCH 사용)
-                query_data = """
-                    SELECT id, pc_name, address1, address2, description 
-                    FROM dbo.target_pcs 
-                    ORDER BY pc_name 
-                    OFFSET %s ROWS FETCH NEXT %s ROWS ONLY
-                """
-                cursor.execute(query_data, (offset, per_page))
-                pcs_on_current_page = cursor.fetchall() # as_dict=True 이므로 딕셔너리 리스트
-            
-            total_pages = math.ceil(total_pcs / per_page) if total_pcs > 0 else 1
-            pagination_data.update({
-                'total_items': total_pcs, 
-                'total_pages': total_pages, 
-                'items': pcs_on_current_page, 
-                'has_prev': page > 1, 
-                'has_next': page < total_pages,
-                'prev_num': page - 1 if page > 1 else 1,
-                'next_num': page + 1 if page < total_pages else total_pages
-            })
-
+            cursor.execute(query_count, params_count or ())
+            count_result = cursor.fetchone()
+            if count_result: total_items = count_result.get('total', 0)
+            if total_items > 0:
+                offset = (page - 1) * per_page
+                final_params_data = (params_data or ()) + (offset, per_page)
+                cursor.execute(query_data, final_params_data)
+                items_on_page = cursor.fetchall()
+            else: items_on_page = []
     except Exception as e:
-        current_app.logger.error(f"제어판 PC 목록 조회 오류: {e}", exc_info=True)
-        flash("PC 목록을 불러오는 중 오류가 발생했습니다. DB 연결을 확인하세요.", "error")
-        # 오류 발생 시 pcs_on_current_page는 빈 리스트, total_pcs는 0으로 유지됨
-        
-    title = "원격 제어판"
-    if g.current_user_role == 'admin': # g 객체는 auth.py의 컨텍스트 프로세서에 의해 설정됨
-        title = "원격 제어판 (관리자 모드)"
-        
-    return render_template('user/control_panel.html', 
-                           pcs=pcs_on_current_page, # pagination_data['items']와 동일
-                           pagination=pagination_data, 
-                           title=title)
+        current_app.logger.error(f"페이지네이션 데이터 조회 오류: {e}", exc_info=True)
+        flash("데이터 로드 중 오류.", "error")
+        return {'page': 1, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 'items': [], 'has_prev': False, 'has_next': False, 'prev_num': 1, 'next_num': 1}
+    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 1
+    return {'page': page, 'per_page': per_page, 'total_items': total_items, 'total_pages': total_pages, 'items': items_on_page, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_num': page - 1, 'next_num': page + 1}
 
-@user_bp.route('/send_batch_command', methods=['POST'])
-@ip_auth_required('user')
-def send_batch_command():
-    selected_pc_ids_str = request.form.getlist('selected_pcs')
-    command_action_str = request.form.get('command_action')
+@admin_bp.route('/pcs')
+@ip_auth_required('admin')
+def manage_target_pcs():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.target_pcs"; q_data = "SELECT id, pc_name, address1, address2, description, created_at, last_modified FROM dbo.target_pcs ORDER BY pc_name OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_target_pcs.html', pcs=pagination['items'], pagination=pagination, title="대상 PC 관리")
 
-    if not selected_pc_ids_str:
-        flash("제어할 PC를 하나 이상 선택해주세요.", 'warning')
-        return redirect(url_for('user.control_panel'))
-    if not command_action_str or command_action_str not in ["켜기", "끄기"]:
-        flash("수행할 명령(켜기/끄기)이 올바르게 지정되지 않았습니다.", 'warning')
-        return redirect(url_for('user.control_panel'))
+@admin_bp.route('/pcs/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_target_pc():
+    form = TargetPCForm()
+    if form.validate_on_submit():
+        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None; conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: sql = "INSERT INTO dbo.target_pcs (pc_name, address1, address2, description) VALUES (%s, %s, %s, %s)"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data))
+            conn.commit(); flash(f"PC '{form.pc_name.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add TargetPC IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"PC 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add TargetPC Err: {e}", exc_info=True)
+    return render_template('admin/edit_target_pc.html', form=form, title="새 PC 추가")
 
-    selected_pc_ids = [int(id_str) for id_str in selected_pc_ids_str]
+@admin_bp.route('/pcs/edit/<int:pc_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_target_pc(pc_id):
+    conn = None; pc_data = None
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs WHERE id = %d", (pc_id,)); pc_data = cursor.fetchone()
+    except Exception as e: flash("PC 정보 로드 오류.", "error"); current_app.logger.error(f"Edit PC (GET) ID {pc_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_target_pcs'))
+    if not pc_data: flash(f"PC ID {pc_id} 없음.", "error"); return redirect(url_for('admin.manage_target_pcs'))
+    form = TargetPCForm(data=pc_data) if request.method == 'GET' else TargetPCForm()
+    if form.validate_on_submit():
+        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.target_pcs SET pc_name = %s, address1 = %s, address2 = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data, pc_id))
+            conn.commit(); flash(f"PC '{form.pc_name.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit PC ID {pc_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"PC 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit PC ID {pc_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_target_pc.html', form=form, title=f"PC 정보 수정: {pc_data['pc_name']}", pc=pc_data)
+
+@admin_bp.route('/pcs/delete/<int:pc_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_target_pc(pc_id):
+    conn = None; pc_name = f"ID {pc_id}"
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT pc_name FROM dbo.target_pcs WHERE id = %d", (pc_id,)); data = cursor.fetchone(); 
+        if data: pc_name = data['pc_name']; cursor.execute("DELETE FROM dbo.target_pcs WHERE id = %d", (pc_id,)); conn.commit(); flash(f"PC '{pc_name}' 삭제 성공.", 'success')
+        else: flash(f"삭제할 PC ID {pc_id} 없음.", 'warning')
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"PC 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete PC ID {pc_id} Err: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_target_pcs'))
+
+@admin_bp.route('/users')
+@ip_auth_required('admin')
+def manage_user_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.allowed_user_ips"; q_data = "SELECT u.id, u.ip_address, u.description, u.created_at, a.ip_address AS admin_ip FROM dbo.allowed_user_ips u LEFT JOIN dbo.admin_ips a ON u.added_by_admin_id = a.id ORDER BY u.ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_user_ips.html', user_ips=pagination['items'], pagination=pagination, title="허용 사용자 IP 관리")
+
+@admin_bp.route('/users/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_user_ip():
+    form = AllowedUserIPForm()
+    if form.validate_on_submit():
+        admin_id = None; conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s", (g.user_ip,)); admin_rec = cursor.fetchone(); 
+            if admin_rec: admin_id = admin_rec['id']; sql = "INSERT INTO dbo.allowed_user_ips (ip_address, description, added_by_admin_id) VALUES (%s, %s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data, admin_id))
+            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add UserIP IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"사용자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add UserIP Err: {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title="새 사용자 IP 추가")
+
+@admin_bp.route('/users/edit/<int:user_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_user_ip(user_ip_id):
+    conn = None; user_ip_data = None
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description, added_by_admin_id FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,)); user_ip_data = cursor.fetchone()
+    except Exception as e: flash("사용자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit UserIP (GET) ID {user_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_user_ips'))
+    if not user_ip_data: flash(f"사용자 IP ID {user_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_user_ips'))
+    form = AllowedUserIPForm(data=user_ip_data) if request.method == 'GET' else AllowedUserIPForm()
+    if form.validate_on_submit():
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.allowed_user_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.ip_address.data, form.description.data, user_ip_id))
+            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"사용자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title=f"사용자 IP 수정: {user_ip_data['ip_address']}", user_ip_obj=user_ip_data)
+
+@admin_bp.route('/users/delete/<int:user_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_user_ip(user_ip_id):
+    conn = None; ip_addr = f"ID {user_ip_id}"
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT ip_address FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,)); data = cursor.fetchone();
+        if data: ip_addr = data['ip_address']; cursor.execute("DELETE FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,)); conn.commit(); flash(f"사용자 IP '{ip_addr}' 삭제 성공.", 'success')
+        else: flash(f"삭제할 사용자 IP ID {user_ip_id} 없음.", 'warning')
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"사용자 IP 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete UserIP ID {user_ip_id} Err: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_user_ips'))
+
+@admin_bp.route('/admins')
+@ip_auth_required('admin')
+def manage_admin_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.admin_ips"; q_data = "SELECT id, ip_address, description, created_at FROM dbo.admin_ips ORDER BY ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_admin_ips.html', admin_ips=pagination['items'], pagination=pagination, title="관리자 IP 관리")
+
+@admin_bp.route('/admins/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_admin_ip():
+    form = AdminIPForm()
+    if form.validate_on_submit():
+        conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: sql = "INSERT INTO dbo.admin_ips (ip_address, description) VALUES (%s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data))
+            conn.commit(); flash(f"관리자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add AdminIP IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"관리자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add AdminIP Err: {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title="새 관리자 IP 추가")
+
+@admin_bp.route('/admins/edit/<int:admin_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_admin_ip(admin_ip_id):
+    conn = None; admin_ip_data = None; original_ip = ""
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
+        if admin_ip_data: original_ip = admin_ip_data['ip_address']
+    except Exception as e: flash("관리자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit AdminIP (GET) ID {admin_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_admin_ips'))
+    if not admin_ip_data: flash(f"관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+    form = AdminIPForm(data=admin_ip_data) if request.method == 'GET' else AdminIPForm()
+    if form.validate_on_submit():
+        new_ip = form.ip_address.data
+        if original_ip != new_ip:
+            if original_ip == g.user_ip: flash("자신의 현재 접속 IP는 변경할 수 없습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+            try:
+                if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+                with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s AND id != %d", (new_ip, admin_ip_id))
+                if cursor.fetchone(): flash(f"IP '{new_ip}'는 이미 다른 관리자 항목에 있습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+            except Exception as e: flash(f"IP 중복 확인 중 오류: {e}", "error"); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.admin_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (new_ip, form.description.data, admin_ip_id))
+            conn.commit(); flash(f"관리자 IP '{new_ip}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{new_ip}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"관리자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+
+@admin_bp.route('/admins/delete/<int:admin_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_admin_ip(admin_ip_id):
+    conn = None; ip_addr_deleted = f"ID {admin_ip_id}"; total_admins = 0
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ip_address FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
+            if not admin_ip_data: flash(f"삭제할 관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+            ip_addr_deleted = admin_ip_data['ip_address']
+            if ip_addr_deleted == g.user_ip: flash("자신의 현재 접속 IP는 삭제할 수 없습니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.admin_ips"); count_res = cursor.fetchone(); total_admins = count_res['total'] if count_res else 0
+            if total_admins <= 1: flash("최소 1개의 관리자 IP는 남아 있어야 합니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
+            cursor.execute("UPDATE dbo.allowed_user_ips SET added_by_admin_id = NULL WHERE added_by_admin_id = %d", (admin_ip_id,))
+            cursor.execute("DELETE FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,))
+        conn.commit(); flash(f"관리자 IP '{ip_addr_deleted}' 삭제 성공.", 'success')
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"관리자 IP 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_admin_ips'))
+
+# === 4. 근무일/비근무일 예외 관리 (달력 UI 적용) ===
+@admin_bp.route('/calendar_exceptions', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def manage_calendar_exceptions():
+    form = WorkCalendarExceptionForm(); conn = None
+    try: year = request.args.get('year', dt_datetime.now().year, type=int); month = request.args.get('month', dt_datetime.now().month, type=int)
+    except ValueError: year = dt_datetime.now().year; month = dt_datetime.now().month
+    if not (1 <= month <= 12): month = dt_datetime.now().month; year = dt_datetime.now().year
+    current_display_month_start_date = date(year, month, 1)
+    prev_month_date = current_display_month_start_date - timedelta(days=1); prev_month_params = {'year': prev_month_date.year, 'month': prev_month_date.month}
+    if month == 12: next_month_first_day = date(year + 1, 1, 1); else: next_month_first_day = date(year, month + 1, 1)
+    next_month_params = {'year': next_month_first_day.year, 'month': next_month_first_day.month}
+
+    if form.validate_on_submit():
+        date_val = form.exception_date.data; is_op_val = bool(int(form.is_operational.data))
+        desc_val = form.description.data if form.description.data and form.description.data.strip() else None
+        date_str_for_db = date_val.strftime('%Y-%m-%d')
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                # 수정: 컬럼에 별칭 부여
+                cursor.execute("SELECT 1 AS existing_check FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (date_str_for_db,))
+                if cursor.fetchone(): flash(f"날짜 {date_str_for_db} 예외 이미 존재.", 'error')
+                else: sql = "INSERT INTO dbo.work_calendar_exceptions (exception_date, is_operational, description) VALUES (%s, %s, %s)"; cursor.execute(sql, (date_str_for_db, is_op_val, desc_val)); conn.commit(); flash(f"날짜 {date_str_for_db} ({'가동일' if is_op_val else '비가동일'}) 예외 추가 성공.", 'success')
+            return redirect(url_for('admin.manage_calendar_exceptions', year=year, month=month))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); flash(f"DB 오류 (중복): {str(ie)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"예외 날짜 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx Err: {e}", exc_info=True)
     
-    timeout_minutes_for_command = 0 if command_action_str == "켜기" else 1
-    action_description_log = "디스플레이 항상 켜기 설정(타임아웃 0분)" if command_action_str == "켜기" else "디스플레이 1분 후 자동 꺼짐 설정"
-    payload_for_agent = {'TimeoutMinutes': timeout_minutes_for_command}
-
-    conn = None
-    target_pcs_to_control = []
+    cal = calendar.Calendar(firstweekday=6); month_days_raw = cal.monthdatescalendar(year, month)
+    kr_holidays = holidays.KR(years=year); db_user_exceptions = {}
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            if selected_pc_ids:
-                placeholders = ', '.join(['%s'] * len(selected_pc_ids)) # 올바른 플레이스홀더 사용
-                sql_select_pcs = f"SELECT id, pc_name, address1, address2 FROM dbo.target_pcs WHERE id IN ({placeholders})"
-                # pymssql은 %s 플레이스홀더에 대해 튜플 형태로 파라미터를 전달해야 함
-                cursor.execute(sql_select_pcs, tuple(selected_pc_ids))
-                target_pcs_to_control = cursor.fetchall()
+            first_day = date(year, month, 1); last_day = date(year, month, calendar.monthrange(year, month)[1])
+            sql_exc = "SELECT exception_date, is_operational, description FROM dbo.work_calendar_exceptions WHERE exception_date BETWEEN %s AND %s"
+            cursor.execute(sql_exc, (first_day.strftime('%Y-%m-%d'), last_day.strftime('%Y-%m-%d')))
+            for row in cursor.fetchall():
+                exc_date = row['exception_date']; 
+                if isinstance(exc_date, dt_datetime): exc_date = exc_date.date()
+                db_user_exceptions[exc_date] = {'is_operational': bool(row['is_operational']), 'description': row['description']}
+    except Exception as e: flash("달력 예외 정보 로드 오류.", "error"); current_app.logger.error(f"Fetch CalendarEx for {year}-{month} Err: {e}", exc_info=True)
+
+    calendar_display_data = []
+    for week_of_dates in month_days_raw:
+        week_data = [];
+        for day_date_obj in week_of_dates:
+            day_info = {'date_obj': day_date_obj, 'day_num': day_date_obj.day, 'is_today': (day_date_obj == date.today()), 'is_current_month': (day_date_obj.month == month), 'status_class': '', 'status_text': '', 'description': '', 'is_operational_final': None }
+            if day_info['is_current_month']:
+                user_exc = db_user_exceptions.get(day_date_obj); holiday_name = kr_holidays.get(day_date_obj)
+                if user_exc: day_info.update({'is_operational_final': user_exc['is_operational'], 'status_class': 'user-op' if user_exc['is_operational'] else 'user-non-op', 'status_text': '★가동(지정)' if user_exc['is_operational'] else '★비가동(지정)', 'description': user_exc['description'] if user_exc['description'] else ('사용자 지정 가동일' if user_exc['is_operational'] else '사용자 지정 비가동일')})
+                elif holiday_name: day_info.update({'is_operational_final': False, 'status_class': 'public-holiday', 'status_text': '공휴일(비가동)', 'description': holiday_name})
+                elif day_date_obj.weekday() >= 5: day_info.update({'is_operational_final': False, 'status_class': 'weekend-sat' if day_date_obj.weekday() == 5 else 'weekend-sun', 'status_text': '주말(비가동)'})
+                else: day_info.update({'is_operational_final': True, 'status_class': 'weekday-op', 'status_text': '평일(가동)'})
+            else: day_info['status_class'] = 'other-month'
+            week_data.append(day_info)
+        calendar_display_data.append(week_data)
+    
+    return render_template('admin/manage_calendar_exceptions.html', title="근무일/비근무일 예외 관리", form=form, 
+                           calendar_weeks=calendar_display_data, current_year=year, current_month=month,
+                           prev_month_params=prev_month_params, next_month_params=next_month_params)
+
+@admin_bp.route('/calendar_exceptions/delete/<string:date_str>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_calendar_exception(date_str):
+    conn = None; year_to_redirect = dt_datetime.now().year; month_to_redirect = dt_datetime.now().month
+    try:
+        date_obj = dt_datetime.strptime(date_str, '%Y-%m-%d').date()
+        year_to_redirect = date_obj.year; month_to_redirect = date_obj.month
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            sql = "DELETE FROM dbo.work_calendar_exceptions WHERE exception_date = %s"; cursor.execute(sql, (date_obj.strftime('%Y-%m-%d'),)); rows_deleted = cursor.rowcount
+        conn.commit()
+        if rows_deleted > 0: flash(f"날짜 {date_str} 예외 삭제 성공.", 'success')
+        else: flash(f"날짜 {date_str} 예외 없음.", 'warning')
+    except ValueError: flash(f"잘못된 날짜 형식: {date_str}", 'error'); current_app.logger.warning(f"Invalid date for delete: {date_str}")
     except Exception as e:
-        current_app.logger.error(f"명령 대상 PC 정보 조회 오류: {e}", exc_info=True)
-        flash("명령 대상 PC 정보를 DB에서 조회하는 중 오류가 발생했습니다.", "error")
-        return redirect(url_for('user.control_panel'))
-
-    if not target_pcs_to_control:
-        flash("선택된 PC 정보를 찾을 수 없습니다.", "warning")
-        return redirect(url_for('user.control_panel'))
-
-    for pc_data in target_pcs_to_control: # pc_data는 딕셔너리
-        command_packet_to_send = {
-            'PacketId': str(uuid.uuid4()),
-            'TimestampUtc': dt_datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-            'CommandName': "SET_DISPLAY_TIMEOUT", 
-            'PayloadJson': json.dumps(payload_for_agent),
-            'ResponseAddress': None, 'ResponsePort': None
-        }
-        target_ip_for_command_send = ""
-        # pc_data가 딕셔너리이므로 .get() 사용 또는 키 존재 확인
-        is_relay = bool(pc_data.get('address2') and pc_data.get('address2','').strip())
-
-        if is_relay:
-            command_packet_to_send['Instruction'] = "RelayToTarget"
-            command_packet_to_send['FinalTargetIpForRelayedCommand'] = pc_data.get('address2')
-            command_packet_to_send['FinalTargetPortForRelayedCommand'] = 4026
-            target_ip_for_command_send = pc_data.get('address1')
-        else:
-            command_packet_to_send['Instruction'] = "DirectExecute"
-            target_ip_for_command_send = pc_data.get('address1')
-        
-        log_msg_prefix = f"PC '{pc_data.get('pc_name', 'N/A')}' ({target_ip_for_command_send})"
-        flash(f"{log_msg_prefix}에 '{action_description_log}' 명령 전송 시도...", 'info')
-        current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_description_log}, PktID: {command_packet_to_send['PacketId']}")
-        
-        agent_response = send_command_to_agent(target_ip_for_command_send, command_packet_to_send)
-        
-        _process_agent_response(agent_response, log_msg_prefix, action_description_log) # 헬퍼 함수 사용
-
-        # "켜기" 명령일 때 추가로 MonitorControl (On) 명령 전송
-        if command_action_str == "켜기":
-            action_desc_monitor_on = "모니터 즉시 켜기"
-            payload_monitor_on = {'Action': -1} # MonitorAction.On
-            
-            packet_monitor_on = {
-                'PacketId': str(uuid.uuid4()), 
-                'TimestampUtc': dt_datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-                'CommandName': "MONITOR_CONTROL", 'PayloadJson': json.dumps(payload_monitor_on),
-                'ResponseAddress': None, 'ResponsePort': None,
-                'Instruction': command_packet_to_send['Instruction'], # 이전 Instruction 유지
-                'FinalTargetIpForRelayedCommand': command_packet_to_send.get('FinalTargetIpForRelayedCommand'),
-                'FinalTargetPortForRelayedCommand': command_packet_to_send.get('FinalTargetPortForRelayedCommand')
-            }
-            flash(f"{log_msg_prefix}에 '{action_desc_monitor_on}' 명령 추가 전송 시도...", 'info')
-            current_app.logger.info(f"{log_msg_prefix} - 명령 전송: {action_desc_monitor_on}, PktID: {packet_monitor_on['PacketId']}")
-            agent_response_monitor_on = send_command_to_agent(target_ip_for_command_send, packet_monitor_on)
-            _process_agent_response(agent_response_monitor_on, log_msg_prefix, action_desc_monitor_on)
-
-
-    return redirect(url_for('user.control_panel'))
-
-def _process_agent_response(agent_response, log_prefix, command_description):
-    """에이전트 응답을 처리하고 flash 메시지와 로그를 남기는 헬퍼 함수"""
-    if agent_response.get('success'):
-        raw_resp_packet = agent_response.get('raw_response')
-        if raw_resp_packet and isinstance(raw_resp_packet, dict) and 'PayloadJson' in raw_resp_packet:
-            payload_json_str = raw_resp_packet.get('PayloadJson')
-            current_app.logger.info(f"{log_prefix} - '{command_description}' 응답 PayloadJson: >>>{payload_json_str}<<<")
-            if payload_json_str is not None:
-                try:
-                    resp_payload = json.loads(payload_json_str) 
-                    if resp_payload.get('Success'):
-                        flash(f"{log_prefix} ({command_description}): 성공 - {resp_payload.get('Message', 'OK')}", 'success')
-                        current_app.logger.info(f"{log_prefix} ({command_description}) - 성공: {resp_payload.get('Message')}")
-                    else:
-                        flash(f"{log_prefix} ({command_description}): 실패 (에이전트) - {resp_payload.get('Message', 'Agent error')}", 'error')
-                        current_app.logger.error(f"{log_prefix} ({command_description}) - 에이전트 실패: {resp_payload.get('Message')}")
-                except json.JSONDecodeError as je:
-                    flash(f"{log_prefix} ({command_description}): 응답 페이로드 JSON 형식 오류 - {je.msg}", 'error')
-                    current_app.logger.error(f"{log_prefix} ({command_description}) - PayloadJson 파싱 오류: {je.msg}. 원본: {payload_json_str}", exc_info=True)
-                except Exception as e:
-                    flash(f"{log_prefix} ({command_description}): 응답 페이로드 처리 중 알 수 없는 오류 - {e}", 'error')
-                    current_app.logger.error(f"{log_prefix} ({command_description}) - PayloadJson 처리 중 알 수 없는 오류: {e}. 원본: {payload_json_str}", exc_info=True)
-            else:
-                flash(f"{log_prefix} ({command_description}): 전송 성공 (에이전트 페이로드 없음)", 'warning')
-                current_app.logger.warning(f"{log_prefix} ({command_description}) - 전송 성공, 페이로드 없음. RawPkt: {raw_resp_packet}")
-        else:
-            flash(f"{log_prefix} ({command_description}): 전송 성공 (에이전트 상세 응답 확인 불가)", 'warning')
-            current_app.logger.warning(f"{log_prefix} ({command_description}) - 전송 성공, 상세 응답/페이로드 없음. RawPkt: {raw_resp_packet}")
-    else:
-        flash(f"{log_prefix} ({command_description}): 전송 실패 - {agent_response.get('message', 'Unknown socket error')}", 'error')
-        current_app.logger.error(f"{log_prefix} ({command_description}) - 전송 실패: {agent_response.get('message')}")
-
-app/routes_user.py 주요 변경 사항:
-
-control_panel() 함수:
-PC 목록 조회 시 pymssql을 사용하도록 수정했습니다.
-페이지네이션 관련 변수(total_pcs_result, pcs_on_current_page)가 None일 경우를 대비한 안전장치를 추가했습니다.
-pagination_data 딕셔너리를 사용하여 페이지네이션 정보를 템플릿에 전달합니다. (이전 _get_pagination_data 유틸리티 함수와 유사한 정보를 직접 생성)
-send_batch_command() 함수:
-선택된 PC들의 정보를 DB에서 조회하는 부분을 pymssql 직접 호출로 변경했습니다. IN (...) 절에 파라미터를 전달하기 위해 플레이스홀더 문자열을 동적으로 생성하고 tuple(selected_pc_ids)를 사용합니다.
-pc_data가 딕셔너리이므로 pc_data.get('address2', '').strip() 와 같이 .get()을 사용하여 안전하게 필드에 접근하도록 수정했습니다.
-"켜기" 명령 시, SetDisplayTimeout 명령 전송 후 추가로 MonitorControl (On) 명령을 전송하는 로직은 그대로 유지됩니다.
-_process_agent_response 헬퍼 함수: 이전 답변에서 추가된 이 함수는 변경 없이 그대로 사용됩니다.
-위 수정된 app/routes_user.py 파일을 프로젝트에 적용해 주십시오. 이로써 Flask 애플리케이션의 사용자 제어판 기능도 pymssql을 직접 사용하여 데이터베이스와 상호작용하도록 변경되었습니다.
-
-이제 Flask 애플리케이션의 모든 주요 Python 파일들(config.py, app/__init__.py, app/db_utils.py, app/auth.py, app/routes_admin.py, app/routes_user.py, app/socket_client.py)이 pymssql 직접 사용 방식에 맞게 수정된 상태입니다.
