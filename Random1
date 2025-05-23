@@ -1,370 +1,533 @@
-, "PC 관리" 페이지에서 삭제 동작이 제대로 반영되지 않고 행이 그대로 남아있는 문제를 해결해 드리겠습니다. 다른 삭제 기능들도 유사한 문제가 있을 수 있으므로 함께 점검하겠습니다.
+네, 이해했습니다. 모니터가 잠금 화면 등으로 꺼진 상태에서 "모니터 켜기" 명령을 보냈을 때, SC_MONITORPOWER만으로는 화면이 지속적으로 켜지지 않는 문제를 해결하기 위해, SendInput API를 사용하여 마우스를 아주 미세하게 움직여서 시스템에 실제 사용자 활동이 있는 것처럼 인식시켜 모니터를 확실하게 깨우는 기능을 추가하겠습니다.
 
-이 문제는 주로 다음 이유 중 하나로 발생할 수 있습니다:
+다음 두 개의 C# 파일을 수정해야 합니다:
 
-데이터베이스에서 실제로 DELETE 명령이 성공하지 않았거나 실행되지 않았음.
-DELETE 명령은 성공했으나, 데이터베이스 트랜잭션이 commit 되지 않아 변경사항이 반영되지 않음.
-삭제 후 페이지를 다시 로드할 때, 변경 전의 데이터가 어떤 이유로든 다시 표시됨 (캐시 문제 등 - 가능성 낮음).
-가장 가능성이 높은 것은 1번 또는 2번입니다. pymssql 사용 시 cursor.execute()로 DELETE를 실행한 후, 반드시 conn.commit()을 호출해야 변경사항이 데이터베이스에 영구적으로 저장됩니다. 오류 발생 시에는 conn.rollback()을 호출해야 합니다. 또한, 실제로 몇 개의 행이 삭제되었는지 확인하는 것도 중요합니다.
+SControl.Common/LocalDeviceControl.cs (수정): SendInput P/Invoke 선언 및 관련 구조체를 추가하고, 마우스 미세 이동을 위한 새로운 메서드를 만듭니다.
+SAgentM.App/Services/AgentCoreService.cs (수정): MonitorControl 명령으로 "모니터 켜기"(MonitorAction.On)가 요청되었을 때, 기존의 SetMonitorState(MonitorAction.On) 호출 이후에 새로 추가된 마우스 이동 시뮬레이션 메서드를 호출합니다.
+1. 수정: SControl.Common/LocalDeviceControl.cs (전체 파일)
+SendInput 관련 P/Invoke 코드와 SimulateSmallMouseMovement() 메서드를 추가합니다.
 
-아래는 app/routes_admin.py 파일의 전체 수정된 코드입니다. 모든 delete_... 함수들을 좀 더 명확하고 안정적으로 수정했습니다.
+C#
 
-삭제 대상이 실제로 존재하는지 먼저 확인합니다.
-cursor.rowcount를 (참고용으로) 확인하여 실제로 행이 삭제되었는지 파악하려고 시도합니다 (단, pymssql에서 DELETE 후 rowcount 동작은 상황에 따라 다를 수 있어, 예외 발생 유무와 SELECT를 통한 재확인이 더 확실할 수 있습니다. 여기서는 예외가 없다면 삭제된 것으로 간주하고 진행합니다).
-commit과 rollback을 명확히 사용합니다.
-최종 수정: app/routes_admin.py (삭제 로직 강화, 전체 코드)
-Python
+// SControl.Common/LocalDeviceControl.cs
+using System;
+using System.Runtime.InteropServices;
+using System.ComponentModel; // Win32Exception 클래스 사용
+using System.Threading;     // Thread.Sleep 사용
 
-# scontrol_flask_web/app/routes_admin.py
-from flask import Blueprint, render_template, redirect, url_for, flash, request, current_app, g
-from app.db_utils import get_db_connection
-from app.forms import TargetPCForm, AllowedUserIPForm, AdminIPForm, WorkCalendarExceptionForm
-from app.auth import ip_auth_required, get_current_user_role
-import math
-import pymssql
-from datetime import datetime as dt_datetime, date, timedelta 
-import calendar 
-import holidays 
+namespace SControl.Common
+{
+    public static class LocalDeviceControl
+    {
+        // --- 기존 모니터 전원 제어 관련 코드 ---
+        private const int HWND_BROADCAST = 0xFFFF;   
+        private const uint WM_SYSCOMMAND = 0x0112;   
+        private const uint SC_MONITORPOWER = 0xF170; 
 
-admin_bp = Blueprint('admin', __name__)
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, IntPtr Msg, UIntPtr wParam, IntPtr lParam,
+            SendMessageTimeoutFlags fuFlags, uint uTimeout, out UIntPtr lpdwResult);
 
-def _get_pagination_data(query_count, query_data, page, per_page, params_count=None, params_data=None):
-    total_items = 0; items_on_page = []
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(query_count, params_count or ())
-            count_result = cursor.fetchone()
-            if count_result: total_items = count_result.get('total', 0)
-            if total_items > 0:
-                offset = (page - 1) * per_page
-                final_params_data = (params_data or ()) + (offset, per_page)
-                cursor.execute(query_data, final_params_data)
-                items_on_page = cursor.fetchall()
-            else: items_on_page = []
-    except Exception as e:
-        current_app.logger.error(f"페이지네이션 데이터 조회 오류: {e}", exc_info=True)
-        flash("데이터 로드 중 오류.", "error")
-        return {'page': 1, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 'items': [], 'has_prev': False, 'has_next': False, 'prev_num': 1, 'next_num': 1}
-    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 1
-    return {'page': page, 'per_page': per_page, 'total_items': total_items, 'total_pages': total_pages, 'items': items_on_page, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_num': page - 1, 'next_num': page + 1}
+        [Flags]
+        private enum SendMessageTimeoutFlags : uint
+        {
+            SMTO_NORMAL = 0x0, SMTO_BLOCK = 0x1, SMTO_ABORTIFHUNG = 0x2,
+            SMTO_NOTIMEOUTIFNOTHUNG = 0x8, SMTO_ERRORONEXIT = 0x20
+        }
 
-# === 1. 대상 PC 관리 ===
-@admin_bp.route('/pcs')
-@ip_auth_required('admin')
-def manage_target_pcs():
-    page = request.args.get('page', 1, type=int); per_page = 10
-    q_count = "SELECT COUNT(*) AS total FROM dbo.target_pcs"; q_data = "SELECT id, pc_name, address1, address2, description, created_at, last_modified FROM dbo.target_pcs ORDER BY pc_name OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
-    pagination = _get_pagination_data(q_count, q_data, page, per_page)
-    return render_template('admin/manage_target_pcs.html', pcs=pagination['items'], pagination=pagination, title="대상 PC 관리")
+        public static void SetMonitorState(MonitorAction action)
+        {
+            if (!Enum.IsDefined(typeof(MonitorAction), action))
+            {
+                throw new ArgumentOutOfRangeException(nameof(action), "유효하지 않은 MonitorAction 값입니다.");
+            }
+            IntPtr lParam = (IntPtr)action;
+            UIntPtr commandResultPlaceholder;
+            IntPtr apiCallResult = SendMessageTimeout(
+                (IntPtr)HWND_BROADCAST, (uint)WM_SYSCOMMAND, (UIntPtr)SC_MONITORPOWER, lParam,
+                SendMessageTimeoutFlags.SMTO_NORMAL | SendMessageTimeoutFlags.SMTO_ABORTIFHUNG | SendMessageTimeoutFlags.SMTO_ERRORONEXIT,
+                1000, out commandResultPlaceholder);
 
-@admin_bp.route('/pcs/add', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def add_target_pc():
-    form = TargetPCForm()
-    if form.validate_on_submit():
-        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None; conn = None
-        try:
-            conn = get_db_connection();
-            with conn.cursor() as cursor: sql = "INSERT INTO dbo.target_pcs (pc_name, address1, address2, description) VALUES (%s, %s, %s, %s)"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data))
-            conn.commit(); flash(f"PC '{form.pc_name.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add TargetPC IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"PC 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add TargetPC Err: {e}", exc_info=True)
-    return render_template('admin/edit_target_pc.html', form=form, title="새 PC 추가")
+            if (apiCallResult == IntPtr.Zero) 
+            {
+                int errorCode = Marshal.GetLastWin32Error();
+                if (errorCode != 0) 
+                {
+                    throw new Win32Exception(errorCode, $"모니터 상태 변경 실패 (요청 동작: {action}). Win32 오류 코드: {errorCode}");
+                }
+            }
+        }
 
-@admin_bp.route('/pcs/edit/<int:pc_id>', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def edit_target_pc(pc_id):
-    conn = None; pc_data = None
-    try:
-        conn = get_db_connection();
-        with conn.cursor() as cursor: cursor.execute("SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs WHERE id = %d", (pc_id,)); pc_data = cursor.fetchone()
-    except Exception as e: flash("PC 정보 로드 오류.", "error"); current_app.logger.error(f"Edit PC (GET) ID {pc_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_target_pcs'))
-    if not pc_data: flash(f"PC ID {pc_id} 없음.", "error"); return redirect(url_for('admin.manage_target_pcs'))
-    form = TargetPCForm(data=pc_data) if request.method == 'GET' else TargetPCForm()
-    if form.validate_on_submit():
-        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None
-        try:
-            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
-            with conn.cursor() as cursor: sql = "UPDATE dbo.target_pcs SET pc_name = %s, address1 = %s, address2 = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data, pc_id))
-            conn.commit(); flash(f"PC '{form.pc_name.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit PC ID {pc_id} IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"PC 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit PC ID {pc_id} Err: {e}", exc_info=True)
-    return render_template('admin/edit_target_pc.html', form=form, title=f"PC 정보 수정: {pc_data['pc_name']}", pc=pc_data)
+        // --- SendInput 관련 P/Invoke 선언 및 구조체 (신규 추가) ---
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
 
-@admin_bp.route('/pcs/delete/<int:pc_id>', methods=['POST'])
-@ip_auth_required('admin')
-def delete_target_pc(pc_id):
-    conn = None
-    pc_name_for_message = f"ID {pc_id}"
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT pc_name FROM dbo.target_pcs WHERE id = %d", (pc_id,))
-            pc_to_delete = cursor.fetchone()
-            if not pc_to_delete:
-                flash(f"삭제할 PC ID {pc_id}를 찾을 수 없습니다.", 'warning')
-                return redirect(url_for('admin.manage_target_pcs'))
-            pc_name_for_message = pc_to_delete['pc_name']
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HARDWAREINPUT
+        {
+            public uint uMsg;
+            public ushort wParamL;
+            public ushort wParamH;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct MOUSEKEYBDHARDWAREINPUT
+        {
+            [FieldOffset(0)]
+            public MOUSEINPUT mi;
+
+            [FieldOffset(0)]
+            public KEYBDINPUT ki;
+
+            [FieldOffset(0)]
+            public HARDWAREINPUT hi;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint type; // INPUT_MOUSE, INPUT_KEYBOARD, INPUT_HARDWARE
+            public MOUSEKEYBDHARDWAREINPUT mkhi; // union
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        private const uint INPUT_MOUSE = 0;
+        private const uint MOUSEEVENTF_MOVE = 0x0001;
+        // --- SendInput 관련 끝 ---
+
+
+        /// <summary>
+        /// 모니터를 깨우기 위해 마우스를 미세하게 움직이는 것을 시뮬레이션합니다.
+        /// (예: 오른쪽으로 1픽셀 이동 후 다시 왼쪽으로 1픽셀 이동)
+        /// </summary>
+        public static void SimulateSmallMouseMovement()
+        {
+            INPUT[] inputs = new INPUT[2];
+
+            // 첫 번째 움직임: 오른쪽으로 1픽셀
+            inputs[0] = new INPUT
+            {
+                type = INPUT_MOUSE,
+                mkhi = new MOUSEKEYBDHARDWAREINPUT
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dx = 1, // X 상대 이동량
+                        dy = 0, // Y 상대 이동량
+                        mouseData = 0,
+                        dwFlags = MOUSEEVENTF_MOVE, // 마우스 이동 이벤트
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
+                    }
+                }
+            };
+
+            // 두 번째 움직임: 왼쪽으로 1픽셀 (원위치)
+            inputs[1] = new INPUT
+            {
+                type = INPUT_MOUSE,
+                mkhi = new MOUSEKEYBDHARDWAREINPUT
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dx = -1, // X 상대 이동량
+                        dy = 0,  // Y 상대 이동량
+                        mouseData = 0,
+                        dwFlags = MOUSEEVENTF_MOVE,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
+                    }
+                }
+            };
             
-            # action_logs 테이블의 target_pc_id 외래키가 ON DELETE SET NULL 이므로, 연관된 로그는 유지됨
-            cursor.execute("DELETE FROM dbo.target_pcs WHERE id = %d", (pc_id,))
-            rows_affected = cursor.rowcount # pymssql에서 DELETE, UPDATE 후 rowcount는 보통 영향을 받은 행의 수
-            
-            if rows_affected > 0:
-                conn.commit()
-                flash(f"PC '{pc_name_for_message}' 정보가 성공적으로 삭제되었습니다.", 'success')
-                current_app.logger.info(f"TargetPC ID {pc_id} ('{pc_name_for_message}') 삭제 성공.")
-            else:
-                # 이 경우는 거의 발생하지 않아야 함 (위에서 존재 확인 후 삭제 시도)
-                conn.rollback() 
-                flash(f"PC '{pc_name_for_message}' 삭제에 실패했거나 이미 삭제된 항목입니다 (영향 받은 행 없음).", 'warning')
-                current_app.logger.warning(f"Delete TargetPC ID {pc_id} ('{pc_name_for_message}') affected 0 rows after existence check.")
-    except Exception as e:
-        if conn: conn.rollback()
-        flash(f"PC '{pc_name_for_message}' 삭제 중 오류 발생: {str(e)[:200]}", 'error')
-        current_app.logger.error(f"Error deleting TargetPC ID {pc_id}: {e}", exc_info=True)
-    return redirect(url_for('admin.manage_target_pcs'))
+            // SendInput 호출. 보통 2개의 INPUT 구조체를 보냄.
+            uint inputsSent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            if (inputsSent < inputs.Length)
+            {
+                // 모든 입력이 성공적으로 보내지지 않은 경우 오류 처리 (선택적)
+                // throw new Win32Exception(Marshal.GetLastWin32Error(), "SendInput API 호출 실패 또는 일부 실패.");
+                // 여기서는 간단히 예외를 던지지 않고 진행. 필요시 로깅.
+                Console.WriteLine($"SimulateSmallMouseMovement: SendInput sent {inputsSent} of {inputs.Length} inputs. LastError: {Marshal.GetLastWin32Error()}");
+            }
+             // 약간의 딜레이를 주어 시스템이 입력을 처리할 시간을 줄 수 있음 (선택적)
+            Thread.Sleep(50); 
+        }
+    }
+}
+LocalDeviceControl.cs 주요 변경 사항:
 
-# === 2. 허용된 사용자 IP 관리 ===
-@admin_bp.route('/users')
-@ip_auth_required('admin')
-def manage_user_ips():
-    page = request.args.get('page', 1, type=int); per_page = 10
-    q_count = "SELECT COUNT(*) AS total FROM dbo.allowed_user_ips"; q_data = "SELECT u.id, u.ip_address, u.description, u.created_at, a.ip_address AS admin_ip FROM dbo.allowed_user_ips u LEFT JOIN dbo.admin_ips a ON u.added_by_admin_id = a.id ORDER BY u.ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
-    pagination = _get_pagination_data(q_count, q_data, page, per_page)
-    return render_template('admin/manage_user_ips.html', user_ips=pagination['items'], pagination=pagination, title="허용 사용자 IP 관리")
+SendInput API 및 관련 구조체들(INPUT, MOUSEINPUT 등)과 상수들(INPUT_MOUSE, MOUSEEVENTF_MOVE)을 P/Invoke로 선언했습니다.
+SimulateSmallMouseMovement() 공개 static 메서드를 새로 추가했습니다. 이 메서드는 SendInput을 사용하여 마우스 커서를 오른쪽으로 1픽셀 이동시킨 후 즉시 다시 왼쪽으로 1픽셀 이동시켜, 실제 커서 위치는 거의 변하지 않지만 시스템에는 사용자 입력이 있었던 것으로 인식시킵니다.
+2. 수정: SAgentM.App/Services/AgentCoreService.cs (전체 파일)
+ExecuteDirectCommandAsync 메서드 내에서 CommandNames.MonitorControl 명령과 MonitorAction.On 액션을 처리할 때, LocalDeviceControl.SetMonitorState(MonitorAction.On) 호출 후에 LocalDeviceControl.SimulateSmallMouseMovement()를 호출하도록 수정합니다.
 
-@admin_bp.route('/users/add', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def add_user_ip():
-    form = AllowedUserIPForm()
-    if form.validate_on_submit():
-        admin_id = None; conn = None
-        try:
-            conn = get_db_connection();
-            with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s", (g.user_ip,)); admin_rec = cursor.fetchone(); 
-            if admin_rec: admin_id = admin_rec['id']; sql = "INSERT INTO dbo.allowed_user_ips (ip_address, description, added_by_admin_id) VALUES (%s, %s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data, admin_id))
-            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add UserIP IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"사용자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add UserIP Err: {e}", exc_info=True)
-    return render_template('admin/edit_user_ip.html', form=form, title="새 사용자 IP 추가")
+C#
 
-@admin_bp.route('/users/edit/<int:user_ip_id>', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def edit_user_ip(user_ip_id):
-    conn = None; user_ip_data = None
-    try:
-        conn = get_db_connection();
-        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description, added_by_admin_id FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,)); user_ip_data = cursor.fetchone()
-    except Exception as e: flash("사용자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit UserIP (GET) ID {user_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_user_ips'))
-    if not user_ip_data: flash(f"사용자 IP ID {user_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_user_ips'))
-    form = AllowedUserIPForm(data=user_ip_data) if request.method == 'GET' else AllowedUserIPForm()
-    if form.validate_on_submit():
-        try:
-            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
-            with conn.cursor() as cursor: sql = "UPDATE dbo.allowed_user_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.ip_address.data, form.description.data, user_ip_id))
-            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"사용자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} Err: {e}", exc_info=True)
-    return render_template('admin/edit_user_ip.html', form=form, title=f"사용자 IP 수정: {user_ip_data['ip_address']}", user_ip_obj=user_ip_data)
+// SAgentM.App/Services/AgentCoreService.cs
+using Newtonsoft.Json;
+using SControl.Common; // CommandPacket, Enums, Payloads, LocalDeviceControl 사용
+using System;
+using System.Configuration;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.ComponentModel;
 
-@admin_bp.route('/users/delete/<int:user_ip_id>', methods=['POST'])
-@ip_auth_required('admin')
-def delete_user_ip(user_ip_id):
-    conn = None
-    ip_address_for_message = f"ID {user_ip_id}"
-    deleted_successfully = False
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ip_address FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
-            user_ip_to_delete = cursor.fetchone()
-            if not user_ip_to_delete:
-                flash(f"삭제할 사용자 IP ID {user_ip_id}를 찾을 수 없습니다.", 'warning')
-                return redirect(url_for('admin.manage_user_ips'))
-            ip_address_for_message = user_ip_to_delete['ip_address']
-            
-            cursor.execute("DELETE FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
-            rows_affected = cursor.rowcount
-            if rows_affected > 0:
-                conn.commit()
-                deleted_successfully = True
-                flash(f"사용자 IP '{ip_address_for_message}' 정보가 성공적으로 삭제되었습니다.", 'success')
-                current_app.logger.info(f"AllowedUserIP ID {user_ip_id} ('{ip_address_for_message}') 삭제 성공.")
-            else:
-                conn.rollback()
-                flash(f"사용자 IP '{ip_address_for_message}' 삭제에 실패했거나 이미 삭제된 항목입니다.", 'warning')
-                current_app.logger.warning(f"Delete AllowedUserIP ID {user_ip_id} ('{ip_address_for_message}') affected 0 rows.")
-    except Exception as e:
-        if conn: conn.rollback()
-        flash(f"사용자 IP '{ip_address_for_message}' 삭제 중 오류 발생: {str(e)[:200]}", 'error')
-        current_app.logger.error(f"Error deleting AllowedUserIP ID {user_ip_id}: {e}", exc_info=True)
-    return redirect(url_for('admin.manage_user_ips'))
+namespace SAgentM.App.Services
+{
+    public interface IAgentCoreService { void Start(); void Stop(); bool IsRunning { get; } }
 
-# === 3. 관리자 IP 관리 ===
-@admin_bp.route('/admins')
-@ip_auth_required('admin')
-def manage_admin_ips():
-    page = request.args.get('page', 1, type=int); per_page = 10
-    q_count = "SELECT COUNT(*) AS total FROM dbo.admin_ips"; q_data = "SELECT id, ip_address, description, created_at FROM dbo.admin_ips ORDER BY ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
-    pagination = _get_pagination_data(q_count, q_data, page, per_page)
-    return render_template('admin/manage_admin_ips.html', admin_ips=pagination['items'], pagination=pagination, title="관리자 IP 관리")
+    public class AgentCoreService : IAgentCoreService
+    {
+        private readonly ILoggingService _loggingService;
+        private readonly int _port;
+        private TcpListener _listener;
+        private Thread _listenThread;
+        private volatile bool _isRunning;
+        private CancellationTokenSource _cancellationTokenSource;
 
-@admin_bp.route('/admins/add', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def add_admin_ip():
-    form = AdminIPForm()
-    if form.validate_on_submit():
-        conn = None
-        try:
-            conn = get_db_connection();
-            with conn.cursor() as cursor: sql = "INSERT INTO dbo.admin_ips (ip_address, description) VALUES (%s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data))
-            conn.commit(); flash(f"관리자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add AdminIP IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"관리자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add AdminIP Err: {e}", exc_info=True)
-    return render_template('admin/edit_admin_ip.html', form=form, title="새 관리자 IP 추가")
+        public bool IsRunning => _isRunning;
 
-@admin_bp.route('/admins/edit/<int:admin_ip_id>', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def edit_admin_ip(admin_ip_id):
-    conn = None; admin_ip_data = None; original_ip = ""
-    try:
-        conn = get_db_connection();
-        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
-        if admin_ip_data: original_ip = admin_ip_data['ip_address']
-    except Exception as e: flash("관리자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit AdminIP (GET) ID {admin_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_admin_ips'))
-    if not admin_ip_data: flash(f"관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
-    form = AdminIPForm(data=admin_ip_data) if request.method == 'GET' else AdminIPForm()
-    if form.validate_on_submit():
-        new_ip = form.ip_address.data
-        if original_ip != new_ip:
-            if original_ip == g.user_ip: flash("자신의 현재 접속 IP는 변경할 수 없습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
-            try:
-                if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
-                with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s AND id != %d", (new_ip, admin_ip_id))
-                if cursor.fetchone(): flash(f"IP '{new_ip}'는 이미 다른 관리자 항목에 있습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
-            except Exception as e: flash(f"IP 중복 확인 중 오류: {e}", "error"); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
-        try:
-            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
-            with conn.cursor() as cursor: sql = "UPDATE dbo.admin_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (new_ip, form.description.data, admin_ip_id))
-            conn.commit(); flash(f"관리자 IP '{new_ip}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); msg = f"IP 주소 '{new_ip}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"관리자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
-    return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+        public AgentCoreService(ILoggingService loggingService)
+        {
+            _loggingService = loggingService ?? throw new ArgumentNullException(nameof(loggingService));
+            if (!int.TryParse(ConfigurationManager.AppSettings["ListenPort"], out _port))
+            {
+                _port = 4026;
+                _loggingService.UiWarn($"ListenPort 설정 누락/오류. 기본값 {_port} 사용.");
+            }
+        }
 
-@admin_bp.route('/admins/delete/<int:admin_ip_id>', methods=['POST'])
-@ip_auth_required('admin')
-def delete_admin_ip(admin_ip_id):
-    conn = None; ip_addr_deleted = f"ID {admin_ip_id}"; total_admins = 0; deleted_successfully = False
-    try:
-        conn = get_db_connection();
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT ip_address FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
-            if not admin_ip_data: flash(f"삭제할 관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
-            ip_addr_deleted = admin_ip_data['ip_address']
-            if ip_addr_deleted == g.user_ip: flash("자신의 현재 접속 IP는 삭제할 수 없습니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
-            cursor.execute("SELECT COUNT(*) AS total FROM dbo.admin_ips"); count_res = cursor.fetchone(); total_admins = count_res['total'] if count_res else 0
-            if total_admins <= 1: flash("최소 1개의 관리자 IP는 남아 있어야 합니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
-            cursor.execute("UPDATE dbo.allowed_user_ips SET added_by_admin_id = NULL WHERE added_by_admin_id = %d", (admin_ip_id,)) # FK 처리 먼저
-            cursor.execute("DELETE FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); rows_affected = cursor.rowcount
-            if rows_affected > 0: conn.commit(); deleted_successfully = True; flash(f"관리자 IP '{ip_addr_deleted}' 삭제 성공.", 'success'); current_app.logger.info(f"AdminIP ID {admin_ip_id} ('{ip_addr_deleted}') 삭제 성공.")
-            else: conn.rollback(); flash(f"관리자 IP '{ip_addr_deleted}' 삭제 실패 또는 이미 삭제됨.", 'warning'); current_app.logger.warning(f"Delete AdminIP ID {admin_ip_id} ('{ip_addr_deleted}') affected 0 rows.")
-    except Exception as e:
-        if conn: conn.rollback(); flash(f"관리자 IP 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
-    return redirect(url_for('admin.manage_admin_ips'))
+        public void Start()
+        {
+            if (_isRunning) { _loggingService.UiWarn("AgentCoreService 이미 실행 중."); return; }
+            _isRunning = true;
+            _cancellationTokenSource = new CancellationTokenSource();
+            _listenThread = new Thread(ListenLoop) { IsBackground = true, Name = "AgentListenThread" };
+            _listenThread.Start();
+            _loggingService.UiInfo($"AgentCoreService 시작됨. 포트: {_port}");
+        }
 
-# === 4. 근무일/비근무일 예외 관리 (달력 UI 적용) ===
-@admin_bp.route('/calendar_exceptions', methods=['GET', 'POST'])
-@ip_auth_required('admin')
-def manage_calendar_exceptions():
-    form = WorkCalendarExceptionForm(); conn = None
-    try: year = request.args.get('year', dt_datetime.now().year, type=int); month = request.args.get('month', dt_datetime.now().month, type=int)
-    except ValueError: year = dt_datetime.now().year; month = dt_datetime.now().month
-    if not (1 <= month <= 12): month = dt_datetime.now().month; year = dt_datetime.now().year
-    current_display_month_start_date = date(year, month, 1)
-    prev_month_date = current_display_month_start_date - timedelta(days=1); prev_month_params = {'year': prev_month_date.year, 'month': prev_month_date.month}
-    if month == 12: next_month_first_day = date(year + 1, 1, 1); else: next_month_first_day = date(year, month + 1, 1)
-    next_month_params = {'year': next_month_first_day.year, 'month': next_month_first_day.month}
+        public void Stop()
+        {
+            if (!_isRunning) { _loggingService.UiWarn("AgentCoreService 이미 중지됨."); return; }
+            _loggingService.UiInfo("AgentCoreService 중지 요청 중...");
+            _isRunning = false;
+            _cancellationTokenSource?.Cancel();
+            _listener?.Stop();
+            if (_listenThread != null && _listenThread.IsAlive)
+            {
+                if (!_listenThread.Join(TimeSpan.FromSeconds(5))) { _loggingService.UiWarn("리스닝 스레드 시간 내 종료 안됨."); }
+            }
+            _cancellationTokenSource?.Dispose(); _cancellationTokenSource = null;
+            _loggingService.UiInfo("AgentCoreService 중지됨.");
+        }
 
-    if form.validate_on_submit():
-        date_val = form.exception_date.data; is_op_val = bool(int(form.is_operational.data))
-        desc_val = form.description.data if form.description.data and form.description.data.strip() else None
-        date_str_for_db = date_val.strftime('%Y-%m-%d')
-        try:
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT 1 AS existing_check FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (date_str_for_db,))
-                if cursor.fetchone(): flash(f"날짜 {date_str_for_db} 예외 이미 존재.", 'error')
-                else: sql = "INSERT INTO dbo.work_calendar_exceptions (exception_date, is_operational, description) VALUES (%s, %s, %s)"; cursor.execute(sql, (date_str_for_db, is_op_val, desc_val)); conn.commit(); flash(f"날짜 {date_str_for_db} ({'가동일' if is_op_val else '비가동일'}) 예외 추가 성공.", 'success')
-            return redirect(url_for('admin.manage_calendar_exceptions', year=year, month=month))
-        except pymssql.IntegrityError as ie:
-            if conn: conn.rollback(); flash(f"DB 오류 (중복): {str(ie)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx IntErr: {ie}", exc_info=False)
-        except Exception as e:
-            if conn: conn.rollback(); flash(f"예외 날짜 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx Err: {e}", exc_info=True)
+        private void ListenLoop()
+        {
+            try {
+                _listener = new TcpListener(IPAddress.Any, _port);
+                _listener.Start();
+                _loggingService.UiInfo($"포트 {_port}에서 클라이언트 연결 대기 중...");
+                while (_isRunning) {
+                    try {
+                        TcpClient client = _listener.AcceptTcpClient();
+                        if (!_isRunning) { client.Close(); break; }
+                        string clientIp = client.Client.RemoteEndPoint?.ToString() ?? "Unknown IP";
+                        _loggingService.UiInfo($"클라이언트 연결됨: {clientIp}");
+                        var currentToken = _cancellationTokenSource?.Token ?? CancellationToken.None;
+                        Task.Run(() => HandleClientAsync(client, clientIp, currentToken), currentToken);
+                    }
+                    catch (SocketException se) { if (!_isRunning && (se.SocketErrorCode == SocketError.Interrupted || se.SocketErrorCode == SocketError.OperationAborted)) { _loggingService.UiInfo("리스너 소켓 정상 중단됨."); break; } _loggingService.UiError("클라이언트 연결 수락 중 소켓 오류.", se); if (!_isRunning) break; Thread.Sleep(100); }
+                    catch (InvalidOperationException ioe) when (!_isRunning) { _loggingService.UiInfo($"리스너 중지 후 InvalidOperationException (무시): {ioe.Message}"); break; }
+                    catch (Exception ex) { _loggingService.UiError("클라이언트 연결 수락 중 예기치 않은 오류.", ex); if (!_isRunning) break; Thread.Sleep(100); }
+                }
+            }
+            catch (Exception ex) { _loggingService.UiError("ListenLoop 심각한 오류. 리스너 중단.", ex); }
+            finally { if (_listener != null && _listener.Server.IsBound) { _listener.Stop(); } _loggingService.UiInfo("ListenLoop 종료됨."); }
+        }
+
+        private async Task HandleClientAsync(TcpClient client, string clientIpInfo, CancellationToken token)
+        {
+            CommandPacket receivedRequestPacket = null; CommandPacket sentResponsePacket = null;
+            try {
+                _loggingService.UiDebug($"[{clientIpInfo}] 처리 시작.");
+                using (client) using (NetworkStream stream = client.GetStream())
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true, 1024, true))
+                using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8, 1024, true) { AutoFlush = true }) {
+                    while (_isRunning && client.Connected && !token.IsCancellationRequested) {
+                        string requestJson = null;
+                        try {
+                            var readTask = reader.ReadLineAsync();
+                            if (await Task.WhenAny(readTask, Task.Delay(Timeout.Infinite, token)) == readTask) { if (token.IsCancellationRequested) token.ThrowIfCancellationRequested(); requestJson = await readTask; }
+                            else { token.ThrowIfCancellationRequested(); }
+                            if (requestJson == null) { _loggingService.UiInfo($"[{clientIpInfo}] 연결 종료됨."); break; }
+                            _loggingService.UiReceived($"[{clientIpInfo}] 수신: {requestJson}");
+                            CommandPacket requestPacket = null;
+                            try { requestPacket = JsonConvert.DeserializeObject<CommandPacket>(requestJson); receivedRequestPacket = requestPacket; }
+                            catch (JsonException jsonEx) { _loggingService.UiError($"[{clientIpInfo}] JSON 역직렬화 실패: {requestJson}", jsonEx); await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(null, $"Invalid JSON: {jsonEx.Message}"))); continue; }
+                            if (requestPacket != null) {
+                                CommandPacket responsePacket = await ProcessCommandAsync(requestPacket, clientIpInfo, token);
+                                sentResponsePacket = responsePacket;
+                                if (responsePacket != null) {
+                                    string responseJson = JsonConvert.SerializeObject(responsePacket);
+                                    if (token.IsCancellationRequested) token.ThrowIfCancellationRequested();
+                                    await writer.WriteLineAsync(responseJson);
+                                    _loggingService.UiSent($"[{clientIpInfo}] 응답: {responseJson}");
+                                    HandleMonitorOffPostProcessing(receivedRequestPacket, sentResponsePacket, clientIpInfo);
+                                }
+                            }
+                        }
+                        catch (IOException ioEx) { _loggingService.UiWarn($"[{clientIpInfo}] IO오류: {ioEx.Message}"); break; }
+                        catch (ObjectDisposedException odEx) { _loggingService.UiWarn($"[{clientIpInfo}] 객체해제오류: {odEx.Message}"); break; }
+                        catch (OperationCanceledException) { _loggingService.UiInfo($"[{clientIpInfo}] 처리 작업 취소됨."); break; }
+                        catch (Exception ex) { _loggingService.UiError($"[{clientIpInfo}] 클라이언트 처리 중 오류.", ex); if (client.Connected && stream.CanWrite) { try { await writer.WriteLineAsync(JsonConvert.SerializeObject(CreateErrorResponse(receivedRequestPacket, $"Server error: {ex.Message}"))); } catch (Exception writeEx){ _loggingService.UiError($"[{clientIpInfo}] 오류 응답 전송 실패.", writeEx); }}}
+                    }
+                }
+            }
+            catch (OperationCanceledException) { _loggingService.UiInfo($"[{clientIpInfo}] HandleClientAsync 작업 취소됨."); }
+            catch (Exception ex) { _loggingService.UiError($"[{clientIpInfo}] HandleClientAsync 외부 오류.", ex); }
+            finally { _loggingService.UiInfo($"[{clientIpInfo}] 처리 종료."); }
+        }
+
+        private void HandleMonitorOffPostProcessing(CommandPacket request, CommandPacket response, string clientIp)
+        {
+            if (request?.Instruction == CommandInstruction.DirectExecute && request.CommandName == CommandNames.MonitorControl) {
+                MonitorControlPayload originalPayload = null;
+                try { if(!string.IsNullOrEmpty(request.PayloadJson)) originalPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(request.PayloadJson); } catch {}
+                if (originalPayload?.Action == MonitorAction.Off) { // "끄기" 명령의 후처리 (조기응답 후 실제 끄기)
+                    bool earlyConfirmSuccess = false;
+                    if (response?.PayloadJson != null) { try { var genericResp = JsonConvert.DeserializeObject<GenericResponsePayload>(response.PayloadJson); if(genericResp != null) earlyConfirmSuccess = genericResp.Success; } catch {} }
+                    if(earlyConfirmSuccess) { _loggingService.UiInfo($"[{clientIp}] 조기 응답 후 실제 모니터 끄기 실행. ID: {request.PacketId}"); Task.Run(() => { try { LocalDeviceControl.SetMonitorState(MonitorAction.Off); _loggingService.UiInfo($"[{clientIp}] 실제 모니터 끄기 완료. ID: {request.PacketId}"); } catch (Exception ex) { _loggingService.UiError($"[{clientIp}] 백그라운드 모니터 끄기 오류. ID: {request.PacketId}", ex); }}); }
+                    else { _loggingService.UiWarn($"[{clientIp}] 모니터 끄기 조기 확인 실패/페이로드 없어 실제 끄기 스킵. ID: {request.PacketId}"); }
+                }
+            }
+        }
+        
+        private async Task<CommandPacket> ProcessCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
+        {
+            try {
+                token.ThrowIfCancellationRequested();
+                switch (requestPacket.Instruction) {
+                    case CommandInstruction.DirectExecute: return await ExecuteDirectCommandAsync(requestPacket, clientIp, token);
+                    case CommandInstruction.RelayToTarget: return await RelayCommandAsync(requestPacket, clientIp, token); 
+                    default: return CreateErrorResponse(requestPacket, $"Unknown instruction: {requestPacket.Instruction}");
+                }
+            }
+            catch (OperationCanceledException) { return CreateErrorResponse(requestPacket, "Processing canceled."); }
+            catch (Exception ex) { return CreateErrorResponse(requestPacket, $"Error processing '{requestPacket.CommandName}': {ex.Message}"); }
+        }
+
+        private async Task<CommandPacket> ExecuteDirectCommandAsync(CommandPacket requestPacket, string clientIp, CancellationToken token)
+        {
+            bool success = false; string message = "Execution failed."; 
+            try {
+                token.ThrowIfCancellationRequested();
+                switch (requestPacket.CommandName) {
+                    case CommandNames.MonitorControl:
+                        if (string.IsNullOrEmpty(requestPacket.PayloadJson)) throw new ArgumentNullException("PayloadJson", "MonitorControl payload missing.");
+                        MonitorControlPayload monitorPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
+                        if (monitorPayload == null) throw new ArgumentException("Cannot deserialize MonitorControlPayload.");
+                        
+                        _loggingService.UiInfo($"[{clientIp}] 모니터 상태 변경 시도: {monitorPayload.Action}");
+                        if (monitorPayload.Action == MonitorAction.Off) { 
+                            success = true; message = $"Monitor Off command acknowledged. Monitor will turn off shortly."; 
+                            // 실제 끄기 동작은 HandleMonitorOffPostProcessing에서 응답 전송 후 수행
+                        }
+                        else { 
+                            LocalDeviceControl.SetMonitorState(monitorPayload.Action); 
+                            if(monitorPayload.Action == MonitorAction.On) // ▼▼▼ 모니터 켜기 시 마우스 이동 추가 ▼▼▼
+                            {
+                                Thread.Sleep(100); // 모니터가 켜질 약간의 시간 부여 (선택적)
+                                LocalDeviceControl.SimulateSmallMouseMovement();
+                                message = $"Monitor state set to {monitorPayload.Action} and mouse nudged.";
+                                _loggingService.UiInfo($"[{clientIp}] {message}");
+                            } // ▲▲▲ 모니터 켜기 시 마우스 이동 추가 ▲▲▲
+                            else 
+                            {
+                                message = $"Monitor state set to {monitorPayload.Action}.";
+                            }
+                            success = true; 
+                        }
+                        _loggingService.UiInfo($"[{clientIp}] {message} (Cmd: MonitorControl, Action: {monitorPayload.Action})");
+                        break;
+                    
+                    case CommandNames.SetDisplayTimeout: 
+                        if (string.IsNullOrEmpty(requestPacket.PayloadJson)) throw new ArgumentNullException("PayloadJson", "SetDisplayTimeout payload missing.");
+                        SetDisplayTimeoutPayload timeoutPayload = JsonConvert.DeserializeObject<SetDisplayTimeoutPayload>(requestPacket.PayloadJson);
+                        if (timeoutPayload == null) throw new ArgumentException("Cannot deserialize SetDisplayTimeoutPayload.");
+                        
+                        int timeoutValueInMinutes = timeoutPayload.TimeoutMinutes;
+                        _loggingService.UiInfo($"[{clientIp}] 디스플레이 타임아웃 설정 시도: {timeoutValueInMinutes}분");
+                        
+                        string outputAc, errorAc, outputDc, errorDc; int exitCodeAc, exitCodeDc;
+                        string acArgs = $"/change monitor-timeout-ac {timeoutValueInMinutes}";
+                        string dcArgs = $"/change monitor-timeout-dc {timeoutValueInMinutes}";
+
+                        RunPowerCfgCommand(acArgs, out outputAc, out errorAc, out exitCodeAc);
+                        RunPowerCfgCommand(dcArgs, out outputDc, out errorDc, out exitCodeDc);
+                        
+                        if (exitCodeAc == 0 && exitCodeDc == 0) { success = true; message = $"Display timeout set to {timeoutValueInMinutes} min for AC/DC."; }
+                        else { success = false; string acErrClean = string.IsNullOrEmpty(errorAc)?"":errorAc.Trim().Replace("\r\n"," ").Replace("\n"," "); string dcErrClean = string.IsNullOrEmpty(errorDc)?"":errorDc.Trim().Replace("\r\n"," ").Replace("\n"," "); message = $"Failed display timeout. AC Exit:{exitCodeAc}, DC Exit:{exitCodeDc}."; if (!string.IsNullOrEmpty(acErrClean)) message += $" AC Err: {acErrClean}"; if (!string.IsNullOrEmpty(dcErrClean)) message += $" DC Err: {dcErrClean}"; }
+                        _loggingService.UiInfo($"[{clientIp}] {message}");
+                        break;
+                        
+                    default: message = $"Unknown direct command: {requestPacket.CommandName}"; success = false; break;
+                }
+            }
+            catch (OperationCanceledException opEx) { message = $"Cmd {requestPacket.CommandName} canceled: {opEx.Message}"; success = false; _loggingService.UiWarn($"[{clientIp}] {message}");}
+            catch (ArgumentNullException argEx) { message = $"Cmd {requestPacket.CommandName} arg error: {argEx.ParamName} - {argEx.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", argEx); }
+            catch (ArgumentException argEx2) { message = $"Cmd {requestPacket.CommandName} arg error: {argEx2.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", argEx2); }
+            catch (JsonException jsonEx) { message = $"Cmd {requestPacket.CommandName} JSON payload error: {jsonEx.Message}"; success = false; _loggingService.UiError($"[{clientIp}] {message}", jsonEx); }
+            catch (Exception ex) { message = $"Error executing {requestPacket.CommandName}: {ex.Message}"; success = false; _loggingService.UiError($"[{clientIp}] ExecuteDirectCmd Error: {message}", ex); }
+            return CreateExecutionResponse(requestPacket, success, message);
+        }
+
+        private void RunPowerCfgCommand(string arguments, out string output, out string error, out int exitCode)
+        {
+            output = ""; error = ""; exitCode = -1;
+            try {
+                _loggingService.UiDebug($"Executing: powercfg.exe {arguments}");
+                ProcessStartInfo startInfo = new ProcessStartInfo("powercfg.exe") { Arguments = arguments, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, Verb = "runas" };
+                using (Process process = Process.Start(startInfo)) {
+                    if (process == null) { error = "Failed to start powercfg.exe."; exitCode = -100; _loggingService.UiError(error); return; }
+                    output = process.StandardOutput.ReadToEnd(); error = process.StandardError.ReadToEnd(); 
+                    if (!process.WaitForExit(7000)) { process.Kill(); error += $"\npowercfg '{arguments}' timeout (7s)."; exitCode = -99;  _loggingService.UiWarn(error); }
+                    else { exitCode = process.ExitCode; }
+                    if(!string.IsNullOrWhiteSpace(output)) _loggingService.UiDebug($"powercfg output: {output.Trim()}");
+                    if(!string.IsNullOrWhiteSpace(error) && exitCode != 0) _loggingService.UiWarn($"powercfg error output: {error.Trim()}");
+                }
+            } 
+            catch (Win32Exception w32Ex) { error = $"powercfg Win32Ex (UAC denied?): {w32Ex.Message}"; exitCode = w32Ex.NativeErrorCode; _loggingService.UiError(error, w32Ex); } 
+            catch (Exception ex) { error = $"powercfg Ex: {ex.Message}"; exitCode = -2; _loggingService.UiError(error, ex); }
+        }
+
+        private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
+        {
+            _loggingService.UiInfo($"[{clientIp}] 릴레이: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
+            if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue) { return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP/Port missing."); }
+            var packetForFinalTarget = new CommandPacket { Instruction = CommandInstruction.DirectExecute, CommandName = originalRelayRequest.CommandName, PayloadJson = originalRelayRequest.PayloadJson, ResponseAddress = originalRelayRequest.ResponseAddress, ResponsePort = originalRelayRequest.ResponsePort, PacketId = Guid.NewGuid() };
+            string relayStatusMessage = $"Relay: {packetForFinalTarget.CommandName} to {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}.";
+            bool relayCommSuccess = false; CommandPacket responseFromFinalTarget = null;
+            try {
+                token.ThrowIfCancellationRequested();
+                using (var targetClient = new TcpClient()) {
+                    var connectTask = targetClient.ConnectAsync(originalRelayRequest.FinalTargetIpForRelayedCommand, originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
+                    if (await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5), token)) != connectTask || token.IsCancellationRequested) { token.ThrowIfCancellationRequested(); targetClient.Close(); throw new TimeoutException("Relay target connection timed out."); }
+                    await connectTask; _loggingService.UiDebug($"[{clientIp}] 릴레이 대상 연결 성공.");
+                    using (NetworkStream rS = targetClient.GetStream()) using (StreamWriter rW = new StreamWriter(rS, Encoding.UTF8){AutoFlush=true}) using (StreamReader rR = new StreamReader(rS, Encoding.UTF8)){
+                        string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget); if(token.IsCancellationRequested) token.ThrowIfCancellationRequested(); await rW.WriteLineAsync(jsonToRelay); _loggingService.UiDebug($"[{clientIp}] 릴레이 데이터 전송: {jsonToRelay}");
+                        var targetResponseTask = rR.ReadLineAsync();
+                        if (await Task.WhenAny(targetResponseTask, Task.Delay(TimeSpan.FromSeconds(10), token)) == targetResponseTask && !token.IsCancellationRequested){
+                            string targetJson = await targetResponseTask; if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
+                            if (!string.IsNullOrEmpty(targetJson)){ _loggingService.UiInfo($"[{clientIp}] 릴레이 대상 응답: {targetJson}"); responseFromFinalTarget = JsonConvert.DeserializeObject<CommandPacket>(targetJson); relayCommSuccess = true; }
+                            else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 빈 응답."); relayStatusMessage = "Relay sent, empty response from final target."; }
+                        } else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 응답 시간 초과/취소."); relayStatusMessage = "Relay sent, no response/timeout/canceled from final target."; }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { relayStatusMessage = $"Relay of {originalRelayRequest.CommandName} canceled."; _loggingService.UiInfo($"[{clientIp}] {relayStatusMessage}"); }
+            catch (TimeoutException tex) { relayStatusMessage = $"Relay failed: Timeout - {tex.Message}"; _loggingService.UiWarn($"[{clientIp}] {relayStatusMessage}"); }
+            catch (SocketException se) { relayStatusMessage = $"Relay failed: Socket error - {se.Message}"; _loggingService.UiError($"[{clientIp}] {relayStatusMessage}", se); }
+            catch (Exception ex) { relayStatusMessage = $"Relay failed: Unexpected error - {ex.Message}"; _loggingService.UiError($"[{clientIp}] {relayStatusMessage}", ex); }
+            if (responseFromFinalTarget != null) { responseFromFinalTarget.PacketId = originalRelayRequest.PacketId; return responseFromFinalTarget; }
+            else { return CreateExecutionResponse(originalRelayRequest, relayCommSuccess, relayStatusMessage); }
+        }
+
+        private CommandPacket CreateExecutionResponse(CommandPacket req, bool success, string msg, object data = null) { Guid pId = req?.PacketId ?? Guid.NewGuid(); string cmdName = req?.CommandName ?? "UNKNOWN"; return new CommandPacket { PacketId = pId, Instruction = CommandInstruction.DirectExecute, CommandName = $"{cmdName}_Response", PayloadJson = JsonConvert.SerializeObject(new GenericResponsePayload { Success = success, Message = msg, Data = data }), ResponseAddress = req?.ResponseAddress, ResponsePort = req?.ResponsePort }; }
+        private CommandPacket CreateErrorResponse(CommandPacket req, string errorMsg) { Guid pId = req?.PacketId ?? Guid.NewGuid(); string cmdName = req?.CommandName ?? "UNKNOWN"; _loggingService.UiError($"Error response for PktID {pId} (Cmd: {cmdName}): {errorMsg}"); return new CommandPacket { PacketId = pId, Instruction = CommandInstruction.DirectExecute, CommandName = $"{cmdName}_ErrorResponse", PayloadJson = JsonConvert.SerializeObject(new GenericResponsePayload { Success = false, Message = errorMsg }), ResponseAddress = req?.ResponseAddress, ResponsePort = req?.ResponsePort }; }
+    }
+}
+AgentCoreService.cs의 ExecuteDirectCommandAsync 메서드 내 MonitorControl 처리 부분 변경점:
+
+C#
+
+// ... 기존 switch 문 내부 ...
+case CommandNames.MonitorControl:
+    if (string.IsNullOrEmpty(requestPacket.PayloadJson)) throw new ArgumentNullException("PayloadJson", "MonitorControl payload missing.");
+    MonitorControlPayload monitorPayload = JsonConvert.DeserializeObject<MonitorControlPayload>(requestPacket.PayloadJson);
+    if (monitorPayload == null) throw new ArgumentException("Cannot deserialize MonitorControlPayload.");
     
-    cal = calendar.Calendar(firstweekday=6); month_days_raw = cal.monthdatescalendar(year, month)
-    kr_holidays = holidays.KR(years=year, observed=True); db_user_exceptions = {} # observed=True 로 대체공휴일 포함
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            first_day = date(year, month, 1); last_day = date(year, month, calendar.monthrange(year, month)[1])
-            sql_exc = "SELECT exception_date, is_operational, description FROM dbo.work_calendar_exceptions WHERE exception_date BETWEEN %s AND %s"
-            cursor.execute(sql_exc, (first_day.strftime('%Y-%m-%d'), last_day.strftime('%Y-%m-%d')))
-            for row in cursor.fetchall():
-                exc_date = row['exception_date']; 
-                if isinstance(exc_date, dt_datetime): exc_date = exc_date.date()
-                db_user_exceptions[exc_date] = {'is_operational': bool(row['is_operational']), 'description': row['description']}
-    except Exception as e: flash("달력 예외 정보 로드 오류.", "error"); current_app.logger.error(f"Fetch CalendarEx for {year}-{month} Err: {e}", exc_info=True)
+    _loggingService.UiInfo($"[{clientIp}] 모니터 상태 변경 시도: {monitorPayload.Action}");
+    if (monitorPayload.Action == MonitorAction.Off) 
+    { 
+        success = true; 
+        message = $"Monitor Off command acknowledged. Monitor will turn off shortly."; 
+        // 실제 끄기 동작은 HandleMonitorOffPostProcessing에서 응답 전송 후 수행됨
+    }
+    else 
+    { 
+        LocalDeviceControl.SetMonitorState(monitorPayload.Action); // 모니터 상태 변경 (예: On 또는 Standby)
+        
+        if(monitorPayload.Action == MonitorAction.On) // "켜기" 명령인 경우에만 추가 동작
+        {
+            _loggingService.UiInfo($"[{clientIp}] MonitorAction.On: 잠시 후 마우스 입력 시뮬레이션 시도.");
+            Thread.Sleep(100); // 모니터가 켜질 물리적인 시간을 약간 기다립니다 (선택적).
+            try
+            {
+                LocalDeviceControl.SimulateSmallMouseMovement(); // 마우스 미세 이동 호출
+                message = $"Monitor state set to {monitorPayload.Action} and simulated mouse input to ensure wake-up.";
+                _loggingService.UiInfo($"[{clientIp}] {message}");
+            }
+            catch (Exception simEx)
+            {
+                message = $"Monitor state set to {monitorPayload.Action}, but mouse simulation failed: {simEx.Message}";
+                _loggingService.UiError($"[{clientIp}] 마우스 입력 시뮬레이션 실패: {simEx.Message}", simEx);
+                // 성공 여부는 SetMonitorState 기준으로 하므로 success는 true 유지 가능
+            }
+        }
+        else // Standby 등 다른 MonitorAction의 경우
+        {
+            message = $"Monitor state set to {monitorPayload.Action}.";
+        }
+        success = true; 
+    }
+    _loggingService.UiInfo($"[{clientIp}] 최종 메시지 (Cmd: MonitorControl, Action: {monitorPayload.Action}): {message}");
+    break;
+// ... 나머지 코드 ...
+주요 변경 사항:
 
-    calendar_display_data = []
-    for week_of_dates in month_days_raw:
-        week_data = [];
-        for day_date_obj in week_of_dates:
-            day_info = {'date_obj': day_date_obj, 'day_num': day_date_obj.day, 'is_today': (day_date_obj == date.today()), 'is_current_month': (day_date_obj.month == month), 'status_class': '', 'status_text': '', 'description': '', 'is_operational_final': None }
-            if day_info['is_current_month']:
-                user_exc = db_user_exceptions.get(day_date_obj); holiday_name = kr_holidays.get(day_date_obj)
-                if user_exc: day_info.update({'is_operational_final': user_exc['is_operational'], 'status_class': 'user-op' if user_exc['is_operational'] else 'user-non-op', 'status_text': '★가동(지정)' if user_exc['is_operational'] else '★비가동(지정)', 'description': user_exc['description'] if user_exc['description'] else ('사용자 지정 가동일' if user_exc['is_operational'] else '사용자 지정 비가동일')})
-                elif holiday_name: day_info.update({'is_operational_final': False, 'status_class': 'public-holiday', 'status_text': '공휴일(비가동)', 'description': holiday_name})
-                elif day_date_obj.weekday() >= 5: day_info.update({'is_operational_final': False, 'status_class': 'weekend-sat' if day_date_obj.weekday() == 5 else 'weekend-sun', 'status_text': '주말(비가동)'})
-                else: day_info.update({'is_operational_final': True, 'status_class': 'weekday-op', 'status_text': '평일(가동)'})
-            else: day_info['status_class'] = 'other-month'
-            week_data.append(day_info)
-        calendar_display_data.append(week_data)
-    
-    return render_template('admin/manage_calendar_exceptions.html', title="근무일/비근무일 예외 관리", form=form, 
-                           calendar_weeks=calendar_display_data, current_year=year, current_month=month,
-                           prev_month_params=prev_month_params, next_month_params=next_month_params)
+SControl.Common/LocalDeviceControl.cs:
+SendInput API와 관련 구조체 및 상수를 P/Invoke로 선언했습니다.
+SimulateSmallMouseMovement() 메서드를 추가하여 마우스를 아주 약간 (1픽셀 이동 후 복귀) 움직이는 입력을 생성합니다. 이는 시스템에 사용자 활동으로 인식되어 잠금 화면 등에서 모니터가 다시 꺼지는 것을 방지하는 데 도움이 될 수 있습니다. Thread.Sleep(50)을 추가하여 입력이 처리될 시간을 약간 줍니다.
+SAgentM.App/Services/AgentCoreService.cs:
+ExecuteDirectCommandAsync 메서드 내에서 CommandNames.MonitorControl 명령을 처리할 때:
+monitorPayload.Action == MonitorAction.On (즉, 모니터 켜기 명령)인 경우:
+기존처럼 LocalDeviceControl.SetMonitorState(MonitorAction.On)을 호출하여 모니터에 켜짐 신호를 보냅니다.
+그 직후에 LocalDeviceControl.SimulateSmallMouseMovement()를 호출하여 마우스 입력을 시뮬레이션합니다.
+성공 메시지에 마우스 입력 시뮬레이션에 대한 내용도 포함될 수 있도록 수정했습니다.
+MonitorAction.Off의 경우는 이전과 동일하게 "조기 확인 응답" 로직을 유지하며, 실제 모니터 끄기는 HandleMonitorOffPostProcessing에서 처리됩니다 (여기서는 마우스 이동 시뮬레이션 불필요).
+위 수정된 파일들을 프로젝트에 적용하시고, SAgentM.App.exe를 (관리자 권한으로) 재빌드 및 실행한 후, Flask 웹 UI에서 "켜기" 명령을 다시 테스트해 보십시오.
 
-@admin_bp.route('/calendar_exceptions/delete/<string:date_str>', methods=['POST'])
-@ip_auth_required('admin')
-def delete_calendar_exception(date_str):
-    conn = None; year_to_redirect = dt_datetime.now().year; month_to_redirect = dt_datetime.now().month
-    try:
-        date_obj = dt_datetime.strptime(date_str, '%Y-%m-%d').date()
-        year_to_redirect = date_obj.year; month_to_redirect = date_obj.month
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            sql = "DELETE FROM dbo.work_calendar_exceptions WHERE exception_date = %s"; cursor.execute(sql, (date_obj.strftime('%Y-%m-%d'),)); rows_deleted = cursor.rowcount
-        conn.commit()
-        if rows_deleted > 0: flash(f"날짜 {date_str} 예외 삭제 성공.", 'success')
-        else: flash(f"날짜 {date_str} 예외 없음.", 'warning')
-    except ValueError: flash(f"잘못된 날짜 형식: {date_str}", 'error'); current_app.logger.warning(f"Invalid date for delete: {date_str}")
-    except Exception as e:
-        if conn: conn.rollback(); flash(f"예외 날짜 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete CalendarEx for {date_str} Error: {e}", exc_info=True)
-    return redirect(url_for('admin.manage_calendar_exceptions', year=year_to_redirect, month=month_to_redirect))
+테스트 시나리오:
 
-이것으로 app/routes_admin.py 파일의 모든 관리자 기능이 pymssql을 사용하고 달력 예외 관리 기능까지 포함된 전체 코드가 되었습니다. 이 파일과 이전에 제공된 각 기능별 HTML 템플릿, 그리고 forms.py 등을 함께 사용하시면 됩니다.
+대상 Windows PC의 모니터가 꺼져 있고, 화면이 잠겨 있는 상태를 만듭니다 (예: "1분 후 끄기" 설정을 통해 자동으로 꺼지게 한 후).
+Flask 웹 UI에서 해당 PC에 대해 "켜기" 명령을 보냅니다.
+모니터가 켜지고, 잠금 해제 화면(로그인 화면)이 표시된 후에도 모니터가 다시 바로 꺼지지 않고 유지되는지 확인합니다.
+SAgentM.App의 로그에 "마우스 입력 시뮬레이션 시도" 및 관련 성공/실패 로그가 남는지 확인합니다.
+이 방법이 모든 시스템 환경에서 100% 동작한다고 보장할 수는 없지만 (특히 특정 보안 소프트웨어가 가상 입력을 차단하는 경우 등), 잠금 화면에서 모니터를 안정적으로 깨우는 데 도움이 될 수 있는 일반적인 접근 방식입니다.
