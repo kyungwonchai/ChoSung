@@ -1,299 +1,370 @@
-ystem.Windows.Forms.NotifyIcon 대신 WPF 환경에 더 적합하고 많이 사용되는 Hardcodet.NotifyIcon.Wpf 라이브러리를 사용하여 시스템 트레이 아이콘 기능을 구현하도록 코드를 수정해 드리겠습니다. 이 라이브러리를 사용하면 XAML에서 트레이 아이콘의 속성이나 컨텍스트 메뉴를 더 쉽게 정의할 수 있습니다.
+, "PC 관리" 페이지에서 삭제 동작이 제대로 반영되지 않고 행이 그대로 남아있는 문제를 해결해 드리겠습니다. 다른 삭제 기능들도 유사한 문제가 있을 수 있으므로 함께 점검하겠습니다.
 
-수정 및 신규 파일:
+이 문제는 주로 다음 이유 중 하나로 발생할 수 있습니다:
 
-SAgentM.App.csproj (수정): Hardcodet.NotifyIcon.Wpf NuGet 패키지를 추가하고, 기존 System.Windows.Forms 참조는 제거합니다.
-아이콘 파일: 이전과 동일하게 agent_icon.ico 파일이 프로젝트에 필요합니다.
-App.xaml (수정): TaskbarIcon (라이브러리의 트레이 아이콘 컨트롤)을 XAML 리소스로 정의하고 컨텍스트 메뉴 등을 설정합니다.
-App.xaml.cs (수정): TaskbarIcon 관련 로직을 처리하고, MainWindow 관리 및 AgentCoreService 시작/종료 로직을 담당합니다.
-MainWindow.xaml.cs (수정): 창을 닫을 때 숨겨지는 로직은 유지됩니다.
-1. SAgentM.App.csproj 파일 수정 - NuGet 패키지 추가
-SAgentM.App 프로젝트에 다음 NuGet 패키지를 설치합니다:
+데이터베이스에서 실제로 DELETE 명령이 성공하지 않았거나 실행되지 않았음.
+DELETE 명령은 성공했으나, 데이터베이스 트랜잭션이 commit 되지 않아 변경사항이 반영되지 않음.
+삭제 후 페이지를 다시 로드할 때, 변경 전의 데이터가 어떤 이유로든 다시 표시됨 (캐시 문제 등 - 가능성 낮음).
+가장 가능성이 높은 것은 1번 또는 2번입니다. pymssql 사용 시 cursor.execute()로 DELETE를 실행한 후, 반드시 conn.commit()을 호출해야 변경사항이 데이터베이스에 영구적으로 저장됩니다. 오류 발생 시에는 conn.rollback()을 호출해야 합니다. 또한, 실제로 몇 개의 행이 삭제되었는지 확인하는 것도 중요합니다.
 
-Hardcodet.NotifyIcon.Wpf: (PowerShell: Install-Package Hardcodet.NotifyIcon.Wpf)
-만약 이전에 System.Windows.Forms 참조를 수동으로 추가했다면, 이 라이브러리를 사용하면서 해당 참조가 더 이상 필요하지 않으므로 제거해도 됩니다 (Hardcodet.NotifyIcon.Wpf 라이브러리가 내부적으로 필요한 부분을 처리할 수 있습니다. 다만, 다른 용도로 System.Windows.Forms를 사용 중이지 않다면 제거 가능).
+아래는 app/routes_admin.py 파일의 전체 수정된 코드입니다. 모든 delete_... 함수들을 좀 더 명확하고 안정적으로 수정했습니다.
 
-2. 아이콘 파일 준비
-(이전과 동일) agent_icon.ico 파일을 프로젝트 루트에 추가하고, 빌드 작업을 "Resource"로 설정합니다.
-3. 수정: App.xaml (전체 파일 - TaskbarIcon 정의)
-StartupUri를 제거하고, Application.Resources 내에 Hardcodet.NotifyIcon.Wpf의 TaskbarIcon을 정의합니다.
+삭제 대상이 실제로 존재하는지 먼저 확인합니다.
+cursor.rowcount를 (참고용으로) 확인하여 실제로 행이 삭제되었는지 파악하려고 시도합니다 (단, pymssql에서 DELETE 후 rowcount 동작은 상황에 따라 다를 수 있어, 예외 발생 유무와 SELECT를 통한 재확인이 더 확실할 수 있습니다. 여기서는 예외가 없다면 삭제된 것으로 간주하고 진행합니다).
+commit과 rollback을 명확히 사용합니다.
+최종 수정: app/routes_admin.py (삭제 로직 강화, 전체 코드)
+Python
 
-XML
+# scontrol_flask_web/app/routes_admin.py
+from flask import Blueprint, render_template, redirect, url_for, flash, request, current_app, g
+from app.db_utils import get_db_connection
+from app.forms import TargetPCForm, AllowedUserIPForm, AdminIPForm, WorkCalendarExceptionForm
+from app.auth import ip_auth_required, get_current_user_role
+import math
+import pymssql
+from datetime import datetime as dt_datetime, date, timedelta 
+import calendar 
+import holidays 
 
-<Application x:Class="SAgentM.App.App"
-             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:local="clr-namespace:SAgentM.App"
-             xmlns:tb="http://www.hardcodet.net/taskbar" ShutdownMode="OnExplicitShutdown">
-    <Application.Resources>
-        <tb:TaskbarIcon x:Key="AppNotifyIcon"
-                        IconSource="/agent_icon.ico" ToolTipText="SAgentM 에이전트"
-                        TrayMouseDoubleClick="AppNotifyIcon_TrayMouseDoubleClick">
-            <tb:TaskbarIcon.ContextMenu>
-                <ContextMenu>
-                    <MenuItem Header="상태 보기/숨기기" Click="ShowHideMainWindow_MenuItemClick"/>
-                    <Separator />
-                    <MenuItem Header="종료" Click="ExitApplication_MenuItemClick"/>
-                </ContextMenu>
-            </tb:TaskbarIcon.ContextMenu>
+admin_bp = Blueprint('admin', __name__)
+
+def _get_pagination_data(query_count, query_data, page, per_page, params_count=None, params_data=None):
+    total_items = 0; items_on_page = []
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(query_count, params_count or ())
+            count_result = cursor.fetchone()
+            if count_result: total_items = count_result.get('total', 0)
+            if total_items > 0:
+                offset = (page - 1) * per_page
+                final_params_data = (params_data or ()) + (offset, per_page)
+                cursor.execute(query_data, final_params_data)
+                items_on_page = cursor.fetchall()
+            else: items_on_page = []
+    except Exception as e:
+        current_app.logger.error(f"페이지네이션 데이터 조회 오류: {e}", exc_info=True)
+        flash("데이터 로드 중 오류.", "error")
+        return {'page': 1, 'per_page': per_page, 'total_items': 0, 'total_pages': 1, 'items': [], 'has_prev': False, 'has_next': False, 'prev_num': 1, 'next_num': 1}
+    total_pages = math.ceil(total_items / per_page) if total_items > 0 else 1
+    return {'page': page, 'per_page': per_page, 'total_items': total_items, 'total_pages': total_pages, 'items': items_on_page, 'has_prev': page > 1, 'has_next': page < total_pages, 'prev_num': page - 1, 'next_num': page + 1}
+
+# === 1. 대상 PC 관리 ===
+@admin_bp.route('/pcs')
+@ip_auth_required('admin')
+def manage_target_pcs():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.target_pcs"; q_data = "SELECT id, pc_name, address1, address2, description, created_at, last_modified FROM dbo.target_pcs ORDER BY pc_name OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_target_pcs.html', pcs=pagination['items'], pagination=pagination, title="대상 PC 관리")
+
+@admin_bp.route('/pcs/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_target_pc():
+    form = TargetPCForm()
+    if form.validate_on_submit():
+        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None; conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: sql = "INSERT INTO dbo.target_pcs (pc_name, address1, address2, description) VALUES (%s, %s, %s, %s)"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data))
+            conn.commit(); flash(f"PC '{form.pc_name.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add TargetPC IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"PC 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add TargetPC Err: {e}", exc_info=True)
+    return render_template('admin/edit_target_pc.html', form=form, title="새 PC 추가")
+
+@admin_bp.route('/pcs/edit/<int:pc_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_target_pc(pc_id):
+    conn = None; pc_data = None
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, pc_name, address1, address2, description FROM dbo.target_pcs WHERE id = %d", (pc_id,)); pc_data = cursor.fetchone()
+    except Exception as e: flash("PC 정보 로드 오류.", "error"); current_app.logger.error(f"Edit PC (GET) ID {pc_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_target_pcs'))
+    if not pc_data: flash(f"PC ID {pc_id} 없음.", "error"); return redirect(url_for('admin.manage_target_pcs'))
+    form = TargetPCForm(data=pc_data) if request.method == 'GET' else TargetPCForm()
+    if form.validate_on_submit():
+        addr2 = form.address2.data if form.address2.data and form.address2.data.strip() else None
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.target_pcs SET pc_name = %s, address1 = %s, address2 = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.pc_name.data, form.address1.data, addr2, form.description.data, pc_id))
+            conn.commit(); flash(f"PC '{form.pc_name.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_target_pcs'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"PC 이름 '{form.pc_name.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit PC ID {pc_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"PC 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit PC ID {pc_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_target_pc.html', form=form, title=f"PC 정보 수정: {pc_data['pc_name']}", pc=pc_data)
+
+@admin_bp.route('/pcs/delete/<int:pc_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_target_pc(pc_id):
+    conn = None
+    pc_name_for_message = f"ID {pc_id}"
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT pc_name FROM dbo.target_pcs WHERE id = %d", (pc_id,))
+            pc_to_delete = cursor.fetchone()
+            if not pc_to_delete:
+                flash(f"삭제할 PC ID {pc_id}를 찾을 수 없습니다.", 'warning')
+                return redirect(url_for('admin.manage_target_pcs'))
+            pc_name_for_message = pc_to_delete['pc_name']
             
-            </tb:TaskbarIcon>
-    </Application.Resources>
-</Application>
-App.xaml 주요 변경 사항:
-
-xmlns:tb 네임스페이스 추가: Hardcodet.NotifyIcon.Wpf 라이브러리의 컨트롤을 사용하기 위해 XML 네임스페이스를 추가합니다.
-ShutdownMode="OnExplicitShutdown": Application.Current.Shutdown()이 호출될 때만 애플리케이션이 종료되도록 설정합니다. (모든 창이 닫혀도 바로 종료되지 않음)
-<tb:TaskbarIcon x:Key="AppNotifyIcon" ...>:
-AppNotifyIcon이라는 키로 TaskbarIcon 리소스를 정의합니다.
-IconSource: agent_icon.ico 파일의 경로를 지정합니다. (프로젝트에 Resource로 포함된 경우 이 경로가 일반적입니다.)
-ToolTipText: 트레이 아이콘에 마우스를 올렸을 때 표시될 텍스트입니다.
-TrayMouseDoubleClick: 트레이 아이콘 더블 클릭 시 호출될 이벤트 핸들러 이름입니다 (App.xaml.cs에서 구현).
-ContextMenu: WPF의 ContextMenu를 사용하여 트레이 아이콘의 우클릭 메뉴를 정의합니다. "상태 보기/숨기기"와 "종료" 메뉴 항목을 만들고, 각 항목 클릭 시 호출될 이벤트 핸들러를 지정합니다.
-4. 수정: App.xaml.cs (전체 파일 - TaskbarIcon 로직 처리)
-System.Windows.Forms.NotifyIcon 관련 코드를 제거하고, XAML에 정의된 TaskbarIcon을 사용하여 로직을 처리합니다.
-
-C#
-
-// SAgentM.App/App.xaml.cs
-using SAgentM.App.Services;
-using SAgentM.App.ViewModels;
-using System;
-using System.Configuration;
-using System.IO;
-using System.Windows;
-// using System.Windows.Forms; // System.Windows.Forms 관련 using 제거
-using Hardcodet.Wpf.TaskbarNotification; // Hardcodet.NotifyIcon.Wpf 라이브러리 using
-using Serilog;
-
-namespace SAgentM.App
-{
-    public partial class App : Application
-    {
-        private TaskbarIcon _notifyIcon; // Hardcodet 라이브러리의 TaskbarIcon 사용
-        private MainWindow _mainWindow;
-
-        private ILoggingService _loggingService;
-        private IAgentCoreService _agentCoreService;
-        private MainViewModel _mainViewModel;
-
-        protected override void OnStartup(StartupEventArgs e)
-        {
-            base.OnStartup(e);
-
-            // Serilog 파일 로거 설정 (이전과 동일)
-            var logFilePath = ConfigurationManager.AppSettings["LogFilePath"] ?? "Logs_SAgentM\\SAgentM_App_.log";
-            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            var fullLogPath = Path.Combine(baseDir, logFilePath);
-            if (!Directory.Exists(Path.GetDirectoryName(fullLogPath))) { Directory.CreateDirectory(Path.GetDirectoryName(fullLogPath)); }
-            Log.Logger = new LoggerConfiguration()
-                .MinimumLevel.Debug()
-                .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
-                .Enrich.FromLogContext().Enrich.WithThreadId().Enrich.WithProcessId()
-                .WriteTo.File(fullLogPath, rollingInterval: RollingInterval.Day, retainedFileCountLimit: 7, shared: true, flushToDiskInterval: TimeSpan.FromSeconds(5))
-                .CreateLogger();
-            Log.Information("SAgentM.App Application_Startup: Logging initialized. Path: {LogPath}", fullLogPath);
-
-            // 서비스 및 ViewModel 초기화
-            _loggingService = new LoggingService();
-            _agentCoreService = new AgentCoreService(_loggingService);
-            _mainViewModel = new MainViewModel(_loggingService, _agentCoreService);
-
-            // MainWindow 인스턴스 생성 및 ViewModel 연결
-            _mainWindow = new MainWindow { DataContext = _mainViewModel };
-            // MainWindow는 처음에는 숨김 (MainWindow.xaml.cs의 Loaded 이벤트에서 Hide() 호출)
-
-            // App.xaml에 정의된 TaskbarIcon 리소스 가져오기
-            _notifyIcon = (TaskbarIcon)FindResource("AppNotifyIcon");
-            if (_notifyIcon == null)
-            {
-                _loggingService.UiError("App.xaml에서 AppNotifyIcon 리소스를 찾을 수 없습니다.", null);
-                // 대체 NotifyIcon 생성 또는 앱 종료 처리 가능
-                // 여기서는 간단히 로그만 남기고 진행 (아이콘 없이 실행될 수 있음)
-            }
-            else
-            {
-                // 이벤트 핸들러 연결 (XAML에서 이미 연결했지만, 코드에서도 확인/추가 가능)
-                // _notifyIcon.TrayMouseDoubleClick += AppNotifyIcon_TrayMouseDoubleClick; 
-                // ContextMenu의 MenuItem 이벤트는 XAML에서 직접 연결했으므로 여기서는 불필요.
-                // 만약 MenuItem을 코드에서 동적으로 생성한다면 여기서 이벤트 연결.
-                 _loggingService.UiInfo("TaskbarIcon 리소스 로드 완료.");
-            }
-
-
-            // AgentCoreService 시작
-            if (!_agentCoreService.IsRunning)
-            {
-                _loggingService.UiInfo("App.xaml.cs: AgentCoreService 시작 시도...");
-                try
-                {
-                    // ViewModel을 통해 시작하거나 직접 시작 가능
-                    // _mainViewModel.StartAgentCommand.Execute(null); // ViewModel 명령 사용 시
-                    _agentCoreService.Start(); // 직접 시작
-                    
-                    // ViewModel 상태 업데이트 (AgentCoreService 시작 후)
-                    _mainViewModel.UpdateAgentStatus(); 
-                }
-                catch (Exception ex)
-                {
-                     _loggingService.UiError("App.xaml.cs: AgentCoreService 시작 중 오류.", ex);
-                     if (_mainViewModel != null) _mainViewModel.AgentStatus = "에이전트 시작 오류";
-                }
-            }
-        }
-
-        // App.xaml에서 TaskbarIcon의 TrayMouseDoubleClick 이벤트에 연결된 핸들러
-        private void AppNotifyIcon_TrayMouseDoubleClick(object sender, RoutedEventArgs e)
-        {
-            ShowHideMainWindow();
-        }
-
-        // App.xaml에서 ContextMenu의 MenuItem 클릭 이벤트에 연결된 핸들러
-        private void ShowHideMainWindow_MenuItemClick(object sender, RoutedEventArgs e)
-        {
-            ShowHideMainWindow();
-        }
-        
-        private void ShowHideMainWindow()
-        {
-            if (_mainWindow == null) return;
-            if (_mainWindow.IsVisible)
-            {
-                _mainWindow.Hide();
-                _loggingService?.UiDebug("MainWindow 숨김.");
-            }
-            else
-            {
-                _mainWindow.Show();
-                if (_mainWindow.WindowState == WindowState.Minimized)
-                {
-                    _mainWindow.WindowState = WindowState.Normal;
-                }
-                _mainWindow.Activate();
-                _loggingService?.UiDebug("MainWindow 표시.");
-            }
-        }
-
-        // App.xaml에서 ContextMenu의 MenuItem 클릭 이벤트에 연결된 핸들러
-        private async void ExitApplication_MenuItemClick(object sender, RoutedEventArgs e)
-        {
-            _loggingService?.UiInfo("애플리케이션 종료 요청 (트레이 메뉴).");
+            # action_logs 테이블의 target_pc_id 외래키가 ON DELETE SET NULL 이므로, 연관된 로그는 유지됨
+            cursor.execute("DELETE FROM dbo.target_pcs WHERE id = %d", (pc_id,))
+            rows_affected = cursor.rowcount # pymssql에서 DELETE, UPDATE 후 rowcount는 보통 영향을 받은 행의 수
             
-            // ViewModel 및 서비스 정리 작업 호출 (비동기적으로)
-            if (_mainViewModel != null)
-            {
-                await _mainViewModel.CleanupAsync(); // 비동기 정리 대기
-            }
-            // AgentCoreService는 ViewModel의 CleanupAsync 내부에서 Stop 호출될 것으로 예상
-            // 또는 여기서 명시적으로 _agentCoreService?.Stop(); 호출
+            if rows_affected > 0:
+                conn.commit()
+                flash(f"PC '{pc_name_for_message}' 정보가 성공적으로 삭제되었습니다.", 'success')
+                current_app.logger.info(f"TargetPC ID {pc_id} ('{pc_name_for_message}') 삭제 성공.")
+            else:
+                # 이 경우는 거의 발생하지 않아야 함 (위에서 존재 확인 후 삭제 시도)
+                conn.rollback() 
+                flash(f"PC '{pc_name_for_message}' 삭제에 실패했거나 이미 삭제된 항목입니다 (영향 받은 행 없음).", 'warning')
+                current_app.logger.warning(f"Delete TargetPC ID {pc_id} ('{pc_name_for_message}') affected 0 rows after existence check.")
+    except Exception as e:
+        if conn: conn.rollback()
+        flash(f"PC '{pc_name_for_message}' 삭제 중 오류 발생: {str(e)[:200]}", 'error')
+        current_app.logger.error(f"Error deleting TargetPC ID {pc_id}: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_target_pcs'))
 
-            if (_notifyIcon != null)
-            {
-                _notifyIcon.Dispose(); // 트레이 아이콘 정리
-            }
-            Current.Shutdown();     // 애플리케이션 완전히 종료
-        }
+# === 2. 허용된 사용자 IP 관리 ===
+@admin_bp.route('/users')
+@ip_auth_required('admin')
+def manage_user_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.allowed_user_ips"; q_data = "SELECT u.id, u.ip_address, u.description, u.created_at, a.ip_address AS admin_ip FROM dbo.allowed_user_ips u LEFT JOIN dbo.admin_ips a ON u.added_by_admin_id = a.id ORDER BY u.ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_user_ips.html', user_ips=pagination['items'], pagination=pagination, title="허용 사용자 IP 관리")
 
-        protected override void OnExit(ExitEventArgs e)
-        {
-            _loggingService?.UiInfo("SAgentM.App Application_Exit: 최종 정리 및 로거 닫기.");
-            _notifyIcon?.Dispose(); // 만약을 위해 한번 더
-            Log.CloseAndFlush();    // Serilog 파일 로거 닫기
-            base.OnExit(e);
-        }
-    }
-}
-5. 수정: MainWindow.xaml.cs (창 동작 변경)
-Window_Loaded 이벤트에서 창을 숨기고, Closing 이벤트에서 실제 종료 대신 창을 숨기도록 합니다.
+@admin_bp.route('/users/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_user_ip():
+    form = AllowedUserIPForm()
+    if form.validate_on_submit():
+        admin_id = None; conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s", (g.user_ip,)); admin_rec = cursor.fetchone(); 
+            if admin_rec: admin_id = admin_rec['id']; sql = "INSERT INTO dbo.allowed_user_ips (ip_address, description, added_by_admin_id) VALUES (%s, %s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data, admin_id))
+            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add UserIP IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"사용자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add UserIP Err: {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title="새 사용자 IP 추가")
 
-C#
+@admin_bp.route('/users/edit/<int:user_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_user_ip(user_ip_id):
+    conn = None; user_ip_data = None
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description, added_by_admin_id FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,)); user_ip_data = cursor.fetchone()
+    except Exception as e: flash("사용자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit UserIP (GET) ID {user_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_user_ips'))
+    if not user_ip_data: flash(f"사용자 IP ID {user_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_user_ips'))
+    form = AllowedUserIPForm(data=user_ip_data) if request.method == 'GET' else AllowedUserIPForm()
+    if form.validate_on_submit():
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.allowed_user_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (form.ip_address.data, form.description.data, user_ip_id))
+            conn.commit(); flash(f"사용자 IP '{form.ip_address.data}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_user_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"사용자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit UserIP ID {user_ip_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_user_ip.html', form=form, title=f"사용자 IP 수정: {user_ip_data['ip_address']}", user_ip_obj=user_ip_data)
 
-// SAgentM.App/MainWindow.xaml.cs
-using SAgentM.App.ViewModels;
-using System;
-using System.ComponentModel;
-using System.Windows;
-using System.Windows.Controls; // ListView 접근용
-
-namespace SAgentM.App
-{
-    public partial class MainWindow : Window
-    {
-        private MainViewModel _viewModel => DataContext as MainViewModel;
-
-        public MainWindow()
-        {
-            InitializeComponent();
-            // DataContext는 App.xaml.cs에서 MainWindow 인스턴스 생성 시 주입됨
-        }
-
-        private void Window_Loaded(object sender, RoutedEventArgs e)
-        {
-            // ViewModel의 LoadedCommand는 App.xaml.cs에서 AgentCoreService를 시작하므로,
-            // 여기서는 ViewModel 상태 업데이트나 UI 관련 초기화만 수행할 수 있음.
-            // 또는 App.xaml.cs에서 ViewModel의 해당 명령을 호출하도록 할 수 있음.
-            // _viewModel?.LoadedCommand?.Execute(null); // App.xaml.cs에서 이미 처리했다면 중복 불필요
-
-            // 로그 자동 스크롤 이벤트 핸들러 등록
-            if (_viewModel != null && _viewModel.UiLogEntries != null)
-            {
-                 _viewModel.UiLogEntries.CollectionChanged += UiLogEntries_CollectionChanged;
-            }
+@admin_bp.route('/users/delete/<int:user_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_user_ip(user_ip_id):
+    conn = None
+    ip_address_for_message = f"ID {user_ip_id}"
+    deleted_successfully = False
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ip_address FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
+            user_ip_to_delete = cursor.fetchone()
+            if not user_ip_to_delete:
+                flash(f"삭제할 사용자 IP ID {user_ip_id}를 찾을 수 없습니다.", 'warning')
+                return redirect(url_for('admin.manage_user_ips'))
+            ip_address_for_message = user_ip_to_delete['ip_address']
             
-            // 창이 로드된 후 바로 숨깁니다 (애플리케이션 시작 시 트레이로만 가도록)
-            this.Hide(); 
-            _viewModel?.UiInfo("MainWindow 로드 완료 및 숨김 처리됨 (트레이 모드).");
-        }
-        
-        private void UiLogEntries_CollectionChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
-        {
-            // XAML에서 ListView에 x:Name="LogListView"가 설정되어 있어야 함
-            if (LogListView != null && LogListView.Items.Count > 0)
-            {
-               var lastItem = LogListView.Items[LogListView.Items.Count - 1];
-               LogListView.ScrollIntoView(lastItem);
-            }
-        }
+            cursor.execute("DELETE FROM dbo.allowed_user_ips WHERE id = %d", (user_ip_id,))
+            rows_affected = cursor.rowcount
+            if rows_affected > 0:
+                conn.commit()
+                deleted_successfully = True
+                flash(f"사용자 IP '{ip_address_for_message}' 정보가 성공적으로 삭제되었습니다.", 'success')
+                current_app.logger.info(f"AllowedUserIP ID {user_ip_id} ('{ip_address_for_message}') 삭제 성공.")
+            else:
+                conn.rollback()
+                flash(f"사용자 IP '{ip_address_for_message}' 삭제에 실패했거나 이미 삭제된 항목입니다.", 'warning')
+                current_app.logger.warning(f"Delete AllowedUserIP ID {user_ip_id} ('{ip_address_for_message}') affected 0 rows.")
+    except Exception as e:
+        if conn: conn.rollback()
+        flash(f"사용자 IP '{ip_address_for_message}' 삭제 중 오류 발생: {str(e)[:200]}", 'error')
+        current_app.logger.error(f"Error deleting AllowedUserIP ID {user_ip_id}: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_user_ips'))
 
-        protected override void OnClosing(CancelEventArgs e)
-        {
-            // 창의 닫기 버튼(X)을 눌렀을 때 애플리케이션을 종료하는 대신 창을 숨김
-            e.Cancel = true; // 실제 종료 방지
-            this.Hide();     // 창 숨기기
-            _viewModel?.UiInfo("MainWindow 창 숨김 (트레이 아이콘으로 최소화).");
-            // base.OnClosing(e)는 e.Cancel=true일 때 호출하지 않는 것이 일반적일 수 있으나,
-            // WPF 기본 동작에 따라 필요하다면 호출. 여기서는 생략해도 무방할 수 있음.
-        }
+# === 3. 관리자 IP 관리 ===
+@admin_bp.route('/admins')
+@ip_auth_required('admin')
+def manage_admin_ips():
+    page = request.args.get('page', 1, type=int); per_page = 10
+    q_count = "SELECT COUNT(*) AS total FROM dbo.admin_ips"; q_data = "SELECT id, ip_address, description, created_at FROM dbo.admin_ips ORDER BY ip_address OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+    pagination = _get_pagination_data(q_count, q_data, page, per_page)
+    return render_template('admin/manage_admin_ips.html', admin_ips=pagination['items'], pagination=pagination, title="관리자 IP 관리")
 
-        // 이 메서드는 이제 App.xaml.cs의 ExitApplication_MenuItemClick에서 Shutdown을 호출하므로,
-        // MainWindow에서 직접적인 Shutdown 호출은 필요 없을 수 있습니다.
-        // public async Task PerformCleanupAndShutdown()
-        // {
-        //     if (_viewModel != null)
-        //     {
-        //         await _viewModel.CleanupAsync();
-        //     }
-        //     Application.Current.Shutdown();
-        // }
-    }
-}
-MainWindow.xaml.cs 주요 변경 사항:
+@admin_bp.route('/admins/add', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def add_admin_ip():
+    form = AdminIPForm()
+    if form.validate_on_submit():
+        conn = None
+        try:
+            conn = get_db_connection();
+            with conn.cursor() as cursor: sql = "INSERT INTO dbo.admin_ips (ip_address, description) VALUES (%s, %s)"; cursor.execute(sql, (form.ip_address.data, form.description.data))
+            conn.commit(); flash(f"관리자 IP '{form.ip_address.data}' 추가 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{form.ip_address.data}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Add AdminIP IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"관리자 IP 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add AdminIP Err: {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title="새 관리자 IP 추가")
 
-Window_Loaded: this.Hide()를 호출하여 창이 처음 나타나자마자 바로 숨깁니다. 로그 자동 스크롤을 위한 이벤트 핸들러도 여기에 등록합니다.
-OnClosing: 창의 닫기(X) 버튼을 클릭했을 때 e.Cancel = true;로 설정하여 실제 종료를 막고, this.Hide()를 호출하여 창만 숨깁니다.
-PerformCleanupAndShutdown 메서드는 이제 App.xaml.cs의 ExitApplication_MenuItemClick에서 Application.Current.Shutdown()을 직접 호출하므로, MainWindow에서 중복으로 호출할 필요는 없습니다.
-6. ViewModels/MainViewModel.cs (약간의 조정 - 선택 사항)
-App.xaml.cs에서 AgentCoreService의 시작을 담당하므로, MainViewModel의 LoadedCommand는 이제 필수가 아니게 됩니다. UpdateAgentStatus()는 App.xaml.cs에서 서비스 상태 변경 시 호출해주거나, AgentCoreService의 상태를 바인딩 가능한 속성으로 만들어 연동할 수 있습니다.
+@admin_bp.route('/admins/edit/<int:admin_ip_id>', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def edit_admin_ip(admin_ip_id):
+    conn = None; admin_ip_data = None; original_ip = ""
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor: cursor.execute("SELECT id, ip_address, description FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
+        if admin_ip_data: original_ip = admin_ip_data['ip_address']
+    except Exception as e: flash("관리자 IP 로드 오류.", "error"); current_app.logger.error(f"Edit AdminIP (GET) ID {admin_ip_id} Err: {e}", exc_info=True); return redirect(url_for('admin.manage_admin_ips'))
+    if not admin_ip_data: flash(f"관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+    form = AdminIPForm(data=admin_ip_data) if request.method == 'GET' else AdminIPForm()
+    if form.validate_on_submit():
+        new_ip = form.ip_address.data
+        if original_ip != new_ip:
+            if original_ip == g.user_ip: flash("자신의 현재 접속 IP는 변경할 수 없습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+            try:
+                if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+                with conn.cursor() as cursor: cursor.execute("SELECT id FROM dbo.admin_ips WHERE ip_address = %s AND id != %d", (new_ip, admin_ip_id))
+                if cursor.fetchone(): flash(f"IP '{new_ip}'는 이미 다른 관리자 항목에 있습니다.", 'error'); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+            except Exception as e: flash(f"IP 중복 확인 중 오류: {e}", "error"); return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
+        try:
+            if conn is None or getattr(conn, '_closed', True): conn = get_db_connection()
+            with conn.cursor() as cursor: sql = "UPDATE dbo.admin_ips SET ip_address = %s, description = %s WHERE id = %d"; cursor.execute(sql, (new_ip, form.description.data, admin_ip_id))
+            conn.commit(); flash(f"관리자 IP '{new_ip}' 수정 성공.", 'success'); return redirect(url_for('admin.manage_admin_ips'))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); msg = f"IP 주소 '{new_ip}' 중복." if "UNIQUE KEY" in str(ie).upper() or "duplicate key" in str(ie) else f"DB 제약 위반: {str(ie)[:100]}"; flash(msg, 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"관리자 IP 수정 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Edit AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
+    return render_template('admin/edit_admin_ip.html', form=form, title=f"관리자 IP 수정: {original_ip}", admin_ip_obj=admin_ip_data)
 
-이전 답변(#52)에서 MainViewModel 코드는 이미 LoadedCommand를 선택적으로 만들고, UpdateAgentStatus를 통해 상태를 반영하도록 되어 있으므로, 큰 변경 없이 사용할 수 있습니다. App.xaml.cs에서 _mainViewModel.UpdateAgentStatus()를 서비스 시작/중지 직후에 호출하는 것이 좋습니다. (위 App.xaml.cs 코드에 반영됨)
+@admin_bp.route('/admins/delete/<int:admin_ip_id>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_admin_ip(admin_ip_id):
+    conn = None; ip_addr_deleted = f"ID {admin_ip_id}"; total_admins = 0; deleted_successfully = False
+    try:
+        conn = get_db_connection();
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ip_address FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); admin_ip_data = cursor.fetchone()
+            if not admin_ip_data: flash(f"삭제할 관리자 IP ID {admin_ip_id} 없음.", "error"); return redirect(url_for('admin.manage_admin_ips'))
+            ip_addr_deleted = admin_ip_data['ip_address']
+            if ip_addr_deleted == g.user_ip: flash("자신의 현재 접속 IP는 삭제할 수 없습니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
+            cursor.execute("SELECT COUNT(*) AS total FROM dbo.admin_ips"); count_res = cursor.fetchone(); total_admins = count_res['total'] if count_res else 0
+            if total_admins <= 1: flash("최소 1개의 관리자 IP는 남아 있어야 합니다.", 'error'); return redirect(url_for('admin.manage_admin_ips'))
+            cursor.execute("UPDATE dbo.allowed_user_ips SET added_by_admin_id = NULL WHERE added_by_admin_id = %d", (admin_ip_id,)) # FK 처리 먼저
+            cursor.execute("DELETE FROM dbo.admin_ips WHERE id = %d", (admin_ip_id,)); rows_affected = cursor.rowcount
+            if rows_affected > 0: conn.commit(); deleted_successfully = True; flash(f"관리자 IP '{ip_addr_deleted}' 삭제 성공.", 'success'); current_app.logger.info(f"AdminIP ID {admin_ip_id} ('{ip_addr_deleted}') 삭제 성공.")
+            else: conn.rollback(); flash(f"관리자 IP '{ip_addr_deleted}' 삭제 실패 또는 이미 삭제됨.", 'warning'); current_app.logger.warning(f"Delete AdminIP ID {admin_ip_id} ('{ip_addr_deleted}') affected 0 rows.")
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"관리자 IP 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete AdminIP ID {admin_ip_id} Err: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_admin_ips'))
 
-실행 및 확인:
+# === 4. 근무일/비근무일 예외 관리 (달력 UI 적용) ===
+@admin_bp.route('/calendar_exceptions', methods=['GET', 'POST'])
+@ip_auth_required('admin')
+def manage_calendar_exceptions():
+    form = WorkCalendarExceptionForm(); conn = None
+    try: year = request.args.get('year', dt_datetime.now().year, type=int); month = request.args.get('month', dt_datetime.now().month, type=int)
+    except ValueError: year = dt_datetime.now().year; month = dt_datetime.now().month
+    if not (1 <= month <= 12): month = dt_datetime.now().month; year = dt_datetime.now().year
+    current_display_month_start_date = date(year, month, 1)
+    prev_month_date = current_display_month_start_date - timedelta(days=1); prev_month_params = {'year': prev_month_date.year, 'month': prev_month_date.month}
+    if month == 12: next_month_first_day = date(year + 1, 1, 1); else: next_month_first_day = date(year, month + 1, 1)
+    next_month_params = {'year': next_month_first_day.year, 'month': next_month_first_day.month}
 
-NuGet 패키지 Hardcodet.NotifyIcon.Wpf를 SAgentM.App 프로젝트에 설치합니다.
-agent_icon.ico 파일을 프로젝트에 올바르게 추가하고 Resource로 설정합니다. (App.xaml의 IconSource 경로 확인)
-위 코드들을 각 파일에 적용하고 프로젝트를 빌드합니다.
-SAgentM.App.exe를 (관리자 권한으로) 실행합니다.
-이제 메인 창이 바로 뜨지 않고 시스템 트레이에 아이콘만 나타나야 합니다.
-AgentCoreService는 자동으로 시작되어야 합니다 (로그 확인).
-트레이 아이콘을 더블 클릭하거나, 우클릭 메뉴에서 "상태 보기/숨기기"를 선택하여 MainWindow가 나타나고 사라지는지 확인합니다.
-MainWindow의 X 버튼을 누르면 창이 숨겨지는지 확인합니다.
+    if form.validate_on_submit():
+        date_val = form.exception_date.data; is_op_val = bool(int(form.is_operational.data))
+        desc_val = form.description.data if form.description.data and form.description.data.strip() else None
+        date_str_for_db = date_val.strftime('%Y-%m-%d')
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 AS existing_check FROM dbo.work_calendar_exceptions WHERE exception_date = %s", (date_str_for_db,))
+                if cursor.fetchone(): flash(f"날짜 {date_str_for_db} 예외 이미 존재.", 'error')
+                else: sql = "INSERT INTO dbo.work_calendar_exceptions (exception_date, is_operational, description) VALUES (%s, %s, %s)"; cursor.execute(sql, (date_str_for_db, is_op_val, desc_val)); conn.commit(); flash(f"날짜 {date_str_for_db} ({'가동일' if is_op_val else '비가동일'}) 예외 추가 성공.", 'success')
+            return redirect(url_for('admin.manage_calendar_exceptions', year=year, month=month))
+        except pymssql.IntegrityError as ie:
+            if conn: conn.rollback(); flash(f"DB 오류 (중복): {str(ie)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx IntErr: {ie}", exc_info=False)
+        except Exception as e:
+            if conn: conn.rollback(); flash(f"예외 날짜 추가 오류: {str(e)[:100]}", 'error'); current_app.logger.error(f"Add CalendarEx Err: {e}", exc_info=True)
+    
+    cal = calendar.Calendar(firstweekday=6); month_days_raw = cal.monthdatescalendar(year, month)
+    kr_holidays = holidays.KR(years=year, observed=True); db_user_exceptions = {} # observed=True 로 대체공휴일 포함
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            first_day = date(year, month, 1); last_day = date(year, month, calendar.monthrange(year, month)[1])
+            sql_exc = "SELECT exception_date, is_operational, description FROM dbo.work_calendar_exceptions WHERE exception_date BETWEEN %s AND %s"
+            cursor.execute(sql_exc, (first_day.strftime('%Y-%m-%d'), last_day.strftime('%Y-%m-%d')))
+            for row in cursor.fetchall():
+                exc_date = row['exception_date']; 
+                if isinstance(exc_date, dt_datetime): exc_date = exc_date.date()
+                db_user_exceptions[exc_date] = {'is_operational': bool(row['is_operational']), 'description': row['description']}
+    except Exception as e: flash("달력 예외 정보 로드 오류.", "error"); current_app.logger.error(f"Fetch CalendarEx for {year}-{month} Err: {e}", exc_info=True)
+
+    calendar_display_data = []
+    for week_of_dates in month_days_raw:
+        week_data = [];
+        for day_date_obj in week_of_dates:
+            day_info = {'date_obj': day_date_obj, 'day_num': day_date_obj.day, 'is_today': (day_date_obj == date.today()), 'is_current_month': (day_date_obj.month == month), 'status_class': '', 'status_text': '', 'description': '', 'is_operational_final': None }
+            if day_info['is_current_month']:
+                user_exc = db_user_exceptions.get(day_date_obj); holiday_name = kr_holidays.get(day_date_obj)
+                if user_exc: day_info.update({'is_operational_final': user_exc['is_operational'], 'status_class': 'user-op' if user_exc['is_operational'] else 'user-non-op', 'status_text': '★가동(지정)' if user_exc['is_operational'] else '★비가동(지정)', 'description': user_exc['description'] if user_exc['description'] else ('사용자 지정 가동일' if user_exc['is_operational'] else '사용자 지정 비가동일')})
+                elif holiday_name: day_info.update({'is_operational_final': False, 'status_class': 'public-holiday', 'status_text': '공휴일(비가동)', 'description': holiday_name})
+                elif day_date_obj.weekday() >= 5: day_info.update({'is_operational_final': False, 'status_class': 'weekend-sat' if day_date_obj.weekday() == 5 else 'weekend-sun', 'status_text': '주말(비가동)'})
+                else: day_info.update({'is_operational_final': True, 'status_class': 'weekday-op', 'status_text': '평일(가동)'})
+            else: day_info['status_class'] = 'other-month'
+            week_data.append(day_info)
+        calendar_display_data.append(week_data)
+    
+    return render_template('admin/manage_calendar_exceptions.html', title="근무일/비근무일 예외 관리", form=form, 
+                           calendar_weeks=calendar_display_data, current_year=year, current_month=month,
+                           prev_month_params=prev_month_params, next_month_params=next_month_params)
+
+@admin_bp.route('/calendar_exceptions/delete/<string:date_str>', methods=['POST'])
+@ip_auth_required('admin')
+def delete_calendar_exception(date_str):
+    conn = None; year_to_redirect = dt_datetime.now().year; month_to_redirect = dt_datetime.now().month
+    try:
+        date_obj = dt_datetime.strptime(date_str, '%Y-%m-%d').date()
+        year_to_redirect = date_obj.year; month_to_redirect = date_obj.month
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            sql = "DELETE FROM dbo.work_calendar_exceptions WHERE exception_date = %s"; cursor.execute(sql, (date_obj.strftime('%Y-%m-%d'),)); rows_deleted = cursor.rowcount
+        conn.commit()
+        if rows_deleted > 0: flash(f"날짜 {date_str} 예외 삭제 성공.", 'success')
+        else: flash(f"날짜 {date_str} 예외 없음.", 'warning')
+    except ValueError: flash(f"잘못된 날짜 형식: {date_str}", 'error'); current_app.logger.warning(f"Invalid date for delete: {date_str}")
+    except Exception as e:
+        if conn: conn.rollback(); flash(f"예외 날짜 삭제 오류: {e}", 'error'); current_app.logger.error(f"Delete CalendarEx for {date_str} Error: {e}", exc_info=True)
+    return redirect(url_for('admin.manage_calendar_exceptions', year=year_to_redirect, month=month_to_redirect))
+
+이것으로 app/routes_admin.py 파일의 모든 관리자 기능이 pymssql을 사용하고 달력 예외 관리 기능까지 포함된 전체 코드가 되었습니다. 이 파일과 이전에 제공된 각 기능별 HTML 템플릿, 그리고 forms.py 등을 함께 사용하시면 됩니다.
