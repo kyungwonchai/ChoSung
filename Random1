@@ -1,128 +1,93 @@
-네, 사용자님께서 올려주신 오류 화면 잘 보았습니다.
+# scontrol_flask_web/app/__init__.py
+from flask import Flask, current_app, render_template, g, request # <<--- g, request 임포트 추가!
+from config import config
+import datetime
+import os
+from flask_apscheduler import APScheduler 
 
-NameError: name 'g' is not defined 오류가 app/auth.py 파일의 decorated_function 내부 (아마도 getattr(g, 'user_ip', ...) 호출 부분 근처 또는 해당 로직이 포함된 로깅 라인)에서 발생한 것으로 보입니다.
+scheduler = APScheduler()
 
-이 오류는 Python이 g라는 이름의 변수(객체)를 현재 범위에서 찾을 수 없을 때 발생합니다. Flask에서 g 객체는 현재 처리 중인 요청(request) 동안 데이터를 임시로 저장하는 데 사용되는 특수한 전역 객체이며, flask 모듈로부터 반드시 임포트(import) 되어야 사용 가능합니다.
+def create_app(config_name='default'):
+    app = Flask(__name__)
+    app.config.from_object(config[config_name])
+    config[config_name].init_app(app)
 
-가장 가능성이 높은 원인:
+    from . import db_utils 
+    app.teardown_appcontext(db_utils.close_db)
 
-app/auth.py 파일 상단에 from flask import g 또는 from flask import request, current_app, abort, g 와 같이 g 객체를 임포트하는 구문이 누락되었거나, 실수로 삭제되었을 수 있습니다.
-
-해결 방법:
-
-app/auth.py 파일의 맨 위에 g를 포함한 필요한 Flask 객체들이 올바르게 임포트되어 있는지 확인하고, 누락되었다면 추가해야 합니다.
-
-아래에 app/auth.py 파일의 수정된 전체 최종 코드를 다시 제공해 드리겠습니다. 이 코드에는 올바른 임포트 구문이 포함되어 있습니다. 사용자님의 app/auth.py 파일을 이 내용으로 완전히 교체해 보시고, Flask 개발 서버를 완전히 재시작한 후 다시 테스트해 주십시오.
-
-수정: app/auth.py (전체 코드, g 임포트 확인)
-Python
-
-# scontrol_flask_web/app/auth.py
-from functools import wraps
-from flask import request, current_app, abort, g # <<--- 여기에 'g'가 포함되어 있는지 확인!
-from .db_utils import get_db_connection 
-
-# AdminIP, AllowedUserIP 모델은 더 이상 직접 사용하지 않음 (pymssql로 직접 쿼리)
-
-def get_current_user_role():
-    if hasattr(g, 'current_user_role'):
-        return g.current_user_role
-
-    user_ip = None
-    if request.headers.getlist("X-Forwarded-For"):
-        user_ip = request.headers.getlist("X-Forwarded-For")[0].split(',')[0].strip()
-    else:
-        user_ip = request.remote_addr
+    # --- Jinja2 필터 및 컨텍스트 프로세서 ---
+    def format_datetime(value, fmt='%Y-%m-%d %H:%M'):
+        if not value: return ""
+        if isinstance(value, str): 
+            original_value_for_log = value 
+            try: 
+                processed_value = value.upper().replace('Z', '')
+                if '.' in processed_value: processed_value = processed_value.split('.')[0]
+                processed_value = processed_value.replace('T', ' ')
+                formats_to_try = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
+                parsed_dt = None
+                for dt_format in formats_to_try:
+                    try: parsed_dt = datetime.datetime.strptime(processed_value, dt_format); break
+                    except ValueError: continue
+                if parsed_dt is None: app.logger.warning(f"날짜 파싱 실패 (format_datetime): '{original_value_for_log}'"); return original_value_for_log 
+                value = parsed_dt
+            except Exception as e_parse: app.logger.error(f"날짜 파싱 중 예외 (format_datetime) '{original_value_for_log}': {e_parse}"); return original_value_for_log 
+        if not isinstance(value, (datetime.datetime, datetime.date)): return value 
+        return value.strftime(fmt)
+    app.jinja_env.filters['datetimeformat'] = format_datetime
     
-    current_app.logger.info(f"AUTH: 현재 접속 시도 IP 주소: {user_ip}")
-    g.user_ip = user_ip # 요청 컨텍스트(g)에 사용자 IP 저장
-    g.current_user_role = 'guest' # 기본값 설정
+    @app.context_processor
+    def inject_now(): return {'now': datetime.datetime.utcnow()}
 
-    if not user_ip:
-        current_app.logger.warning("사용자 IP 주소를 확인할 수 없습니다 (auth.py).")
-        return g.current_user_role
-
-    # 1. config.py의 ADMIN_IPS 목록에서 먼저 확인
-    if user_ip in current_app.config.get('ADMIN_IPS', []):
-        g.current_user_role = 'admin'
-        current_app.logger.info(f"AUTH: IP {user_ip}는 config.py의 ADMIN_IPS 목록에 포함되어 'admin' 역할을 부여받았습니다.")
-        return 'admin'
-
-    # 2. 데이터베이스의 admin_ips 테이블에서 확인
-    conn = None
-    try:
-        conn = get_db_connection()
-        if conn:
-            with conn.cursor() as cursor:
-                sql_admin_check = "SELECT ip_address FROM dbo.admin_ips WHERE ip_address = %s"
-                cursor.execute(sql_admin_check, (user_ip,))
-                admin_entry = cursor.fetchone()
-                if admin_entry:
-                    g.current_user_role = 'admin'
-                    current_app.logger.info(f"AUTH: IP {user_ip}는 DB의 admin_ips 테이블에 포함되어 'admin' 역할을 부여받았습니다.")
-                    return 'admin'
-
-                # 3. 데이터베이스의 allowed_user_ips 테이블에서 확인
-                sql_user_check = "SELECT ip_address FROM dbo.allowed_user_ips WHERE ip_address = %s"
-                cursor.execute(sql_user_check, (user_ip,))
-                allowed_user_entry = cursor.fetchone()
-                if allowed_user_entry:
-                    g.current_user_role = 'user'
-                    current_app.logger.info(f"AUTH: IP {user_ip}는 DB의 allowed_user_ips 테이블에 포함되어 'user' 역할을 부여받았습니다.")
-                    return 'user'
-        else:
-             current_app.logger.error(f"AUTH: DB 연결 실패. IP {user_ip}에 대한 DB 기반 역할 확인 불가.")
-    except Exception as e:
-        current_app.logger.error(f"AUTH: IP 역할 확인 중 DB 오류 발생: {e}", exc_info=True)
-    
-    current_app.logger.info(f"AUTH: IP {user_ip}는 허용 목록에 없어 'guest' 역할이 부여됩니다.")
-    # g.current_user_role은 이미 'guest'로 설정되어 있음
-    return g.current_user_role
+    from .auth import inject_user_info_to_templates # 이 함수는 내부적으로 g와 request 사용
+    app.context_processor(inject_user_info_to_templates)
 
 
-def ip_auth_required(role_required=None):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            user_role = get_current_user_role() 
-            
-            # getattr(g, 'user_ip', ...)를 사용하여 안전하게 g.user_ip 접근
-            client_ip_for_log = getattr(g, 'user_ip', 'IP_정보_없음') 
-
-            if role_required == 'admin' and user_role != 'admin':
-                current_app.logger.warning(f"접근 거부 (관리자 필요): IP {client_ip_for_log} -> {request.path}")
-                abort(403) 
-            elif role_required == 'user' and user_role not in ['admin', 'user']:
-                current_app.logger.warning(f"접근 거부 (사용자 필요): IP {client_ip_for_log} -> {request.path}")
-                abort(403)
-            elif role_required is None and user_role not in ['admin', 'user']: 
-                current_app.logger.warning(f"접근 거부 (허용 IP 아님): IP {client_ip_for_log} -> {request.path}")
-                abort(403)
-            
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
+    # --- 블루프린트 등록 ---
+    from .routes_main import main_bp
+    app.register_blueprint(main_bp) 
+    from .routes_admin import admin_bp
+    app.register_blueprint(admin_bp, url_prefix='/admin') 
+    from .routes_user import user_bp
+    app.register_blueprint(user_bp, url_prefix='/user') 
+    from .routes_logs import logs_bp 
+    app.register_blueprint(logs_bp, url_prefix='/history')
 
 
-def inject_user_info_to_templates():
-    current_role = get_current_user_role() 
-    return dict(
-        current_user_ip=getattr(g, 'user_ip', 'IP 확인 불가'), 
-        current_user_role=current_role
-    )
-주요 확인 및 수정 사항:
+    # --- 403 에러 핸들러 등록 ---
+    @app.errorhandler(403)
+    def forbidden_page(error): # error 인자는 Flask가 자동으로 전달
+        # inject_user_info_to_templates 컨텍스트 프로세서가 먼저 실행되어 g.user_ip를 설정했을 것임
+        # 만약 설정되지 않았다면 'IP 확인 불가'로 표시됨
+        client_ip_for_log = getattr(g, 'user_ip', 'IP 확인 불가')
+        # request 객체는 이 컨텍스트에서 사용 가능해야 함 (Flask가 관리)
+        requested_path = request.path if request else '경로 확인 불가'
+        
+        app.logger.warning(f"403 Forbidden error handled for IP: {client_ip_for_log}, Path: {requested_path}")
+        return render_template('errors/403.html'), 403
+    # --- 403 에러 핸들러 등록 끝 ---
 
-파일 상단 from flask import ... 라인:
-Python
 
-from flask import request, current_app, abort, g
-이 라인에 g가 포함되어 있는지 다시 한번 확인해 주십시오. 만약 빠져있다면, 위 코드처럼 추가해주시면 됩니다.
-getattr(g, 'user_ip', ...) 사용: ip_auth_required 데코레이터 내에서 g.user_ip를 참조할 때, g 객체에 user_ip 속성이 아직 설정되지 않았을 수도 있는 아주 예외적인 상황을 대비하여 getattr(g, 'user_ip', 'IP_정보_없음') 형태로 좀 더 안전하게 접근하도록 수정했습니다. (이론적으로 get_current_user_role()이 먼저 호출되어 g.user_ip를 설정하므로 큰 문제는 없어야 합니다.)
-조치:
+    # --- APScheduler 초기화 및 작업 등록 ---
+    if not scheduler.running:
+        scheduler.init_app(app)
+        app.logger.info("APScheduler init_app(app) 호출됨.")
+        from . import scheduler_tasks 
+        current_flask_app_for_scheduler = app 
+        job_id_on = 'scheduled_task_monitor_on_daily'; job_id_off = 'scheduled_task_monitor_off_daily'
+        try:
+            scheduler.add_job(id=job_id_on, func=scheduler_tasks.scheduled_task_monitor_on, args=[current_flask_app_for_scheduler], trigger='cron', hour=6, minute=0, misfire_grace_time=3600, replace_existing=True)
+            app.logger.info(f"스케줄 작업 '{job_id_on}' 매일 06:00 등록/대체됨.")
+            scheduler.add_job(id=job_id_off, func=scheduler_tasks.scheduled_task_monitor_off, args=[current_flask_app_for_scheduler], trigger='cron', hour=7, minute=0, misfire_grace_time=3600, replace_existing=True )
+            app.logger.info(f"스케줄 작업 '{job_id_off}' 매일 07:00 등록/대체됨.")
+            if not app.config.get('TESTING', False): scheduler.start(); app.logger.info("APScheduler 시작됨.")
+            else: app.logger.info("TESTING 모드: APScheduler 자동 시작 안 함.")
+        except Exception as e: app.logger.error(f"APScheduler 작업 등록 또는 시작 실패: {e}", exc_info=True)
+    else: app.logger.info("APScheduler가 이미 실행 중이거나 다른 방식으로 초기화됨.")
 
-위 전체 코드로 scontrol_flask_web/app/auth.py 파일을 교체합니다.
-프로젝트 내의 모든 __pycache__ 폴더를 삭제합니다.
-Flask 개발 서버를 완전히 종료했다가 다시 시작합니다.
-이것으로 NameError: name 'g' is not defined 오류가 해결되어야 합니다. 이 오류는 대부분 Flask의 g 객체를 사용하기 전에 해당 파일에서 from flask import g로 임포트하지 않았을 때 발생합니다.
+    app.logger.info("Flask application 생성 및 설정 완료 (커스텀 403 핸들러 포함).")
+    if app.debug:
+        app.logger.debug(f"DB 연결 (pymssql): Server={app.config.get('DB_SERVER')}:{app.config.get('DB_PORT')}, DB={app.config.get('DB_DATABASE')}")
+        if scheduler.running: app.logger.debug(f"등록된 스케줄러 작업: {scheduler.get_jobs()}")
 
-다시 한번 테스트해보시고 결과를 알려주세요!
+    return app
