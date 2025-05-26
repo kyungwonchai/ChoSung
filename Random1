@@ -1,594 +1,137 @@
-네, 알겠습니다. 이전 설명이 다소 복잡했던 것 같습니다. 요구사항을 다시 정리해서, 로깅 동작 중에 설정된 특정 프로세스(예: InlineTesterPBA_V1_V2.0.8.exe)를 찾을 수 없게 되면, 30초마다 "InlineTesterPBA"로 시작하는 다른 실행 중인 프로세스를 찾아 자동으로 그 이름으로 대상을 갱신하는 기능으로 수정하겠습니다.
+, 알겠습니다. SearchTimer_Tick에서 "대상 창/프로세스를 찾는 중..." 메시지가 계속 뜨는데, 사용자님께서는 'InlineTesterPBA'로 시작하는 프로세스가 분명히 실행 중이라고 생각하시는 상황이군요.
 
-그리고 요청하신 대로 모든 LogTrace 호출을 제거하고, 수정이 필요한 MainWindow.xaml.cs 파일의 전체 코드를 드리겠습니다.
+이 경우, GetTargetWindowHandle() 함수가 실제로 무엇을 찾고 있고, 왜 못 찾는지를 상세히 추적하는 로그가 필요합니다. 이 함수는 단순히 프로세스가 실행 중인지 뿐만 아니라, 화면 캡처에 사용할 수 있는 **유효한 창 핸들(Window Handle, HWND)**을 가지고 있는지를 최종적으로 확인하기 때문입니다.
 
-주요 변경 사항
-TARGET_PROCESS_PREFIX 상수 정의: "InlineTesterPBA"와 같이 자동으로 찾아야 할 프로세스 이름의 시작 부분을 상수로 정의합니다.
-자동 대상 갱신 타이머 (autoUpdateTargetTimer):
-30초 간격으로 동작합니다.
-이 타이머는 PerformLogging 함수 내에서, 현재 '프로세스 이름으로 찾기'가 선택되어 있고 txtTarget.Text에 지정된 프로세스를 찾지 못했을 때만 활성화됩니다.
-AutoUpdateTargetTimer_Tick 이벤트 핸들러:
-실행 중인 프로세스 중 TARGET_PROCESS_PREFIX로 시작하는 프로세스를 검색합니다.
-정확히 하나만 발견되면:
-txtTarget.Text를 새로 발견된 프로세스의 전체 이름으로 업데이트합니다.
-'프로세스 이름으로 찾기' 라디오 버튼이 선택되도록 합니다.
-이 변경 사항을 즉시 설정에 저장합니다.
-autoUpdateTargetTimer를 중지합니다.
-상태 메시지를 업데이트하고, 주 로깅 타이머(timer)를 다시 시작하려고 시도합니다 (수동 '로깅 시작' 버튼 클릭과 유사하게 동작).
-기존 타이머 관리 로직 수정:
-사용자가 수동으로 '로깅 시작/중지'를 하거나 '수정/잠금' 모드를 변경할 때, 새로 추가된 autoUpdateTargetTimer를 포함한 모든 관련 타이머들이 적절히 중지되도록 합니다.
-초기 자동 시작 로직(AttemptAutoStart)에서 txtTarget.Text가 비어있고 '프로세스 이름으로 찾기'가 선택된 경우, 이 새로운 autoUpdateTargetTimer를 활용하여 초기 감지를 시도하도록 합니다.
-MainWindow.xaml.cs 전체 코드 (자동 대상 갱신 기능 포함, LogTrace 제거)
+요청하신 대로, GetTargetWindowHandle() 함수 내부에 아주 상세한 추적 로그를 추가하여, 현재 실행 중인 프로세스 목록 (검색 대상과 관련된), 찾으려는 대상 정보, 그리고 왜 일치하지 않는지에 대한 설명까지 로그로 남기도록 수정하겠습니다.
+
+MainWindow.xaml.cs 파일 내 GetTargetWindowHandle() 함수 수정
+아래 코드는 GetTargetWindowHandle() 함수만 수정한 것입니다. 기존 MainWindow.xaml.cs 파일에서 이 함수 부분을 아래 코드로 교체하시면 됩니다. 다른 부분은 수정하지 마세요.
+
 C#
 
-using System;
-using System.ComponentModel;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Windows;
-using funcenvget.Properties;
-using MySql.Data.MySqlClient;
-using Tesseract;
-using Gdi = System.Drawing;
-using Wpf = System.Windows;
-
-namespace funcenvget
-{
-    public partial class MainWindow : Wpf.Window
-    {
-        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-        [DllImport("user32.dll")]
-        private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, int nFlags);
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool IsIconic(IntPtr hWnd);
-        [StructLayout(LayoutKind.Sequential)]
-        public struct RECT { public int Left, Top, Right, Bottom; }
-
-        private Wpf.Threading.DispatcherTimer timer; // 10초 로깅 타이머
-        private Wpf.Threading.DispatcherTimer searchTimer; // 1분 일반 재탐색 타이머
-        private Wpf.Threading.DispatcherTimer autoUpdateTargetTimer; // 30초 자동 대상 갱신 타이머
-
-        private TesseractEngine _ocrEngine;
-        private bool isLocked = true;
-        private readonly string agentBasePath = @"C:\Agent\funcenvget";
-        private string previewImagePath;
-        private bool isExiting = false;
-
-        // 자동 감지 및 갱신할 프로세스 이름의 시작 부분
-        private const string TARGET_PROCESS_PREFIX = "InlineTesterPBA";
-
-        private TesseractEngine OcrEngine
+        // GetTargetWindowHandle 함수 (상세 추적 로그 추가 버전)
+        private IntPtr GetTargetWindowHandle()
         {
-            get
+            string target = txtTarget.Text; // UI에서 현재 설정된 대상 값
+            string searchMethod = rbFindByTitle.IsChecked == true ? "창 제목" : "프로세스 이름";
+
+            LogTrace($"GetTargetWindowHandle: 함수 진입. UI에 설정된 대상: '{target}', 탐색 방법: '{searchMethod}'");
+
+            if (string.IsNullOrWhiteSpace(target))
             {
-                if (_ocrEngine == null)
-                {
-                    string exePath = AppDomain.CurrentDomain.BaseDirectory;
-                    string tessDataPath = Path.Combine(exePath, "tessdata");
-                    _ocrEngine = new TesseractEngine(tessDataPath, "eng", EngineMode.Default);
-                    _ocrEngine.SetVariable("tessedit_char_whitelist", "0123456789.");
-                }
-                return _ocrEngine;
+                LogTrace("GetTargetWindowHandle: 대상 문자열이 비어있으므로 IntPtr.Zero 반환.");
+                return IntPtr.Zero;
             }
-        }
-        
-        public MainWindow()
-        {
-            InitializeComponent();
-            InitializeApp();
-        }
 
-        protected override void OnContentRendered(EventArgs e)
-        {
-            base.OnContentRendered(e);
-            this.Hide();
-        }
-
-        private void InitializeApp()
-        {
-            CheckRequiredFiles();
-            timer = new Wpf.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
-            timer.Tick += Timer_Tick;
-            searchTimer = new Wpf.Threading.DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
-            searchTimer.Tick += SearchTimer_Tick;
-            autoUpdateTargetTimer = new Wpf.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
-            autoUpdateTargetTimer.Tick += AutoUpdateTargetTimer_Tick;
-            Directory.CreateDirectory(agentBasePath);
-            previewImagePath = Path.Combine(agentBasePath, "preview_capture.png");
-        }
-        
-        private void SearchTimer_Tick(object sender, EventArgs e)
-        {
-            lblStatus.Text = "대상 창/프로세스를 찾는 중... (1분마다 재시도)";
-            IntPtr hWnd = GetTargetWindowHandle();
-            if (hWnd != IntPtr.Zero)
+            if (rbFindByTitle.IsChecked == true)
             {
-                searchTimer.Stop();
-                lblStatus.Text = "대상 발견! 자동 로깅을 시작합니다.";
-                if (!timer.IsEnabled) { btnStart_Click(this, new RoutedEventArgs()); }
-            }
-        }
-
-        private void AutoUpdateTargetTimer_Tick(object sender, EventArgs e)
-        {
-            lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스 자동 갱신 중... (30초마다)";
-
-            Process[] allProcesses = Process.GetProcesses();
-            var candidateProcesses = allProcesses.Where(p => 
-                p.ProcessName.StartsWith(TARGET_PROCESS_PREFIX, StringComparison.OrdinalIgnoreCase)
-            ).ToList();
-
-            if (candidateProcesses.Count == 1)
-            {
-                var foundProcess = candidateProcesses[0];
-                string newTargetName = foundProcess.ProcessName;
-
-                if (txtTarget.Text != newTargetName) // 현재 설정된 이름과 다를 경우에만 업데이트
+                LogTrace($"GetTargetWindowHandle: '창 제목으로 찾기' 실행. 찾을 제목: '{target}'");
+                IntPtr hWndByTitle = FindWindow(null, target); // 첫 번째 인자는 ClassName, null이면 모든 클래스 대상
+                if (hWndByTitle != IntPtr.Zero)
                 {
-                    autoUpdateTargetTimer.Stop(); 
-
-                    txtTarget.Text = newTargetName;
-                    if (!rbFindByProcess.IsChecked == true) // 강제로 프로세스 이름으로 설정
-                    {
-                        rbFindByProcess.IsChecked = true; 
-                        // SearchMethod_Changed(null, null); // SearchMethod_Changed는 rbFindByProcess.IsChecked=true에 의해 자동 호출될 수 있음
-                    }
-                    SaveApplicationSettings(); 
-
-                    lblStatus.Text = $"대상 프로세스가 '{newTargetName}'(으)로 자동 변경되었습니다. 로깅 재시작 시도.";
-                    
-                    // 메인 로깅 타이머 시작 시도
-                    if (isLocked && !string.IsNullOrWhiteSpace(txtPcName.Text) && !timer.IsEnabled)
-                    {
-                        btnStart_Click(this, new RoutedEventArgs()); 
-                    }
+                    LogTrace($"GetTargetWindowHandle: FindWindow API 성공! 창 제목 '{target}'에 해당하는 핸들 {hWndByTitle} 찾음.");
                 }
                 else
                 {
-                     lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스 확인됨 ({newTargetName}). 변경 없음.";
-                     // 이름은 같지만 GetTargetWindowHandle이 실패하는 경우, 이 타이머는 계속 돌 필요 없음.
-                     // 일반 searchTimer가 HWND를 찾도록 넘김.
-                     autoUpdateTargetTimer.Stop();
-                     if (!timer.IsEnabled && !searchTimer.IsEnabled)
-                     {
-                        searchTimer.Start(); // 일반 재탐색으로 전환
-                        lblStatus.Text = $"대상 프로세스 '{newTargetName}'의 창 핸들 재탐색 중 (1분 간격).";
-                     }
+                    LogTrace($"GetTargetWindowHandle: FindWindow API 실패. 창 제목 '{target}'에 해당하는 핸들 찾지 못함.");
                 }
+                return hWndByTitle;
             }
-            else if (candidateProcesses.Count > 1)
+            else // rbFindByProcess.IsChecked == true (프로세스 이름으로 찾기)
             {
-                lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스가 여러 개({candidateProcesses.Count}개) 발견되어 자동 갱신 불가.";
-            }
-            else
-            {
-                lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스를 찾지 못함. 자동 갱신 계속 시도.";
-            }
-        }
+                string processNameForSearch = target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? Path.GetFileNameWithoutExtension(target) : target;
+                LogTrace($"GetTargetWindowHandle: '프로세스 이름으로 찾기' 실행. 검색할 정제된 프로세스 이름: '{processNameForSearch}'");
 
-        private void CheckRequiredFiles()
-        {
-            string exePath = AppDomain.CurrentDomain.BaseDirectory;
-            string[] requiredFiles = { "tesseract53.dll", "leptonica-1.83.1.dll" }; 
-            foreach (var file in requiredFiles)
-            {
-                if (!File.Exists(Path.Combine(exePath, file)))
-                {
-                    MessageBox.Show($"실행에 필수적인 파일이 없습니다: {file}\n\nClickOnce 게시 설정에서 모든 관련 파일이 '포함(Include)'되었는지 확인하세요.", "실행 오류", MessageBoxButton.OK, MessageBoxImage.Error);
-                    Application.Current.Shutdown();
-                    return;
-                }
-            }
-            if (!Directory.Exists(Path.Combine(exePath, "tessdata")))
-            {
-                MessageBox.Show("tessdata 폴더를 찾을 수 없습니다.\n\nClickOnce 게시 설정에서 tessdata 폴더와 그 안의 파일들이 포함되었는지 확인하세요.", "실행 오류", MessageBoxButton.OK, MessageBoxImage.Error);
-                Application.Current.Shutdown();
-                return;
-            }
-        }
-
-        private void Window_Loaded(object sender, RoutedEventArgs e)
-        {
-            txtTarget.Text = Settings.Default.WindowTitle;
-            txtX.Text = Settings.Default.CaptureX.ToString();
-            txtY.Text = Settings.Default.CaptureY.ToString();
-            txtWidth.Text = Settings.Default.CaptureWidth.ToString();
-            txtHeight.Text = Settings.Default.CaptureHeight.ToString();
-            txtPcName.Text = Settings.Default.PcName;
-
-            if (Settings.Default.SearchByProcessName) { rbFindByProcess.IsChecked = true; }
-            else { rbFindByTitle.IsChecked = true; }
-            SearchMethod_Changed(null, null); 
-
-            if (File.Exists(previewImagePath))
-            {
+                Process[] processes;
                 try
                 {
-                    var preview = new Wpf.Media.Imaging.BitmapImage();
-                    preview.BeginInit();
-                    using (var stream = new FileStream(previewImagePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    {
-                        preview.StreamSource = stream;
-                        preview.CacheOption = Wpf.Media.Imaging.BitmapCacheOption.OnLoad;
-                        preview.EndInit();
-                    }
-                    imgPreview.Source = preview;
+                    processes = Process.GetProcessesByName(processNameForSearch);
                 }
-                catch { }
-            }
-            UpdateLockState(true);
-            AttemptAutoStart();
-        }
-
-        private void AttemptAutoStart()
-        {
-            if (!string.IsNullOrWhiteSpace(txtPcName.Text) && !string.IsNullOrWhiteSpace(txtTarget.Text))
-            {
-                IntPtr hWnd = GetTargetWindowHandle();
-                if (hWnd != IntPtr.Zero)
+                catch (Exception ex)
                 {
-                    if (!timer.IsEnabled) { btnStart_Click(this, new RoutedEventArgs()); }
-                }
-                else // 대상은 설정되어 있으나, 현재 창 핸들을 못가져오는 경우
-                {
-                    lblStatus.Text = "기존 설정 대상을 찾을 수 없어, 1분마다 일반 재검색을 시작합니다.";
-                    if(!searchTimer.IsEnabled) searchTimer.Start(); // 일반 재탐색 타이머 시작
-                }
-            }
-            else if (!string.IsNullOrWhiteSpace(txtPcName.Text) && rbFindByProcess.IsChecked == true && string.IsNullOrWhiteSpace(txtTarget.Text))
-            {
-                // PC 이름은 있고, 프로세스 이름 찾기가 선택되었는데, 대상 프로세스 이름이 비어있는 경우 (초기 설정 시)
-                lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스 자동 감지를 시작합니다 (30초 간격).";
-                if (!autoUpdateTargetTimer.IsEnabled) autoUpdateTargetTimer.Start();
-            }
-        }
-        
-        private void SaveApplicationSettings()
-        {
-            Settings.Default.WindowTitle = txtTarget.Text;
-            Settings.Default.CaptureX = int.TryParse(txtX.Text, out int x) ? x : 0;
-            Settings.Default.CaptureY = int.TryParse(txtY.Text, out int y) ? y : 0;
-            Settings.Default.CaptureWidth = int.TryParse(txtWidth.Text, out int w) ? w : 0;
-            Settings.Default.CaptureHeight = int.TryParse(txtHeight.Text, out int h) ? h : 0;
-            Settings.Default.PcName = txtPcName.Text;
-            Settings.Default.SearchByProcessName = rbFindByProcess.IsChecked == true;
-            Settings.Default.Save();
-        }
-
-        private void btnSaveSettings_Click(object sender, RoutedEventArgs e)
-        {
-            SaveApplicationSettings();
-            lblStatus.Text = $"상태: {DateTime.Now:T} - 설정이 저장되었습니다.";
-            MessageBox.Show("설정이 저장되었습니다.", "알림", MessageBoxButton.OK, MessageBoxImage.Information);
-        }
-
-        private void btnToggleEdit_Click(object sender, RoutedEventArgs e)
-        {
-            if (timer.IsEnabled || searchTimer.IsEnabled || autoUpdateTargetTimer.IsEnabled)
-            {
-                MessageBox.Show("로깅 또는 대상 탐색/자동갱신이 실행 중일 때는 설정을 수정할 수 없습니다.", "알림", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-            isLocked = !isLocked;
-            UpdateLockState(isLocked);
-
-            if (isLocked)
-            {
-                SaveApplicationSettings();
-                lblStatus.Text = $"상태: {DateTime.Now:T} - 변경된 설정이 저장되었습니다.";
-                // 잠금 시, 자동 시작 조건 다시 확인 (특히 txtTarget이 비어있다가 채워진 경우)
-                if (rbFindByProcess.IsChecked == true && string.IsNullOrWhiteSpace(txtTarget.Text) && !string.IsNullOrWhiteSpace(txtPcName.Text))
-                {
-                     if (!autoUpdateTargetTimer.IsEnabled) autoUpdateTargetTimer.Start();
-                     lblStatus.Text = $"'{TARGET_PROCESS_PREFIX}' 시작 프로세스 자동 감지를 시작합니다 (30초 간격).";
-                }
-            }
-        }
-
-        private void UpdateLockState(bool lockState)
-        {
-            isLocked = lockState;
-            txtPcName.IsReadOnly = isLocked;
-            txtTarget.IsReadOnly = isLocked;
-            rbFindByTitle.IsEnabled = !isLocked;
-            rbFindByProcess.IsEnabled = !isLocked;
-            btnSelectArea.IsEnabled = !isLocked;
-            btnSaveSettings.IsEnabled = !isLocked; 
-
-            if (isLocked) { btnToggleEdit.Content = "수정"; txtPcName.Background = Wpf.Media.Brushes.LightGray; txtTarget.Background = Wpf.Media.Brushes.LightGray; }
-            else { btnToggleEdit.Content = "잠금"; txtPcName.Background = Wpf.Media.Brushes.White; txtTarget.Background = Wpf.Media.Brushes.White; }
-        }
-
-        private void btnStart_Click(object sender, RoutedEventArgs e)
-        {
-            if (timer.IsEnabled || searchTimer.IsEnabled || autoUpdateTargetTimer.IsEnabled)
-            {
-                timer.Stop();
-                searchTimer.Stop();
-                autoUpdateTargetTimer.Stop();
-                btnStart.Content = "로깅 시작";
-                lblStatus.Text = "상태: 모든 작업이 중지되었습니다.";
-            }
-            else
-            {
-                searchTimer.Stop(); 
-                autoUpdateTargetTimer.Stop();
-
-                if (!isLocked) { MessageBox.Show("설정을 먼저 '잠금' 상태로 변경해주세요.", "알림", MessageBoxButton.OK, MessageBoxImage.Information); return; }
-                if (string.IsNullOrWhiteSpace(txtPcName.Text) || string.IsNullOrWhiteSpace(txtTarget.Text)) { MessageBox.Show("PC이름과 대상(창 제목/프로세스 이름)을 모두 설정해야 합니다.", "입력 오류", MessageBoxButton.OK, MessageBoxImage.Error); return; }
-                
-                IntPtr hWnd = GetTargetWindowHandle();
-                if (hWnd == IntPtr.Zero) 
-                { 
-                    lblStatus.Text = "상태: 오류! 대상을 찾을 수 없어 일반 재탐색을 시작합니다.";
-                    if(!searchTimer.IsEnabled) searchTimer.Start(); 
-                    return; 
+                    LogTrace($"GetTargetWindowHandle: Process.GetProcessesByName('{processNameForSearch}') 호출 중 오류 발생: {ex.Message}. IntPtr.Zero 반환.");
+                    return IntPtr.Zero;
                 }
                 
-                timer.Start();
-                btnStart.Content = "로깅 중지";
-                lblStatus.Text = "상태: 로깅 시작됨...";
-            }
-        }
-        
-        private void SearchMethod_Changed(object sender, RoutedEventArgs e)
-        {
-            if (lblTarget == null || txtTarget == null) return;
-            if (rbFindByTitle.IsChecked == true) { lblTarget.Content = "대상 창 제목:"; txtTarget.ToolTip = "찾으려는 프로그램의 전체 창 제목을 입력하세요."; }
-            else { lblTarget.Content = "프로세스 이름:"; txtTarget.ToolTip = "작업 관리자의 '세부 정보' 탭에 있는 프로세스 이름을 입력하세요 (예: notepad)"; }
-        }
-        
-        private IntPtr GetTargetWindowHandle()
-        {
-            string target = txtTarget.Text;
-            if (string.IsNullOrWhiteSpace(target)) return IntPtr.Zero;
-            if (rbFindByTitle.IsChecked == true) { return FindWindow(null, target); }
-            else
-            {
-                string processName = target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? Path.GetFileNameWithoutExtension(target) : target;
-                Process[] processes = Process.GetProcessesByName(processName);
-                if (processes.Length == 0) return IntPtr.Zero;
-                var processWithWindow = processes.FirstOrDefault(p => p.MainWindowHandle != IntPtr.Zero);
-                return processWithWindow?.MainWindowHandle ?? IntPtr.Zero;
-            }
-        }
+                LogTrace($"GetTargetWindowHandle: Process.GetProcessesByName('{processNameForSearch}') 결과, {processes.Length}개의 프로세스 인스턴스 발견.");
 
-        private void MyNotifyIcon_TrayMouseDoubleClick(object sender, RoutedEventArgs e) { this.Show(); this.WindowState = WindowState.Normal; this.Activate(); }
-        private void MenuOpen_Click(object sender, RoutedEventArgs e) { this.Show(); this.WindowState = WindowState.Normal; this.Activate(); }
-        private void MenuExit_Click(object sender, RoutedEventArgs e) { isExiting = true; this.Close(); }
-
-        protected override void OnClosing(CancelEventArgs e)
-        {
-            if (!isExiting) { e.Cancel = true; this.Hide(); }
-            else
-            {
-                SaveApplicationSettings();
-                MyNotifyIcon.Dispose();
-                _ocrEngine?.Dispose();
-            }
-            base.OnClosing(e);
-        }
-
-        private void Timer_Tick(object sender, EventArgs e) { PerformLogging(); }
-
-        private void PerformLogging()
-        {
-            Gdi.Rectangle cropArea = Gdi.Rectangle.Empty;
-            Gdi.Size bmpSize = Gdi.Size.Empty;
-            try
-            {
-                IntPtr hWnd = GetTargetWindowHandle();
-                if (hWnd == IntPtr.Zero)
+                if (processes.Length == 0)
                 {
-                    lblStatus.Text = "상태: 오류! 대상 창/프로세스를 찾을 수 없습니다.";
-                    if (rbFindByProcess.IsChecked == true && !autoUpdateTargetTimer.IsEnabled && !searchTimer.IsEnabled)
+                    LogTrace($"GetTargetWindowHandle: '{processNameForSearch}' 이름의 활성 프로세스를 찾을 수 없음. IntPtr.Zero 반환.");
+                    // 추가 디버깅: 현재 실행 중인 모든 프로세스 중 비슷한 이름이 있는지 확인 (너무 많을 수 있으니 주의)
+                    /* var allProcs = Process.GetProcesses().Select(p => p.ProcessName).Distinct().OrderBy(name => name);
+                    LogTrace($"GetTargetWindowHandle: 참고 - 현재 실행 중인 모든 프로세스 이름 (일부): {string.Join(", ", allProcs.Take(20))}{(allProcs.Count() > 20 ? "..." : "")}");
+                    */
+                    return IntPtr.Zero;
+                }
+
+                LogTrace($"GetTargetWindowHandle: 발견된 {processes.Length}개 프로세스 인스턴스 각각의 MainWindowHandle 검사 시작...");
+                for (int i = 0; i < processes.Length; i++)
+                {
+                    Process p = processes[i];
+                    IntPtr currentHandle = IntPtr.Zero;
+                    string processIdInfo = "N/A";
+                    string mainWindowTitle = "N/A";
+                    bool hasExited = false;
+
+                    try
                     {
-                        timer.Stop(); 
-                        autoUpdateTargetTimer.Start(); 
-                        lblStatus.Text = $"현재 대상({txtTarget.Text})을 찾을 수 없습니다. '{TARGET_PROCESS_PREFIX}' 자동 갱신 시작 (30초 간격).";
+                        if (!p.HasExited) // 프로세스가 이미 종료되었는지 확인
+                        {
+                            currentHandle = p.MainWindowHandle;
+                            processIdInfo = p.Id.ToString();
+                            mainWindowTitle = string.IsNullOrEmpty(p.MainWindowTitle) ? "(비어 있음)" : p.MainWindowTitle;
+                        }
+                        else
+                        {
+                            hasExited = true;
+                        }
                     }
-                    else if (!searchTimer.IsEnabled && !autoUpdateTargetTimer.IsEnabled) 
+                    catch (InvalidOperationException ioe) // 프로세스가 이미 종료된 후 속성에 접근하려 할 때
                     {
-                        timer.Stop();
-                        searchTimer.Start();
-                        lblStatus.Text = "대상 연결 끊김. 1분마다 재탐색합니다.";
+                        LogTrace($"  - [{i+1}/{processes.Length}] 프로세스 '{p.ProcessName}' (ID 접근 불가) 검사 중 오류: {ioe.Message} (이미 종료된 프로세스일 수 있음)");
+                        hasExited = true; // 오류 발생 시 종료된 것으로 간주
                     }
-                    return;
-                }
-                
-                // 대상이 성공적으로 찾아지면, 모든 보조 탐색 타이머는 중지
-                if (searchTimer.IsEnabled) searchTimer.Stop();
-                if (autoUpdateTargetTimer.IsEnabled) autoUpdateTargetTimer.Stop();
-
-                if (IsIconic(hWnd)) { lblStatus.Text = $"상태: 오류! 대상 창이 최소화되었습니다."; return; }
-                GetWindowRect(hWnd, out RECT rect);
-                int width = rect.Right - rect.Left;
-                int height = rect.Bottom - rect.Top;
-                if (width <= 0 || height <= 0) { lblStatus.Text = "상태: 오류! 대상 창의 크기가 유효하지 않습니다."; return; }
-                bmpSize = new Gdi.Size(width, height);
-                using (var bmp = new Gdi.Bitmap(width, height, Gdi.Imaging.PixelFormat.Format32bppArgb))
-                {
-                    using (var g = Gdi.Graphics.FromImage(bmp)) { IntPtr hdc = g.GetHdc(); PrintWindow(hWnd, hdc, 2); g.ReleaseHdc(hdc); }
-                    cropArea = new Gdi.Rectangle(int.Parse(txtX.Text), int.Parse(txtY.Text), int.Parse(txtWidth.Text), int.Parse(txtHeight.Text));
-                    if (cropArea.Right > bmp.Width || cropArea.Bottom > bmp.Height || cropArea.X < 0 || cropArea.Y < 0)
+                    catch (Exception ex) // 기타 예외
                     {
-                        timer.Stop(); btnStart.Content = "로깅 시작"; lblStatus.Text = "상태: 오류! 캡처 영역이 창 크기를 벗어났습니다.";
-                        MessageBox.Show("캡처 영역 설정이 잘못되었습니다.\n대상 창의 크기나 위치가 변경되었을 수 있습니다.\n프로그램을 열어 영역을 다시 설정해주세요.", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
-                        return;
+                         LogTrace($"  - [{i+1}/{processes.Length}] 프로세스 '{p.ProcessName}' 검사 중 예외: {ex.Message}");
                     }
-                    using (var croppedBmp = bmp.Clone(cropArea, bmp.PixelFormat)) { using (var page = OcrEngine.Process(croppedBmp)) { string rawText = page.GetText().Trim(); if (!string.IsNullOrWhiteSpace(rawText)) { ProcessOcrResult(rawText); } else { lblStatus.Text = "상태: 캡처 영역에서 텍스트를 인식하지 못했습니다."; } } }
+
+
+                    if (hasExited)
+                    {
+                        LogTrace($"  - [{i+1}/{processes.Length}] 프로세스 '{p.ProcessName}'는 이미 종료된 상태입니다. 건너뜁니다.");
+                        continue;
+                    }
+                    
+                    LogTrace($"  - [{i+1}/{processes.Length}] 검사 중: 프로세스 ID {processIdInfo} ('{p.ProcessName}'), MainWindowHandle: {currentHandle}, MainWindowTitle: '{mainWindowTitle}'");
+                    
+                    if (currentHandle != IntPtr.Zero)
+                    {
+                        LogTrace($"  - 유효한 MainWindowHandle ({currentHandle}) 발견! 이 핸들을 사용합니다.");
+                        return currentHandle;
+                    }
+                    else
+                    {
+                        LogTrace($"  - 이 프로세스 인스턴스의 MainWindowHandle이 0입니다. (화면에 주 창이 없거나, 아직 생성되지 않았거나, UI가 없는 프로세스일 수 있습니다)");
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                if (timer.IsEnabled) timer.Stop();
-                if (searchTimer.IsEnabled) searchTimer.Stop();
-                if (autoUpdateTargetTimer.IsEnabled) autoUpdateTargetTimer.Stop();
-                btnStart.Content = "로깅 시작";
-                var sb = new StringBuilder();
-                sb.AppendLine("캡처 중 예측하지 못한 오류가 발생하여 작업을 중지합니다.");
-                sb.AppendLine("==============================================");
-                sb.AppendLine($"[진단 정보]");
-                sb.AppendLine($"전체 창 크기: {bmpSize.Width} x {bmpSize.Height}");
-                sb.AppendLine($"잘라낼 영역 (X,Y,W,H): {cropArea.X}, {cropArea.Y}, {cropArea.Width}, {cropArea.Height}");
-                sb.AppendLine("==============================================");
-                Exception currentEx = ex;
-                int indentLevel = 0;
-                while (currentEx != null)
-                {
-                    sb.AppendLine($"\n[오류 레벨 {indentLevel}] {(indentLevel == 1 ? "(진짜 원인일 가능성이 높음)" : "")}");
-                    sb.AppendLine($"  - 오류 유형: {currentEx.GetType().Name}");
-                    sb.AppendLine($"  - 메시지: {currentEx.Message}");
-                    sb.AppendLine($"  - 스택 트레이스:\n{currentEx.StackTrace}");
-                    currentEx = currentEx.InnerException;
-                    indentLevel++;
-                }
-                MessageBox.Show(sb.ToString(), "캡처 상세 오류 보고", MessageBoxButton.OK, MessageBoxImage.Error);
-                lblStatus.Text = "상태: 캡처 오류 발생. 로깅 중지됨.";
+
+                LogTrace($"GetTargetWindowHandle: '{processNameForSearch}' 이름의 프로세스들은 {processes.Length}개 찾았으나, 모두 유효한 MainWindowHandle (0이 아닌 값)을 가지고 있지 않습니다. 캡처 가능한 창이 없다고 판단하여 IntPtr.Zero 반환.");
+                return IntPtr.Zero;
             }
         }
-        
-        private void ProcessOcrResult(string rawText) 
-        {
-            string processedText = rawText.Replace("-", "");
-            string[] parts = processedText.Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 2) { lblStatus.Text = $"상태: 값 분리 오류 (인식된 값 {parts.Length}개)"; return; }
-            
-            string part1String = parts[0];
-            string part2String = parts[1];
+사용 방법 및 다음 단계
+위 GetTargetWindowHandle 함수 코드를 MainWindow.xaml.cs 파일의 기존 함수와 교체합니다.
+프로그램을 다시 빌드하고 클릭원스로 게시한 후, 문제가 발생하는 PC에서 실행합니다.
+프로그램이 대상을 찾지 못하고 1분마다 재탐색을 시도하는 상태가 되면, 몇 분 정도 기다렸다가 프로그램을 종료합니다.
+C:\Agent\funcenvget\logs\trace_log.txt 파일을 엽니다.
+파일 내용 중에서 GetTargetWindowHandle 함수가 호출될 때 기록되는 로그들을 찾아 그 내용을 전체적으로 복사해서 저에게 알려주세요.
+특히 아래와 같은 로그 패턴을 주목해서 알려주시면 됩니다.
 
-            if (!part1String.Contains(".") && part1String.Length >= 2) { part1String = part1String.Insert(part1String.Length - 1, "."); }
-            if (!part2String.Contains(".") && part2String.Length >= 2) { part2String = part2String.Insert(part2String.Length - 1, "."); }
-
-            if (decimal.TryParse(part1String, out decimal val1) && decimal.TryParse(part2String, out decimal val2))
-            {
-                decimal temp = Math.Truncate(val1 * 10) / 10m;
-                decimal humid = Math.Truncate(val2 * 10) / 10m;
-                UploadToDatabase(temp, humid);
-            }
-            else { lblStatus.Text = $"상태: 숫자 변환 오류 ({part1String},{part2String})"; }
-        }
-
-        private void UploadToDatabase(decimal temp, decimal humid)
-        {
-            string pcName = txtPcName.Text;
-            if (string.IsNullOrWhiteSpace(pcName)) { lblStatus.Text = "상태: PC 이름이 비어있어 DB 작업을 건너뜁니다."; return; }
-            string connectionString = "Server=127.0.0.1;Port=3306;Database=smd;Uid=root;Pwd=password;"; 
-            MySqlConnection conn = null;
-            MySqlTransaction trans = null;
-            int rowsAffected = 0;
-            try
-            {
-                conn = new MySqlConnection(connectionString);
-                conn.Open();
-                trans = conn.BeginTransaction();
-                using (MySqlCommand cmd = new MySqlCommand())
-                {
-                    cmd.Connection = conn;
-                    cmd.Transaction = trans;
-                    cmd.CommandText = "UPDATE smd.repair_func_now SET temp1 = @temp1, humid1 = @humid1, stdtime = NOW() WHERE line = @line;";
-                    cmd.Parameters.Clear();
-                    cmd.Parameters.AddWithValue("@line", pcName);
-                    cmd.Parameters.AddWithValue("@temp1", temp);
-                    cmd.Parameters.AddWithValue("@humid1", humid);
-                    rowsAffected = cmd.ExecuteNonQuery();
-                    cmd.CommandText = "INSERT INTO smd.repair_func_new_log (line, temp1, humid1, stdtime) VALUES (@line, @temp1, @humid1, NOW());";
-                    cmd.ExecuteNonQuery();
-                }
-                trans.Commit();
-                if (rowsAffected > 0) { lblStatus.Text = $"상태: {DateTime.Now:T} - DB 업데이트 성공!"; }
-                else { lblStatus.Text = $"상태: {DateTime.Now:T} - 로그 기록 완료 (now 테이블에 해당 PC 없음)"; }
-            }
-            catch (Exception ex)
-            {
-                try { trans?.Rollback(); } catch { }
-                lblStatus.Text = $"상태: DB 오류! {ex.Message}";
-            }
-            finally { conn?.Close(); }
-        }
-        
-        private void btnSelectArea_Click(object sender, RoutedEventArgs e)
-        {
-            IntPtr hWnd = GetTargetWindowHandle();
-            if (hWnd == IntPtr.Zero) { MessageBox.Show("먼저 유효한 '대상 창/프로세스 이름'을 입력하세요.", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); return; }
-            this.Visibility = Visibility.Hidden;
-            System.Threading.Thread.Sleep(200);
-            var selectionWindow = new SelectionWindow();
-            selectionWindow.Activate();
-            if (selectionWindow.ShowDialog() == true)
-            {
-                Wpf.Rect screenRect = selectionWindow.SelectedArea;
-                GetWindowRect(hWnd, out RECT windowRect);
-                int relativeX = (int)screenRect.X - windowRect.Left;
-                int relativeY = (int)screenRect.Y - windowRect.Top;
-                relativeX = Math.Max(0, relativeX);
-                relativeY = Math.Max(0, relativeY);
-                txtX.Text = relativeX.ToString();
-                txtY.Text = relativeY.ToString();
-                txtWidth.Text = ((int)screenRect.Width).ToString();
-                txtHeight.Text = ((int)screenRect.Height).ToString();
-                UpdatePreviewImage();
-            }
-            this.Visibility = Visibility.Visible;
-            this.Activate();
-        }
-
-        private void UpdatePreviewImage()
-        {
-            try
-            {
-                IntPtr hWnd = GetTargetWindowHandle();
-                if (hWnd == IntPtr.Zero) return;
-                if (IsIconic(hWnd)) { MessageBox.Show("대상 창이 최소화되어 있어 미리보기를 생성할 수 없습니다.", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); imgPreview.Source = null; return; }
-                if (!int.TryParse(txtX.Text, out int capX) || !int.TryParse(txtY.Text, out int capY) || !int.TryParse(txtWidth.Text, out int capW) || !int.TryParse(txtHeight.Text, out int capH) || capW <= 0 || capH <= 0)
-                { imgPreview.Source = null; return; }
-                GetWindowRect(hWnd, out RECT rect);
-                int width = rect.Right - rect.Left;
-                int height = rect.Bottom - rect.Top;
-                if (width <= 0 || height <= 0) return;
-                using (var bmp = new Gdi.Bitmap(width, height, Gdi.Imaging.PixelFormat.Format32bppArgb))
-                {
-                    using (var g = Gdi.Graphics.FromImage(bmp)) { IntPtr hdc = g.GetHdc(); PrintWindow(hWnd, hdc, 2); g.ReleaseHdc(hdc); }
-                    var cropArea = new Gdi.Rectangle(capX, capY, capW, capH);
-                    if (cropArea.Right > bmp.Width || cropArea.Bottom > bmp.Height || cropArea.X < 0 || cropArea.Y < 0)
-                    { imgPreview.Source = null; MessageBox.Show("미리보기를 위한 캡처 영역이 창 크기를 벗어났습니다. 영역을 다시 설정해주세요.", "설정 오류", MessageBoxButton.OK, MessageBoxImage.Warning); return; }
-                    using (var croppedBmp = bmp.Clone(cropArea, bmp.PixelFormat)) { imgPreview.Source = BitmapToImageSource(croppedBmp); croppedBmp.Save(previewImagePath, Gdi.Imaging.ImageFormat.Png); }
-                }
-            }
-            catch { }
-        }
-
-        Wpf.Media.Imaging.BitmapImage BitmapToImageSource(Gdi.Bitmap bitmap)
-        {
-            using (MemoryStream memory = new MemoryStream())
-            {
-                bitmap.Save(memory, Gdi.Imaging.ImageFormat.Png);
-                memory.Position = 0;
-                var bitmapimage = new Wpf.Media.Imaging.BitmapImage();
-                bitmapimage.BeginInit();
-                bitmapimage.StreamSource = memory;
-                bitmapimage.CacheOption = Wpf.Media.Imaging.BitmapCacheOption.OnLoad;
-                bitmapimage.EndInit();
-                return bitmapimage;
-            }
-        }
-    }
-}
-&lt;/details>
-
-
-소스
-
-
-
-
-
-Deep Research
+GetTargetWindowHandle: 'InlineTesterPBA' 이름으로 N개의 프로세스 찾음. (여기서 N이 몇 개인지)
+GetTargetWindowHandle: 발견된 N개 프로세스 인스턴스 각각의 MainWindowHandle 검사 시작...
+- [번호] 검사 중: 프로세스 ID XXX ('InlineTesterPBA...'), MainWindowHandle: YYY, MainWindowTitle: 'ZZZ' (여기서 YYY가 항상 0인지, 아니면 다른 값인지, ZZZ는 무엇인지)
+GetTargetWindowHandle: ... MainWindowHandle이 0입니다. ...
+GetTargetWindowHandle: ... 유효한 MainWindowHandle을 가진 프로세스가 없음 ...
+이 로그를 보면, "InlineTesterPBA"로 시작하는 프로세스를 이름으로는 찾았는지, 찾았다면 왜 그 프로세스의 창 핸들(MainWindowHandle)을 가져오지 못하는지 (또는 가져왔는데 왜 0인지) 명확하게 알 수 있습니다.
