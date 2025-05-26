@@ -1,4 +1,4 @@
-네, 알겠습니다. SAgentM.App (WPF 에이전트)에서 생성되는 로그 파일 중 3일이 지난 오래된 로그 파일은 자동으로 삭제되도록 기능을 추가하겠습니다. 이 작업은 에이전트 프로그램이 시작될 때 수행하는 것이 간단하고 효과적입니다.
+, 알겠습니다. SAgentM.App (WPF 에이전트)에서 생성되는 로그 파일 중 3일이 지난 오래된 로그 파일은 자동으로 삭제되도록 기능을 추가하겠습니다. 이 작업은 에이전트 프로그램이 시작될 때 수행하는 것이 간단하고 효과적입니다.
 
 수정 대상 파일:
 
@@ -171,3 +171,242 @@ Directory.GetFiles()와 Select(filePath => new FileInfo(filePath))를 사용하�
 
 LogFilePath 설정: App.config의 LogFilePath 값은 Serilog가 로그 파일을 생성할 때 사용하는 패턴입니다. 예시(Logs_SAgentM\SAgentM_App_.log)는 Logs_SAgentM 폴더 아래에 SAgentM_App_20240101.log, SAgentM_App_20240102.log 와 같이 날짜가 포함된 파일명을 생성합니다. 위 삭제 로직은 이 패턴을 기준으로 파일명에서 날짜를 추출합니다. 만약 다른 패턴을 사용 중이시라면 날짜 추출 로직(datePart 생성 및 DateTime.TryParseExact 부분)을 그에 맞게 수정해야 합니다.
 retainedFileCountLimit in Serilog: Serilog의 WriteTo.File 설정에서 retainedFileCountLimit를 null로 설정했습니다. 이렇게 하면 Serilog 자체적으로는 오래된 로그 파일을 삭제하지 않고, 위에서 추가한 로직을 통해서만 3일 이전 파일이 삭제됩니다. 만약 Serilog의 이 기능을 사용하고 싶다면, daysToKeep 대신 retainedFileCountLimit를 원하는 값으로 설정하고 위 수동 삭제 로직은 제거할 수 있습니다. (단, retainedFileCountLimit는 파일 개수 기준이고, 여기서는 날짜 기준 삭제입니다.)
+서비스 및 UI 초기화 코드: 위 코드에서 // 서비스 및 ViewModel 초기화... 주석 아래 부분은 이전 답변(#61)에서 트레이 아이콘 기능을 위해 제공했던 App.xaml.cs의 나머지 OnStartup 로직(NotifyIcon 생성, MainWindow 생성, AgentCoreService 시작 등)을 그대로 가져와 사용하시면 됩니다. 이 답변에서는 로그 삭제 로직에 집중하기 위해 해당 부분을 생략했습니다. 반드시 이전 코드와 병합하여 전체 OnStartup 메서드를 완성해야 합니다.
+이 수정된 App.xaml.cs를 SAgentM.App 프로젝트에 적용하시면, 프로그램 시작 시마다 3일이 지난 로그 파일은 자동으로 정리됩니다.
+
+
+소스
+
+이중실행이 가능하던데 이중실행을 방지하기위해 수정해야할 파일의 전체코드주세요
+
+
+
+
+생각하는 과정 표시
+네, 알겠습니다. SAgentM.App (WPF 에이전트)이 여러 번 실행되는 것을 방지하고 단일 인스턴스만 실행되도록 하는 이중 실행 방지 기능을 추가하겠습니다.
+
+이 기능은 주로 Mutex(뮤텍스) 라는 동기화 객체를 사용하여 구현합니다. 애플리케이션 시작 시 고유한 이름의 Mutex를 선점하려고 시도하고, 이미 다른 인스턴스에 의해 선점되어 있다면 현재 인스턴스는 종료하는 방식입니다.
+
+수정 대상 파일:
+
+SAgentM.App/App.xaml.cs: 애플리케이션의 시작(OnStartup) 및 종료(OnExit) 시점에 Mutex 관련 로직을 추가합니다.
+수정: SAgentM.App/App.xaml.cs (이중 실행 방지 Mutex 로직 추가)
+C#
+
+// SAgentM.App/App.xaml.cs
+using SAgentM.App.Services;
+using SAgentM.App.ViewModels;
+using System;
+using System.Configuration;
+using System.IO;
+using System.Windows;
+using Hardcodet.Wpf.TaskbarNotification; // Hardcodet.NotifyIcon.Wpf 라이브러리
+using Serilog;
+using Serilog.Events;
+using System.Threading; // Mutex 사용을 위해 추가
+using System.Diagnostics; // Process 관련 (필요시)
+
+namespace SAgentM.App
+{
+    public partial class App : Application
+    {
+        private TaskbarIcon _notifyIcon;
+        private MainWindow _mainWindow;
+
+        private ILoggingService _loggingService;
+        private IAgentCoreService _agentCoreService;
+        private MainViewModel _mainViewModel;
+
+        // --- ▼▼▼ 이중 실행 방지를 위한 Mutex 선언 (신규 추가) ▼▼▼ ---
+        private Mutex _mutex;
+        // Mutex 이름은 애플리케이션마다 고유해야 합니다. GUID를 사용하는 것이 좋습니다.
+        private const string MutexName = "Global\\SAgentMApp_Mutex_20250526_UniqueId"; // 예시 GUID 포함 또는 고유 이름
+        // --- ▲▲▲ 이중 실행 방지를 위한 Mutex 선언 끝 ▲▲▲ ---
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            // --- ▼▼▼ Mutex를 사용한 이중 실행 방지 로직 (OnStartup 최상단에 추가) ▼▼▼ ---
+            bool createdNew;
+            _mutex = new Mutex(true, MutexName, out createdNew);
+
+            if (!createdNew)
+            {
+                // 이미 다른 인스턴스가 실행 중입니다.
+                MessageBox.Show("SAgentM 에이전트가 이미 실행 중입니다. 기존 프로그램을 확인해주세요.", 
+                                "이중 실행 알림", MessageBoxButton.OK, MessageBoxImage.Warning);
+                // 현재 인스턴스를 종료합니다.
+                Application.Current.Shutdown();
+                return; // OnStartup의 나머지 로직을 실행하지 않습니다.
+            }
+            // --- ▲▲▲ Mutex를 사용한 이중 실행 방지 로직 끝 ▲▲▲ ---
+
+
+            base.OnStartup(e); // 이중 실행이 아닐 경우에만 base.OnStartup 이후 로직 진행
+
+            // Serilog 전역 파일 로거 설정 (이전과 동일)
+            var logFilePattern = ConfigurationManager.AppSettings["LogFilePath"] ?? "Logs_SAgentM\\SAgentM_App_.log";
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            var fullLogPathPattern = Path.Combine(baseDir, logFilePattern);
+            var logDirectory = Path.GetDirectoryName(fullLogPathPattern);
+            if (!string.IsNullOrEmpty(logDirectory) && !Directory.Exists(logDirectory))
+            {
+                Directory.CreateDirectory(logDirectory);
+            }
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Debug()
+                .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+                .Enrich.FromLogContext().Enrich.WithThreadId().Enrich.WithProcessId()
+                .WriteTo.File(fullLogPathPattern, rollingInterval: RollingInterval.Day, retainedFileCountLimit: null, shared: true, flushToDiskInterval: TimeSpan.FromSeconds(5))
+                .CreateLogger();
+            Log.Information("SAgentM.App OnStartup: 로깅 초기화 완료. 경로: {LogPathPattern}", fullLogPathPattern);
+
+            // 오래된 로그 파일 삭제 로직 (이전과 동일)
+            try
+            {
+                if (!string.IsNullOrEmpty(logDirectory) && Directory.Exists(logDirectory))
+                {
+                    Log.Information("SAgentM.App: 오래된 로그 파일 정리 시작...");
+                    int daysToKeep = 3; DateTime cutoffDate = DateTime.Now.Date.AddDays(-daysToKeep);
+                    string fileNameWithoutDate = Path.GetFileNameWithoutExtension(logFilePattern).TrimEnd('_');
+                    string fileExtension = Path.GetExtension(logFilePattern);
+                    string searchPattern = $"{fileNameWithoutDate}_*{fileExtension}";
+                    var logFiles = Directory.GetFiles(logDirectory, searchPattern).Select(filePath => new FileInfo(filePath)).ToList();
+                    int deletedCount = 0;
+                    foreach (var logFile in logFiles) {
+                        string datePart = logFile.Name.Replace(fileNameWithoutDate + "_", "").Replace(fileExtension, "");
+                        if (DateTime.TryParseExact(datePart, "yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out DateTime fileDate)) {
+                            if (fileDate.Date < cutoffDate) {
+                                try { logFile.Delete(); deletedCount++; Log.Information("SAgentM.App: 오래된 로그 파일 삭제: {DeletedLogFile}", logFile.FullName); }
+                                catch (IOException ioEx) { Log.Warning(ioEx, "SAgentM.App: 로그 파일 삭제 IO 오류 (사용 중?): {LogFile}", logFile.FullName); }
+                                catch (UnauthorizedAccessException uaEx) { Log.Error(uaEx, "SAgentM.App: 로그 파일 삭제 권한 없음: {LogFile}", logFile.FullName); }
+                            }
+                        } else { Log.Warning("SAgentM.App: 로그 파일 날짜 파싱 불가: {LogFile}", logFile.Name); }
+                    }
+                    if (deletedCount > 0) Log.Information("SAgentM.App: 총 {Count}개 오래된 로그 파일 삭제 완료.", deletedCount);
+                    else Log.Information("SAgentM.App: 삭제할 오래된 로그 파일 없음.");
+                } else { Log.Warning("SAgentM.App: 로그 디렉토리 없음, 정리 스킵. 경로: {LogDirectory}", logDirectory); }
+            }
+            catch (Exception ex) { Log.Error(ex, "SAgentM.App: 오래된 로그 파일 정리 중 예외 발생."); }
+
+            // 서비스 및 ViewModel 초기화 (이전과 동일)
+            _loggingService = new LoggingService(); 
+            _agentCoreService = new AgentCoreService(_loggingService);
+            _mainViewModel = new MainViewModel(_loggingService, _agentCoreService);
+            _mainWindow = new MainWindow { DataContext = _mainViewModel };
+
+            // TaskbarIcon 설정 (이전과 동일)
+            _notifyIcon = (TaskbarIcon)FindResource("AppNotifyIcon");
+            if (_notifyIcon == null) { _loggingService.UiError("AppNotifyIcon 리소스 찾을 수 없음.", null); }
+            else { _loggingService.UiInfo("TaskbarIcon 리소스 로드 완료."); }
+
+            // AgentCoreService 시작 (이전과 동일)
+            if (!_agentCoreService.IsRunning) {
+                _loggingService.UiInfo("App.xaml.cs: AgentCoreService 시작 시도...");
+                try { _agentCoreService.Start(); _mainViewModel.UpdateAgentStatus(); } // ViewModel 상태 업데이트 호출
+                catch (Exception ex) { _loggingService.UiError("App.xaml.cs: AgentCoreService 시작 중 오류.", ex); if (_mainViewModel != null) _mainViewModel.AgentStatus = "에이전트 시작 오류"; }
+            }
+        }
+
+        // App.xaml에서 TaskbarIcon의 TrayMouseDoubleClick 이벤트에 연결된 핸들러
+        private void AppNotifyIcon_TrayMouseDoubleClick(object sender, RoutedEventArgs e)
+        {
+            ShowHideMainWindow();
+        }
+
+        // App.xaml에서 ContextMenu의 MenuItem 클릭 이벤트에 연결된 핸들러
+        private void ShowHideMainWindow_MenuItemClick(object sender, RoutedEventArgs e)
+        {
+            ShowHideMainWindow();
+        }
+        
+        private void ShowHideMainWindow()
+        {
+            if (_mainWindow == null) return;
+            if (_mainWindow.IsVisible) { _mainWindow.Hide(); _loggingService?.UiDebug("MainWindow 숨김."); }
+            else { _mainWindow.Show(); if (_mainWindow.WindowState == WindowState.Minimized) { _mainWindow.WindowState = WindowState.Normal; } _mainWindow.Activate(); _loggingService?.UiDebug("MainWindow 표시."); }
+        }
+
+        private async void ExitApplication_MenuItemClick(object sender, RoutedEventArgs e)
+        {
+            _loggingService?.UiInfo("애플리케이션 종료 요청 (트레이 메뉴).");
+            if (_mainViewModel != null) { await _mainViewModel.CleanupAsync(); }
+            // _agentCoreService?.Stop(); // CleanupAsync에서 호출될 것으로 예상되지만, 여기서도 명시적 호출 가능
+            
+            // --- ▼▼▼ Mutex 해제 로직 추가 (OnExit보다 먼저) ▼▼▼ ---
+            _notifyIcon?.Dispose(); 
+            _notifyIcon = null; // 이미 해제된 아이콘 재사용 방지
+
+            if (_mutex != null)
+            {
+                _mutex.ReleaseMutex();
+                _mutex.Close();
+                _mutex = null;
+                Log.Information("SAgentM.App: Mutex 해제됨.");
+            }
+            // --- ▲▲▲ Mutex 해제 로직 추가 끝 ▲▲▲ ---
+            
+            Current.Shutdown();
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            _loggingService?.UiInfo("SAgentM.App OnExit: 최종 정리 및 로거 닫기.");
+            // ExitApplication_MenuItemClick 에서 이미 Mutex와 NotifyIcon을 정리했어야 함
+            // 하지만 만약을 위해 여기서도 시도 (중복 Dispose/Close는 문제되지 않도록 null 체크)
+            _notifyIcon?.Dispose();
+            if (_mutex != null)
+            {
+                // ReleaseMutex는 Mutex를 소유한 스레드만 호출 가능.
+                // OnExit이 다른 스레드에서 호출될 가능성은 낮지만, 안전하게 Close만.
+                // 또는 Mutex 생성 시 initiallyOwned를 false로 하고 WaitOne으로 소유권 획득 후 Release하는 패턴 사용.
+                // 현재는 initiallyOwned=true 이므로, 주 스레드가 소유.
+                // ExitApplication_MenuItemClick에서 ReleaseMutex를 이미 호출했어야 함.
+                // 여기서는 Close만으로 충분할 수 있음.
+                try { _mutex.ReleaseMutex(); } catch (ApplicationException) { /* 이미 해제됨 */ } catch (ObjectDisposedException) { /* 이미 해제됨 */ }
+                _mutex.Close();
+                Log.Information("SAgentM.App OnExit: Mutex 닫힘.");
+            }
+            Log.CloseAndFlush();    
+            base.OnExit(e);
+        }
+    }
+}
+App.xaml.cs 파일의 주요 변경 사항:
+
+using System.Threading; 추가: Mutex 클래스를 사용하기 위해 네임스페이스를 추가했습니다.
+Mutex 멤버 변수 및 이름 상수 선언:
+C#
+
+private Mutex _mutex;
+private const string MutexName = "Global\\SAgentMApp_Mutex_20250526_UniqueId"; 
+MutexName은 시스템 전체에서 이 애플리케이션을 식별하는 고유한 이름이어야 합니다. "Global\" 접두사는 시스템 전역 뮤텍스를 의미합니다. (필요에 따라 "Local\"을 사용하거나 접두사 없이 세션 로컬 뮤텍스로 만들 수도 있지만, 이중 실행 방지에는 전역이 더 확실합니다.) GUID나 매우 특정한 이름을 사용하여 다른 애플리케이션과 충돌하지 않도록 합니다.
+OnStartup 메서드 최상단에 이중 실행 방지 로직 추가:
+C#
+
+bool createdNew;
+_mutex = new Mutex(true, MutexName, out createdNew);
+
+if (!createdNew)
+{
+    MessageBox.Show("SAgentM 에이전트가 이미 실행 중입니다. 기존 프로그램을 확인해주세요.", 
+                    "이중 실행 알림", MessageBoxButton.OK, MessageBoxImage.Warning);
+    Application.Current.Shutdown();
+    return; 
+}
+// base.OnStartup(e); // 이중 실행이 아닐 때만 호출되도록 위치 변경
+new Mutex(true, MutexName, out createdNew):
+true: 현재 인스턴스가 Mutex의 소유권을 즉시 요청합니다.
+MutexName: 시스템에서 Mutex를 식별하는 이름입니다.
+createdNew (out 파라미터): 이 호출로 인해 Mutex가 새로 만들어졌다면 true (즉, 현재 인스턴스가 최초 실행), 이미 존재했다면 false가 됩니다.
+!createdNew인 경우 (다른 인스턴스가 이미 실행 중): 사용자에게 알림 메시지를 표시하고 현재 인스턴스를 즉시 종료합니다. return;을 통해 OnStartup의 나머지 로직(로거 설정, 서비스 시작 등)이 실행되지 않도록 합니다.
+base.OnStartup(e); 호출을 Mutex 체크 이후로 옮겼습니다.
+ExitApplication_MenuItemClick 메서드에 Mutex 해제 로직 추가: 애플리케이션이 정상적으로 종료될 때 (트레이 메뉴의 "종료" 클릭 시) Mutex를 해제합니다.
+C#
+
+if (_mutex != null)
+{
+    _mutex.ReleaseMutex(); // Mutex 소유권 반환
+    _mutex.Close();        // Mutex 리소스 해제
+    _mutex = null;         // 참조 제거
+    Log.Information("SAgentM.App: Mutex 해제됨.");
+}
