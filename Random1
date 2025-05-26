@@ -1,175 +1,112 @@
-{% extends 'layout.html' %}
+private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
+{
+    _loggingService.UiInfo($"[{clientIp}] 릴레이: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
+    if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue)
+    { return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP/Port missing."); }
 
-{% block content %}
-<div class="container">
-    <h1>{{ title }}</h1>
+    // 릴레이 대상이 여러 IP일 경우 (세미콜론 구분) 파싱 및 순차 전송
+    string[] finalTargetIps = originalRelayRequest.FinalTargetIpForRelayedCommand.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                                  .Select(ip => ip.Trim())
+                                  .Distinct() // 중복 제거
+                                  .ToArray();
 
-    <div class="mb-3">
-        <button onclick="location.reload()" class="btn-custom btn-primary-custom">상태 새로고침: 전체보기</button>
-        <button onclick="toggleFailedConnections()" class="btn-custom btn-danger-custom ml-2-custom">통신이상 보기</button>
-    </div>
+    if (!finalTargetIps.Any())
+    {
+        return CreateErrorResponse(originalRelayRequest, "Relay failed: No valid final target IPs after parsing.");
+    }
 
-    <div class="table-responsive-custom">
-        <table class="table-custom table-bordered-custom table-hover-custom">
-            <thead class="thead-light-custom">
-                <tr>
-                    <th>PC 이름</th>
-                    <th>IP 주소</th>
-                    <th>TS/2000 포트 상태</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for pc in pcs %}
-                <tr>
-                    <td>{{ pc.name }}</td>
-                    <td>{{ pc.address }}</td>
-                    <td class="{% if results.get(pc.id) %}status-success{% else %}status-warning{% endif %} text-white-custom">
-                        {% if results.get(pc.id) %}
-                        연결 정상
-                        {% else %}
-                        연결 실패
-                        {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
-</div>
-{% endblock %}
+    _loggingService.UiInfo($"[{clientIp}] Parsed {finalTargetIps.Length} unique final relay targets: {string.Join(", ", finalTargetIps)}");
 
-{% block scripts %}
-<script>
-    let isShowingFailedOnly = false; // 현재 통신 이상인 행만 보고 있는지 여부
+    // 각 최종 타겟에 대한 응답을 수집하거나, 첫 번째 성공/실패만 보고할 수 있음.
+    // 여기서는 각 타겟에 명령을 보내고, 전체적인 성공/실패를 요약하여 응답.
+    int successCount = 0;
+    List<string> individualResults = new List<string>();
 
-    function toggleFailedConnections() {
-        const rows = document.querySelectorAll('tbody tr');
-        isShowingFailedOnly = !isShowingFailedOnly; // 토글
+    foreach (var finalIp in finalTargetIps)
+    {
+        if (token.IsCancellationRequested) { _loggingService.UiInfo($"[{clientIp}] Relay loop canceled before processing {finalIp}."); token.ThrowIfCancellationRequested(); }
 
-        rows.forEach(row => {
-            // 연결 상태를 나타내는 TD 요소를 찾습니다.
-            // 이 TD는 status-success 또는 status-warning 클래스를 가집니다.
-            const statusCell = row.querySelector('.status-success, .status-warning');
+        var packetForFinalTarget = new CommandPacket {
+            Instruction = CommandInstruction.DirectExecute,
+            CommandName = originalRelayRequest.CommandName,
+            PayloadJson = originalRelayRequest.PayloadJson,
+            // 최종 목적지는 이 릴레이 에이전트나 원 요청자에게 직접 응답하지 않음 (단순화)
+            // 필요하다면 ResponseAddress/Port를 설정하여 다단계 응답 체인 구성 가능
+            ResponseAddress = null,
+            ResponsePort = null,
+            PacketId = Guid.NewGuid()
+        };
+        string currentRelayTargetDesc = $"{finalIp}:{originalRelayRequest.FinalTargetPortForRelayedCommand.Value}";
+        _loggingService.UiDebug($"[{clientIp}] Relaying to {currentRelayTargetDesc}...");
 
-            if (statusCell) {
-                const isFailedConnection = statusCell.classList.contains('status-warning'); // 연결 실패 여부 확인
+        CommandPacket responseFromThisFinalTarget = null;
+        string thisTargetMessage = $"Relay to {currentRelayTargetDesc}: ";
 
-                if (isShowingFailedOnly) {
-                    // '통신이상 보기' 모드일 때 (즉, 통신 이상인 행만 보여주고 싶을 때)
-                    if (isFailedConnection) {
-                        // 통신 이상인 행은 보이게 유지
-                        row.style.display = ''; // 또는 'table-row' (기본값으로 되돌림)
-                    } else {
-                        // 연결 정상인 행은 숨김
-                        row.style.display = 'none';
+        try
+        {
+            using (var targetClient = new TcpClient())
+            {
+                var connectTask = targetClient.ConnectAsync(finalIp, originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
+                
+                // ### 변경 지점 1: 연결 타임아웃을 5초에서 200ms로 변경 ###
+                if (await Task.WhenAny(connectTask, Task.Delay(200, token)) != connectTask || token.IsCancellationRequested)
+                { 
+                    token.ThrowIfCancellationRequested(); 
+                    targetClient.Close(); 
+                    throw new TimeoutException($"Connection to final relay target {currentRelayTargetDesc} timed out (200ms)."); 
+                }
+                
+                await connectTask;
+                _loggingService.UiDebug($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 연결 성공.");
+
+                using (NetworkStream relayStream = targetClient.GetStream())
+                using (StreamWriter relayWriter = new StreamWriter(relayStream, Encoding.UTF8){AutoFlush=true})
+                using (StreamReader relayReader = new StreamReader(relayStream, Encoding.UTF8))
+                {
+                    string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget);
+                    if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
+                    await relayWriter.WriteLineAsync(jsonToRelay);
+                    _loggingService.UiDebug($"[{clientIp}] 릴레이 데이터 전송 to {currentRelayTargetDesc}: {jsonToRelay}");
+                    
+                    var targetResponseTask = relayReader.ReadLineAsync();
+                    
+                    // ### 변경 지점 2: 응답 대기 타임아웃을 10초에서 200ms로 변경 ###
+                    if (await Task.WhenAny(targetResponseTask, Task.Delay(200, token)) == targetResponseTask && !token.IsCancellationRequested)
+                    {
+                        string targetJson = await targetResponseTask;
+                        if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
+                        if (!string.IsNullOrEmpty(targetJson))
+                        {
+                            _loggingService.UiInfo($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 응답: {targetJson}");
+                            responseFromThisFinalTarget = JsonConvert.DeserializeObject<CommandPacket>(targetJson);
+                            // 최종 타겟의 응답 페이로드에서 실제 성공 여부 확인
+                            if (responseFromThisFinalTarget?.PayloadJson != null) {
+                                var finalPayload = JsonConvert.DeserializeObject<GenericResponsePayload>(responseFromThisFinalTarget.PayloadJson);
+                                if (finalPayload != null && finalPayload.Success) {
+                                    successCount++;
+                                    thisTargetMessage += $"Success - {finalPayload.Message}";
+                                } else {
+                                    thisTargetMessage += $"Failed - {finalPayload?.Message ?? "Unknown error from target."}";
+                                }
+                            } else { thisTargetMessage += "Sent, but no detailed payload from target.";}
+                        } else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 빈 응답."); thisTargetMessage += "Sent, but empty response from final target."; }
+                    } else { 
+                        _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 응답 시간 초과(200ms)/취소."); 
+                        thisTargetMessage += "Sent, but no response/timeout/canceled from final target (200ms).";
                     }
-                } else {
-                    // '전체 보기' 모드일 때
-                    // 모든 행을 보이게 합니다.
-                    row.style.display = ''; // 또는 'table-row' (기본값으로 되돌림)
                 }
             }
-        });
-    }
-</script>
+        }
+        catch (OperationCanceledException) { thisTargetMessage += "Operation Canceled."; _loggingService.UiInfo($"[{clientIp}] Relay to {currentRelayTargetDesc} canceled."); }
+        catch (TimeoutException tex) { thisTargetMessage += $"Timeout - {tex.Message}"; _loggingService.UiWarn($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}"); }
+        catch (SocketException se) { thisTargetMessage += $"Socket error - {se.Message}"; _loggingService.UiError($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}", se); }
+        catch (Exception ex) { thisTargetMessage += $"Unexpected error - {ex.Message}"; _loggingService.UiError($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}", ex); }
+        individualResults.Add(thisTargetMessage);
+    } // end foreach finalIp
 
-<style>
-    /* 기본적인 컨테이너 및 버튼 스타일 (부트스트랩 없다는 가정 하에 직접 정의) */
-    .container {
-        margin: 20px;
-        padding: 20px;
-        border: 1px solid #ddd;
-        border-radius: 5px;
-    }
-    .mb-3 {
-        margin-bottom: 1rem; /* 약 16px */
-    }
-    .ml-2-custom { /* 원래 ml-2 였던 부분에 ml-2-custom 추가하여 이름 충돌 방지 */
-        margin-left: 0.5rem; /* 약 8px */
-    }
-
-    /* 커스텀 버튼 스타일 */
-    .btn-custom {
-        display: inline-block;
-        font-weight: 400;
-        color: #212529;
-        text-align: center;
-        vertical-align: middle;
-        user-select: none;
-        background-color: transparent;
-        border: 1px solid transparent;
-        padding: 0.375rem 0.75rem;
-        font-size: 1rem;
-        line-height: 1.5;
-        border-radius: 0.25rem;
-        transition: color 0.15s ease-in-out, background-color 0.15s ease-in-out, border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
-        cursor: pointer;
-    }
-    .btn-custom:hover {
-        opacity: 0.8;
-    }
-    .btn-primary-custom {
-        color: #fff;
-        background-color: #007bff;
-        border-color: #007bff;
-    }
-    .btn-danger-custom {
-        color: #fff;
-        background-color: #dc3545;
-        border-color: #dc3545;
-    }
-
-    /* 테이블 스타일 (부트스트랩 없다는 가정 하에 직접 정의) */
-    .table-responsive-custom {
-        overflow-x: auto; /* 테이블이 너무 넓을 경우 스크롤 허용 */
-    }
-    .table-custom {
-        width: 100%;
-        margin-bottom: 1rem;
-        color: #212529;
-        border-collapse: collapse; /* 셀 경계선 겹치기 */
-    }
-    .table-custom th,
-    .table-custom td {
-        padding: 0.75rem;
-        vertical-align: top;
-        border-top: 1px solid #dee2e6;
-    }
-    .table-bordered-custom {
-        border: 1px solid #dee2e6;
-    }
-    .table-bordered-custom th,
-    .table-bordered-custom td {
-        border: 1px solid #dee2e6;
-    }
-    .table-hover-custom tbody tr:hover {
-        color: #212529;
-        background-color: rgba(0, 0, 0, 0.075);
-    }
-    .thead-light-custom th {
-        color: #495057;
-        background-color: #e9ecef;
-        border-color: #dee2e6;
-    }
-
-    /* 상태 색상 (부트스트랩 없다는 가정 하에 직접 정의) */
-    .status-success {
-        background-color: #28a745; /* green */
-        color: #fff; /* white text */
-    }
-    .status-warning {
-        background-color: #ffc107; /* yellow */
-        color: #212529; /* dark text for contrast */
-    }
-    .text-white-custom { /* 원래 text-white 였던 부분에 text-white-custom 추가하여 이름 충돌 방지 */
-        color: #fff;
-    }
-
-    /* 행을 숨기는 CSS */
-    /* .hidden-row {
-        display: none;
-    } */
-    /* 위 주석 처리된 부분 대신 JavaScript에서 직접 style.display를 조작합니다. */
-
-</style>
-{% endblock %}
+    // 릴레이 작업 전체에 대한 요약 응답 생성
+    bool overallSuccess = successCount == finalTargetIps.Length && finalTargetIps.Length > 0;
+    string finalMessage = $"Relay to {finalTargetIps.Length} targets. Success: {successCount}/{finalTargetIps.Length}. Details: {string.Join(" | ", individualResults)}";
+    
+    return CreateExecutionResponse(originalRelayRequest, overallSuccess, finalMessage.Length > 1000 ? finalMessage.Substring(0,1000) + "..." : finalMessage); // 메시지 길이 제한
+}
