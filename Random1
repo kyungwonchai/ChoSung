@@ -1,112 +1,80 @@
-private async Task<CommandPacket> RelayCommandAsync(CommandPacket originalRelayRequest, string clientIp, CancellationToken token)
-{
-    _loggingService.UiInfo($"[{clientIp}] 릴레이: {originalRelayRequest.CommandName} -> {originalRelayRequest.FinalTargetIpForRelayedCommand}:{originalRelayRequest.FinalTargetPortForRelayedCommand}");
-    if (string.IsNullOrEmpty(originalRelayRequest.FinalTargetIpForRelayedCommand) || !originalRelayRequest.FinalTargetPortForRelayedCommand.HasValue)
-    { return CreateErrorResponse(originalRelayRequest, "Relay failed: Final target IP/Port missing."); }
+네, 내부망에 있는 JSP 웹페이지 두 개를 화면에 나란히 띄우는 방법을 찾고 계시는군요.
 
-    // 릴레이 대상이 여러 IP일 경우 (세미콜론 구분) 파싱 및 순차 전송
-    string[] finalTargetIps = originalRelayRequest.FinalTargetIpForRelayedCommand.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-                                  .Select(ip => ip.Trim())
-                                  .Distinct() // 중복 제거
-                                  .ToArray();
+질문하신 자바스크립트 코드보다 HTML <iframe> 태그를 사용하는 것이 훨씬 간단하고 안정적인 방법입니다. <iframe>을 사용하면 특정 웹페이지를 현재 페이지 안에 쉽게 삽입할 수 있습니다.
 
-    if (!finalTargetIps.Any())
-    {
-        return CreateErrorResponse(originalRelayRequest, "Relay failed: No valid final target IPs after parsing.");
-    }
+아래에 바로 사용할 수 있는 HTML 코드를 두 가지 버전으로 제공해 드립니다.
 
-    _loggingService.UiInfo($"[{clientIp}] Parsed {finalTargetIps.Length} unique final relay targets: {string.Join(", ", finalTargetIps)}");
+추천 방법: <iframe>과 CSS를 이용한 화면 분할
+이 방법은 현대 웹 표준에 더 잘 맞고 유연합니다.
 
-    // 각 최종 타겟에 대한 응답을 수집하거나, 첫 번째 성공/실패만 보고할 수 있음.
-    // 여기서는 각 타겟에 명령을 보내고, 전체적인 성공/실패를 요약하여 응답.
-    int successCount = 0;
-    List<string> individualResults = new List<string>();
+index.html
 
-    foreach (var finalIp in finalTargetIps)
-    {
-        if (token.IsCancellationRequested) { _loggingService.UiInfo($"[{clientIp}] Relay loop canceled before processing {finalIp}."); token.ThrowIfCancellationRequested(); }
+HTML
 
-        var packetForFinalTarget = new CommandPacket {
-            Instruction = CommandInstruction.DirectExecute,
-            CommandName = originalRelayRequest.CommandName,
-            PayloadJson = originalRelayRequest.PayloadJson,
-            // 최종 목적지는 이 릴레이 에이전트나 원 요청자에게 직접 응답하지 않음 (단순화)
-            // 필요하다면 ResponseAddress/Port를 설정하여 다단계 응답 체인 구성 가능
-            ResponseAddress = null,
-            ResponsePort = null,
-            PacketId = Guid.NewGuid()
-        };
-        string currentRelayTargetDesc = $"{finalIp}:{originalRelayRequest.FinalTargetPortForRelayedCommand.Value}";
-        _loggingService.UiDebug($"[{clientIp}] Relaying to {currentRelayTargetDesc}...");
-
-        CommandPacket responseFromThisFinalTarget = null;
-        string thisTargetMessage = $"Relay to {currentRelayTargetDesc}: ";
-
-        try
-        {
-            using (var targetClient = new TcpClient())
-            {
-                var connectTask = targetClient.ConnectAsync(finalIp, originalRelayRequest.FinalTargetPortForRelayedCommand.Value);
-                
-                // ### 변경 지점 1: 연결 타임아웃을 5초에서 200ms로 변경 ###
-                if (await Task.WhenAny(connectTask, Task.Delay(200, token)) != connectTask || token.IsCancellationRequested)
-                { 
-                    token.ThrowIfCancellationRequested(); 
-                    targetClient.Close(); 
-                    throw new TimeoutException($"Connection to final relay target {currentRelayTargetDesc} timed out (200ms)."); 
-                }
-                
-                await connectTask;
-                _loggingService.UiDebug($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 연결 성공.");
-
-                using (NetworkStream relayStream = targetClient.GetStream())
-                using (StreamWriter relayWriter = new StreamWriter(relayStream, Encoding.UTF8){AutoFlush=true})
-                using (StreamReader relayReader = new StreamReader(relayStream, Encoding.UTF8))
-                {
-                    string jsonToRelay = JsonConvert.SerializeObject(packetForFinalTarget);
-                    if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
-                    await relayWriter.WriteLineAsync(jsonToRelay);
-                    _loggingService.UiDebug($"[{clientIp}] 릴레이 데이터 전송 to {currentRelayTargetDesc}: {jsonToRelay}");
-                    
-                    var targetResponseTask = relayReader.ReadLineAsync();
-                    
-                    // ### 변경 지점 2: 응답 대기 타임아웃을 10초에서 200ms로 변경 ###
-                    if (await Task.WhenAny(targetResponseTask, Task.Delay(200, token)) == targetResponseTask && !token.IsCancellationRequested)
-                    {
-                        string targetJson = await targetResponseTask;
-                        if(token.IsCancellationRequested) token.ThrowIfCancellationRequested();
-                        if (!string.IsNullOrEmpty(targetJson))
-                        {
-                            _loggingService.UiInfo($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 응답: {targetJson}");
-                            responseFromThisFinalTarget = JsonConvert.DeserializeObject<CommandPacket>(targetJson);
-                            // 최종 타겟의 응답 페이로드에서 실제 성공 여부 확인
-                            if (responseFromThisFinalTarget?.PayloadJson != null) {
-                                var finalPayload = JsonConvert.DeserializeObject<GenericResponsePayload>(responseFromThisFinalTarget.PayloadJson);
-                                if (finalPayload != null && finalPayload.Success) {
-                                    successCount++;
-                                    thisTargetMessage += $"Success - {finalPayload.Message}";
-                                } else {
-                                    thisTargetMessage += $"Failed - {finalPayload?.Message ?? "Unknown error from target."}";
-                                }
-                            } else { thisTargetMessage += "Sent, but no detailed payload from target.";}
-                        } else { _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 빈 응답."); thisTargetMessage += "Sent, but empty response from final target."; }
-                    } else { 
-                        _loggingService.UiWarn($"[{clientIp}] 릴레이 대상 {currentRelayTargetDesc} 응답 시간 초과(200ms)/취소."); 
-                        thisTargetMessage += "Sent, but no response/timeout/canceled from final target (200ms).";
-                    }
-                }
-            }
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>웹페이지 분할 뷰어</title>
+    <style>
+        /* 기본 여백 제거 */
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden; /* 스크롤바 숨기기 */
         }
-        catch (OperationCanceledException) { thisTargetMessage += "Operation Canceled."; _loggingService.UiInfo($"[{clientIp}] Relay to {currentRelayTargetDesc} canceled."); }
-        catch (TimeoutException tex) { thisTargetMessage += $"Timeout - {tex.Message}"; _loggingService.UiWarn($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}"); }
-        catch (SocketException se) { thisTargetMessage += $"Socket error - {se.Message}"; _loggingService.UiError($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}", se); }
-        catch (Exception ex) { thisTargetMessage += $"Unexpected error - {ex.Message}"; _loggingService.UiError($"[{clientIp}] Relay to {currentRelayTargetDesc}: {thisTargetMessage}", ex); }
-        individualResults.Add(thisTargetMessage);
-    } // end foreach finalIp
+        /* iframe을 담을 컨테이너 설정 */
+        #container {
+            display: flex; /* Flexbox 레이아웃 사용 */
+            width: 100vw; /* 뷰포트 너비의 100% */
+            height: 100vh; /* 뷰포트 높이의 100% */
+        }
+        /* iframe 기본 스타일 */
+        .frame {
+            width: 50%; /* 컨테이너의 50% 너비 차지 */
+            height: 100%;
+            border: none; /* 테두리 없애기 */
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <iframe class="frame" src="http://내부망_주소/페이지1.jsp" title="왼쪽 페이지"></iframe>
 
-    // 릴레이 작업 전체에 대한 요약 응답 생성
-    bool overallSuccess = successCount == finalTargetIps.Length && finalTargetIps.Length > 0;
-    string finalMessage = $"Relay to {finalTargetIps.Length} targets. Success: {successCount}/{finalTargetIps.Length}. Details: {string.Join(" | ", individualResults)}";
-    
-    return CreateExecutionResponse(originalRelayRequest, overallSuccess, finalMessage.Length > 1000 ? finalMessage.Substring(0,1000) + "..." : finalMessage); // 메시지 길이 제한
-}
+        <iframe class="frame" src="http://내부망_주소/페이지2.jsp" title="오른쪽 페이지"></iframe>
+    </div>
+</body>
+</html>
+사용 방법
+위 코드를 index.html과 같은 파일 이름으로 저장합니다.
+src="..." 부분의 "http://내부망_주소/페이지1.jsp"와 "http://내부망_주소/페이지2.jsp"를 실제 접속하려는 내부망 JSP 페이지 주소로 변경합니다.
+만약 같은 페이지를 두 개 띄우고 싶다면, 두 src에 동일한 주소를 입력하면 됩니다.
+이 index.html 파일을 웹 브라우저에서 열면, 지정한 두 페이지가 화면 좌우에 나란히 표시됩니다.
+간단한 방법: <frameset>을 이용한 화면 분할
+frameset은 오래된 방식이지만, 매우 간단하게 화면을 분할할 수 있습니다. 다만, HTML5에서는 지원되지 않는 구식 방법이라는 점을 참고하세요.
+
+index.html
+
+HTML
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Frameset//EN" "http://www.w3.org/TR/html4/frameset.dtd">
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>웹페이지 분할 뷰어</title>
+</head>
+<frameset cols="50%, 50%">
+    <frame src="http://내부망_주소/페이지1.jsp">
+
+    <frame src="http://내부망_주소/페이지2.jsp">
+</frameset>
+</html>
+사용 방법
+<iframe> 방식과 동일하게 src="..." 부분에 실제 JSP 페이지 주소를 입력하고 브라우저에서 열면 됩니다.
+
+어떤 것을 선택해야 할까요?
+구분	<iframe> (추천)	<frameset>
+장점	현대 웹 표준 방식, CSS로 유연한 디자인 가능, 유지보수 용이	코드가 매우 간단함
+단점	frameset보다는 코드가 약간 김	구식 기술(HTML5 미지원), 검색엔진 최적화 불리, 유연성 부족
