@@ -1,27 +1,35 @@
- 그 현상이 발생하는 이유를 정확히 이해했습니다. 그리고 그것은 매우 정상적인 문제입니다.
+네, 그 오류는 매우 중요한 단서이며, 현대 브라우저의 동작 방식 때문에 발생하는 문제입니다. 정확한 원인과 해결책을 설명해 드리겠습니다.
 
-문제의 원인: 최신 브라우저들(크롬, 엣지 등)은 효율성을 위해, 이미 창이 열려 있을 때 외부에서 새 주소로 실행을 요청받으면, 새 창을 띄우는 대신 기존에 열려있던 창에 '새 탭으로 추가'하는 것이 기본 동작입니다.
+오류의 정확한 원인: '런처 프로세스'의 함정
+사용자님이 보신 "프로세스가 끝났으므로..." 오류는 다음과 같은 순서로 발생합니다.
 
-저희가 만든 C# 코드는 '새로운 창'이 생성되고 그 창의 제어권을 얻기를 기다립니다. 하지만 실제로는 탭만 추가될 뿐 새로운 창이 뜨지 않으니, 코드는 창을 찾지 못하고 시간 초과로 실패하는 것입니다.
+저희 C# 코드가 Process.Start("chrome.exe", ...)를 실행합니다.
+이때 실행되는 chrome.exe는 실제 웹 화면을 그리는 메인 프로세스가 아니라, 아주 잠깐(0.1초 이내) 실행되었다가 바로 종료되는 '런처(Launcher)' 또는 '브로커(Broker)' 프로세스입니다.
+이 런처의 유일한 역할은 이미 실행 중인 진짜 크롬 메인 프로세스에게 "이 주소로 새 창 하나 띄워줘"라고 명령을 전달하는 것입니다.
+저희 코드는 이 '금방 사라지는' 런처 프로세스를 붙잡고, 그 프로세스의 창 정보(MainWindowHandle)를 달라고 계속 요청합니다.
+하지만 런처 프로세스는 명령 전달 후 즉시 종료되었기 때문에, 우리 코드가 창 정보를 요청하는 시점에는 이미 사라지고 없는 상태입니다. 따라서 .NET은 "프로세스가 끝났으므로 정보를 요청할 수 없다"는 예외를 발생시킵니다.
+해결책: 프로세스가 아닌 '창(Window)' 직접 추적
+이 문제를 해결하기 위해, 접근 방식을 완전히 바꾸겠습니다. 불안정한 프로세스 추적을 포기하고, 화면에 나타나는 창(Window) 자체를 직접 추적하는 훨씬 더 안정적인 방법입니다.
 
-해결책: '새 창으로 열기' 강제하기
-이 문제를 해결하려면, 브라우저를 실행할 때 '반드시 새 창으로 열어라' 라는 명령 인수(Argument)를 직접 전달해야 합니다.
+새로운 로직:
 
-이를 위해 코드를 아래와 같이 수정해야 합니다.
-
-윈도우 레지스트리에서 기본 브라우저의 실행 파일(.exe) 경로를 직접 찾습니다. (예: C:\Program Files\Google\Chrome\Application\chrome.exe)
-찾아낸 실행 파일을 직접 실행하면서, --new-window 라는 '새 창으로 열기' 옵션과 주소를 함께 전달합니다.
-아래는 이 로직이 적용된 최종 WPF 코드입니다. 이 코드는 훨씬 더 안정적으로 동작할 것입니다.
-
-최종 수정된 WPF 코드 (MainWindow.xaml.cs)
-MainWindow.xaml 파일은 이전과 동일하게 두고, MainWindow.xaml.cs 파일만 아래 내용으로 전체를 교체해 주세요.
+브라우저를 실행하기 전(Before), 현재 화면에 열려있는 모든 브라우저 창의 목록을 저장합니다.
+브라우저를 실행시킵니다. (이때 어떤 프로세스가 뜨든 신경 쓰지 않습니다)
+잠시 기다린 후, 다시 화면의 모든 브라우저 창 목록을 가져옵니다. (After)
+After 목록과 Before 목록을 비교해서 새로 생긴 창을 찾아냅니다.
+새로 찾은 그 창의 위치와 크기를 조절합니다.
+최종 완성 코드 (WPF, MainWindow.xaml.cs)
+MainWindow.xaml은 그대로 두시고, MainWindow.xaml.cs의 전체 코드를 아래 내용으로 교체해주세요. 이 코드가 최종 버전입니다.
 
 C#
 
-using Microsoft.Win32; // 레지스트리 접근을 위해 추가
+using Microsoft.Win32;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 
@@ -29,8 +37,25 @@ namespace WpfBrowserLauncher
 {
     public partial class MainWindow : Window
     {
+        #region P/Invoke Win32 API Declarations
+        // 창의 위치/크기 변경
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+        
+        // 화면의 모든 최상위 창을 열거(순회)
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        // 창의 스레드/프로세스 ID 가져오기
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        // 창이 보이는지 확인
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+        #endregion
 
         public MainWindow()
         {
@@ -45,49 +70,106 @@ namespace WpfBrowserLauncher
             launchButton.IsEnabled = false;
             statusTextBlock.Text = "기본 브라우저 경로를 찾는 중...";
 
-            // 1. 기본 브라우저의 실행 파일 경로를 가져옵니다.
             string browserPath = GetDefaultBrowserPath();
             if (string.IsNullOrEmpty(browserPath))
             {
-                MessageBox.Show("기본 브라우저를 찾을 수 없습니다. 레지스트리 설정을 확인해주세요.");
+                MessageBox.Show("기본 브라우저를 찾을 수 없습니다.");
                 launchButton.IsEnabled = true;
                 return;
             }
             
-            // 2. 브라우저 종류에 맞는 '새 창' 명령 인수 설정 (대부분 --new-window 사용)
-            string arguments = $"--new-window";
-            if (browserPath.Contains("firefox"))
-            {
-                arguments = "-new-window"; // Firefox의 경우
-            }
+            string browserProcessName = System.IO.Path.GetFileNameWithoutExtension(browserPath).ToLower();
+            string arguments = browserProcessName.Contains("firefox") ? "-new-window" : "--new-window";
 
-            statusTextBlock.Text = "브라우저를 새 창으로 실행하고 정렬하는 중입니다...";
+            statusTextBlock.Text = "브라우저를 새 창으로 실행하고 추적합니다...";
 
-            // 3. 브라우저를 '새 창'으로 강제 실행하고 위치 조정
-            await LaunchAndPositionBrowserAsync(browserPath, arguments, urlLeft, 0, 0, (int)(SystemParameters.PrimaryScreenWidth / 2), (int)SystemParameters.PrimaryScreenHeight);
-            await LaunchAndPositionBrowserAsync(browserPath, arguments, urlRight, (int)(SystemParameters.PrimaryScreenWidth / 2), 0, (int)(SystemParameters.PrimaryScreenWidth / 2), (int)SystemParameters.PrimaryScreenHeight);
-
+            // 두 브라우저를 순차적으로 실행하고 배치
+            await LaunchAndPositionBrowserAsync(browserPath, browserProcessName, arguments, urlLeft, 0, 0, (int)(SystemParameters.PrimaryScreenWidth / 2), (int)SystemParameters.PrimaryScreenHeight);
+            await LaunchAndPositionBrowserAsync(browserPath, browserProcessName, arguments, urlRight, (int)(SystemParameters.PrimaryScreenWidth / 2), 0, (int)(SystemParameters.PrimaryScreenWidth / 2), (int)SystemParameters.PrimaryScreenHeight);
+            
             statusTextBlock.Text = "완료되었습니다! 2초 후에 프로그램을 종료합니다.";
             await Task.Delay(2000);
             this.Close();
         }
 
+        private async Task LaunchAndPositionBrowserAsync(string browserPath, string browserProcessName, string newWindowArg, string url, int x, int y, int width, int height)
+        {
+            // 1. 실행 '전' 상태의 브라우저 창 목록을 가져옵니다.
+            List<IntPtr> beforeHandles = FindBrowserWindows(browserProcessName);
+
+            // 2. 브라우저 실행
+            Process.Start(browserPath, $"{newWindowArg} \"{url}\"");
+
+            // 3. '새 창'이 나타날 때까지 대기하고, 그 창의 핸들을 찾아냅니다.
+            IntPtr newWindowHandle = IntPtr.Zero;
+            var stopwatch = Stopwatch.StartNew();
+            while (stopwatch.ElapsedMilliseconds < 8000) // 최대 8초 대기
+            {
+                await Task.Delay(250); // 0.25초마다 확인
+                List<IntPtr> afterHandles = FindBrowserWindows(browserProcessName);
+                
+                // after 목록에는 있고 before 목록에는 없는 창을 찾습니다. (이것이 새로 생긴 창!)
+                var newHandle = afterHandles.Except(beforeHandles).FirstOrDefault();
+
+                if (newHandle != IntPtr.Zero)
+                {
+                    newWindowHandle = newHandle;
+                    break;
+                }
+            }
+            stopwatch.Stop();
+
+            // 4. 새로 찾은 창의 위치를 조절합니다.
+            if (newWindowHandle != IntPtr.Zero)
+            {
+                MoveWindow(newWindowHandle, x, y, width, height, true);
+            }
+            else
+            {
+                statusTextBlock.Text = $"{url} 창을 찾는 데 실패했습니다.";
+            }
+        }
+        
         /// <summary>
-        /// 기본 브라우저의 실행 파일 경로를 레지스트리에서 조회합니다.
+        /// 특정 프로세스 이름(예: "chrome")을 가진 모든 보이는 창의 핸들 목록을 반환합니다.
         /// </summary>
+        private List<IntPtr> FindBrowserWindows(string processName)
+        {
+            var windowHandles = new List<IntPtr>();
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd)) return true; // 보이는 창만 대상으로 함
+
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid == 0) return true;
+                
+                try
+                {
+                    Process p = Process.GetProcessById((int)pid);
+                    if (p.ProcessName.ToLower() == processName)
+                    {
+                        windowHandles.Add(hWnd);
+                    }
+                }
+                catch (ArgumentException) { /* 프로세스가 이미 종료된 경우 등 예외 무시 */ }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return windowHandles;
+        }
+
         private string GetDefaultBrowserPath()
         {
+            // 이 함수는 이전과 동일
             try
             {
                 string key = @"HTTP\shell\open\command";
                 using (RegistryKey registryKey = Registry.ClassesRoot.OpenSubKey(key))
                 {
                     if (registryKey == null) return null;
-                    // 예: "C:\Program Files\Google\Chrome\Application\chrome.exe" -- "%1"
                     string command = registryKey.GetValue(null) as string;
                     if (string.IsNullOrEmpty(command)) return null;
-
-                    // 큰따옴표로 묶인 첫 번째 부분을 실행 파일 경로로 간주합니다.
                     var parts = command.Split('\"');
                     if (parts.Length >= 2 && !string.IsNullOrEmpty(parts[1]))
                     {
@@ -95,54 +177,16 @@ namespace WpfBrowserLauncher
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show("기본 브라우저 경로 조회 중 오류 발생: " + ex.Message);
-            }
+            catch { /* 예외 무시 */ }
             return null;
-        }
-
-        /// <summary>
-        /// 브라우저를 '새 창'으로 강제 실행하고 위치를 조정하는 함수
-        /// </summary>
-        private async Task<bool> LaunchAndPositionBrowserAsync(string browserPath, string newWindowArg, string url, int x, int y, int width, int height)
-        {
-            try
-            {
-                // 중요: URL을 직접 실행하는 대신, 브라우저 실행 파일에 '명령 인수'를 전달합니다.
-                string arguments = $"{newWindowArg} \"{url}\"";
-                var psi = new ProcessStartInfo(browserPath, arguments);
-                Process process = Process.Start(psi);
-
-                int timeoutMilliseconds = 8000;
-                var stopwatch = Stopwatch.StartNew();
-                while (process.MainWindowHandle == IntPtr.Zero && stopwatch.ElapsedMilliseconds < timeoutMilliseconds)
-                {
-                    await Task.Delay(100);
-                    process.Refresh();
-                }
-
-                if (process.MainWindowHandle != IntPtr.Zero)
-                {
-                    MoveWindow(process.MainWindowHandle, x, y, width, height, true);
-                    return true;
-                }
-                else
-                {
-                    statusTextBlock.Text = $"{url} 창을 찾는 데 실패했습니다.";
-                    return false;
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"오류 발생: {ex.Message}");
-                return false;
-            }
         }
     }
 }
-주요 변경 사항 설명
-GetDefaultBrowserPath() 함수 추가: 이 함수는 Windows 레지스트리를 직접 조회하여 현재 기본 브라우저로 설정된 프로그램의 .exe 파일 경로를 알아냅니다. 이로써 어떤 브라우저가 기본 설정이든 대응할 수 있습니다.
-ProcessStartInfo 사용법 변경:
-이전: new ProcessStartInfo(url) -> OS에게 URL 처리를 맡김 (탭으로 열림)
-변경 후: new ProcessStartInfo(browserPath, arguments) -> 브라우저 실행 파일을 직접 지정하고, --new-window "주소" 라는 명령어를 전달하여 '새 창'으로 열도록 강제합니다.
+핵심 변경점 상세 설명
+새로운 Win32 API 함수 추가: EnumWindows, GetWindowThreadProcessId, IsWindowVisible 등 창 목록을 직접 다루기 위한 API들을 선언했습니다.
+FindBrowserWindows 함수: 이 함수는 현재 화면에 떠 있는 모든 창을 하나하나 확인하여, 특정 프로세스 이름(예: "chrome")을 가진 창들의 핸들(고유 ID) 목록을 반환하는 핵심적인 역할을 합니다.
+LaunchAndPositionBrowserAsync 로직 변경:
+프로세스 추적 포기: 더 이상 Process.Start()가 반환하는 프로세스 객체에 의존하지 않습니다.
+실행 전 스냅샷: FindBrowserWindows를 호출하여 현재 열려있는 브라우저 창들을 기록합니다. (beforeHandles)
+실행 후 비교: 브라우저 실행 후, 루프를 돌면서 계속 현재 창 목록을 가져와(afterHandles) 이전 목록과 비교합니다.
+Except(..).FirstOrDefault(): LINQ의 Except 메서드를 사용하여 after 목록에는 있지만 before 목록에는 없는, 즉 **'새로 생긴 창'**을 정확하게 찾아냅니다.
