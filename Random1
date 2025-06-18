@@ -1,196 +1,88 @@
-네, 방금 보내주신 코드는 Vite 플러그인 형태로 IP 접근 제어를 구현하는 방식입니다. 이 방식은 Vite 개발 서버에서 작동하며, 프로덕션 배포 시 Nginx 같은 별도 웹 서버를 사용하지 않는 경우에도 유용할 수 있습니다.
+import socket
+import threading
+from queue import Queue
 
-여기서 "엑세스 불가" 메시지 대신 좀 더 멋진(사용자 친화적인) 에러 페이지를 띄우는 방법은 다음과 같습니다.
+def check_smb_port(ip_address, port=445, timeout=1):
+    """
+    주어진 IP 주소의 지정된 포트가 열려 있는지 확인합니다.
+    기본 포트는 SMB/CIFS 프로토콜에 사용되는 445번입니다.
+    성공하면 True를, 실패하면 False를 반환합니다.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip_address, port))
+        sock.close()
+        return result == 0
+    except (socket.gaierror, socket.timeout, Exception):
+        return False
 
-1. HTML 파일로 에러 페이지 띄우기 (권장)
-가장 깔끔하고 일반적인 방법은 별도의 HTML 파일을 만들어서 해당 파일을 응답으로 보내는 것입니다.
+def worker(q, results):
+    """큐에서 IP 주소를 가져와 포트 체크를 수행하는 워커 함수"""
+    while True:
+        ip = q.get()
+        if ip is None: # None을 받으면 종료
+            break
+        
+        if check_smb_port(ip):
+            print(f"? {ip}:445 포트가 열려 있습니다. 공유 폴더가 있을 가능성이 높습니다.")
+            results.append(ip)
+        else:
+            # 닫혀있는 포트는 출력하지 않아 로그를 깔끔하게 유지합니다.
+            pass
+        q.task_done()
 
-수정된 Vite 플러그인 코드:
+# --- 스캔 설정 ---
+base_ip_prefix = "10.56."
+# 스캔할 세 번째 옥텟 (xx 부분)의 시작과 끝을 151부터 173으로 설정
+start_third_octet = 151
+end_third_octet = 173
 
-JavaScript
+# 한 IP 대역 내에서 스캔할 네 번째 옥텟의 범위
+start_fourth_octet = 1
+end_fourth_octet = 254 # 255는 브로드캐스트 주소일 수 있으므로 254까지
 
-import path from 'path';
-import { defineConfig, loadEnv, Plugin } from 'vite';
-import fs from 'fs'; // fs 모듈 추가
+num_threads = 50 # 동시에 체크할 스레드 수 (네트워크 상황에 따라 조절)
 
-// IP 화이트리스트 (허용할 IP 목록)
-const ipWhitelist = ['127.0.0.1', '::1', '10.244.120.24']; // 로컬호스트, 특정 내부 IP 등
+# --- 스캔 실행 ---
+if __name__ == "__main__":
+    print(f"--- 10.56.{start_third_octet}.* ~ 10.56.{end_third_octet}.* 대역 SMB (445) 포트 스캔 시작 ---")
+    print(f"스캔 범위: {base_ip_prefix}{start_third_octet}.{start_fourth_octet} 부터 {base_ip_prefix}{end_third_octet}.{end_fourth_octet} 까지")
+    print(f"동시 스레드 수: {num_threads}")
+    print("---------------------------------------------------\n")
 
-// IP 제한 미들웨어를 추가하는 Vite 플러그인
-const ipRestrictionPlugin = (): Plugin => ({
-  name: 'vite-plugin-ip-restriction',
-  configureServer(server) {
-    server.middlewares.use((req, res, next) => {
-      const clientIp = req.socket.remoteAddress;
+    ip_queue = Queue()
+    open_ips = []
+    threads = []
 
-      console.log(`Incoming request from IP: ${clientIp}`); // 접속 시도 IP 로그
+    # 큐에 스캔할 IP 주소 추가
+    for third_octet in range(start_third_octet, end_third_octet + 1):
+        for fourth_octet in range(start_fourth_octet, end_fourth_octet + 1):
+            ip = f"{base_ip_prefix}{third_octet}.{fourth_octet}"
+            ip_queue.put(ip)
 
-      // 허용된 IP가 아니면 접근 거부
-      // IPv6 주소 형식으로 들어올 수 있으므로 IPv4 주소만 추출 (::ffff:127.0.0.1 -> 127.0.0.1)
-      const cleanedClientIp = clientIp.includes('::ffff:') ? clientIp.split(':').pop() : clientIp;
+    # 워커 스레드 시작
+    for _ in range(num_threads):
+        t = threading.Thread(target=worker, args=(ip_queue, open_ips))
+        t.daemon = True 
+        t.start()
+        threads.append(t)
 
-      if (!ipWhitelist.includes(cleanedClientIp)) {
-        // 엑세스 거부 페이지 로드
-        const deniedPagePath = path.resolve(__dirname, 'public/access-denied.html'); // public 폴더에 있다고 가정
-        fs.readFile(deniedPagePath, (err, data) => {
-          if (err) {
-            // 파일을 찾을 수 없거나 읽을 수 없을 때의 폴백
-            console.error('Error reading access-denied.html:', err);
-            res.statusCode = 403;
-            res.setHeader('Content-Type', 'text/plain');
-            res.end('Access Denied: Your IP is not allowed.');
-          } else {
-            res.statusCode = 403;
-            res.setHeader('Content-Type', 'text/html');
-            res.end(data); // HTML 파일 내용 응답
-          }
-        });
-        return; // 여기서 응답을 보내고 종료
-      }
+    # 모든 IP 주소가 처리될 때까지 기다림
+    ip_queue.join()
 
-      // 허용된 IP라면 다음 단계로 진행
-      next();
-    });
-  }
-});
+    # 워커 스레드 종료 신호 보내기
+    for _ in range(num_threads):
+        ip_queue.put(None)
+    for t in threads:
+        t.join() 
 
-export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, '', '');
-  return {
-    // ?? 여기에 IP 제한 플러그인을 추가합니다.
-    plugins: [ipRestrictionPlugin()], // 플러그인 배열에 추가
-
-    resolve: {
-      alias: {
-        '@': path.resolve(___dirname, '.'),
-      },
-    },
-    server: {
-      host: '0.0.0.0', // 모든 IP에서 접근 가능하게 설정 (플러그인에서 제어)
-    },
-  };
-});
-public/access-denied.html 파일 생성 (예시):
-
-프로젝트의 public 폴더 (또는 다른 적절한 위치)에 access-denied.html 파일을 만듭니다.
-
-HTML
-
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>접근 거부됨</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f8f8f8;
-            color: #333;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-            text-align: center;
-        }
-        .container {
-            background-color: #fff;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-            max-width: 500px;
-            width: 90%;
-        }
-        h1 {
-            color: #d9534f; /* 빨간색 계열 */
-            margin-bottom: 20px;
-        }
-        p {
-            font-size: 1.1em;
-            line-height: 1.6;
-        }
-        .contact-info {
-            margin-top: 30px;
-            font-size: 0.9em;
-            color: #777;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>?? 접근이 제한되었습니다.</h1>
-        <p>죄송합니다. 이 페이지는 특정 IP 주소에서만 접근이 허용됩니다.</p>
-        <p>현재 사용하시는 IP 주소로는 접근이 불가능합니다.</p>
-        <p>문의사항이 있으시면 관리자에게 연락해주십시오.</p>
-        <div class="contact-info">
-            <p><strong>이메일:</strong> your.email@example.com</p>
-            <p><strong>전화:</strong> 010-1234-5678</p>
-        </div>
-    </div>
-</body>
-</html>
-변경 사항 요약:
-
-fs 모듈 import: Node.js의 fs (File System) 모듈을 사용하여 파일을 읽습니다.
-deniedPagePath 설정: path.resolve를 사용하여 access-denied.html 파일의 절대 경로를 지정합니다. 일반적으로 public 폴더에 정적 파일을 두는 것이 Vite에서 권장됩니다.
-fs.readFile 사용: access-denied.html 파일을 비동기적으로 읽어옵니다.
-res.end(data): 파일을 성공적으로 읽으면, 읽어온 HTML 파일 내용을 응답으로 보냅니다. Content-Type을 text/html로 설정하여 브라우저가 HTML로 렌더링하도록 합니다.
-에러 처리: fs.readFile에서 에러가 발생하면 (예: 파일이 없으면) 기본적인 텍스트 메시지를 폴백으로 보냅니다.
-2. 인라인 HTML/CSS 사용 (간단한 메시지)
-만약 별도의 HTML 파일을 만드는 것이 번거롭다면, 자바스크립트 코드 내에 직접 HTML 문자열을 삽입하여 보낼 수도 있습니다. 다만, 복잡한 디자인은 어려울 수 있습니다.
-
-JavaScript
-
-// ... (이전 코드 동일)
-
-const ipRestrictionPlugin = (): Plugin => ({
-  name: 'vite-plugin-ip-restriction',
-  configureServer(server) {
-    server.middlewares.use((req, res, next) => {
-      const clientIp = req.socket.remoteAddress;
-      console.log(`Incoming request from IP: ${clientIp}`);
-
-      const cleanedClientIp = clientIp.includes('::ffff:') ? clientIp.split(':').pop() : clientIp;
-
-      if (!ipWhitelist.includes(cleanedClientIp)) {
-        const deniedHtml = `
-          <!DOCTYPE html>
-          <html lang="ko">
-          <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>접근 제한</title>
-              <style>
-                  body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #f0f0f0; color: #333; }
-                  h1 { color: #cc0000; }
-                  p { font-size: 1.1em; }
-              </style>
-          </head>
-          <body>
-              <h1>?? 접근이 허용되지 않았습니다.</h1>
-              <p>귀하의 IP 주소는 이 서비스에 접근할 수 없습니다.</p>
-              <p>관리자에게 문의하십시오.</p>
-          </body>
-          </html>
-        `;
-        res.statusCode = 403;
-        res.setHeader('Content-Type', 'text/html');
-        res.end(deniedHtml);
-        return;
-      }
-      next();
-    });
-  }
-});
-
-// ... (나머지 코드 동일)
-선택 가이드:
-
-HTML 파일 방식: 에러 페이지의 디자인을 자유롭게 커스터마이징하고 싶다면 이 방법을 사용하는 것이 좋습니다. 유지보수 및 가독성 측면에서도 유리합니다.
-인라인 HTML 방식: 매우 간단한 메시지만 띄울 것이라면 이 방식도 가능합니다.
-주의 사항:
-
-이 플러그인은 Vite 개발 서버 (npm run dev)에만 적용됩니다. 프로덕션 환경에 배포할 때는 Nginx와 같은 웹 서버를 사용하고, 해당 웹 서버에서 IP 접근 제어 및 에러 페이지 설정을 하는 것이 일반적이고 더 강력합니다.
-__dirname을 사용하여 파일 경로를 찾는 방식은 Node.js 환경에서 작동합니다. vite.config.js 파일이 위치한 디렉토리를 기준으로 public 폴더의 경로를 정확히 지정해야 합니다.
-보안: IP 주소 기반의 접근 제어는 완벽한 보안 솔루션이 아닙니다 (예: VPN, 프록시 사용 시 우회 가능). 중요한 애플리케이션의 경우, 사용자 인증/인가 시스템을 함께 사용하는 것
+    print("\n---------------------------------------------------")
+    print("--- 스캔 완료 ---")
+    if open_ips:
+        print("\n열려있는 445 포트 (공유 폴더 가능성 있는 IP) 목록:")
+        for ip in sorted(open_ips):
+            print(f"- {ip}")
+    else:
+        print("열려있는 445 포트를 찾을 수 없었습니다.")
+    print("---------------------------------------------------")
