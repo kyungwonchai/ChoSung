@@ -1,44 +1,333 @@
-  <style>
-      @media print {
-        @page {
-          margin: 0;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+// ============================================================
+// == 실행을 위한 메인 클래스
+// ============================================================
+public class TrackingSystemRunner {
+
+    public static void main(String[] args) {
+        System.out.println("====== 수배자 추적 시스템 시뮬레이션 시작 ======");
+
+        // --- 1. 시스템의 모든 부품(의존성) 준비 ---
+        I로깅서비스 logger = new ConsoleLogger();
+        커맨드실행기 invoker = new 커맨드실행기();
+        
+        // AI 서버의 구성요소들
+        I추적데이터저장_AI trackingHistoryRepo = new TrackingHistoryRepository();
+        ResultPublisher resultPublisher = new ResultPublisher();
+        I분석파이프라인 pipeline = new AnalysisPipeline(resultPublisher);
+        // [오류 수정] 클래스 이름을 다이어그램과 일치하도록 변경
+        I추적상태및전략관리 strategyPlanner = new 상황인식전략수립기Facade(trackingHistoryRepo);
+        TrackingMissionManager missionManager = new TrackingMissionManager(pipeline, strategyPlanner);
+        TaskReceiver taskReceiver = new TaskReceiver(missionManager);
+        VirtualMessageBroker messageBroker = new VirtualMessageBroker(taskReceiver, strategyPlanner);
+        resultPublisher.setMessageBroker(messageBroker);
+        
+        // App 서버의 외부연동 게이트웨이들
+        Map<String, IGateway> gateways = new HashMap<>();
+        gateways.put("CCTV", new CctvGateway());
+        gateways.put("MQ", new MqGateway(messageBroker));
+        gateways.put("STORAGE", new StorageGateway());
+        gateways.put("SATELLITE", new SatelliteGateway());
+
+        // --- 2. [핵심] 임무 내용에 따라 팩토리를 선택해주는 '팩토리 제공자' 생성 ---
+        임무명령팩토리_제공자 factoryProvider = new 임무명령팩토리_제공자(gateways);
+
+        // --- 3. 다양한 임무 요청들을 생성하여 시뮬레이션 ---
+        List<임무요청DTO> missionRequests = new ArrayList<>();
+        missionRequests.add(new 임무요청DTO("실시간 추적", "강남역 일대", MissionPriority.NORMAL, MissionEnvironment.URBAN));
+        missionRequests.add(new 임무요청DTO("실시간 추적", "설악산 국립공원", MissionPriority.HIGH, MissionEnvironment.MOUNTAIN));
+        missionRequests.add(new 임무요청DTO("배치 분석", "/videos/2025/archive-01.mp4", MissionPriority.LOW, MissionEnvironment.NONE));
+        missionRequests.add(new 임무요청DTO("시스템 점검", "AI 서버 클러스터", MissionPriority.NORMAL, MissionEnvironment.NONE));
+
+        // --- 4. 요청들을 순서대로 처리 ---
+        for (임무요청DTO request : missionRequests) {
+            System.out.println("\n\n========================================================");
+            System.out.println(">>> 새로운 임무 요청 수신: " + request);
+
+            I임무명령팩토리 selectedFactory = factoryProvider.getFactory(request);
+            System.out.println("[Factory Provider] 임무에 적합한 '" + selectedFactory.getClass().getSimpleName() + "' 선택 완료.");
+
+            I임무오케스트레이션 service = new 임무오케스트레이션서비스(selectedFactory, invoker, logger);
+            String jobId = service.임무요청처리(request).join();
+
+            if (request.missionType().contains("추적")) {
+                resultPublisher.publishAnalysisResult(new AnalysisResult(jobId, "FOUND", request.target()));
+                resultPublisher.publishAnalysisResult(new AnalysisResult(jobId, "LOST", "알 수 없는 위치"));
+            }
         }
         
-        html, body {
-          margin: 0 !important;
-          padding: 0 !important;
-        }
+        System.out.println("\n\n====== 시뮬레이션 종료 ======");
+    }
+}
 
-        body > #root > div > header, 
-        body > #root > div > main > aside,
-        body > #root > div > main > div[id^=editor-wrapper] > div > div[id^=label-canvas] > div[class~=select-none] > div {
-          display: none !important;
-        }
-        
-        #editor-wrapper {
-          display: none !important;
-        }
+// ============================================================
+// == 가상 메시지 브로커
+// ============================================================
+class VirtualMessageBroker {
+    private TaskReceiver taskReceiver; private I추적상태및전략관리 strategyPlanner;
+    public VirtualMessageBroker(TaskReceiver r, I추적상태및전략관리 p) { this.taskReceiver = r; this.strategyPlanner = p; }
+    public void publishTask(String topic, 분석데이터 data) {
+        System.out.println("\n[Virtual MQ] 작업 수신 (Priority: "+ data.priority +"). AI 서버 TaskReceiver에게 전달...");
+        taskReceiver.onMessageReceived(data);
+    }
+    public void publishResult(String topic, AnalysisResult result) {
+        System.out.println("\n[Virtual MQ] 결과 수신. AI 서버 StrategyPlanner에게 전달...");
+        strategyPlanner.handleEvent(result.jobId(), new EventData(result.status(), result.location()));
+    }
+}
 
-        #print-area {
-          display: block !important;
-          position: absolute;
-          left: 0;
-          top: 0;
+// ============================================================
+// == 공통 DTO 및 로깅
+// ============================================================
+enum MissionPriority { LOW, NORMAL, HIGH }
+enum MissionEnvironment { URBAN, MOUNTAIN, NONE }
+record 임무요청DTO(String missionType, String target, MissionPriority priority, MissionEnvironment environment) {}
+record EventData(String type, String location) {}
+record AnalysisResult(String jobId, String status, String location) {}
+class 분석데이터 { public String jobId; public MissionEnvironment environment; public String priority; }
+interface I로깅서비스 { void log(String message); }
+class ConsoleLogger implements I로깅서비스 {
+    @Override public void log(String message) { System.out.println("[LOG] " + message); }
+}
+
+// ============================================================
+// == Node 2: 추적 및 관리 서비스 노드 (App Server)
+// ============================================================
+interface I임무오케스트레이션 { CompletableFuture<String> 임무요청처리(임무요청DTO 요청); }
+class 임무오케스트레이션서비스 implements I임무오케스트레이션 {
+    private final I임무명령팩토리 _commandFactory; private final 커맨드실행기 _commandInvoker; private final I로깅서비스 _logger;
+    public 임무오케스트레이션서비스(I임무명령팩토리 f, 커맨드실행기 i, I로깅서비스 l) {
+        this._commandFactory = f; this._commandInvoker = i; this._logger = l;
+    }
+    @Override
+    public CompletableFuture<String> 임무요청처리(임무요청DTO 요청) {
+        _logger.log(요청.missionType() + " 임무 요청 처리 시작...");
+        String 작업ID = "job-" + UUID.randomUUID().toString().substring(0, 8);
+        분석데이터 data = new 분석데이터(); data.jobId = 작업ID; data.environment = 요청.environment(); data.priority = 요청.priority().name();
+        I명령 primaryCommand = _commandFactory.주요명령생성(요청.target());
+        I명령 secondaryCommand = _commandFactory.보조명령생성(data);
+        _commandInvoker.커맨드추가및실행(primaryCommand);
+        _commandInvoker.커맨드추가및실행(secondaryCommand);
+        return CompletableFuture.completedFuture(작업ID);
+    }
+}
+
+// ============================================================
+// == 커맨드 패턴
+// ============================================================
+interface I명령 { CompletableFuture<Void> 실행하기(); }
+class 커맨드실행기 {
+    private final Queue<I명령> _commandQueue = new ConcurrentLinkedQueue<>();
+    public void 커맨드추가및실행(I명령 명령) { _commandQueue.add(명령); 명령.실행하기(); }
+}
+class 영상요청명령 implements I명령 {
+    private final I영상소스제공 _receiver; private final String _area;
+    public 영상요청명령(I영상소스제공 r, String a) { this._receiver = r; this._area = a; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.requestStream(_area)); }
+}
+class AI분석요청명령 implements I명령 {
+    private final I이벤트발행 _receiver; private final 분석데이터 _data;
+    public AI분석요청명령(I이벤트발행 r, 분석데이터 d) { this._receiver = r; this._data = d; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.publishEvent(_data)); }
+}
+class 저장된영상요청명령 implements I명령 {
+    private final I저장된영상소스 _receiver; private final String _filePath;
+    public 저장된영상요청명령(I저장된영상소스 r, String f) { this._receiver = r; this._filePath = f; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.requestFile(_filePath)); }
+}
+class 위성영상분석명령 implements I명령 {
+    private final I위성영상소스 _receiver; private final String _area;
+    public 위성영상분석명령(I위성영상소스 r, String a) { this._receiver = r; this._area = a; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.requestSatelliteImage(_area)); }
+}
+class 시스템상태점검명령 implements I명령 {
+    private final I시스템점검 _receiver; private final String _target;
+    public 시스템상태점검명령(I시스템점검 r, String t) { this._receiver = r; this._target = t; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.checkStatus(_target)); }
+}
+class 결과리포트생성명령 implements I명령 {
+    private final I리포트생성 _receiver; private final 분석데이터 _data;
+    public 결과리포트생성명령(I리포트생성 r, 분석데이터 d) { this._receiver = r; this._data = d; }
+    @Override public CompletableFuture<Void> 실행하기() { return CompletableFuture.runAsync(() -> _receiver.generateReport(_data)); }
+}
+
+// ============================================================
+// == 추상 팩토리 패턴
+// ============================================================
+interface I임무명령팩토리 { I명령 주요명령생성(String p); I명령 보조명령생성(분석데이터 d); }
+class 실시간추적명령팩토리 implements I임무명령팩토리 {
+    private final I영상소스제공 _videoProvider; private final I이벤트발행 _eventPublisher;
+    public 실시간추적명령팩토리(IGateway v, IGateway e) { this._videoProvider = (I영상소스제공)v; this._eventPublisher = (I이벤트발행)e; }
+    @Override public I명령 주요명령생성(String p) { return new 영상요청명령(_videoProvider, p); }
+    @Override public I명령 보조명령생성(분석데이터 d) { return new AI분석요청명령(_eventPublisher, d); }
+}
+class 배치분석명령팩토리 implements I임무명령팩토리 {
+    private final I저장된영상소스 _storageProvider; private final I이벤트발행 _eventPublisher;
+    public 배치분석명령팩토리(IGateway s, IGateway e) { this._storageProvider = (I저장된영상소스)s; this._eventPublisher = (I이벤트발행)e; }
+    @Override public I명령 주요명령생성(String p) { return new 저장된영상요청명령(_storageProvider, p); }
+    @Override public I명령 보조명령생성(분석데이터 d) { return new AI분석요청명령(_eventPublisher, d); }
+}
+class 광역수색명령팩토리 implements I임무명령팩토리 {
+    private final I위성영상소스 _satelliteProvider; private final I이벤트발행 _eventPublisher;
+    public 광역수색명령팩토리(IGateway s, IGateway e) { this._satelliteProvider = (I위성영상소스)s; this._eventPublisher = (I이벤트발행)e; }
+    @Override public I명령 주요명령생성(String p) { return new 위성영상분석명령(_satelliteProvider, p); }
+    @Override public I명령 보조명령생성(분석데이터 d) { return new AI분석요청명령(_eventPublisher, d); }
+}
+class 시스템점검명령팩토리 implements I임무명령팩토리 {
+    private final I시스템점검 _checker; private final I리포트생성 _reporter;
+    public 시스템점검명령팩토리(IGateway c, IGateway r) { this._checker = (I시스템점검)c; this._reporter = (I리포트생성)r; }
+    @Override public I명령 주요명령생성(String p) { return new 시스템상태점검명령(_checker, p); }
+    @Override public I명령 보조명령생성(분석데이터 d) { return new 결과리포트생성명령(_reporter, d); }
+}
+class 임무명령팩토리_제공자 {
+    private final Map<String, IGateway> gateways;
+    public 임무명령팩토리_제공자(Map<String, IGateway> g) { this.gateways = g; }
+    public I임무명령팩토리 getFactory(임무요청DTO request) {
+        return switch (request.missionType()) {
+            case "실시간 추적" -> {
+                if (request.environment() == MissionEnvironment.MOUNTAIN) {
+                    yield new 광역수색명령팩토리(gateways.get("SATELLITE"), gateways.get("MQ"));
+                } else {
+                    yield new 실시간추적명령팩토리(gateways.get("CCTV"), gateways.get("MQ"));
+                }
+            }
+            case "배치 분석" -> new 배치분석명령팩토리(gateways.get("STORAGE"), gateways.get("MQ"));
+            case "시스템 점검" -> new 시스템점검명령팩토리(new SystemChecker(), new ReportGenerator());
+            default -> throw new IllegalArgumentException("Unknown mission type: " + request.missionType());
+        };
+    }
+}
+
+// ============================================================
+// == 게이트웨이 및 외부 연동 모듈
+// ============================================================
+interface IGateway {}
+interface I영상소스제공 extends IGateway { void requestStream(String area); }
+interface I저장된영상소스 extends IGateway { void requestFile(String filePath); }
+interface I이벤트발행 extends IGateway { void publishEvent(분석데이터 data); }
+interface I위성영상소스 extends IGateway { void requestSatelliteImage(String area); }
+interface I시스템점검 extends IGateway { void checkStatus(String target); }
+interface I리포트생성 extends IGateway { void generateReport(분석데이터 data); }
+
+class CctvGateway implements I영상소스제공 {
+    @Override public void requestStream(String a) { System.out.println("  > [CctvGateway] " + a + " 실시간 CCTV 영상 요청"); }
+}
+class StorageGateway implements I저장된영상소스 {
+    @Override public void requestFile(String f) { System.out.println("  > [StorageGateway] " + f + " 파일 영상 요청"); }
+}
+class MqGateway implements I이벤트발행 {
+    private final VirtualMessageBroker messageBroker;
+    public MqGateway(VirtualMessageBroker b) { this.messageBroker = b; }
+    @Override public void publishEvent(분석데이터 d) { System.out.println("  > [MqGateway] AI 분석 이벤트 발행"); messageBroker.publishTask("Analysis_Tasks", d); }
+}
+class SatelliteGateway implements I위성영상소스 {
+    @Override public void requestSatelliteImage(String a) { System.out.println("  > [SatelliteGateway] ★★★ " + a + " 광역 위성 영상 요청 ★★★"); }
+}
+class SystemChecker implements I시스템점검 {
+    @Override public void checkStatus(String t) { System.out.println("  > [SystemChecker] " + t + " 상태 점검 수행"); }
+}
+class ReportGenerator implements I리포트생성 {
+    @Override public void generateReport(분석데이터 d) { System.out.println("  > [ReportGenerator] 점검 결과 리포트 생성"); }
+}
+
+// ============================================================
+// == Node 3: 지능형 영상 분석 노드 (AI Server)
+// ============================================================
+class TaskReceiver {
+    private final TrackingMissionManager _missionManager;
+    public TaskReceiver(TrackingMissionManager m) { this._missionManager = m; }
+    public void onMessageReceived(분석데이터 message) { _missionManager.startNewMission(message); }
+}
+class ResultPublisher {
+    private VirtualMessageBroker messageBroker;
+    public void setMessageBroker(VirtualMessageBroker b) { this.messageBroker = b; }
+    public void publishAnalysisResult(AnalysisResult result) {
+        System.out.println("  > [ResultPublisher] 분석 결과 발행");
+        messageBroker.publishResult("Analysis_Results", result);
+    }
+}
+class TrackingMissionManager {
+    private final I분석파이프라인 _pipeline; private final I추적상태및전략관리 _strategyPlanner;
+    public TrackingMissionManager(I분석파이프라인 p, I추적상태및전략관리 s) { this._pipeline = p; this._strategyPlanner = s; }
+    public void startNewMission(분석데이터 missionData) {
+        System.out.println("[AI-Server] " + missionData.jobId + " 임무 시작 (환경: " + missionData.environment + ")");
+        _strategyPlanner.initializeContext(missionData.jobId, missionData.environment);
+        _pipeline.process(missionData.jobId, "videostream-example");
+    }
+}
+interface I분석파이프라인 { void process(String jobId, Object videoStream); }
+class AnalysisPipeline implements I분석파이프라인 {
+    public AnalysisPipeline(ResultPublisher p) { }
+    @Override public void process(String jobId, Object videoStream) { System.out.println("  > [Pipeline] " + jobId + " 영상 처리 시작..."); }
+}
+interface I추적상태및전략관리 {
+    void initializeContext(String jobId, MissionEnvironment environment);
+    void handleEvent(String jobId, EventData event);
+}
+
+// [오류 수정] 클래스 이름을 다이어그램의 '상황인식전략수립기Facade'와 일치시킴
+class 상황인식전략수립기Facade implements I추적상태및전략관리 {
+    private final Map<String, 추적작업맥락> _contextMap = new ConcurrentHashMap<>(); private final I추적데이터저장_AI _repo;
+    public 상황인식전략수립기Facade(I추적데이터저장_AI repo) { this._repo = repo; }
+    private 추적작업맥락 getContext(String jobId) { return _contextMap.get(jobId); }
+    @Override public void initializeContext(String jobId, MissionEnvironment env) { _contextMap.put(jobId, new 추적작업맥락(jobId, env, _repo)); }
+    @Override
+    public void handleEvent(String jobId, EventData event) {
+        추적작업맥락 context = getContext(jobId); if (context == null) return;
+        System.out.println("[AI-Server] " + jobId + "에 " + event.type() + " 이벤트 발생 ("+ event.location() +")");
+        context.handle(event);
+    }
+}
+class 추적작업맥락 {
+    private I추적상태 _currentState; private final 이력관리자 _caretaker; public String lastKnownLocation; public final MissionEnvironment environment;
+    public 추적작업맥락(String jobId, MissionEnvironment env, I추적데이터저장_AI repo) {
+        this.environment = env; this._currentState = new 탐색중상태();
+        System.out.println("  >> " + jobId + " 작업 맥락 생성. [환경: " + env + "] [초기 상태: 탐색중]");
+    }
+    public void setState(I추적상태 newState) { this._currentState = newState; }
+    public void handle(EventData event) { this.lastKnownLocation = event.location(); _currentState.handle(this, event); }
+}
+interface I추적상태 { void handle(추적작업맥락 context, EventData event); }
+class 탐색중상태 implements I추적상태 {
+    @Override public void handle(추적작업맥락 c, EventData e) {
+        if ("FOUND".equals(e.type())) { System.out.println("  >> [상태 변경] 탐색중 -> 추적중"); c.setState(new 추적중상태()); }
+    }
+}
+class 추적중상태 implements I추적상태 {
+    @Override public void handle(추적작업맥락 c, EventData e) {
+        if ("LOST".equals(e.type())) { System.out.println("  >> [상태 변경] 추적중 -> 놓침"); c.setState(new 놓침상태()); }
+    }
+}
+class 놓침상태 implements I추적상태 {
+    @Override public void handle(추적작업맥락 c, EventData e) {
+        if ("FOUND".equals(e.type())) { System.out.println("  >> [상태 변경] 놓침 -> 추적중"); c.setState(new 추적중상태()); } 
+        else {
+            I재탐색전략 strategy;
+            if (c.environment == MissionEnvironment.MOUNTAIN) {
+                strategy = new 드론지원탐색전략();
+            } else {
+                strategy = new 과거동선기반전략();
+            }
+            System.out.println("    - ('" + c.environment + "' 환경이므로 '" + strategy.getClass().getSimpleName() + "' 전략 선택)");
+            strategy.execute(c.lastKnownLocation);
         }
-      }
-      /* Custom scrollbar for better aesthetics */
-      ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-      }
-      ::-webkit-scrollbar-track {
-        background: #f1f5f9;
-      }
-      ::-webkit-scrollbar-thumb {
-        background: #94a3b8;
-        border-radius: 10px;
-      }
-      ::-webkit-scrollbar-thumb:hover {
-        background: #475569;
-      }
-    </style>
+    }
+}
+interface I재탐색전략 { void execute(String lastKnownLocation); }
+class 반경확대전략 implements I재탐색전략 {
+    @Override public void execute(String l) { System.out.println("    - [전략 실행] '" + l + "' 주변 반경 확대 재탐색"); }
+}
+class 과거동선기반전략 implements I재탐색전략 {
+    @Override public void execute(String l) { System.out.println("    - [전략 실행] '" + l + "'에서 과거 동선 기반 재탐색"); }
+}
+class 드론지원탐색전략 implements I재탐색전략 {
+    @Override public void execute(String l) { System.out.println("    - [전략 실행] ★★★ '" + l + "'에 드론을 급파하여 긴급 항공 수색 실시 ★★★"); }
+}
+interface I추적데이터저장_AI { }
+class TrackingHistoryRepository implements I추적데이터저장_AI { }
+class 이력관리자 {} // 단순화를 위해 Memento 관련 로직은 시뮬레이션에서 제외
