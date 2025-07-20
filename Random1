@@ -21,18 +21,25 @@ public class TrackingSystemRunner {
         // 로거 생성
         I로깅서비스 logger = new ConsoleLogger();
 
-        // AI 서버 구성
+        // [AI 서버] 구성요소 생성 (수정된 구조)
         I추적데이터저장_AI trackingHistoryRepo = new TrackingHistoryRepository();
-        StrategyPlannerFacade strategyPlanner = new StrategyPlannerFacade(trackingHistoryRepo);
+        ResultPublisher resultPublisher = new ResultPublisher(); // 결과 발행기는 독립적으로 존재
+        I분석파이프라인 pipeline = new AnalysisPipeline(resultPublisher);
+        I추적상태및전략관리 strategyPlanner = new StrategyPlannerFacade(trackingHistoryRepo);
+        
+        // 지휘자인 '추적 임무 관리자'를 생성하고, 전문가들(파이프라인, 전략기)을 주입
+        TrackingMissionManager missionManager = new TrackingMissionManager(pipeline, strategyPlanner);
+        
+        // 입구인 '작업 수신기'를 생성하고, 지휘자(임무 관리자)를 주입
+        TaskReceiver taskReceiver = new TaskReceiver(missionManager);
         
         // App 서버와 AI 서버를 연결할 가상 메시지 큐 생성
-        // TaskReceiver가 strategyPlanner를 통해 상태를 변경하도록 연결
-        TaskReceiver taskReceiver = new TaskReceiver(strategyPlanner);
         VirtualMessageBroker messageBroker = new VirtualMessageBroker(taskReceiver);
+        resultPublisher.setMessageBroker(messageBroker); // 결과 발행기에도 메시지 브로커 연결
 
-        // App 서버 구성
+        // [App 서버] 구성요소 생성
         I영상소스제공_App cctvGw = new CctvGateway();
-        I비동기이벤트발행_App mqGw = new MqGateway(messageBroker); // 가상 메시지큐 주입
+        I비동기이벤트발행_App mqGw = new MqGateway(messageBroker);
         I명령팩토리 realTimeFactory = new 실시간추적명령팩토리(cctvGw, mqGw);
         커맨드실행기 invoker = new 커맨드실행기();
         I추적오케스트레이션 service = new TrackingOrchestrationService(realTimeFactory, invoker, logger);
@@ -41,20 +48,20 @@ public class TrackingSystemRunner {
         // --- 시뮬레이션 시작 ---
         System.out.println("\n--- [시나리오 1] 경찰관 A, 'S-001' 실시간 추적 요청 ---");
         추적요청DTO request = new 추적요청DTO("S-001", "강남역 일대", "officerA");
+        // App서버가 요청을 받아 메시지큐에 '분석 작업'을 발행하면, messageBroker를 통해 AI서버의 taskReceiver가 호출됨
         CompletableFuture<String> jobIdFuture = service.추적요청처리(request);
-        String jobId = jobIdFuture.join(); // 비동기 작업이지만 여기서는 결과를 기다림
+        String jobId = jobIdFuture.join();
         
         System.out.println("\n--- [시나리오 2] AI 서버, 'S-001' 발견! (탐색중 -> 추적중) ---");
-        // AI가 용의자를 찾았다고 가정하고, 'FOUND' 이벤트를 강제로 발생시킴
-        strategyPlanner.handleEvent(jobId, new EventData("FOUND", "강남역 11번 출구"));
+        // AI 파이프라인이 용의자를 '발견'했다고 가정하고, 결과를 메시지큐로 발행
+        // 이 메시지는 messageBroker를 통해 strategyPlanner로 전달됨
+        resultPublisher.publishAnalysisResult(new AnalysisResult(jobId, "FOUND", "강남역 11번 출구"));
         
         System.out.println("\n--- [시나리오 3] AI 서버, 'S-001' 추적 중 놓침! (추적중 -> 놓침) ---");
-        // 용의자가 옷을 갈아입는 등 이유로 놓쳤다고 가정
-        strategyPlanner.handleEvent(jobId, new EventData("LOST", "CGV 뒷골목"));
+        resultPublisher.publishAnalysisResult(new AnalysisResult(jobId, "LOST", "CGV 뒷골목"));
 
         System.out.println("\n--- [시나리오 4] AI 서버, 재탐색 전략 실행 후 재발견! (놓침 -> 추적중) ---");
-        // '놓침' 상태가 된 후, 재탐색 전략(반경확대)을 통해 다시 찾았다고 가정
-        strategyPlanner.handleEvent(jobId, new EventData("FOUND", "OO빌딩 앞"));
+        resultPublisher.publishAnalysisResult(new AnalysisResult(jobId, "FOUND", "OO빌딩 앞"));
 
         System.out.println("\n--- [시나리오 5] 추적 이력 조회 ---");
         strategyPlanner.printHistory(jobId);
@@ -67,12 +74,23 @@ public class TrackingSystemRunner {
 // == 가상 메시지 브로커 (시뮬레이션을 위함)
 // ============================================================
 class VirtualMessageBroker {
-    private final TaskReceiver taskReceiver;
+    private TaskReceiver taskReceiver;
+    private I추적상태및전략관리 strategyPlanner; // 결과 수신을 위해 전략기 참조 추가
+
     public VirtualMessageBroker(TaskReceiver receiver) { this.taskReceiver = receiver; }
-    public void publish(String topic, 분석데이터 data) {
+    public void setStrategyPlanner(I추적상태및전략관리 planner) { this.strategyPlanner = planner; }
+
+    // App 서버 -> AI 서버로 분석 '작업' 발행
+    public void publishTask(String topic, 분석데이터 data) {
         System.out.println("\n[Virtual MQ] 토픽 '" + topic + "'으로 메시지 수신. AI 서버 TaskReceiver에게 전달...");
-        // 실제로는 네트워크를 통해 전달되지만, 여기서는 직접 메서드를 호출하여 흉내
         taskReceiver.onMessageReceived(data);
+    }
+    
+    // AI 서버 -> App 서버(또는 자기자신)로 분석 '결과' 발행
+    public void publishResult(String topic, AnalysisResult result) {
+        System.out.println("\n[Virtual MQ] 토픽 '" + topic + "'으로 결과 수신. AI 서버 StrategyPlanner에게 전달...");
+        // 실제로는 App 서버의 다른 수신기가 받겠지만, 여기서는 AI서버의 전략기가 직접 받는 것으로 시뮬레이션
+        strategyPlanner.handleEvent(result.jobId(), new EventData(result.status(), result.location()));
     }
 }
 
@@ -81,7 +99,8 @@ class VirtualMessageBroker {
 // ============================================================
 record 추적요청DTO(String suspectId, String area, String requestedBy) {}
 record EventData(String type, String location) {}
-class 분석데이터 {}
+record AnalysisResult(String jobId, String status, String location) {}
+class 분석데이터 { public String jobId; }
 
 
 // ============================================================
@@ -97,9 +116,7 @@ class ConsoleLogger implements I로깅서비스 {
 // ============================================================
 interface I추적오케스트레이션 { CompletableFuture<String> 추적요청처리(추적요청DTO 요청); }
 class TrackingOrchestrationService implements I추적오케스트레이션 {
-    private final I명령팩토리 _commandFactory;
-    private final 커맨드실행기 _commandInvoker;
-    private final I로깅서비스 _logger;
+    private final I명령팩토리 _commandFactory; private final 커맨드실행기 _commandInvoker; private final I로깅서비스 _logger;
     public TrackingOrchestrationService(I명령팩토리 f, 커맨드실행기 i, I로깅서비스 l) {
         this._commandFactory = f; this._commandInvoker = i; this._logger = l;
     }
@@ -108,8 +125,9 @@ class TrackingOrchestrationService implements I추적오케스트레이션 {
         _logger.log(요청.requestedBy() + "로부터 추적 요청 수신");
         String 작업ID = "job-" + UUID.randomUUID().toString().substring(0, 8);
         _logger.log(작업ID + ": [" + 요청.area() + "]에 대한 요청 처리 시작...");
+        분석데이터 data = new 분석데이터(); data.jobId = 작업ID;
         I명령 영상요청 = _commandFactory.영상요청명령생성(요청.area());
-        I명령 AI분석요청 = _commandFactory.AI분석요청명령생성(new 분석데이터());
+        I명령 AI분석요청 = _commandFactory.AI분석요청명령생성(data);
         _commandInvoker.커맨드추가및실행(영상요청);
         _commandInvoker.커맨드추가및실행(AI분석요청);
         _logger.log(작업ID + ": 관련 명령들이 실행기에 전달됨.");
@@ -148,135 +166,134 @@ class MqGateway implements I비동기이벤트발행_App {
     public MqGateway(VirtualMessageBroker broker) { this.messageBroker = broker; }
     @Override public void publishAnalysisRequest(분석데이터 data) {
         System.out.println("  > [MqGateway] AI 분석 작업 발행");
-        messageBroker.publish("Analysis_Tasks", data);
+        messageBroker.publishTask("Analysis_Tasks", data);
     }
 }
 
 // ============================================================
-// == Node 3: 지능형 영상 분석 노드 (AI Server) - 신규 추가/수정
+// == Node 3: 지능형 영상 분석 노드 (AI Server) - 수정된 구조
 // ============================================================
 
 // --- Endpoint (System Interaction) ---
+/**
+ * [코드 리뷰] 작업 수신기 (역할: 입구/현관)
+ * 외부 메시지 큐와의 기술적인 통신만 전담합니다.
+ * 메시지를 받으면, 비즈니스 로직의 총괄 지휘자인 '추적 임무 관리자'에게 전달하는 역할만 수행합니다.
+ */
 class TaskReceiver {
-    private final I추적상태및전략관리 _taskHandler;
-    public TaskReceiver(I추적상태및전략관리 h) { this._taskHandler = h; }
+    private final TrackingMissionManager _missionManager;
+    public TaskReceiver(TrackingMissionManager m) { this._missionManager = m; }
     public void onMessageReceived(분석데이터 message) {
-        System.out.println("[AI-Server] 작업 수신. 초기 탐색 시작...");
-        // 실제로는 메시지에서 JobId 등을 추출하여 전달
-        _taskHandler.handleEvent("job-id-placeholder", new EventData("INITIAL_SEARCH", ""));
+        _missionManager.startNewMission(message);
     }
 }
 
-// --- Facade & Main Interface ---
-interface I추적상태및전략관리 {
-    void handleEvent(String jobId, EventData event);
-    String getCurrentState(String jobId);
-    void printHistory(String jobId); // 시뮬레이션을 위한 편의 메서드
+class ResultPublisher {
+    private VirtualMessageBroker messageBroker;
+    // main 메서드에서 VirtualMessageBroker가 생성된 후 주입하기 위한 setter
+    public void setMessageBroker(VirtualMessageBroker broker) { this.messageBroker = broker; }
+    public void publishAnalysisResult(AnalysisResult result) {
+        System.out.println("  > [ResultPublisher] 분석 결과 발행");
+        messageBroker.publishResult("Analysis_Results", result);
+    }
 }
 
+// --- Business Logic ---
+
 /**
- * [코드 리뷰] Facade 패턴
- * 복잡한 내부의 상태(State), 전략(Strategy), 이력(Memento) 관리 로직을
- * 외부에는 handleEvent() 라는 단순한 창구 하나로 보이게 합니다.
+ * [코드 리뷰] 추적 임무 관리자 (역할: 총괄 지휘자/오케스트레이터)
+ * AI 서버의 모든 비즈니스 로직을 총괄 지휘합니다.
+ * '파이프라인'과 '전략 수립기'라는 두 전문가를 부하로 두고,
+ * 임무(Mission)의 전체 흐름을 책임집니다.
  */
+class TrackingMissionManager {
+    private final I분석파이프라인 _pipeline;
+    private final I추적상태및전략관리 _strategyPlanner;
+    public TrackingMissionManager(I분석파이프라인 p, I추적상태및전략관리 s) { this._pipeline = p; this._strategyPlanner = s; }
+
+    public void startNewMission(분석데이터 missionData) {
+        System.out.println("[AI-Server] " + missionData.jobId + " 임무 관리자: 새로운 임무 시작");
+        // 1. 임무가 시작되면, 먼저 전략 수립기에게 '탐색중' 상태로 초기화하라고 지시
+        _strategyPlanner.handleEvent(missionData.jobId, new EventData("INITIAL_SEARCH", ""));
+        
+        // 2. 그 다음, 분석 파이프라인에게 실제 영상 분석을 시작하라고 지시
+        // 분석 결과는 파이프라인 내부의 ResultPublisher가 발행하여 다시 전략 수립기로 전달됨
+        _pipeline.process(missionData.jobId, "videostream-example");
+    }
+}
+
+interface I분석파이프라인 { AnalysisResult process(String jobId, Object videoStream); }
+class AnalysisPipeline implements I분석파이프라인 {
+    private final ResultPublisher _resultPublisher;
+    public AnalysisPipeline(ResultPublisher p) { this._resultPublisher = p; }
+    @Override
+    public AnalysisResult process(String jobId, Object videoStream) {
+        System.out.println("  > [Pipeline] " + jobId + " 영상 처리 시작...");
+        // ... 복잡한 AI 분석 로직 수행 ...
+        // 분석이 끝나면 결과를 ResultPublisher를 통해 발행
+        // 여기서는 시뮬레이션을 위해 즉시 결과를 반환하지 않고, main 메서드에서 수동으로 결과를 발행함
+        return new AnalysisResult(jobId, "PROCESSING", "");
+    }
+}
+
+interface I추적상태및전략관리 {
+    void handleEvent(String jobId, EventData event);
+    void printHistory(String jobId);
+}
 class StrategyPlannerFacade implements I추적상태및전략관리 {
     private final Map<String, 추적작업맥락> _contextMap = new ConcurrentHashMap<>();
     private final I추적데이터저장_AI _repo;
     public StrategyPlannerFacade(I추적데이터저장_AI repo) { this._repo = repo; }
-
     private 추적작업맥락 getOrCreateContext(String jobId) {
         return _contextMap.computeIfAbsent(jobId, id -> new 추적작업맥락(id, _repo));
     }
     @Override
     public void handleEvent(String jobId, EventData event) {
         추적작업맥락 context = getOrCreateContext(jobId);
-        System.out.println("\n[AI-Server] " + jobId + "에 " + event.type() + " 이벤트 발생 ("+ event.location() +")");
+        System.out.println("[AI-Server] " + jobId + "에 " + event.type() + " 이벤트 발생 ("+ event.location() +")");
         context.handle(event);
     }
-    @Override public String getCurrentState(String jobId) { return getOrCreateContext(jobId).getCurrentStateName(); }
     @Override public void printHistory(String jobId) { getOrCreateContext(jobId).printHistory(); }
 }
 
-// --- Memento Pattern ---
-/**
- * [코드 리뷰] Memento: 스냅샷 객체
- * Originator(추적작업맥락)의 특정 시점 상태를 저장합니다.
- * 이 객체 자신은 아무 로직이 없고 데이터만 담는 것이 특징입니다.
- */
+// --- State, Strategy, Memento Patterns (이전과 동일) ---
 class 추적상태메멘토 {
-    private final String stateName;
-    private final LocalDateTime timestamp;
-    private final String location; // 간략화를 위해 location만 저장
-
+    private final String stateName; private final LocalDateTime timestamp; private final String location;
     public 추적상태메멘토(String stateName, String location) {
-        this.stateName = stateName;
-        this.location = location;
-        this.timestamp = LocalDateTime.now();
+        this.stateName = stateName; this.location = location; this.timestamp = LocalDateTime.now();
     }
     @Override public String toString() { return timestamp + " | 상태: " + stateName + " | 위치: " + location; }
 }
-
-/**
- * [코드 리뷰] Caretaker: 창고 관리자
- * Memento 객체들을 저장하고 관리합니다.
- * Memento의 내용이 무엇인지는 전혀 신경쓰지 않는 것이 핵심입니다.
- */
 class 이력관리자 {
-    private final List<추적상태메멘토> _mementos = new ArrayList<>();
-    private final I추적데이터저장_AI _repository;
-    private final String _jobId;
+    private final List<추적상태메멘토> _mementos = new ArrayList<>(); private final I추적데이터저장_AI _repository; private final String _jobId;
     public 이력관리자(String jobId, I추적데이터저장_AI repository) { this._jobId = jobId; this._repository = repository; }
     public void saveState(추적작업맥락 originator) {
-        추적상태메멘토 memento = originator.createMemento();
-        _mementos.add(memento);
-        _repository.saveHistory(_jobId, _mementos); // DB에도 저장
+        _mementos.add(originator.createMemento()); _repository.saveHistory(_jobId, _mementos);
     }
     public void printHistory() {
         System.out.println("--- 추적 이력 (" + _jobId + ") ---");
-        for (추적상태메멘토 m : _mementos) {
-            System.out.println("  " + m);
-        }
+        _mementos.forEach(m -> System.out.println("  " + m));
         System.out.println("-------------------------");
     }
 }
-
-// --- State & Strategy Pattern ---
-/**
- * [코드 리뷰] State 패턴의 Context
- * 자신의 '상태'를 I추적상태 객체에게 위임합니다.
- * Memento 패턴에서는 상태를 저장하고 복원하는 Originator 역할도 합니다.
- */
 class 추적작업맥락 {
-    private I추적상태 _currentState;
-    private final 이력관리자 _caretaker;
-    public final String jobId;
-    public String lastKnownLocation;
-
+    private I추적상태 _currentState; private final 이력관리자 _caretaker; public String lastKnownLocation;
     public 추적작업맥락(String jobId, I추적데이터저장_AI repo) {
-        this.jobId = jobId;
-        this._caretaker = new 이력관리자(jobId, repo);
-        this._currentState = new 탐색중상태(); // 초기 상태
+        this._caretaker = new 이력관리자(jobId, repo); this._currentState = new 탐색중상태();
         System.out.println("  >> " + jobId + " 작업 맥락 생성. [초기 상태: 탐색중]");
-        saveState(); // 초기 상태 저장
+        saveState();
     }
     public void setState(I추적상태 newState) { this._currentState = newState; }
     public void handle(EventData event) {
-        this.lastKnownLocation = event.location(); // 마지막 위치 업데이트
+        this.lastKnownLocation = event.location();
         _currentState.handle(this, event);
-        saveState(); // 상태 변경 후 항상 저장
+        saveState();
     }
-    public String getCurrentStateName() { return _currentState.getClass().getSimpleName(); }
-    public 추적상태메멘토 createMemento() { return new 추적상태메멘토(getCurrentStateName(), lastKnownLocation); }
+    public 추적상태메멘토 createMemento() { return new 추적상태메멘토(_currentState.getClass().getSimpleName(), lastKnownLocation); }
     public void saveState() { _caretaker.saveState(this); }
     public void printHistory() { _caretaker.printHistory(); }
 }
-
-/**
- * [코드 리뷰] State 패턴의 State 인터페이스
- * 모든 '상태' 클래스가 따라야 할 규칙(handle 메서드)을 정의합니다.
- */
 interface I추적상태 { void handle(추적작업맥락 context, EventData event); }
-
 class 탐색중상태 implements I추적상태 {
     @Override public void handle(추적작업맥락 context, EventData event) {
         if ("FOUND".equals(event.type())) {
@@ -285,7 +302,6 @@ class 탐색중상태 implements I추적상태 {
         }
     }
 }
-
 class 추적중상태 implements I추적상태 {
     @Override public void handle(추적작업맥락 context, EventData event) {
         if ("LOST".equals(event.type())) {
@@ -296,16 +312,9 @@ class 추적중상태 implements I추적상태 {
         }
     }
 }
-
-/**
- * [코드 리뷰] State와 Strategy 패턴의 결합
- * '놓침' 상태일 때의 행동으로 '재탐색'을 수행해야 하는데,
- * "어떻게" 재탐색할 것인지를 Strategy 패턴에 위임합니다.
- */
 class 놓침상태 implements I추적상태 {
     private I재탐색전략 _strategy;
     public 놓침상태() {
-        // 기본 전략으로 '반경확대전략'을 설정
         this._strategy = new 반경확대전략();
         System.out.println("    - (놓침 상태 진입. 재탐색 전략으로 '" + _strategy.getClass().getSimpleName() + "' 설정)");
     }
@@ -314,37 +323,20 @@ class 놓침상태 implements I추적상태 {
             System.out.println("  >> [놓침] -> [추적중] 상태로 변경!");
             context.setState(new 추적중상태());
         } else {
-            // 재탐색 이벤트가 오면 현재 설정된 전략을 실행
             _strategy.execute(context.lastKnownLocation);
         }
     }
 }
-
-/**
- * [코드 리뷰] Strategy 패턴의 Strategy 인터페이스
- * 모든 '재탐색 전략' 클래스가 따라야 할 규칙(execute 메서드)을 정의합니다.
- */
 interface I재탐색전략 { void execute(String lastKnownLocation); }
-
 class 반경확대전략 implements I재탐색전략 {
-    @Override public void execute(String lastKnownLocation) {
-        System.out.println("    - [전략 실행] '" + lastKnownLocation + "' 주변 반경을 2배로 확대하여 재탐색합니다.");
-    }
+    @Override public void execute(String location) { System.out.println("    - [전략 실행] '" + location + "' 주변 반경 확대 재탐색"); }
 }
-
 class 과거동선기반전략 implements I재탐색전략 {
-    @Override public void execute(String lastKnownLocation) {
-        System.out.println("    - [전략 실행] '" + lastKnownLocation + "'에서 과거 동선 기반으로 예상 경로를 재탐색합니다.");
-    }
+    @Override public void execute(String location) { System.out.println("    - [전략 실행] '" + location + "'에서 과거 동선 기반 재탐색"); }
 }
 
 // --- Repository (Infrastructure) ---
-interface I추적데이터저장_AI {
-    void saveHistory(String jobId, List<추적상태메멘토> mementos);
-}
-
+interface I추적데이터저장_AI { void saveHistory(String jobId, List<추적상태메멘토> mementos); }
 class TrackingHistoryRepository implements I추적데이터저장_AI {
-    @Override public void saveHistory(String jobId, List<추적상태메멘토> mementos) {
-        // System.out.println("    - [Repository] " + jobId + "의 추적 이력을 DB에 저장합니다.");
-    }
+    @Override public void saveHistory(String jobId, List<추적상태메멘토> mementos) { }
 }
