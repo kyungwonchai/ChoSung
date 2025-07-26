@@ -1,253 +1,113 @@
-, 맞습니다. 블렌더에서는 이름만 가진 모델을 만들고, 말씀하신 모든 기능(초기화, 이름 부여, 바코드 인식, 램프 점등, 마스크 애니메이션)은 이제부터 설명할 유니티 C# 스크립트 하나로 처리하게 됩니다.
+import bpy
+import math
+import random # 랜덤 선택을 위해 random 모듈 추가
 
-유니티에서 버튼 하나만 누르면 모든 것이 연동되도록, 전체 시스템을 관리하는 스크립트 파일을 작성했습니다.
+# 실행 전 기존 씬의 모든 오브젝트 삭제
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
 
-## ?? 유니티 통합 관리 스크립트 (RackSystemManager.cs)
-아래는 유니티 프로젝트의 Scripts 폴더에 생성할 C# 스크립트 전체 내용입니다.
+# =================================================================
+# 머티리얼 생성 (이 부분에서 색상 커스터마이징 가능)
+# =================================================================
+def create_color_material(name, color_rgba):
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    mat.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = color_rgba
+    return mat
 
-C#
+# 연한 핑크, 노랑 머티리얼 생성 (R, G, B, Alpha)
+pink_material = create_color_material("LightPink", (1.0, 0.7, 0.8, 1.0))
+yellow_material = create_color_material("Yellow", (1.0, 0.9, 0.2, 1.0))
+mask_materials = [pink_material, yellow_material]
 
-using UnityEngine;
-using UnityEngine.UI;
-using System.Collections;
-using System.Collections.Generic;
 
-public class RackSystemManager : MonoBehaviour
-{
-    [Header("랙 설정")]
-    [Tooltip("모든 랙 프리팹의 부모가 될 오브젝트 (예: 빈 오브젝트 'Rack_Installations')")]
-    public Transform rackContainer;
+# =================================================================
+# 랙 생성을 위한 파라미터
+# =================================================================
+# --- 슬롯 관련 ---
+SLOT_COUNT = 12
+FLOOR_NAMES = ['A', 'B', 'C']  # 위에서부터 A, B, C 층
 
-    [Header("머티리얼 설정")]
-    [Tooltip("꺼져 있을 때의 기본 램프 머티리얼")]
-    public Material defaultLampMaterial;
-    [Tooltip("켜졌을 때의 발광(Emission) 램프 머티리얼")]
-    public Material litLampMaterial;
+# --- 크기 관련 (미터 단위) ---
+SLOT_WIDTH = 0.08      # 슬롯 1개의 너비
+SLOT_HEIGHT = 0.6      # 슬롯 1개의 높이
+SLOT_DEPTH = 0.5       # 랙의 깊이
+DIVIDER_THICKNESS = 0.01 # 칸막이 두께
 
-    [Header("애니메이션 설정")]
-    [Tooltip("마스크가 슬라이드되는 시간")]
-    public float animationDuration = 0.5f;
-    [Tooltip("마스크가 앞으로 나오는 거리")]
-    public float slideOutDistance = 0.4f;
+# --- 프레임 관련 ---
+FRAME_THICKNESS = 0.04 # 외부 프레임 두께
 
-    // 내부 데이터 저장을 위한 딕셔너리
-    private Dictionary<string, GameObject> maskObjects = new Dictionary<string, GameObject>();
-    private Dictionary<string, Renderer> lampRenderers = new Dictionary<string, Renderer>();
+# --- 램프 관련 ---
+LAMP_RADIUS = 0.01     # 램프의 반지름
+LAMP_DEPTH = 0.005     # 램프의 깊이(두께)
 
-    // 마지막으로 활성화된 오브젝트 상태 저장용 변수
-    private Coroutine lastAnimationCoroutine;
-    private GameObject lastMovedMask;
-    private Renderer lastLitLamp;
-    private Vector3 lastMaskOriginalPosition;
+# =================================================================
+# 자동 계산 변수
+# =================================================================
+FLOOR_COUNT = len(FLOOR_NAMES)
+RACK_TOTAL_WIDTH = (SLOT_WIDTH * SLOT_COUNT) + (DIVIDER_THICKNESS * (SLOT_COUNT + 1))
+RACK_TOTAL_HEIGHT = (SLOT_HEIGHT * FLOOR_COUNT) + (DIVIDER_THICKNESS * (FLOOR_COUNT - 1)) + (FRAME_THICKNESS * 2)
 
-    void Start()
-    {
-        InitializeAllRacks();
-    }
+# =================================================================
+# 랙 모델링 시작
+# =================================================================
+rack_parent = bpy.data.objects.new("Rack_Template", None)
+bpy.context.collection.objects.link(rack_parent)
 
-    /// <summary>
-    /// 게임 시작 시 모든 랙과 그 하위의 램프/마스크를 초기화하는 메인 함수
-    /// </summary>
-    void InitializeAllRacks()
-    {
-        Debug.Log("랙 시스템 초기화를 시작합니다...");
+def create_box(name, size, position):
+    bpy.ops.mesh.primitive_cube_add(location=position)
+    box = bpy.context.active_object
+    box.name = name
+    box.scale = (size[0] / 2, size[1] / 2, size[2] / 2)
+    box.parent = rack_parent
+    return box
 
-        // 1. rackContainer 아래의 모든 랙을 순회하며 이름 재정의 및 등록
-        foreach (Transform rackInstance in rackContainer)
-        {
-            // 예: rackInstance.name = "A_E" (A구역 E랙)
-            string rackID = rackInstance.name;
+# --- 외부 프레임 및 패널들...
+top_frame_z = RACK_TOTAL_HEIGHT / 2 - FRAME_THICKNESS / 2
+bottom_frame_z = -RACK_TOTAL_HEIGHT / 2 + FRAME_THICKNESS / 2
+create_box("Frame_Top", (RACK_TOTAL_WIDTH, SLOT_DEPTH, FRAME_THICKNESS), (0, 0, top_frame_z))
+create_box("Frame_Bottom", (RACK_TOTAL_WIDTH, SLOT_DEPTH, FRAME_THICKNESS), (0, 0, bottom_frame_z))
+back_panel_y = -SLOT_DEPTH / 2 + (DIVIDER_THICKNESS / 2)
+panel_height = RACK_TOTAL_HEIGHT - (FRAME_THICKNESS * 2)
+create_box("Back_Panel", (RACK_TOTAL_WIDTH, DIVIDER_THICKNESS, panel_height), (0, back_panel_y, 0))
 
-            // 랙 하위의 모든 자식 오브젝트(램프, 마스크)를 찾음
-            Transform[] children = rackInstance.GetComponentsInChildren<Transform>(true);
-            foreach (Transform child in children)
-            {
-                // 블렌더에서 가져온 이름 (예: "Lamp_A01", "Mask_C12")
-                string originalName = child.name;
+# --- 층별 구조 생성
+start_x = -RACK_TOTAL_WIDTH / 2
+start_z = RACK_TOTAL_HEIGHT / 2 - FRAME_THICKNESS
 
-                // 2. 글로벌 고유 ID 생성 및 이름 변경
-                if (originalName.StartsWith("Lamp_") || originalName.StartsWith("Mask_"))
-                {
-                    string globalID = $"{rackID}_{originalName}"; // 최종 ID 예시: "A_E_Lamp_A01"
-                    child.name = globalID;
-
-                    // 3. 딕셔너리에 종류별로 저장
-                    if (originalName.StartsWith("Lamp_"))
-                    {
-                        Renderer lampRenderer = child.GetComponent<Renderer>();
-                        if (lampRenderer != null && !lampRenderers.ContainsKey(globalID))
-                        {
-                            lampRenderers.Add(globalID, lampRenderer);
-                            lampRenderer.material = defaultLampMaterial; // 기본 머티리얼로 초기화
-                        }
-                    }
-                    else if (originalName.StartsWith("Mask_"))
-                    {
-                        if (!maskObjects.ContainsKey(globalID))
-                        {
-                            maskObjects.Add(globalID, child.gameObject);
-                        }
-                    }
-                }
-            }
-        }
-        Debug.Log($"초기화 완료: {lampRenderers.Count}개의 램프, {maskObjects.Count}개의 마스크가 등록되었습니다.");
-    }
-
-    /// <summary>
-    /// 바코드 문자열을 받아 해당 슬롯을 활성화하는 메인 처리 함수
-    /// </summary>
-    /// <param name="barcode">예: "MMF10AEB05"</param>
-    public void ProcessBarcode(string barcode)
-    {
-        // 1. 이전 슬롯 초기화
-        ResetPreviousSlot();
-
-        // 2. 바코드 파싱
-        // MMF10 A E B 05 -> MMF10(고정) / A(구역) / E(랙) / B(층) / 05(칸)
-        if (barcode.Length != 11 || !barcode.StartsWith("MMF10"))
-        {
-            Debug.LogError($"잘못된 바코드 형식입니다: {barcode}");
-            return;
-        }
-
-        string zone = barcode.Substring(5, 1);
-        string rack = barcode.Substring(6, 1);
-        string floor = barcode.Substring(7, 1);
-        string slot = barcode.Substring(8, 2); // 01~12
-
-        // 3. 유니티 오브젝트 이름 조합
-        // 씬 하이어라키 이름(A_E) + 블렌더 모델 내부 이름(Lamp_B05)
-        string rackID = $"{zone}_{rack}";
-        string lampID = $"{rackID}_Lamp_{floor}{slot}";
-        string maskID = $"{rackID}_Mask_{floor}{slot}";
-
-        // 4. 램프 켜기
-        if (lampRenderers.TryGetValue(lampID, out Renderer targetLampRenderer))
-        {
-            targetLampRenderer.material = litLampMaterial;
-            lastLitLamp = targetLampRenderer;
-        }
-
-        // 5. 마스크 애니메이션 재생
-        if (maskObjects.TryGetValue(maskID, out GameObject targetMask))
-        {
-            lastMovedMask = targetMask;
-            lastMaskOriginalPosition = targetMask.transform.position;
-            lastAnimationCoroutine = StartCoroutine(AnimateMask(targetMask, true));
-        }
-    }
-
-    /// <summary>
-    /// 이전에 활성화됐던 램프와 마스크를 원래 상태로 되돌림
-    /// </summary>
-    void ResetPreviousSlot()
-    {
-        if (lastAnimationCoroutine != null)
-        {
-            StopCoroutine(lastAnimationCoroutine);
-        }
-
-        if (lastLitLamp != null)
-        {
-            lastLitLamp.material = defaultLampMaterial;
-            lastLitLamp = null;
-        }
-
-        if (lastMovedMask != null)
-        {
-            StartCoroutine(AnimateMask(lastMovedMask, false)); // 다시 들어가는 애니메이션
-            lastMovedMask = null;
-        }
-    }
-
-    /// <summary>
-    /// 마스크를 부드럽게 움직이는 코루틴
-    /// </summary>
-    /// <param name="mask">움직일 마스크 오브젝트</param>
-    /// <param name="isSlidingOut">true: 나옴, false: 들어감</param>
-    IEnumerator AnimateMask(GameObject mask, bool isSlidingOut)
-    {
-        Vector3 startPosition = mask.transform.position;
-        Vector3 endPosition;
-
-        if (isSlidingOut)
-        {
-            endPosition = startPosition - (mask.transform.forward * slideOutDistance);
-        }
-        else
-        {
-            // 들어갈 때는 원래 저장해둔 위치로 정확히 돌아감
-            endPosition = lastMaskOriginalPosition;
-        }
-
-        float timeElapsed = 0;
-        while (timeElapsed < animationDuration)
-        {
-            mask.transform.position = Vector3.Lerp(startPosition, endPosition, timeElapsed / animationDuration);
-            timeElapsed += Time.deltaTime;
-            yield return null;
-        }
-        mask.transform.position = endPosition; // 정확한 위치 보정
-    }
+for i, floor_name in enumerate(FLOOR_NAMES):
+    floor_base_z = start_z - i * (SLOT_HEIGHT + DIVIDER_THICKNESS)
     
-    // UI 버튼이 호출할 함수 (InputField와 연결)
-    public void ActivateFromInputField(InputField inputField)
-    {
-        if(inputField != null && !string.IsNullOrEmpty(inputField.text))
-        {
-            ProcessBarcode(inputField.text.ToUpper());
-        }
-    }
-}
+    if i < FLOOR_COUNT - 1:
+        divider_z = floor_base_z - SLOT_HEIGHT - (DIVIDER_THICKNESS / 2)
+        create_box(f"Floor_Divider_{floor_name}", (RACK_TOTAL_WIDTH, SLOT_DEPTH, DIVIDER_THICKNESS), (0, 0, divider_z))
+    
+    for j in range(SLOT_COUNT + 1):
+        divider_x = start_x + (DIVIDER_THICKNESS / 2) + j * (SLOT_WIDTH + DIVIDER_THICKNESS)
+        divider_z = floor_base_z - (SLOT_HEIGHT / 2)
+        create_box(f"Vertical_Divider_{floor_name}{j+1:02d}", (DIVIDER_THICKNESS, SLOT_DEPTH, SLOT_HEIGHT), (divider_x, 0, divider_z))
 
-## ?? 유니티 설정 방법 (매우 중요)
-스크립트만 있어서는 안되고, 아래 순서대로 유니티 씬을 구성해야 합니다.
+        if j < SLOT_COUNT:
+            slot_center_x = divider_x + (DIVIDER_THICKNESS / 2) + (SLOT_WIDTH / 2)
+            slot_center_z = floor_base_z - (SLOT_HEIGHT / 2)
 
-씬(Scene) 구성:
+            lamp_y = SLOT_DEPTH / 2 - LAMP_DEPTH / 2
+            lamp_z = floor_base_z - 0.001
+            bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=LAMP_RADIUS, depth=LAMP_DEPTH, location=(slot_center_x, lamp_y, lamp_z), rotation=(math.radians(90), 0, 0))
+            lamp_obj = bpy.context.active_object
+            lamp_obj.name = f"Lamp_{floor_name}{j+1:02d}"
+            lamp_obj.parent = rack_parent
+            
+            mask_size = (SLOT_WIDTH * 0.95, SLOT_DEPTH * 0.98, SLOT_HEIGHT * 0.85)
+            mask_position = (slot_center_x, 0, slot_center_z)
+            mask_obj = create_box(f"Mask_{floor_name}{j+1:02d}", mask_size, mask_position)
 
-RackSystemManager 라는 빈 게임 오브젝트를 하나 만듭니다.
+            # ★★★ 마스크에 랜덤 머티리얼 적용 ★★★
+            chosen_material = random.choice(mask_materials)
+            if mask_obj.data.materials:
+                mask_obj.data.materials[0] = chosen_material
+            else:
+                mask_obj.data.materials.append(chosen_material)
 
-위에서 만든 RackSystemManager.cs 스크립트를 이 오브젝트에 붙여줍니다(Add Component).
 
-Rack_Installations 라는 또 다른 빈 게임 오브젝트를 만듭니다. 이 오브젝트는 모든 랙들의 최상위 부모가 됩니다.
-
-랙 배치 및 이름 규칙:
-
-블렌더에서 가져온 랙 프리팹(Prefab)을 Rack_Installations 의 자식으로 배치합니다.
-
-가장 중요한 부분: 각 랙 인스턴스의 이름을 {구역}_{랙} 규칙으로 변경합니다.
-
-예: A구역 E랙 → A_E, B구역 J랙 → B_J
-
-머티리얼(Material) 생성:
-
-Project 창에서 Create -> Material을 선택하여 2개의 머티리얼을 만듭니다.
-
-DefaultLampMaterial: 기본 회색 또는 금속 재질
-
-LitLampMaterial: Emission(방출) 항목을 체크하고, 색상과 강도를 조절하여 빛나는 재질로 만듭니다.
-
-RackSystemManager 인스펙터 설정:
-
-1번에서 만든 RackSystemManager 오브젝트를 선택합니다.
-
-인스펙터 창에 스크립트의 Public 변수들이 나타납니다.
-
-Rack Container 필드에 2번에서 만든 Rack_Installations 오브젝트를 드래그 앤 드롭합니다.
-
-Default Lamp Material과 Lit Lamp Material 필드에 3번에서 만든 머티리얼들을 각각 드래그 앤 드롭합니다.
-
-UI 구성 및 연결:
-
-씬에 Canvas, Input Field, Button을 생성합니다.
-
-Button 오브젝트를 선택하고 인스펙터의 On Click () 섹션에서 +를 누릅니다.
-
-빈 슬롯에 RackSystemManager 오브젝트를 드래그 앤 드롭합니다.
-
-No Function 드롭다운 메뉴에서 RackSystemManager -> ActivateFromInputField (InputField)를 선택합니다.
-
-마지막으로 나타난 빈 InputField 슬롯에 Input Field 오브젝트를 드래그 앤 드롭합니다.
-
-이제 유니티를 실행하고 Input Field에 MMF10AEB05 와 같은 바코드를 입력한 후 버튼을 누르면, 해당 위치의 램프가 켜지고 마스크가 나오는 것을 확인할 수 있습니다.
+print("마스크에 랜덤 색상을 적용한 랙 생성이 완료되었습니다: Rack_Template")
