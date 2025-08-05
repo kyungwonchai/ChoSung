@@ -1,32 +1,89 @@
-설정 파일 수정
-생성된 ecosystem.config.js 파일을 열고, apps 부분을 아래와 같이 maskrack-api-server에 맞게 수정합니다.
+const express = require('express');
+const net = require('net');
 
-JavaScript
+const app = express();
+const API_PORT = process.env.API_PORT || 3000;
 
-// ecosystem.config.js
-module.exports = {
-  apps : [{
-    name   : "maskrack-api-server", // 1. PM2에서 사용할 이름
-    script : "./server.js",         // 2. 실행할 스크립트 파일
-    watch  : false,                 // 3. 파일 변경 감지 후 자동 재시작 여부 (개발 시 true 유용)
-    env    : {
-       "NODE_ENV": "development",
-    },
-    env_production: {
-       "NODE_ENV": "production",
-       "API_PORT": 3000              // 4. 운영 환경용 환경 변수 설정
+// --- 단일 아두이노 컨트롤러 정보 ---
+// 모든 제어 명령은 이 IP와 포트로 전송됩니다.
+const ARDUINO_IP = '192.168.0.177'; // 실제 환경의 아두이노 고정 IP로 변경
+const ARDUINO_PORT = 8888;
+
+app.use(express.json());
+
+// --- 랙 ID와 RS485 전송 값 매핑 ---
+// key: 바코드에서 추출한 3자리 랙 ID (e.g., 'A01')
+// value: 해당 랙을 제어하기 위해 아두이노로 보낼 숫자 값
+const rackIdToValueMap = new Map([
+    ['A01', 1],
+    ['A02', 2],
+    ['A03', 3],
+    ['B14', 14],
+    // ... 필요한 모든 랙 ID와 숫자 값을 여기에 추가 ...
+
+    // 로컬 테스트용 (테스트 가이드 참고)
+    ['T01', 99],
+]);
+
+// MES로부터 바코드 위치 조회 요청을 받는 API 엔드포인트
+app.post('/api/v1/locate', (req, res) => {
+    const { barcode } = req.body;
+
+    if (!barcode) {
+        return res.status(400).json({ error: 'Barcode is required' });
     }
-  }]
+
+    // 1. 바코드 유효성 검사 (길이 11자리)
+    if (barcode.length !== 11) {
+        console.warn(`[WARN] Invalid barcode length: "${barcode}". Expected 11 characters.`);
+        return res.status(400).json({ error: 'Invalid barcode format. Expected 11 characters.' });
+    }
+    
+    console.log('[HTTP-RECV] ' + new Date().toISOString() + ' | Barcode request: ' + barcode);
+    
+    // 2. 바코드에서 랙 ID 추출 (6번째부터 3글자)
+    const rackId = barcode.substring(5, 8).toUpperCase();
+    const commandValue = rackIdToValueMap.get(rackId);
+
+    if (commandValue === undefined) {
+        console.warn(`[WARN] Rack ID "${rackId}" not found in map for barcode: ${barcode}`);
+        // 랙 ID가 없어도 요청은 정상 처리되었음을 알림
+        return res.status(202).json({ status: 'Request accepted, but rack ID not found.' });
+    }
+    
+    // MES에 즉시 응답 (Fire-and-Forget)
+    res.status(202).json({ status: 'Request accepted, processing command.', sentValue: commandValue });
+
+    // 백그라운드에서 아두이노에 TCP 명령 전송
+    sendTcpCommand(commandValue);
+});
+
+// 단일 아두이노 컨트롤러에 TCP 소켓으로 명령어를 전송하는 함수
+function sendTcpCommand(value) {
+    // 아두이노가 파싱하기 쉽도록 <값> 형태로 명령 포맷팅
+    const command = `<${value}>`;
+    const client = new net.Socket();
+
+    client.connect(ARDUINO_PORT, ARDUINO_IP, () => {
+        console.log(`[TCP-SEND] Connected to Arduino at ${ARDUINO_IP}:${ARDUINO_PORT}`);
+        client.write(command);
+        console.log(`[TCP-SEND] Sent command: ${command}`);
+    });
+
+    client.on('data', (data) => {
+        console.log('[TCP-RECV] Received from Arduino: ' + data);
+        client.destroy(); // 데이터 수신 후 연결 종료
+    });
+
+    client.on('close', () => {
+        console.log('[TCP-SEND] Connection closed.');
+    });
+
+    client.on('error', (err) => {
+        console.error(`[TCP-ERROR] Could not connect to Arduino: ${err.message}`);
+    });
 }
-설정 파일로 서버 시작
-이제 server.js 파일 대신 설정 파일을 이용하여 서버를 시작합니다. --env production 옵션으로 env_production에 설정된 환경변수를 사용하도록 지정할 수 있습니다.
 
-Bash
-
-# production 환경으로 서버 시작
-pm2 start ecosystem.config.js --env production
-
-# 서버 재시작, 중지 등 모든 명령어는 기존과 동일하게 --name으로 지정한 이름을 사용합니다.
-pm2 restart maskrack-api-server
-pm2 logs maskrack-api-server
-이제 maskrack-api-server는 PM2의 관리를 받으며, 훨씬 안정적으로 운영될 준비가 되었습니다. 코드를 수정한 후에는 pm2 restart maskrack-api-server 명령어로 변경 사
+app.listen(API_PORT, () => {
+    console.log('MaskRack API Server listening on port ' + API_PORT);
+});
