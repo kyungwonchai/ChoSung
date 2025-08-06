@@ -1,27 +1,140 @@
-# 분석의 명확성을 위해 '호기-레인'을 합친 새로운 컬럼을 만듭니다.
-# 예: m1=1, lane1=2 -> 'M1-L2'
-df['m1_lane'] = 'M' + df['m1'].astype(str) + '-L' + df['lane1'].astype(str)
+SMD 공정 설비 조치 가이드처럼 명확한 정답이 있는 분야에 이는 매우 효과적인 접근입니다. 이를 위해선 두 가지, ①자동 강화 아키텍처와 ②에이전트가 학습하기 좋은 문서 작성법이 핵심입니다.
 
-# 데이터에 있는 고유한 생산 라인 목록 가져오기
-unique_lines = df['line1'].unique()
+## 1. 자동 강화(Self-Reinforcement) RAG 아키텍처
+기존 RAG가 '검색(Retrieve) → 생성(Generate)'의 단방향 흐름이라면, 자동 강화 RAG는 여기에 '피드백(Feedback) → 평가(Evaluate) → 재학습(Fine-tuning)' 이라는 선순환 고리를 추가한 구조입니다.
 
-# 각 생산 라인에 대해 개별 차트 생성
-for line in sorted(unique_lines):
-    # 현재 라인에 해당하는 데이터만 필터링
-    line_df = df[df['line1'] == line]
+동작 원리
+질의응답: 사용자가 질문하면, 에이전트는 평소처럼 문서를 검색해 답변을 생성합니다.
 
-    # 차트 그리기
-    plt.figure(figsize=(18, 9)) # 차트 크기를 넉넉하게 설정
+상호작용 기록: 질문, 검색된 문서, 생성된 답변, 사용자의 모든 상호작용을 로그 데이터베이스에 기록합니다.
+
+피드백 수집: 사용자는 에이전트의 답변에 '좋아요??/싫어요??' 같은 평가를 남기거나, 정답 문서를 직접 알려주는 등 피드백을 제공합니다.
+
+주기적 재학습: 시스템은 주기적으로 쌓인 로그와 피드백 데이터를 분석합니다.
+
+'좋아요' 받은 답변: "정답 데이터셋"으로 분류됩니다. (질문-정답 문서-좋은 답변)
+
+'싫어요' 받은 답변: "오답 데이터셋"으로 분류됩니다. (질문-오답 문서-나쁜 답변)
+
+모델 성능 강화: 이렇게 만들어진 고품질의 '정답/오답' 데이터셋을 이용해 **검색 모델(Embedding Model)이나 생성 모델(LLM)을 주기적으로 미세조정(Fine-tuning)**합니다. 이를 통해 에이전트는 어떤 문서가 더 중요한지, 어떤 스타일로 답변해야 하는지를 스스로 학습하게 됩니다.
+
+Python 코드 예시 (개념)
+전체 시스템 구현은 복잡하지만, 핵심적인 피드백 수집 및 재학습 데이터 생성 파이썬 코드의 개념은 다음과 같습니다.
+
+Python
+
+import pandas as pd
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.chains import RetrievalQA
+
+# --- 1. 기본 RAG 체인 설정 (가정) ---
+# vector_db = FAISS.load_local("smd_manual_db", OpenAIEmbeddings())
+# llm = ChatOpenAI(model_name="gpt-4", temperature=0)
+# qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vector_db.as_retriever())
+
+# --- 2. 상호작용 및 피드백 기록 (핵심) ---
+interaction_logs = []
+
+def get_answer_and_log(user_query: str):
+    """사용자 질문에 답변하고 로그를 기록하는 함수"""
+    # result = qa_chain.invoke(user_query) # 실제 답변 생성
+    result = {"query": user_query, "result": "임시 답변: 스퀴지 압력을 5.5kg/f로 조절하세요."} # 예시
     
-    # x축(m1_lane) 순서를 정렬하여 그리기
-    sorted_order = sorted(line_df['m1_lane'].unique())
-    sns.boxplot(data=line_df, x='m1_lane', y='ct2', order=sorted_order)
+    interaction_id = len(interaction_logs)
+    log_entry = {
+        "id": interaction_id,
+        "query": user_query,
+        "retrieved_docs": "임시 문서: E-404.md", # 실제로는 검색된 문서 정보
+        "generated_answer": result["result"],
+        "feedback": None # 아직 피드백 없음
+    }
+    interaction_logs.append(log_entry)
     
-    # 차트 제목과 라벨 설정
-    plt.title(f'? 생산 라인 [{line}] - 호기/레인별 사이클 타임 분포', fontsize=18, pad=20)
-    plt.xlabel('호기-레인', fontsize=14)
-    plt.ylabel('사이클 타임 (ct2)', fontsize=14)
-    plt.xticks(rotation=45) # x축 라벨이 겹치지 않도록 45도 회전
+    print(f"답변: {result['result']}")
+    return interaction_id
+
+def submit_feedback(interaction_id: int, is_correct: bool):
+    """사용자가 피드백을 제출하는 함수"""
+    for log in interaction_logs:
+        if log["id"] == interaction_id:
+            log["feedback"] = "good" if is_correct else "bad"
+            print(f"ID {interaction_id}에 대한 피드백이 '{log['feedback']}'으로 기록되었습니다.")
+            break
+
+# --- 3. 사용 예시 ---
+query = "SP-1000 설비에서 E-404 에러 발생 시 조치 방법 알려줘"
+current_id = get_answer_and_log(query)
+
+# 사용자가 답변이 마음에 들어 '좋아요'를 눌렀다고 가정
+submit_feedback(current_id, is_correct=True)
+
+# --- 4. 주기적 재학습 데이터 생성 (오프라인 작업) ---
+def create_finetuning_dataset():
+    """피드백 로그를 바탕으로 재학습용 데이터셋 생성"""
+    good_cases = [log for log in interaction_logs if log["feedback"] == "good"]
     
-    # 차트 보여주기
-    plt.show()
+    # 이 데이터를 Hugging Face TRL 같은 라이브러리 형식에 맞게 가공
+    # 예: {"instruction": "질문", "input": "참고 문서", "output": "좋은 답변"}
+    finetuning_df = pd.DataFrame(good_cases)
+    print("\n--- 재학습용 데이터셋 ---")
+    print(finetuning_df)
+    # finetuning_df.to_csv("smd_finetuning_data.csv", index=False)
+
+create_finetuning_dataset()
+## 2. 에이전트를 위한 최적의 문서 작성 가이드
+에이전트가 스스로 학습하려면, 무엇보다 **데이터(문서)가 기계가 해석하기 좋은 구조(Machine-Readable)**로 작성되어야 합니다. 사람이 읽기 편한 장문의 서술형 가이드보다, '원자적(Atomic) 질의응답' 형태로 구조화하는 것이 핵심입니다.
+
+최적의 문서 형식: Markdown + YAML Frontmatter
+아래는 SMD 설비 조치 가이드 문서를 위한 최적의 템플릿 예시입니다. 모든 문서를 이 형식에 맞춰 작성하는 것을 추천합니다.
+
+파일명: E-404_솔더_분리_불량.md
+
+Markdown
+
+---
+id: "SMD-E-001"
+equipment_model: "SP-1000"
+error_code: "E-404"
+symptom: "솔더 페이스트(Solder Paste)가 스텐실(Stencil)에서 제대로 분리되지 않음"
+tags:
+  - "솔더링 불량"
+  - "스텐실"
+  - "E-404"
+  - "SP-1000"
+author: "김민준"
+last_updated: "2025-08-07"
+---
+
+## ?? 문제 현상 (Symptom)
+설비 화면에 **에러코드 E-404**가 표시되며, PCB 인쇄 후 스텐실 마스크에서 솔더 페이스트가 깨끗하게 떨어지지 않고 일부가 남아있거나 끌리는 현상이 발생함.
+
+## ?? 예상 원인 및 해결 방안 (Causes & Solutions)
+
+### 원인 1: 스텐실 클리닝 용액 부족
+* **진단 방법**: 설비 전면의 클리닝 유닛 투명 커버를 열고 용액 레벨을 육안으로 확인함. 레벨 게이지가 'MIN' 이하일 경우 해당.
+* **해결 방안**: 지정된 클리닝 용액(모델명: **SC-200**)을 레벨 게이지 'MAX'까지 보충함.
+
+### 원인 2: 스퀴지(Squeegee) 압력 과다 또는 부족
+* **진단 방법**: 설비 제어판에서 `메뉴 > 파라미터 > 스퀴지 설정`으로 이동하여 현재 압력 값을 확인. (기준값: **5.5kg/f**)
+* **해결 방안**: 압력 조절 다이얼을 이용해 기준값으로 맞춘 후, 테스트 인쇄를 1회 진행하여 개선 여부 확인.
+
+### 원인 3: 솔더 페이스트 점도 이상 (유효기간 경과)
+* **진단 방법**: 사용 중인 솔더 페이스트 용기에 부착된 라벨에서 유효기간(EXP)을 확인. 냉장 보관 상태도 함께 체크.
+* **해결 방안**: 유효기간이 경과했거나 상온에 오래 방치된 경우, 즉시 새 솔더 페이스트로 교체.
+왜 이 방식이 최적인가?
+YAML Frontmatter (---로 감싸인 상단 부분)
+
+이 부분은 구조화된 메타데이터입니다. 에이전트는 의미 기반의 벡터 검색을 하기 전에, equipment_model: "SP-1000" 이나 error_code: "E-404" 같은 조건으로 정확하게 문서를 필터링할 수 있습니다. 이는 검색 정확도를 폭발적으로 높여줍니다.
+
+tags는 동의어나 관련 검색어를 처리하는 데 매우 유용합니다.
+
+Markdown 헤더 (##, ###)
+
+'문제 현상', '원인', '해결 방안' 등 정보의 위계를 명확하게 구분해 줍니다. 에이전트는 이 구조를 파악하여 "E-404의 원인 2는 뭐야?" 와 같은 세부 질문에 정확히 해당 부분만 찾아 답변할 수 있습니다.
+
+명확한 키워드 사용과 강조 (*, **)
+
+진단 방법, 해결 방안 처럼 일관된 키워드를 사용하고, **5.5kg/f** 와 같이 중요한 수치나 모델명을 강조하면, 에이전트가 답변을 생성할 때 핵심 정보를 놓치지 않고 인용할 확률이 높아집니다.
+
+이처럼 구조화된 문서를 기반으로, 사용자 피드백을 통해 지속적으로 재학습하는 선순환 구조를 구축하는 것이 단순 RAG를 넘어 진정한 지능형 에이전트를 만드는 핵심입니
