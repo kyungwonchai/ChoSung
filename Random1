@@ -4,6 +4,7 @@ import os
 import logging
 import platform
 import subprocess
+import base64
 from datetime import datetime
 
 # ===================================================================
@@ -65,9 +66,6 @@ def is_host_reachable(hostname, logger):
         logger.error("[오류] 'ping' 명령어를 찾을 수 없습니다.")
         return False
 
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# ==       문제가 되었던 복잡한 함수를 버리고 단순화한 로직       ==
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 def deploy_to_host(hostname, logger):
     logger.info(f"[{hostname}] 워치독 배포 작업 시작...")
     client = paramiko.SSHClient()
@@ -79,31 +77,30 @@ def deploy_to_host(hostname, logger):
         )
         logger.info(f"[{hostname}] SSH 연결 성공.")
         
-        # 1. PM2 서비스 직접 중지 및 비활성화 (기다리지 않음)
+        # 1. PM2 서비스 직접 중지 및 비활성화 (기다리지 않고 명령만 전송)
         logger.info(f"[{hostname}] 1단계: PM2 서비스 중지 및 비활성화 시도...")
-        
-        # PM2가 만드는 기본 서비스 이름 ('pm2-[유저이름].service')
         pm2_service_name = f"pm2-{SSH_USER}.service"
-        
-        # 그냥 명령만 내리고 넘어갑니다. (오류가 나도 무시하고 진행)
         client.exec_command(f"pm2 stop {PM2_APP_NAME}")
         client.exec_command(f"sudo systemctl stop {pm2_service_name}")
         client.exec_command(f"sudo systemctl disable {pm2_service_name}")
         logger.info(f"[{hostname}] PM2 중지/비활성화 명령 전송 완료. (2초 대기)")
         time.sleep(2)
 
-        # 2. SFTP로 새로운 서비스 파일 생성 (가장 안정적인 방법)
-        logger.info(f"[{hostname}] 2단계: SFTP로 새로운 서비스 파일 생성")
-        sftp = client.open_sftp()
-        # sudo 권한이 필요한 최종 경로에 직접 쓸 수 없으므로, 임시 경로에 먼저 업로드
-        remote_tmp_path = f"/tmp/{SERVICE_FILE_NAME}" 
-        with sftp.file(remote_tmp_path, 'w') as f:
-            f.write(SERVICE_FILE_CONTENT)
-        sftp.close()
-        # 임시 파일을 최종 목적지로 sudo 권한으로 이동시킴
-        client.exec_command(f"sudo mv {remote_tmp_path} /etc/systemd/system/{SERVICE_FILE_NAME}")
-        logger.info(f"[{hostname}] 서비스 파일 생성 완료. (2초 대기)")
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ==     Base64를 이용한 가장 안정적인 파일 생성 방식 (핵심)     ==
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        logger.info(f"[{hostname}] 2단계: Base64로 서비스 파일 생성")
+        # 서비스 파일 내용을 Base64로 인코딩
+        encoded_content = base64.b64encode(SERVICE_FILE_CONTENT.encode('utf-8')).decode('utf-8')
+        # 인코딩된 내용을 원격지에서 디코딩하여 파일로 저장하는 단일 명령어
+        command = f"echo '{encoded_content}' | base64 --decode | sudo tee /etc/systemd/system/{SERVICE_FILE_NAME} > /dev/null"
+        
+        # 이 명령어는 즉시 끝나므로, 결과를 기다릴 필요 없이 실행
+        stdin, stdout, stderr = client.exec_command(command)
+        # 명령어 실행 보장을 위한 잠시 대기
         time.sleep(2)
+        logger.info(f"[{hostname}] 서비스 파일 생성 명령 전송 완료.")
+
 
         # 3. 새로운 서비스 활성화
         logger.info(f"[{hostname}] 3단계: 새로운 systemd 서비스 활성화 및 시작")
@@ -113,7 +110,7 @@ def deploy_to_host(hostname, logger):
         logger.info(f"[{hostname}] 서비스 재시작 명령 전송 완료. (3초 대기)")
         time.sleep(3)
 
-        # 4. 최종 상태 확인 (이것만 결과를 기다림)
+        # 4. 최종 상태 확인
         logger.info(f"[{hostname}] 4단계: 최종 서비스 상태 확인")
         stdin, stdout, stderr = client.exec_command(f"sudo systemctl status {SERVICE_FILE_NAME}")
         status_output = stdout.read().decode('utf-8')
@@ -129,7 +126,7 @@ def deploy_to_host(hostname, logger):
 
 if __name__ == '__main__':
     logger = setup_logging()
-    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (단순/직접 제어 버전) " + "="*20)
+    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (Base64 버전) " + "="*20)
 
     for host in HOSTS:
         if is_host_reachable(host, logger):
