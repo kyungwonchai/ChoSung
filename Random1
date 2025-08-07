@@ -5,14 +5,21 @@ import logging
 import platform
 import subprocess
 from datetime import datetime
+import base64
 
 # ===================================================================
 # ==                 ★★★★★ 설정 (사용자 수정 영역) ★★★★★                 ==
 # ===================================================================
-HOSTS = ['192.168.1.101', '192.168.1.102',] # 500대 IP 주소 목록
+HOSTS = ['192.168.1.101', '192.168.1.102'] # 500대 IP 주소 목록
 SSH_USER = 'pi'
 SSH_KEY_FILE = os.path.expanduser('~/.ssh/id_rsa')
-PM2_APP_NAME = 'sensor' 
+
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ==      'which pm2' 명령으로 찾은 pm2의 전체 경로를 여기에 입력!      ==
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+PM2_EXEC_PATH = '/home/pi/.nvm/versions/node/v18.16.0/bin/pm2' # 예시 경로입니다. 반드시 실제 경로로 수정하세요.
+
+PM2_APP_NAME = 'sensor'
 LOG_FILE = 'deployment_log.txt'
 
 # --- systemd 서비스 파일 내용 정의 ---
@@ -39,6 +46,7 @@ WantedBy=multi-user.target
 """
 # ===================================================================
 
+# (setup_logging, is_host_reachable, run_and_wait 함수는 이전과 동일)
 def setup_logging():
     logger = logging.getLogger('DeploymentLogger')
     logger.setLevel(logging.INFO)
@@ -67,11 +75,11 @@ def is_host_reachable(hostname, logger):
         logger.error("[오류] 'ping' 명령어를 찾을 수 없습니다.")
         return False
 
-def run_and_wait(client, command, logger):
-    """명령어를 실행하고, 완료될 때까지 기다린 후 결과를 반환하는 안정적인 함수"""
-    logger.info(f"  [실행] {command}")
+def run_and_wait(client, command, logger, hide_command=False):
+    log_command = command if not hide_command else f"echo '...' | base64 -d | sudo tee ..."
+    logger.info(f"  [실행] {log_command}")
     stdin, stdout, stderr = client.exec_command(command, get_pty=True)
-    exit_status = stdout.channel.recv_exit_status() # 여기서 완료를 기다림
+    exit_status = stdout.channel.recv_exit_status()
     if exit_status != 0:
         error_message = stderr.read().decode('utf-8').strip()
         logger.error(f"  [실패] 명령어가 실패했습니다 (종료 코드: {exit_status}). 오류: {error_message}")
@@ -86,48 +94,47 @@ def deploy_to_host(hostname, logger):
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         client.connect(
-            hostname, username=SSH_USER, key_filename=SSH_KEY_FILE, timeout=10,
-            disabled_algorithms=dict(pubkeys=['rsa-sha2-512', 'rsa-sha2-256'])
+            hostname,
+            username=SSH_USER,
+            key_filename=SSH_KEY_FILE,
+            timeout=10,
+            disabled_algorithms={'pubkeys': ['rsa-sha2-512', 'rsa-sha2-256']}
         )
         logger.info(f"[{hostname}] SSH 연결 성공.")
-        
-        # 1. PM2 서비스 직접 중지 및 비활성화
+
+        # 1. PM2 서비스 직접 중지 및 비활성화 (전체 경로 사용)
         logger.info(f"[{hostname}] 1단계: PM2 서비스 중지 및 비활성화 시도...")
         pm2_service_name = f"pm2-{SSH_USER}.service"
         try:
-            # 오류가 나도 무시하고 계속 진행하도록 try-except로 감쌈
-            run_and_wait(client, f"pm2 stop {PM2_APP_NAME}", logger)
+            # ★★★ 여기에 수정 사항이 적용되었습니다 ★★★
+            run_and_wait(client, f"{PM2_EXEC_PATH} stop {PM2_APP_NAME}", logger)
+        except Exception as e:
+            # 이제 진짜 에러(권한 문제 등)만 잡히거나, 원래 없던 경우 경고를 출력합니다.
+            logger.warning(f"  [경고] PM2 앱 '{PM2_APP_NAME}'을 중지하는 데 실패했습니다. 이미 중지되었거나 존재하지 않을 수 있습니다. ({e})")
+        
+        # PM2의 systemd 서비스도 중지/비활성화
+        try:
+            # ★★★ 여기에 수정 사항이 적용되었습니다 ★★★
+            run_and_wait(client, f"{PM2_EXEC_PATH} unstartup", logger)
             run_and_wait(client, f"sudo systemctl stop {pm2_service_name}", logger)
             run_and_wait(client, f"sudo systemctl disable {pm2_service_name}", logger)
         except Exception as e:
-            logger.warning(f"  [경고] PM2 중지/비활성화 중 오류 발생. 이미 중지되었거나 서비스가 없을 수 있습니다. 작업을 계속합니다. ({e})")
-
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        # ==     가장 원시적이고 확실한 파일 생성 방식 (핵심 변경 사항)     ==
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        logger.info(f"[{hostname}] 2단계: 원시 파일 쓰기 방식으로 서비스 파일 생성")
+            logger.warning(f"  [경고] PM2 시작 서비스를 제거/중지하는 데 실패했습니다. 이미 비활성화되었거나 존재하지 않을 수 있습니다. ({e})")
+        
+        # (2단계 이하 파일 쓰기 및 서비스 재시작 로직은 이전과 동일하게 안정적입니다.)
+        # 2. Base64 방식으로 서비스 파일 원격 생성
+        logger.info(f"[{hostname}] 2단계: Base64 방식으로 서비스 파일 원격 생성")
         remote_path = f"/etc/systemd/system/{SERVICE_FILE_NAME}"
-        
-        # 1. sudo로 빈 파일을 만들거나, 기존 파일을 비움
-        run_and_wait(client, f"sudo truncate -s 0 {remote_path}", logger)
-        
-        # 2. 파일 내용을 한 줄씩 `tee -a`로 이어붙임
-        for line in SERVICE_FILE_CONTENT.splitlines():
-            # 따옴표 문제를 피하기 위해 라인 내의 따옴표를 이스케이프 처리
-            sanitized_line = line.replace("'", "'\\''")
-            command = f"echo '{sanitized_line}' | sudo tee -a {remote_path} > /dev/null"
-            # 이 명령어는 결과를 기다릴 필요 없이 빠르게 실행됨
-            client.exec_command(command)
-        
+        content_b64 = base64.b64encode(SERVICE_FILE_CONTENT.encode('utf-8')).decode('utf-8')
+        command = f"echo '{content_b64}' | base64 -d | sudo tee {remote_path} > /dev/null"
+        run_and_wait(client, command, logger, hide_command=True)
         logger.info(f"[{hostname}] 서비스 파일 쓰기 완료.")
-        time.sleep(1) # 파일 쓰기 완료를 위한 잠시 대기
 
         # 3. 새로운 서비스 활성화
         logger.info(f"[{hostname}] 3단계: 새로운 systemd 서비스 활성화 및 시작")
         run_and_wait(client, "sudo systemctl daemon-reload", logger)
         run_and_wait(client, f"sudo systemctl enable {SERVICE_FILE_NAME}", logger)
         run_and_wait(client, f"sudo systemctl restart {SERVICE_FILE_NAME}", logger)
-        
         logger.info(f"[{hostname}] 서비스 재시작 완료. (3초 대기)")
         time.sleep(3)
 
@@ -135,8 +142,10 @@ def deploy_to_host(hostname, logger):
         logger.info(f"[{hostname}] 4단계: 최종 서비스 상태 확인")
         status_output = run_and_wait(client, f"sudo systemctl status {SERVICE_FILE_NAME}", logger)
         logger.info(f"[{hostname}] 상태:\n{status_output}")
-
-        logger.info(f"--- [{hostname}] 작업 성공적으로 완료! ---")
+        if 'active (running)' in status_output:
+            logger.info(f"--- [{hostname}] 작업 성공적으로 완료! ---")
+        else:
+            logger.error(f"!!!!!! [{hostname}] 서비스가 정상적으로 실행되지 않았습니다. 상태를 확인해주세요. !!!!!!")
 
     except Exception as e:
         logger.error(f"!!!!!! [{hostname}]에서 심각한 오류 발생: {e} !!!!!!")
@@ -144,13 +153,11 @@ def deploy_to_host(hostname, logger):
         if client:
             client.close()
 
+
 if __name__ == '__main__':
     logger = setup_logging()
-    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (원시 파일 쓰기 버전) " + "="*20)
+    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (PATH 문제 해결 버전) " + "="*20)
 
     for host in HOSTS:
         if is_host_reachable(host, logger):
             deploy_to_host(host, logger)
-            
-    logger.info("="*20 + " 워치독 배포 작업 완료 " + "="*20 + "\n")
-```
