@@ -1,53 +1,114 @@
 import paramiko
-import logging
+import time
 import os
+import logging
+import platform
+import subprocess
+from datetime import datetime
 
-# paramiko의 상세한 디버그 로그를 활성화하여 모든 통신 과정을 출력합니다.
-logging.basicConfig(level=logging.DEBUG)
-paramiko_logger = logging.getLogger("paramiko")
-paramiko_logger.setLevel(logging.DEBUG)
-
-# --- ★★★★★ 사용자 설정 ★★★★★ ---
-# 테스트할 라즈베리파이의 IP 주소 하나만 입력하세요.
-HOST_IP = '192.168.1.101' # 테스트할 IP 하나
-SSH_USER = 'kw'
-# kw 계정의 id_rsa 키 파일 경로를 정확하게 지정합니다.
+# ===================================================================
+# ==                 ★★★★★ 설정 (사용자 수정 영역) ★★★★★                 ==
+# ===================================================================
+HOSTS = ['192.168.1.101', '192.168.1.102',] # 500대 IP 주소 목록
+SSH_USER = 'pi' # 접속 대상 계정
 SSH_KEY_FILE = os.path.expanduser('~/.ssh/id_rsa')
-# --- 설정 끝 ---
+PM2_APP_NAME = 'main'
+LOG_FILE = 'deployment_log.txt'
 
-print("="*50)
-print(f"SSH 연결 진단 스크립트 시작")
-print(f"대상 호스트: {HOST_IP}")
-print(f"사용자: {SSH_USER}")
-print(f"키 파일 경로: {SSH_KEY_FILE}")
-print("="*50)
+# --- systemd 서비스 파일 내용 정의 ---
+PYTHON_EXEC_PATH = '/usr/bin/python3'
+APP_WORKING_DIR = '/home/pi/my_project'
+APP_SCRIPT_PATH = '/home/pi/my_project/main.py'
+APP_ARGS = '--mode production --port 8080'
+SERVICE_FILE_NAME = 'myapp.service'
+SERVICE_FILE_CONTENT = f"""[Unit]
+Description=My Python Application with Watchdog
+After=network.target
+[Service]
+ExecStart={PYTHON_EXEC_PATH} {APP_SCRIPT_PATH} {APP_ARGS}
+WorkingDirectory={APP_WORKING_DIR}
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User={SSH_USER}
+WatchdogSec=60
+[Install]
+WantedBy=multi-user.target
+"""
+# ===================================================================
 
-# 키 파일이 존재하는지 먼저 확인합니다.
-if not os.path.exists(SSH_KEY_FILE):
-    print(f"!!!!!! [치명적 오류] SSH 키 파일을 찾을 수 없습니다: {SSH_KEY_FILE}")
-    print("이전에 'ssh-keygen -t rsa' 명령어가 성공적으로 완료되었는지 확인해주세요.")
-    exit()
+def setup_logging():
+    logger = logging.getLogger('DeploymentLogger')
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+    return logger
 
-client = paramiko.SSHClient()
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def is_host_reachable(hostname, logger):
+    logger.info(f"[{hostname}] Ping 테스트 시작...")
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    command = ['ping', param, '1', '-w', '2', hostname]
+    try:
+        response = subprocess.run(command, capture_output=True, check=False)
+        if response.returncode == 0:
+            logger.info(f"[{hostname}] Ping 성공. 장비가 온라인 상태입니다.")
+            return True
+        else:
+            logger.warning(f"[{hostname}] Ping 실패. 장비를 건너뜁니다.")
+            return False
+    except FileNotFoundError:
+        logger.error("[오류] 'ping' 명령어를 찾을 수 없습니다.")
+        return False
 
-try:
-    print("\n>>> paramiko 연결 시도...")
-    client.connect(
-        hostname=HOST_IP,
-        username=SSH_USER,
-        key_filename=SSH_KEY_FILE,
-        timeout=10
-    )
-    print("\n\n★★★★★ [성공] 인증에 성공했습니다! SSH 연결이 정상적으로 이루어졌습니다. ★★★★★")
-    print("이제 deploy_watchdog_robust.py 스크립트도 작동할 것입니다.")
-
-except Exception as e:
-    print(f"\n\n!!!!!! [실패] 인증에 실패했습니다. 아래는 상세 오류 로그입니다. !!!!!!")
-    print(f"발생한 오류 유형: {type(e).__name__}")
-    print(f"오류 메시지: {e}")
-    print("\n이 로그 전체를 복사해서 알려주시면 원인을 정확히 분석할 수 있습니다.")
-
-finally:
-    if client:
+def deploy_to_host(hostname, logger):
+    logger.info(f"[{hostname}] 워치독 배포 작업 시작...")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ==                  여기가 바로 핵심 수정 사항                  ==
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        client.connect(
+            hostname,
+            username=SSH_USER,
+            key_filename=SSH_KEY_FILE,
+            timeout=10,
+            # 구형 SSH 서버와 호환성을 위해 최신 알고리즘을 사용하지 않도록 설정
+            disabled_algorithms=dict(pubkeys=['rsa-sha2-512', 'rsa-sha2-256'])
+        )
+        
+        logger.info(f"[{hostname}] SSH 연결 성공.")
+        
+        # PM2 비활성화
+        pm2_path = client.exec_command("which pm2")[1].read().decode().strip()
+        if not pm2_path: pm2_path = 'pm2'
+        client.exec_command(f"sudo {pm2_path} unstartup")
+        client.exec_command(f"{pm2_path} stop {PM2_APP_NAME}")
+        
+        # 서비스 파일 생성
+        client.exec_command(f"echo '{SERVICE_FILE_CONTENT}' | sudo tee /etc/systemd/system/{SERVICE_FILE_NAME}")
+        
+        # 서비스 활성화
+        client.exec_command("sudo systemctl daemon-reload")
+        client.exec_command(f"sudo systemctl enable {SERVICE_FILE_NAME}")
+        client.exec_command(f"sudo systemctl restart {SERVICE_FILE_NAME}")
+        
+        logger.info(f"[{hostname}] 워치독 배포 성공.")
+    except Exception as e:
+        logger.error(f"[{hostname}] 워치독 배포 실패. 오류: {e}")
+    finally:
         client.close()
+
+if __name__ == '__main__':
+    logger = setup_logging()
+    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 " + "="*20)
+
+    for host in HOSTS:
+        if is_host_reachable(host, logger):
+            deploy_to_host(host, logger)
+            
