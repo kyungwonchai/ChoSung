@@ -1,39 +1,146 @@
-업은 **배포 대상이 되는 모든 서버(500대 전부)**에 각각 접속해서 최초 한 번만 해주시면 됩니다. 그 이후로는 이전에 드린 파이썬 스크립트가 아무런 문제 없이 작동할 것입니다.
+amiko 라이브러리를 사용하시는 것이 정답입니다. PuTTY 매크로는 화면의 특정 위치를 클릭하거나 정해진 시간만큼 기다리는 방식이라, 네트워크가 조금만 느려지거나 창 위치가 바뀌면 바로 오류가 나는 반면, Paramiko는 SSH 프로토콜로 직접 통신하기 때문에 훨씬 정확하고 빠릅니다.
 
-1단계: 원격 서버 접속
-터미널에서 pi 계정으로 원격 서버에 접속합니다.
+아래 코드는 '로그인 → 새 계정 생성 → 암호 설정 → sudo 권한 부여 → SSH 키 복사 → NOPASSWD 설정' 까지의 모든 과정을 단 한 번의 스크립트 실행으로 모든 서버에 적용해 주는 완전 자동화 스크립트입니다.
+
+## PuTTY 매크로 방식의 문제점
+PuTTY 같은 GUI 프로그램을 조작하는 매크로는 다음과 같은 치명적인 단점이 있습니다.
+
+깨지기 쉬움 (Fragile): 네트워크 지연, 예상치 못한 팝업창 등 작은 변수 하나에도 전체 프로세스가 멈추거나 오작동합니다.
+
+오류 확인 불가: 명령어가 실패했는지 성공했는지 알 방법이 없습니다. 그냥 키보드 입력만 흉내 낼 뿐입니다.
+
+느림: 사람의操作 속도에 맞춰야 하므로 스크립트 방식보다 몇 배나 느립니다.
+
+확장성 제로: 500대에 적용하려면 500번의 불안한 과정을 지켜봐야 합니다.
+
+비유하자면, 매크로는 눈을 가리고 조립 설명서만 듣는 것과 같고, Paramiko 스크립트는 눈으로 보고 손으로 만지며 확인하는 것과 같습니다.
+
+## 해결책: Python + Paramiko 스크립트로 전체 과정 자동화
+이전에 만들었던 스크립트의 로직을 활용하여, 사용자 생성 과정을 자동화할 수 있습니다. 아래 코드를 create_admin_users.py 와 같은 이름으로 저장해서 사용하세요.
+
+주요 자동화 기법:
+
+adduser 명령어에 옵션을 주어 비밀번호나 사용자 정보를 묻는 대화형 프롬프트를 건너뜁니다.
+
+chpasswd 명령어를 사용해 비밀번호를 비대화형으로 설정합니다.
+
+visudo를 직접 수정하는 대신, /etc/sudoers.d/ 디렉터리에 설정 파일을 추가합니다. 이 방식이 훨씬 안전하고 자동화에 용이합니다.
+
+Python
+
+import paramiko
+import os
+import logging
+import platform
+import subprocess
+
+# ===================================================================
+# ==                 ★★★★★ 설정 (사용자 수정 영역) ★★★★★                 ==
+# ===================================================================
+# 접속할 서버 목록
+HOSTS = ['192.168.1.101', '192.168.1.102'] 
+
+# 접속에 사용할 기존 관리자 계정 정보 (초기에는 'pi' 계정 사용)
+EXISTING_USER = 'pi'
+SSH_KEY_FILE = os.path.expanduser('~/.ssh/id_rsa')
+
+# 생성할 새 관리자 계정 정보
+NEW_USER = 'minjun' # 원하는 새 계정 ID
+NEW_USER_PASSWORD = 'Your_Super_Strong_Password_123!' # 새 계정의 비밀번호
+
+# 로그 파일 이름
+LOG_FILE = 'user_creation_log.txt'
+# ===================================================================
+
+def setup_logging():
+    logger = logging.getLogger('UserCreationLogger')
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter('%(message)s'))
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+    return logger
+
+def run_and_wait(client, command, logger):
+    """명령어를 실행하고, 완료될 때까지 기다린 후 결과를 반환하는 안정적인 함수"""
+    logger.info(f"  [실행] {command}")
+    stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+    exit_status = stdout.channel.recv_exit_status() # 여기서 완료를 기다림
+    
+    # adduser는 성공해도 exit_status가 0이 아닐 수 있어 예외 처리
+    if exit_status != 0 and not command.startswith('sudo adduser'):
+        error_message = stderr.read().decode('utf-8').strip()
+        logger.error(f"  [실패] 명령어가 실패했습니다 (종료 코드: {exit_status}). 오류: {error_message}")
+        raise Exception(f"명령어 실행 실패: {command}")
+        
+    logger.info(f"  [성공] 명령어가 성공적으로 완료되었습니다.")
+    return stdout.read().decode('utf-8').strip()
+
+def create_user_on_host(hostname, logger):
+    logger.info(f"======== [{hostname}] 새 관리자 계정 생성 작업 시작 ========")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        # 1. 기존 계정('pi')으로 SSH 연결
+        logger.info(f"[{hostname}] '{EXISTING_USER}' 계정으로 SSH 연결 시도...")
+        client.connect(
+            hostname,
+            username=EXISTING_USER,
+            key_filename=SSH_KEY_FILE,
+            timeout=10
+        )
+        logger.info(f"[{hostname}] SSH 연결 성공.")
+
+        # 2. 새 사용자 생성 (대화형 프롬프트 비활성화)
+        run_and_wait(client, f"sudo adduser --disabled-password --gecos '' {NEW_USER}", logger)
+
+        # 3. 새 사용자 비밀번호 설정 (비대화형)
+        run_and_wait(client, f"echo '{NEW_USER}:{NEW_USER_PASSWORD}' | sudo chpasswd", logger)
+        
+        # 4. 새 사용자에게 sudo 권한 부여
+        run_and_wait(client, f"sudo usermod -aG sudo {NEW_USER}", logger)
+
+        # 5. 새 사용자에게 SSH 키 복사 및 권한 설정
+        key_setup_command = (
+            f"sudo mkdir -p /home/{NEW_USER}/.ssh && "
+            f"sudo cp /home/{EXISTING_USER}/.ssh/authorized_keys /home/{NEW_USER}/.ssh/authorized_keys && "
+            f"sudo chown -R {NEW_USER}:{NEW_USER} /home/{NEW_USER}/.ssh && "
+            f"sudo chmod 700 /home/{NEW_USER}/.ssh && "
+            f"sudo chmod 600 /home/{NEW_USER}/.ssh/authorized_keys"
+        )
+        run_and_wait(client, key_setup_command, logger)
+        
+        # 6. 새 사용자에게 NOPASSWD sudo 권한 부여 (가장 안전한 방식)
+        sudoers_command = f"echo '{NEW_USER} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/010_{NEW_USER}-nopasswd"
+        run_and_wait(client, sudoers_command, logger)
+        
+        logger.info(f"SUCCESS! --- [{hostname}]에 새 관리자 '{NEW_USER}' 계정 생성 완료! ---")
+
+    except Exception as e:
+        logger.error(f"!!!!!!!! [{hostname}]에서 심각한 오류 발생: {e} !!!!!!!!!!")
+    finally:
+        if client:
+            client.close()
+        logger.info(f"======== [{hostname}] 작업 종료 ========\n")
+
+
+if __name__ == '__main__':
+    logger = setup_logging()
+    logger.info("\n" + "="*20 + " 전체 서버에 새 관리자 계정 생성 시작 " + "="*20)
+
+    for host in HOSTS:
+        create_user_on_host(host, logger)
+            
+    logger.info("="*20 + " 모든 작업 완료 " + "="*20 + "\n")
+## 스크립트 실행 방법
+위 코드를 create_admin_users.py 같은 파일 이름으로 저장합니다.
+
+스크립트 상단의 설정 영역에서 HOSTS, NEW_USER, NEW_USER_PASSWORD 등을 원하는 값으로 수정합니다.
+
+터미널(CMD, PowerShell, Git Bash 등)에서 아래 명령어로 스크립트를 실행합니다.
 
 Bash
-
-ssh pi@192.168.1.101
-2단계: visudo로 sudo 권한 파일 열기
-절대로 vim이나 nano로 /etc/sudoers 파일을 직접 열면 안 됩니다. 문법이 틀리면 sudo 권한을 영원히 잃을 수 있습니다. 반드시 아래 명령어를 사용해야 합니다. 이 명령어는 저장할 때 문법을 검사해서 실수를 막아줍니다.
-
-Bash
-
-sudo visudo
-3단계: 파일 맨 아래에 권한 추가
-sudo visudo를 실행하면 편집기가 열립니다. 키보드 방향키를 이용해 파일의 맨 아래로 이동한 후, 다음 내용을 똑같이 추가해 주세요.
-
-pi ALL=(ALL) NOPASSWD: ALL
-pi: pi라는 사용자는
-
-ALL=: 어떤 컴퓨터에서 접속하든
-
-(ALL): 모든 사용자의 권한으로
-
-NOPASSWD: ALL: 암호 없이 모든 명령어를 실행할 수 있다.
-
-4단계: 저장하고 종료
-편집기가 nano일 가능성이 높습니다. 아래 순서대로 키보드를 눌러 저장하고 종료합니다.
-
-Ctrl + X (종료)
-
-Y (저장하겠냐는 물음에 Yes)
-
-Enter (파일 이름을 그대로 사용)
-
-5단계: 모든 서버에 반복
-192.168.1.102를 포함한 모든 나머지 서버에 접속하여 위 1~4단계를 똑같이 반복해 주시면 모든 준비가 끝납니다.
-
-이제 모든 서버에 pi 사용자의 sudo 마스터키가 발급되었습니다.
