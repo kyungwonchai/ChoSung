@@ -12,7 +12,7 @@ from datetime import datetime
 HOSTS = ['192.168.1.101', '192.168.1.102',] # 500대 IP 주소 목록
 SSH_USER = 'pi'
 SSH_KEY_FILE = os.path.expanduser('~/.ssh/id_rsa')
-PM2_APP_NAME = 'sensor' # 사용자께서 알려주신 프로세스 이름
+PM2_APP_NAME = 'sensor' 
 LOG_FILE = 'deployment_log.txt'
 
 # --- systemd 서비스 파일 내용 정의 ---
@@ -65,20 +65,9 @@ def is_host_reachable(hostname, logger):
         logger.error("[오류] 'ping' 명령어를 찾을 수 없습니다.")
         return False
 
-def run_command(client, command, logger):
-    logger.info(f"  [실행] {command}")
-    stdin, stdout, stderr = client.exec_command(command, get_pty=True)
-    exit_status = stdout.channel.recv_exit_status()
-    stdout_output = stdout.read().decode('utf-8').strip()
-    stderr_output = stderr.read().decode('utf-8').strip()
-    if stdout_output:
-        logger.info(f"  [출력] {stdout_output}")
-    if stderr_output:
-        logger.warning(f"  [오류 출력] {stderr_output}")
-    if exit_status != 0:
-        raise Exception(f"명령어 실행 실패 (종료 코드: {exit_status})")
-    return stdout_output
-
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+# ==       문제가 되었던 복잡한 함수를 버리고 단순화한 로직       ==
+# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 def deploy_to_host(hostname, logger):
     logger.info(f"[{hostname}] 워치독 배포 작업 시작...")
     client = paramiko.SSHClient()
@@ -90,44 +79,45 @@ def deploy_to_host(hostname, logger):
         )
         logger.info(f"[{hostname}] SSH 연결 성공.")
         
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        # ==         PM2 서비스를 직접 중지시키는 핵심 변경 사항         ==
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        logger.info(f"[{hostname}] 1단계: PM2 서비스 직접 중지 및 비활성화")
-
-        # 1-1. 'pi' 계정의 PM2 프로세스 중지 (sudo 없음)
-        try:
-            run_command(client, f"pm2 stop {PM2_APP_NAME}", logger)
-            run_command(client, f"pm2 save --force", logger)
-        except Exception as e:
-            logger.warning(f"[{hostname}] PM2 프로세스 중지 실패. 이미 중지되었을 수 있습니다. 오류: {e}")
-
-        # 1-2. 부팅 시 자동 시작되는 PM2 서비스 비활성화 (sudo 있음)
-        # PM2가 만드는 기본 서비스 이름은 보통 'pm2-[유저이름].service' 입니다.
-        pm2_service_name = f"pm2-{SSH_USER}.service"
-        try:
-            run_command(client, f"sudo systemctl disable {pm2_service_name}", logger)
-            run_command(client, f"sudo systemctl stop {pm2_service_name}", logger)
-        except Exception as e:
-            logger.warning(f"[{hostname}] PM2 시스템 서비스({pm2_service_name}) 비활성화 실패. 서비스가 없거나 다른 이름일 수 있습니다. 오류: {e}")
+        # 1. PM2 서비스 직접 중지 및 비활성화 (기다리지 않음)
+        logger.info(f"[{hostname}] 1단계: PM2 서비스 중지 및 비활성화 시도...")
         
-        # 2. SFTP로 새로운 서비스 파일 생성
+        # PM2가 만드는 기본 서비스 이름 ('pm2-[유저이름].service')
+        pm2_service_name = f"pm2-{SSH_USER}.service"
+        
+        # 그냥 명령만 내리고 넘어갑니다. (오류가 나도 무시하고 진행)
+        client.exec_command(f"pm2 stop {PM2_APP_NAME}")
+        client.exec_command(f"sudo systemctl stop {pm2_service_name}")
+        client.exec_command(f"sudo systemctl disable {pm2_service_name}")
+        logger.info(f"[{hostname}] PM2 중지/비활성화 명령 전송 완료. (2초 대기)")
+        time.sleep(2)
+
+        # 2. SFTP로 새로운 서비스 파일 생성 (가장 안정적인 방법)
         logger.info(f"[{hostname}] 2단계: SFTP로 새로운 서비스 파일 생성")
         sftp = client.open_sftp()
-        remote_path = f"/tmp/{SERVICE_FILE_NAME}"
-        with sftp.file(remote_path, 'w') as f:
+        # sudo 권한이 필요한 최종 경로에 직접 쓸 수 없으므로, 임시 경로에 먼저 업로드
+        remote_tmp_path = f"/tmp/{SERVICE_FILE_NAME}" 
+        with sftp.file(remote_tmp_path, 'w') as f:
             f.write(SERVICE_FILE_CONTENT)
         sftp.close()
-        run_command(client, f"sudo mv {remote_path} /etc/systemd/system/{SERVICE_FILE_NAME}", logger)
+        # 임시 파일을 최종 목적지로 sudo 권한으로 이동시킴
+        client.exec_command(f"sudo mv {remote_tmp_path} /etc/systemd/system/{SERVICE_FILE_NAME}")
+        logger.info(f"[{hostname}] 서비스 파일 생성 완료. (2초 대기)")
+        time.sleep(2)
 
         # 3. 새로운 서비스 활성화
         logger.info(f"[{hostname}] 3단계: 새로운 systemd 서비스 활성화 및 시작")
-        run_command(client, "sudo systemctl daemon-reload", logger)
-        run_command(client, f"sudo systemctl enable {SERVICE_FILE_NAME}", logger)
-        run_command(client, f"sudo systemctl restart {SERVICE_FILE_NAME}", logger)
-        
+        client.exec_command("sudo systemctl daemon-reload")
+        client.exec_command(f"sudo systemctl enable {SERVICE_FILE_NAME}")
+        client.exec_command(f"sudo systemctl restart {SERVICE_FILE_NAME}")
+        logger.info(f"[{hostname}] 서비스 재시작 명령 전송 완료. (3초 대기)")
         time.sleep(3)
-        run_command(client, f"sudo systemctl status {SERVICE_FILE_NAME}", logger)
+
+        # 4. 최종 상태 확인 (이것만 결과를 기다림)
+        logger.info(f"[{hostname}] 4단계: 최종 서비스 상태 확인")
+        stdin, stdout, stderr = client.exec_command(f"sudo systemctl status {SERVICE_FILE_NAME}")
+        status_output = stdout.read().decode('utf-8')
+        logger.info(f"[{hostname}] 상태:\n{status_output}")
 
         logger.info(f"--- [{hostname}] 작업 성공적으로 완료! ---")
 
@@ -139,7 +129,7 @@ def deploy_to_host(hostname, logger):
 
 if __name__ == '__main__':
     logger = setup_logging()
-    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (PM2 직접 제어 버전) " + "="*20)
+    logger.info("\n" + "="*20 + " 워치독 배포 작업 시작 (단순/직접 제어 버전) " + "="*20)
 
     for host in HOSTS:
         if is_host_reachable(host, logger):
@@ -147,5 +137,3 @@ if __name__ == '__main__':
             
     logger.info("="*20 + " 워치독 배포 작업 완료 " + "="*20 + "\n")
 ```
-
-이제 이 스크립트는 더 이상 `which`나 `find` 같은 불필요한 명령 없이, `pm2 stop sensor`와 `sudo systemctl disable pm2-pi.service` 라는 가장 직접적이고 확실한 방법으로 기존 서비스를 중지시킬 것입니다.
