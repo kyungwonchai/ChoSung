@@ -1,41 +1,3 @@
-네, 아주 중요한 점을 지적해주셨습니다. 말씀하신 대로, 현재 로직은 재부팅 직후에 무한 재부팅에 빠지는 치명적인 문제가 있습니다. 이 문제를 해결한 새로운 로직과 전체 코드를 설명해 드리겠습니다.
-
-## 1. 기존 스크립트 로직 설명
-먼저 기존 스크립트가 어떻게 동작하는지 간단히 설명드리겠습니다.
-
-Bash
-
-LAST_MODIFIED=$(stat -c %Y "$TARGET_FOLDER")
-CURRENT_TIME=$(date +%s)
-TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
-stat -c %Y "$TARGET_FOLDER": 폴더의 마지막 수정 시간을 '초' 단위의 거대한 정수(타임스탬프)로 가져옵니다.
-
-date +%s: 현재 시간을 똑같이 '초' 단위 정수로 가져옵니다.
-
-TIME_DIFF: 현재 시간에서 마지막 수정 시간을 빼서, 수정된 후 얼마나 시간이 흘렀는지를 계산합니다.
-
-문제점: 재부팅 직후, 폴더는 아직 업데이트되지 않았으므로 LAST_MODIFIED는 재부팅 전의 아주 오래된 시간입니다. 따라서 TIME_DIFF는 당연히 설정된 MAX_DELAY (예: 300초)를 훌쩍 넘게 되고, 시스템이 준비되기도 전에 Watchdog이 또다시 재부팅을 거는 것입니다.
-
-## 2. 문제 해결을 위한 새로운 로직
-이 문제를 해결하기 위해 "유예 기간 (Grace Period)" 개념을 도입합니다.
-
-핵심 아이디어: "시스템이 부팅된 지 특정 시간(예: 22분)이 지나지 않았다면, 폴더 상태를 확인하지 말고 무조건 정상(Success)으로 처리한다."
-
-이렇게 하면 시스템이 완전히 켜지고, 주요 프로세스가 폴더에 값을 쓸 충분한 시간을 벌 수 있어 무한 재부팅을 막을 수 있습니다.
-
-시스템이 부팅된 후 얼마나 지났는지(업타임)는 /proc/uptime 파일을 통해 알 수 있습니다.
-
-새로운 로직 순서:
-
-시스템의 업타임을 초 단위로 확인한다.
-
-만약 업타임이 우리가 설정한 유예 기간(예: 1320초 = 22분)보다 작으면, 폴더 시간은 묻지도 따지지도 않고 exit 0 (정상)을 반환한다.
-
-만약 업타임이 유예 기간보다 길면, 그때부터 원래의 폴더 수정 시간 확인 로직을 수행한다.
-
-## 3. 최종 자동화 Python 스크립트 (수정된 로직 적용)
-위의 새로운 로직을 반영한 전체 Python 스크립트입니다. BOOT_GRACE_PERIOD_SECONDS 변수가 추가되었습니다.
-
 Python
 
 import paramiko
@@ -56,7 +18,6 @@ TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder" # 감시할 폴더의 
 MAX_DELAY_SECONDS = 300  # 폴더 수정이 없을 때 재부팅까지 기다릴 시간 (5분)
 
 # [중요] 부팅 후 무한 재부팅 방지를 위한 유예 기간 (Grace Period)
-# 폴더가 처음 업데이트되기까지 20분 걸린다고 하셨으므로, 안전하게 22분으로 설정합니다.
 BOOT_GRACE_PERIOD_SECONDS = 1320 # (22 * 60)
 # ===============================================================
 
@@ -77,7 +38,6 @@ def run_sudo_command(ssh_client, command, password):
                  raise Exception(f"Sudo command failed. Check password or sudoers config. Error: {stderr_output}")
             raise Exception(f"Command failed with exit status {exit_status}. Error: {stderr_output}")
             
-        # 표준 출력이 있는 경우 함께 반환
         if stdout_output:
             print(stdout_output)
             
@@ -97,23 +57,18 @@ def setup_watchdog_on_remote(hostname, port, username, password, target_folder, 
         sftp = ssh_client.open_sftp()
         print("Connection successful.")
 
-        # --- 수정된 폴더 감시 스크립트 내용 생성 ---
         check_script_path = "/etc/watchdog.d/quick_folder_check.sh"
         check_script_content = f"""#!/bin/bash
 TARGET_FOLDER="{target_folder}"
 MAX_DELAY={max_delay}
 GRACE_PERIOD={grace_period}
 
-# --- 부팅 유예 기간 로직 ---
-# /proc/uptime의 첫 번째 숫자가 시스템 업타임(초) 입니다.
 UPTIME=$(cut -d' ' -f1 /proc/uptime | cut -d'.' -f1)
 
 if [ "$UPTIME" -lt "$GRACE_PERIOD" ]; then
-  # 업타임이 유예 기간보다 짧으면, 무조건 정상으로 처리하여 무한 재부팅 방지
   exit 0
 fi
 
-# --- 유예 기간이 지났을 때만 아래의 원래 로직 실행 ---
 if [ ! -d "$TARGET_FOLDER" ]; then
     exit 1
 fi
@@ -130,7 +85,9 @@ fi
 """
         print("Uploading updated check script...")
         temp_script_path = "/tmp/quick_folder_check.sh"
-        sftp.putfo(io.StringIO(check_script_content), temp_script_path)
+        
+        # ▼▼▼ [수정된 부분 1] StringIO -> BytesIO, .encode('utf-8') 추가 ▼▼▼
+        sftp.putfo(io.BytesIO(check_script_content.encode('utf-8')), temp_script_path)
         
         run_sudo_command(ssh_client, "sudo mkdir -p /etc/watchdog.d", password)
         
@@ -141,7 +98,6 @@ fi
         if not success: raise Exception(msg)
         print("Check script setup complete.")
 
-        # --- Watchdog 설정 파일 내용 (이전과 동일) ---
         config_path = "/etc/watchdog.conf"
         config_content = f"""
 watchdog-device        = /dev/watchdog
@@ -152,7 +108,9 @@ test-timeout           = 5
 """
         print(f"Uploading watchdog config to {config_path}...")
         temp_config_path = "/tmp/watchdog.conf"
-        sftp.putfo(io.StringIO(config_content.strip()), temp_config_path)
+
+        # ▼▼▼ [수정된 부분 2] StringIO -> BytesIO, .encode('utf-8') 추가 ▼▼▼
+        sftp.putfo(io.BytesIO(config_content.strip().encode('utf-8')), temp_config_path)
 
         success, msg = run_sudo_command(ssh_client, f"sudo mv {temp_config_path} {config_path}", password)
         if not success: raise Exception(msg)
@@ -196,15 +154,3 @@ if __name__ == "__main__":
     print("-" * 30)
     if success:
         print(f"✅ Success: {message}")
-    else:
-        print(f"❌ Failure: {message}")
-## 4. 사용 방법
-사용법은 이전과 거의 동일합니다.
-
-우분투에 pip install paramiko 로 라이브러리를 설치합니다.
-
-위 코드를 setup_pi_watchdog_safe.py 같은 파일로 저장합니다.
-
-스크립트 상단의 사용자 설정 부분을 본인의 환경에 맞게 수정합니다. 특히 BOOT_GRACE_PERIOD_SECONDS 값이 중요합니다.
-
-우분투 터미널에서 python3 setup_pi_watchdog_safe.py로 실행합니다.
