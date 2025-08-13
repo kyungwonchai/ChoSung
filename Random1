@@ -1,176 +1,155 @@
-안녕하세요! 라즈베리파이3의 Watchdog 5.15 버전을 사용하여 PM2 프로세스를 감시하고, 10초마다 체크하여 20번 연속 실패 시 재부팅하는 목표를 달성하기 위한 설정 방법을 아주 상세하게 설명해 드리겠습니다.
+지적해주신 내용이 정확합니다. 죄송합니다. 제가 제시한 이전 방법은 체크 스크립트(check.sh)가 수 초 내에 완료되는 일반적인 경우를 가정한 것이었습니다.
 
-test-timeout, interval, retry-timeout 등의 옵션들이 어떻게 상호작용하는지 명확하게 이해하실 수 있도록 구성했습니다.
+스크립트 실행 시간(3분)이 Watchdog의 확인 주기(interval=10초)보다 훨씬 길기 때문에, 말씀하신 대로 10초마다 3분짜리 프로세스가 계속 생성되어 시스템 리소스를 고갈시키고 결국 시스템이 다운되는 심각한 문제가 발생합니다.
 
-## 🎯 목표 달성을 위한 핵심 원리
-사용자님의 목표를 달성하기 위한 핵심은 Watchdog 데몬의 역할과 테스트 스크립트의 역할을 분리하는 것입니다.
+이 문제를 해결하기 위한 올바른 아키텍처는 역할을 명확히 분리하는 것입니다.
 
-Watchdog 데몬 (/etc/watchdog.conf):
+## ⚙️ 해결 방안: 역할 분리 (Decoupling)
+핵심은 오래 걸리는 작업과 빠른 상태 확인을 분리하는 것입니다.
 
-주기적으로(interval) 테스트 스크립트를 실행합니다.
+장기 실행 검사 서비스 (Checker Daemon): 3분짜리 검사 스크립트(check.sh)를 백그라운드에서 계속 실행시키는 별도의 서비스입니다. 이 서비스는 검사가 성공할 때마다 "나 살아있어"라는 의미의 생존 신호(Heartbeat) 파일을 갱신합니다.
 
-스크립트가 정해진 시간(test-timeout) 내에 끝나지 않으면 실패로 간주합니다.
+Watchdog: 10초마다 아주 빠른 스크립트를 실행합니다. 이 스크립트는 3분짜리 검사를 직접 실행하는 것이 아니라, 위에서 만든 생존 신호 파일이 최근에 갱신되었는지만 1초 안에 확인합니다.
 
-스크립트의 결과(종료 코드) 가 '최종 실패'일 경우, 하드웨어 Watchdog 타이머를 더 이상 갱신하지 않아 시스템 재부팅을 유발합니다. (watchdog-timeout 시간 이후)
+만약 장기 실행 검사 서비스가 어떤 이유로 멈추거나 먹통이 되면, 생존 신호 파일이 더 이상 갱신되지 않습니다. 그러면 Watchdog이 이를 감지하고 시스템을 재부팅하게 됩니다.
 
-테스트 스크립트 (test.sh):
+## 📝 단계별 실행 방법
+1. 장기 실행 검사 서비스 스크립트 작성 (/usr/local/bin/long_running_checker.sh)
+이 스크립트는 무한 루프를 돌며 실제 3분짜리 검사를 수행하고, 성공 시 생존 신호 파일을 touch 명령어로 갱신합니다.
 
-실질적인 감시 로직을 수행합니다. 즉, PM2 프로세스가 'online' 상태인지 확인합니다.
-
-'20번 연속 실패'라는 조건을 스스로 카운트하고 상태를 관리합니다.
-
-20번 연속 실패에 도달하기 전까지는 PM2 프로세스가 멈춰있더라도 Watchdog 데몬에게는 '성공(종료 코드 0)' 신호를 보냅니다. (아직 재부팅할 때가 아니므로)
-
-마침내 20번 연속 실패가 누적되면, 그때서야 Watch_dog 데몬에게 '최종 실패(종료 코드 1)' 신호를 보내 재부팅을 유발합니다.
-
-이 구조를 이해하시면 아래 설정이 훨씬 명확하게 다가올 것입니다.
-
-## ⚙️ Watchdog 옵션 상세 설명 및 상관관계
-핵심적인 옵션들의 의미와 서로 어떻게 영향을 주는지 설명드리겠습니다. 이 값들은 /etc/watchdog.conf 파일에 설정합니다.
-
-옵션명	설명	사용자 목표와의 관계
-interval	Watchdog 데몬의 메인 루프 주기 (초 단위) 입니다. 이 시간마다 시스템 상태를 체크하고, 설정된 테스트 바이너리(스크립트)를 실행합니다.	10 으로 설정합니다. "10초마다 체크"라는 요구사항을 정확히 만족시킵니다.
-watchdog-timeout	하드웨어 Watchdog 타이머의 타임아웃 (초 단위) 입니다. Watchdog 데몬이 이 시간 안에 하드웨어 타이머(/dev/watchdog)를 갱신("pet the dog")해주지 않으면 하드웨어가 시스템을 강제 재부팅시킵니다.	15 또는 20으로 설정하는 것을 권장합니다. 반드시 interval 보다 커야 합니다. interval이 10초인데 데몬이 어떤 이유로 11초만에 깨어난다면, watchdog-timeout이 10초일 경우 불필요한 재부팅이 발생할 수 있습니다. interval보다 약간의 여유를 주는 것이 안정적입니다.
-test-binary	interval 주기마다 실행할 테스트 프로그램의 절대 경로입니다. 이 프로그램의 종료 코드로 성공/실패를 판단합니다.	/etc/watchdog.d/pm2_check.sh 와 같이 스크립트 파일의 경로를 지정합니다. (파일 이름은 자유롭게 지정 가능)
-test-timeout	test-binary가 실행되고 완료되기까지 기다려주는 최대 시간 (초 단위) 입니다. 이 시간을 초과하면 테스트가 실패한 것으로 간주합니다.	반드시 interval 보다 작아야 합니다. interval이 10초인데 test-timeout이 10초 이상이면 테스트가 끝나기도 전에 다음 루프가 시작될 수 있습니다. 8 정도로 설정하는 것이 안전합니다.
-상관관계 정리
-가장 중요한 관계는 시간 순서입니다.
-
-test-timeout < interval < watchdog-timeout
-
-10초(interval) 마다 테스트 스크립트를 실행한다.
-
-이 스크립트는 8초(test-timeout) 안에 반드시 종료되어야 한다.
-
-만약 스크립트가 '최종 실패' 신호를 보내면, Watchdog 데몬은 더 이상 하드웨어 타이머를 갱신하지 않고, 15초(watchdog-timeout) 후에 시스템이 재부팅된다.
-
-retry-timeout 은 왜 사용하지 않는가?
-retry-timeout은 테스트가 실패했을 때, 수리 스크립트(repair-binary) 가 실행되고 완료될 때까지 기다리는 시간입니다. 하지만 우리의 목표는 '20회 누적 실패'를 확인하는 것이지, 실패 즉시 무언가를 수리하는 것이 아닙니다. 실패 횟수 관리는 테스트 스크립트 내부에서 처리하는 것이 훨씬 명확하고 간단하므로 이 시나리오에서는 retry-timeout과 repair-binary 옵션을 사용할 필요가 없습니다.
-
-## 📝 해결책: 설정 파일 및 테스트 스크립트 작성
-이제 실제 설정 파일과 스크립트를 작성해 보겠습니다.
-
-1. /etc/watchdog.conf 파일 설정
-sudo nano /etc/watchdog.conf 명령어로 파일을 열고 아래 내용과 같이 수정하거나 추가합니다. 주석(#)이 없는 라인들이 핵심입니다.
-
-코드 스니펫
-
-# ====================================================================
-# watchdog.conf for Raspberry Pi - PM2 Process Check
-# ====================================================================
-
-# 하드웨어 Watchdog 장치 파일 경로입니다. 라즈베리파이는 /dev/watchdog 입니다.
-watchdog-device        = /dev/watchdog
-
-# 하드웨어 Watchdog 타이머의 타임아웃을 15초로 설정합니다. (interval 보다 커야 함)
-watchdog-timeout       = 15
-
-# 테스트 스크립트를 10초마다 실행합니다.
-interval               = 10
-
-# 10초마다 실행할 테스트 스크립트의 경로를 지정합니다.
-test-binary            = /etc/watchdog.d/pm2_check.sh
-
-# 테스트 스크립트의 타임아웃을 8초로 설정합니다. (interval 보다 작아야 함)
-test-timeout           = 8
-
-# 실시간 모니터링을 활성화하여 메모리 할당 등을 더 엄격하게 관리합니다.
-realtime               = yes
-priority               = 1
-
-# 관리자 이메일이나 로그 파일 경로 등은 필요에 따라 설정합니다.
-# log-dir                = /var/log/watchdog
-# admin                  = root
-2. /etc/watchdog.d/pm2_check.sh 테스트 스크립트 작성
-먼저 디렉토리가 없다면 생성합니다: sudo mkdir -p /etc/watchdog.d
-
-이제 sudo nano /etc/watchdog.d/pm2_check.sh 명령어로 스크립트 파일을 생성하고 아래 내용을 붙여넣으세요.
+sudo nano /usr/local/bin/long_running_checker.sh
 
 Bash
 
 #!/bin/bash
 
-# --- 설정부 ---
-# 감시할 PM2 프로세스의 이름 또는 id를 정확하게 입력하세요.
-PM2_PROCESS_NAME="my-app"
+# 생존 신호를 남길 파일 경로
+HEARTBEAT_FILE="/tmp/checker_heartbeat"
 
-# 실패 횟수를 기록할 파일의 경로입니다.
-FAIL_COUNT_FILE="/tmp/pm2_watchdog_fail_count"
+while true; do
+    # 여기에 원래 3분 이상 걸리는 실제 검사 명령어를 넣으세요.
+    # 예시: /path/to/your/real_check.sh
+    # 아래는 예시로 3분간 대기하는 코드입니다. 실제 검사 코드로 대체하세요.
+    echo "Starting 3-minute check..."
+    /path/to/your/real_check.sh
 
-# 재부팅을 트리거할 최대 실패 횟수입니다.
-MAX_FAILS=20
-# --- 설정부 끝 ---
+    # 위 검사가 성공적으로 끝나면 (종료 코드 0), 생존 신호 파일을 갱신합니다.
+    # $? 변수는 직전 명령어의 종료 코드를 담고 있습니다.
+    if [ $? -eq 0 ]; then
+        echo "Check successful. Updating heartbeat."
+        touch "$HEARTBEAT_FILE"
+    else
+        echo "Check failed. Not updating heartbeat."
+    fi
 
+    # 다음 검사까지 잠시 대기 (선택 사항)
+    sleep 10
+done
+[중요]
 
-# PM2 프로세스의 상태가 'online'인지 확인합니다.
-# "pm2 describe"는 JSON 출력을 제공하므로 jq를 사용하는 것이 가장 안정적입니다.
-# 만약 jq가 없다면 'grep'을 사용할 수 있지만, 정확도가 떨어질 수 있습니다.
-# sudo apt-get install jq -y  <-- jq 설치 명령어
+/path/to/your/real_check.sh 부분을 실제 3분짜리 검사 스크립트의 경로로 반드시 바꾸세요.
 
-# jq를 이용한 정확한 상태 확인
-# pm2 describe "$PM2_PROCESS_NAME" | jq -e '.[] | select(.pm2_env.status == "online")' > /dev/null 2>&1
+스크립트에 실행 권한을 부여합니다: sudo chmod +x /usr/local/bin/long_running_checker.sh
 
-# jq 없이 grep을 이용한 확인 (대안)
-pm2 describe "$PM2_PROCESS_NAME" | grep -q "│ status.*│ online"
+2. 장기 실행 검사 서비스를 systemd로 등록
+이 스크립트가 항상 백그라운드에서 실행되도록 systemd 서비스로 만드는 것이 가장 안정적입니다.
 
-# 위 명령어의 종료 코드를 확인합니다. $?는 직전 명령어의 종료 코드를 담고 있습니다.
-# grep -q가 'online' 문자열을 찾았다면 종료 코드는 0 (성공)이 됩니다.
-PROCESS_IS_ONLINE=$?
+sudo nano /etc/systemd/system/long-checker.service
 
-if [ $PROCESS_IS_ONLINE -eq 0 ]; then
-  # 프로세스가 'online' 상태일 경우 (정상)
-  if [ -f "$FAIL_COUNT_FILE" ]; then
-    # 이전에 실패 카운트 파일이 있었다면 깨끗하게 삭제합니다.
-    rm "$FAIL_COUNT_FILE"
-  fi
-  # Watchdog 데몬에게 '성공'을 알리기 위해 종료 코드 0으로 종료합니다.
-  exit 0
-else
-  # 프로세스가 'online' 상태가 아닐 경우 (오류 또는 중지)
-  COUNT=0
-  if [ -f "$FAIL_COUNT_FILE" ]; then
-    # 실패 카운트 파일이 있다면, 현재 카운트를 읽어옵니다.
-    COUNT=$(cat "$FAIL_COUNT_FILE")
-  fi
+Ini, TOML
 
-  # 카운트를 1 증가시킵니다.
-  COUNT=$((COUNT + 1))
-  
-  # 증가된 카운트를 파일에 다시 기록합니다.
-  echo $COUNT > "$FAIL_COUNT_FILE"
+[Unit]
+Description=Long Running Checker Service
+After=network.target
 
-  if [ $COUNT -ge $MAX_FAILS ]; then
-    # 카운트가 최대 허용치(20)에 도달했거나 넘었을 경우
-    echo "PM2 process '$PM2_PROCESS_NAME' failed $COUNT times. Triggering reboot." >&2
-    # Watchdog 데몬에게 '최종 실패'를 알리기 위해 종료 코드 1로 종료합니다.
+[Service]
+ExecStart=/usr/local/bin/long_running_checker.sh
+Restart=always
+User=pi  # 스크립트를 실행할 사용자 계정 (필요시 변경)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+이제 서비스를 활성화하고 시작합니다.
+
+Bash
+
+sudo systemctl enable long-checker.service
+sudo systemctl start long-checker.service
+
+# 서비스가 잘 동작하는지 확인
+sudo systemctl status long-checker.service
+3. Watchdog용 빠른 상태 확인 스크립트 작성 (/etc/watchdog.d/quick_heartbeat_check.sh)
+이 스크립트는 1초도 안 걸립니다. 오직 생존 신호 파일의 수정 시간만 확인합니다.
+
+sudo nano /etc/watchdog.d/quick_heartbeat_check.sh
+
+Bash
+
+#!/bin/bash
+
+HEARTBEAT_FILE="/tmp/checker_heartbeat"
+# 허용할 최대 지연 시간(초). 장기 실행 검사가 3분(180초)이므로,
+# 그보다 넉넉하게 5분(300초) 정도로 설정합니다.
+MAX_DELAY=300
+
+# 파일이 존재하지 않으면 즉시 실패
+if [ ! -f "$HEARTBEAT_FILE" ]; then
     exit 1
-  else
-    # 아직 최대 허용치에 도달하지 않았을 경우
-    echo "PM2 process '$PM2_PROCESS_NAME' is not online. Fail count: $COUNT. Not rebooting yet." >&2
-    # 아직 재부팅할 때가 아니므로, Watchdog 데몬에게는 '성공' 신호를 보냅니다.
-    exit 0
-  fi
 fi
-[중요] 스크립트의 PM2_PROCESS_NAME="my-app" 부분은 실제 감시하고 있는 PM2 프로세스 이름으로 반드시 변경해주세요.
 
-3. 스크립트에 실행 권한 부여
-스크립트를 작성한 후에는 Watchdog 데몬이 실행할 수 있도록 실행 권한을 주어야 합니다.
+# 파일의 마지막 수정 시간과 현재 시간의 차이를 초 단위로 계산
+LAST_MODIFIED=$(stat -c %Y "$HEARTBEAT_FILE")
+CURRENT_TIME=$(date +%s)
+TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
+
+# 시간 차이가 허용된 지연 시간을 초과하면 실패(exit 1)
+if [ $TIME_DIFF -gt $MAX_DELAY ]; then
+    # 장기 실행 검사 프로세스가 멈췄다고 판단, 재부팅 유발
+    exit 1
+else
+    # 아직 정상 범위, 성공(exit 0)
+    exit 0
+fi
+마찬가지로 실행 권한을 부여합니다: sudo chmod +x /etc/watchdog.d/quick_heartbeat_check.sh
+
+4. /etc/watchdog.conf 파일 수정
+이제 Watchdog이 빠른 스크립트를 호출하도록 test-binary 경로를 수정합니다.
+
+sudo nano /etc/watchdog.conf
+
+코드 스니펫
+
+# ... 기존 설정 ...
+
+# Watchdog이 10초마다 실행할 테스트 바이너리를 '빠른 확인 스크립트'로 변경
+test-binary            = /etc/watchdog.d/quick_heartbeat_check.sh
+
+# 빠른 확인 스크립트의 타임아웃은 넉넉하게 5초로 설정
+test-timeout           = 5
+
+# 메인 루프 주기는 그대로 10초
+interval               = 10
+
+# 하드웨어 타임아웃도 그대로 15초
+watchdog-timeout       = 15
+
+# ... 나머지 설정 ...
+## ✅ 최종 적용 및 요약
+모든 파일 수정이 끝났으면 Watchdog 서비스를 재시작하여 최종 적용합니다.
 
 Bash
 
-sudo chmod +x /etc/watchdog.d/pm2_check.sh
-## ✅ 최종 확인 및 서비스 재시작
-모든 설정이 완료되었습니다. 이제 Watchdog 서비스를 활성화하고 시작(또는 재시작)하여 변경사항을 적용합니다.
-
-Bash
-
-# Watchdog 서비스가 부팅 시 자동으로 시작되도록 활성화
-sudo systemctl enable watchdog
-
-# Watchdog 서비스 시작 (또는 재시작)
 sudo systemctl restart watchdog
-이제 Watchdog 서비스가 10초마다 pm2_check.sh 스크립트를 실행하기 시작합니다. 스크립트는 PM2 프로세스의 상태를 확인하고, 20번 연속으로 online 상태가 아닐 경우 exit 1을 반환하여 시스템을 재부팅시킬 것입니다.
+새로운 작동 방식 요약:
 
-서비스가 잘 동작하는지 상태를 확인하려면 아래 명령어를 사용하세요.
+long-checker.service가 백그라운드에서 3분짜리 실제 검사를 계속 수행하며, 성공 시 /tmp/checker_heartbeat 파일의 시간을 갱신합니다.
 
-Bash
+watchdog 서비스는 10초마다 quick_heartbeat_check.sh를 실행합니다.
+
+quick_heartbeat_check.sh는 /tmp/checker_heartbeat 파일의 수정 시간이 5분 이내인지 순식간에 확인하고 종료합니다.
+
+만약 long-checker.service가 멈추면, heartbeat 파일은 더 이상 갱신되지 않습니다.
+
+결국 heartbeat 파일의 수정 시간은 5분을 넘게 되고, quick_heartbeat_check.sh가 exit 1 (실패)을 반환하여 Watchdog이 시스템을 재부팅시킵니다.
