@@ -1,70 +1,192 @@
-네, 아주 좋은 생각입니다. 애플리케이션의 핵심 동작이 특정 폴더의 파일을 계속 수정하는 것이라면, 그 폴더의 마지막 수정 시간을 감시하는 것이 가장 직접적이고 확실한 방법입니다.
+겠습니다. 처음부터 설정하는 상황에 맞춰, 우분투에서 실행할 단 하나의 Python 스크립트로 라즈베리파이의 Watchdog 설정을 모두 자동화하는 코드를 드리겠습니다.
 
-이전 단계에서 만들었던 long_running_checker.sh와 long-checker.service는 이제 필요 없습니다. 실제 애플리케이션이 그 역할을 대신하기 때문입니다.
+제공된 코드를 기반으로, 폴더 감시 스크립트 생성 및 Watchdog 서비스 재시작까지 모든 과정을 포함하도록 수정했습니다.
 
-전체 과정을 훨씬 더 간단하게 만들 수 있습니다.
+## 최종 자동화 Python 스크립트
+아래는 우분투 머신에서 실행할 최종 Python 스크립트입니다. 이 스크립트 하나로 라즈베리파이에 필요한 모든 파일을 생성하고, 권한을 설정하며, 서비스를 재시작합니다.
 
-수정된 실행 순서
-1단계: (선택) 이전에 만든 검사 서비스 중지 및 비활성화
-이전 단계에서 만들었던 long-checker.service는 더 이상 필요 없으므로 중지하고 비활성화합니다.
+Python
 
-Bash
+import paramiko
+import io
+import time
 
-# 1. 서비스 중지
-sudo systemctl stop long-checker.service
+# ===============================================================
+# ▼▼▼ 사용자 설정 (이 부분만 수정하세요) ▼▼▼
+# ===============================================================
+# 라즈베리파이 접속 정보
+REMOTE_HOST = '192.168.0.10'  # 라즈베리파이 IP 주소
+REMOTE_PORT = 22
+REMOTE_USER = 'pi'
+REMOTE_PASSWORD = 'your_pi_password' # 라즈베리파이 비밀번호
 
-# 2. 서비스 비활성화 (부팅 시 자동 실행 방지)
-sudo systemctl disable long-checker.service
-2단계: Watchdog용 '폴더 시간' 확인 스크립트 생성
-quick_heartbeat_check.sh를 폴더 버전으로 수정합니다.
+# Watchdog 감시 설정
+TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder" # 감시할 폴더의 절대 경로
+MAX_DELAY_SECONDS = 300  # 이 시간(초) 동안 폴더 수정이 없으면 재부팅
+# ===============================================================
 
-Bash
+def run_sudo_command(ssh_client, command, password):
+    """SSH 클라이언트에서 단일 sudo 명령어를 실행하고 결과를 반환합니다."""
+    try:
+        stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=True)
+        # sudo 프롬프트에 비밀번호 입력
+        stdin.write(password + '\n')
+        stdin.flush()
+        
+        # 명령어 실행이 끝날 때까지 대기
+        exit_status = stdout.channel.recv_exit_status()
+        
+        stdout_output = stdout.read().decode('utf-8').strip()
+        stderr_output = stderr.read().decode('utf-8').strip()
 
-# 1. 스크립트 파일 생성 (이름을 바꿔서 명확하게 합시다)
-sudo nano /etc/watchdog.d/quick_folder_check.sh
+        if exit_status != 0:
+            # sudo 오류 메시지가 포함된 경우 좀 더 명확한 예외 발생
+            if "sudo" in stderr_output.lower():
+                 raise Exception(f"Sudo command failed. Check password or sudoers config. Error: {stderr_output}")
+            raise Exception(f"Command failed with exit status {exit_status}. Error: {stderr_output}")
+            
+        return True, f"Command '{command}' executed successfully."
+    except Exception as e:
+        return False, str(e)
 
-# 2. 아래 내용 붙여넣기
-#!/bin/bash
 
-# ▼▼▼ 감시할 폴더의 절대 경로를 여기에 넣으세요 ▼▼▼
-TARGET_FOLDER="/path/to/your/important/folder"
-# ▲▲▲ 감시할 폴더의 절대 경로를 여기에 넣으세요 ▲▲▲
+def setup_watchdog_on_remote(hostname, port, username, password, target_folder, max_delay):
+    """
+    원격 라즈베리파이에 접속하여 Watchdog 설정을 자동화하는 메인 함수
+    1. 폴더 감시 스크립트 생성 및 업로드
+    2. Watchdog 설정 파일 생성 및 업로드
+    3. Watchdog 서비스 재시작
+    """
+    ssh_client = None
+    try:
+        # --- 1. SSH 연결 ---
+        print("Connecting to Raspberry Pi...")
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(hostname, port=port, username=username, password=password, timeout=10)
+        sftp = ssh_client.open_sftp()
+        print("Connection successful.")
 
-# 허용할 최대 지연 시간(초). 이 시간 이상 폴더 수정이 없으면 재부팅.
-MAX_DELAY=300
+        # --- 2. 폴더 감시 스크립트 내용 생성 ---
+        check_script_path = "/etc/watchdog.d/quick_folder_check.sh"
+        check_script_content = f"""#!/bin/bash
+TARGET_FOLDER="{target_folder}"
+MAX_DELAY={max_delay}
 
-# 폴더가 존재하지 않으면 즉시 실패
 if [ ! -d "$TARGET_FOLDER" ]; then
     exit 1
 fi
 
-# 폴더의 마지막 수정 시간과 현재 시간의 차이를 초 단위로 계산
 LAST_MODIFIED=$(stat -c %Y "$TARGET_FOLDER")
 CURRENT_TIME=$(date +%s)
 TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
 
-# 시간 차이가 허용된 지연 시간을 초과하면 실패(exit 1)
 if [ $TIME_DIFF -gt $MAX_DELAY ]; then
     exit 1
 else
     exit 0
 fi
+"""
+        # --- 3. 폴더 감시 스크립트 업로드 및 권한 설정 ---
+        print(f"Uploading check script to {check_script_path}...")
+        temp_script_path = "/tmp/quick_folder_check.sh"
+        sftp.putfo(io.StringIO(check_script_content), temp_script_path)
+        
+        # /etc/watchdog.d 디렉토리 생성 (없을 경우 대비)
+        run_sudo_command(ssh_client, "sudo mkdir -p /etc/watchdog.d", password)
+        
+        # 임시 파일을 최종 위치로 이동
+        success, msg = run_sudo_command(ssh_client, f"sudo mv {temp_script_path} {check_script_path}", password)
+        if not success: raise Exception(msg)
+        
+        # 실행 권한 부여
+        success, msg = run_sudo_command(ssh_client, f"sudo chmod +x {check_script_path}", password)
+        if not success: raise Exception(msg)
+        print("Check script setup complete.")
 
-# 3. 저장 후 나와서 실행 권한 부여
-sudo chmod +x /etc/watchdog.d/quick_folder_check.sh
-3단계: Watchdog 설정 파일 수정
-Watchdog이 새로 만든 폴더 확인 스크립트를 바라보도록 경로만 수정합니다.
+        # --- 4. Watchdog 설정 파일 내용 생성 ---
+        config_path = "/etc/watchdog.conf"
+        config_content = f"""
+watchdog-device        = /dev/watchdog
+watchdog-timeout       = 15
+interval               = 10
+test-binary            = {check_script_path}
+test-timeout           = 5
+"""
+        # --- 5. Watchdog 설정 파일 업로드 ---
+        print(f"Uploading watchdog config to {config_path}...")
+        temp_config_path = "/tmp/watchdog.conf"
+        sftp.putfo(io.StringIO(config_content.strip()), temp_config_path)
+
+        success, msg = run_sudo_command(ssh_client, f"sudo mv {temp_config_path} {config_path}", password)
+        if not success: raise Exception(msg)
+
+        # 파일 소유권 및 권한 설정
+        run_sudo_command(ssh_client, f"sudo chown root:root {config_path}", password)
+        run_sudo_command(ssh_client, f"sudo chmod 644 {config_path}", password)
+        print("Watchdog config setup complete.")
+
+        # --- 6. Watchdog 서비스 재시작 ---
+        print("Restarting watchdog service...")
+        success, msg = run_sudo_command(ssh_client, "sudo systemctl restart watchdog", password)
+        if not success: raise Exception(msg)
+        print("Watchdog service restarted.")
+        
+        # 서비스 상태 확인 (선택 사항)
+        time.sleep(2)
+        print("\nVerifying watchdog service status...")
+        run_sudo_command(ssh_client, "sudo systemctl status watchdog --no-pager -l", password)
+
+        sftp.close()
+        return (True, "Watchdog setup on Raspberry Pi completed successfully!")
+
+    except Exception as e:
+        return (False, f"An error occurred: {e}")
+    
+    finally:
+        if ssh_client:
+            ssh_client.close()
+            print("\nConnection closed.")
+
+
+if __name__ == "__main__":
+    success, message = setup_watchdog_on_remote(
+        hostname=REMOTE_HOST,
+        port=REMOTE_PORT,
+        username=REMOTE_USER,
+        password=REMOTE_PASSWORD,
+        target_folder=TARGET_FOLDER_TO_WATCH,
+        max_delay=MAX_DELAY_SECONDS
+    )
+    
+    print("-" * 30)
+    if success:
+        print(f"✅ Success: {message}")
+    else:
+        print(f"❌ Failure: {message}")
+
+## 사용 방법
+라이브러리 설치: 우분투 머신에 paramiko가 설치되어 있지 않다면 설치합니다.
 
 Bash
 
-# 1. 설정 파일 열기
-sudo nano /etc/watchdog.conf
+pip install paramiko
+스크립트 저장: 위 코드를 setup_pi_watchdog.py 와 같은 이름으로 우분투 머신에 저장합니다.
 
-# 2. test-binary 경로를 새 스크립트 이름으로 변경
-test-binary = /etc/watchdog.d/quick_folder_check.sh
-watchdog.conf 파일의 다른 설정(interval=10, watchdog-timeout=15 등)은 그대로 두시면 됩니다.
+변수 수정: 스크립트 상단의 사용자 설정 섹션에서 다음 4가지 값을 실제 환경에 맞게 수정합니다.
 
-4단계: Watchdog 서비스 재시작
+REMOTE_HOST: 라즈베리파이의 IP 주소
+
+REMOTE_PASSWORD: 라즈베리파이의 pi 계정 비밀번호
+
+TARGET_FOLDER_TO_WATCH: Watchdog이 감시할 라즈베리파이 내의 폴더 경로
+
+MAX_DELAY_SECONDS: 폴더 수정이 없을 때 재부팅까지 기다릴 시간 (초)
+
+스크립트 실행: 우분투 터미널에서 스크립트를 실행합니다.
+
 Bash
 
-# 설정 적용을 위해 Watchdog 재시작
+python3 setup_pi_watchdog.py
+스크립트가 실행되면 라즈베리파이에 자동으로 접속하여 모든 설정 작업을 순서대로 진행하고, 최종적으로 성공 또는 실패 메시지를 출력합니다.
+
