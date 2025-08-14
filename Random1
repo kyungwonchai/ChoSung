@@ -1,151 +1,115 @@
-import paramiko
-import io
-import time
-import os
+네, 자꾸 재부팅된다면 테스트 스크립트가 '실패' 신호를 보내고 있을 확률이 매우 높습니다.
 
-# ===============================================================
-# ▼▼▼ 사용자 설정 (이 부분만 수정하세요) ▼▼▼
-# ===============================================================
-# 라즈베리파이 접속 정보
-REMOTE_HOST = '192.168.0.10'
-REMOTE_PORT = 22
-REMOTE_USER = 'pi'
-REMOTE_PASSWORD = 'your_pi_password'
+스크립트가 내부적으로 어떤 값을 계산하고, 어떤 판단을 내리는지 상세하게 출력하도록 디버깅 코드를 추가해 드리겠습니다. 이걸 실행해보면 왜 자꾸 재부팅되는지 원인을 확실히 알 수 있습니다.
 
-# 설치할 .deb 파일의 '우분투 머신' 내 로컬 경로
-LOCAL_DEB_FILE_PATH = '/home/your_user/packages/your-package.deb'
+## 1. 디버깅 기능이 추가된 스크립트 (quick_folder_check.sh)
+아래는 현재 상태를 터미널에 모두 출력해주는 수정된 버전의 스크립트입니다.
 
-# Watchdog 감시 설정
-TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder"
-MAX_DELAY_SECONDS = 300
-BOOT_GRACE_PERIOD_SECONDS = 1320 # (22 * 60)
-# ===============================================================
+Bash
 
-def run_sudo_command(ssh_client, command, password, allow_any_exit=False):
-    """SSH 클라이언트에서 단일 sudo 명령어를 실행하고 결과를 반환합니다."""
-    try:
-        stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=True)
-        stdin.write(password + '\n')
-        stdin.flush()
-        exit_status = stdout.channel.recv_exit_status()
-        stderr_output = stderr.read().decode('utf-8').strip()
-        if not allow_any_exit and exit_status != 0:
-            if "sudo" in stderr_output.lower():
-                 raise Exception(f"Sudo command failed. Check password or sudoers config. Error: {stderr_output}")
-            raise Exception(f"Command '{command}' failed with exit status {exit_status}. Error: {stderr_output}")
-        if "systemctl status" in command:
-            status_output = stdout.read().decode('utf-8').strip()
-            print("--- Service Status ---\n" + status_output + "\n----------------------")
-        return True, f"Command '{command}' executed."
-    except Exception as e:
-        return False, str(e)
+#!/bin/bash
 
+# --- 설정값 (이 값들은 watchdog.conf 설정과 무관하게 스크립트 자체의 동작을 결정) ---
+# 파이썬 스크립트가 이 파일에 값을 써주므로 직접 수정할 필요는 없습니다.
+TARGET_FOLDER="/path/to/your/important/folder"
+MAX_DELAY=300
+GRACE_PERIOD=1320
 
-def setup_pi_environment(hostname, port, username, password, local_deb_path, target_folder, max_delay, grace_period):
-    """
-    SFTP로 .deb 파일을 직접 복사하여 설치하고 Watchdog을 설정하는 최종 스크립트
-    """
-    if not os.path.exists(local_deb_path):
-        return (False, f"Local file not found at: {local_deb_path}")
+# --- [디버깅] 현재 설정된 변수 값들을 출력 ---
+echo "================================================="
+echo "[설정] 스크립트 내부 설정값 확인"
+echo "  - 감시 폴더: $TARGET_FOLDER"
+echo "  - 최대 지연: $MAX_DELAY 초"
+echo "  - 부팅 유예: $GRACE_PERIOD 초"
+echo "-------------------------------------------------"
 
-    ssh_client = None
-    try:
-        print("Connecting to Raspberry Pi...")
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(hostname, port=port, username=username, password=password, timeout=10)
-        sftp = ssh_client.open_sftp()
-        print("Connection successful.")
-
-        # --- .deb 패키지 설치 (Fire and Forget) ---
-        print("\n--- Starting Package Installation (Fire and Forget) ---")
-        deb_filename = os.path.basename(local_deb_path)
-        remote_temp_path = f"/tmp/{deb_filename}"
-
-        print(f"Step 1: Uploading {deb_filename} to Pi...")
-        sftp.put(local_deb_path, remote_temp_path)
-        print("Upload complete.")
-
-        print(f"Step 2: Executing installation command for {deb_filename}...")
-        install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold {remote_temp_path}"
-        run_sudo_command(ssh_client, install_cmd, password, allow_any_exit=True)
-        
-        print("Command sent. Waiting for 30 seconds for installation to proceed...")
-        time.sleep(30)
-        
-        print("Step 3: Cleaning up temporary file...")
-        run_sudo_command(ssh_client, f"sudo rm {remote_temp_path}", password)
-        print("--- Package Installation Task Finished ---")
-        
-
-        # --- Watchdog 설정 ---
-        print("\n--- Starting Watchdog Setup ---")
-        check_script_path = "/etc/watchdog.d/quick_folder_check.sh"
-        check_script_content = f"""#!/bin/bash
-TARGET_FOLDER="{target_folder}"
-MAX_DELAY={max_delay}
-GRACE_PERIOD={grace_period}
+# --- 1. 부팅 유예 기간(Grace Period) 확인 ---
+# /proc/uptime의 첫 번째 숫자가 시스템 업타임(초) 입니다.
 UPTIME=$(cut -d' ' -f1 /proc/uptime | cut -d'.' -f1)
-if [ "$UPTIME" -lt "$GRACE_PERIOD" ]; then exit 0; fi
-if [ ! -d "$TARGET_FOLDER" ]; then exit 1; fi
+echo "[정보] 현재 시스템 업타임: $UPTIME 초"
+
+if [ "$UPTIME" -lt "$GRACE_PERIOD" ]; then
+  echo "[상태] 부팅 유예 기간입니다. (현재 업타임 < 유예 시간)"
+  echo "[결과] ✅ 성공(0)을 반환하고 검사를 건너뜁니다."
+  echo "================================================="
+  exit 0
+fi
+
+echo "[상태] 유예 기간이 지났습니다. 폴더 시간 검사를 시작합니다."
+
+# --- 2. 감시 폴더 존재 여부 확인 ---
+if [ ! -d "$TARGET_FOLDER" ]; then
+    echo "[오류] 감시할 폴더를 찾을 수 없습니다: $TARGET_FOLDER"
+    echo "[결과] ❌ 실패(1)를 반환합니다. (재부팅 원인)"
+    echo "================================================="
+    exit 1
+fi
+
+# --- 3. 폴더 수정 시간 계산 ---
 LAST_MODIFIED=$(stat -c %Y "$TARGET_FOLDER")
 CURRENT_TIME=$(date +%s)
 TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
-if [ $TIME_DIFF -gt $MAX_DELAY ]; then exit 1; else exit 0; fi
-"""
-        # 테스트 스크립트 업로드 및 설정
-        sftp.putfo(io.BytesIO(check_script_content.encode('utf-8')), "/tmp/check.sh")
-        run_sudo_command(ssh_client, "sudo mkdir -p /etc/watchdog.d", password)
-        run_sudo_command(ssh_client, f"sudo mv /tmp/check.sh {check_script_path}", password)
-        run_sudo_command(ssh_client, f"sudo chmod +x {check_script_path}", password)
 
-        # ===============================================================
-        # ▼▼▼ 바로 이 부분이 watchdog.conf 파일 내용을 만드는 곳입니다 ▼▼▼
-        # ===============================================================
-        config_content = f"""
-watchdog-device        = /dev/watchdog
-watchdog-timeout       = 15
-interval               = 10
-test-binary            = {check_script_path}
-test-timeout           = 5
-"""
-        # ===============================================================
-        
-        # 설정 파일 업로드 및 권한 설정
-        sftp.putfo(io.BytesIO(config_content.strip().encode('utf-8')), "/tmp/wd.conf")
-        run_sudo_command(ssh_client, "sudo mv /tmp/wd.conf /etc/watchdog.conf", password)
-        run_sudo_command(ssh_client, "sudo chown root:root /etc/watchdog.conf", password)
-        
-        # Watchdog 서비스 재시작 및 상태 확인
-        run_sudo_command(ssh_client, "sudo systemctl restart watchdog", password)
-        time.sleep(2)
-        run_sudo_command(ssh_client, "sudo systemctl status watchdog --no-pager -l", password, allow_any_exit=True)
-        print("--- Watchdog Setup Complete ---")
+echo "[정보] 폴더 최종 수정 시간 (타임스탬프): $LAST_MODIFIED"
+echo "[정보] 현재 시간 (타임스탬프): $CURRENT_TIME"
+echo "[정보] 계산된 시간 차이: $TIME_DIFF 초"
 
-        sftp.close()
-        return (True, "All tasks including package installation attempt completed!")
+# --- 4. 최종 판단 ---
+if [ $TIME_DIFF -gt $MAX_DELAY ]; then
+  echo "[상태] 계산된 시간 차이($TIME_DIFF)가 최대 허용치($MAX_DELAY)를 초과했습니다."
+  echo "[결과] ❌ 실패(1)를 반환합니다. (재부팅 원인)"
+  echo "================================================="
+  exit 1
+else
+  echo "[상태] 계산된 시간 차이($TIME_DIFF)가 허용 범위 내에 있습니다."
+  echo "[결과] ✅ 성공(0)을 반환합니다."
+  echo "================================================="
+  exit 0
+fi
+## 2. 스크립트 수정 및 수동 실행 방법
+스크립트 열기: 라즈베리파이 터미널에서 아래 명령어로 스크립트 파일을 엽니다.
 
-    except Exception as e:
-        return (False, f"An error occurred: {e}")
-    
-    finally:
-        if ssh_client:
-            ssh_client.close()
-            print("\nConnection closed.")
+Bash
 
+sudo nano /etc/watchdog.d/quick_folder_check.sh
+붙여넣기: 기존 내용을 모두 지우고, 위에 있는 디버깅 버전의 코드 전체를 복사해서 붙여넣습니다. 그 후 Ctrl+X -> Y -> Enter 키를 눌러 저장합니다.
 
-if __name__ == "__main__":
-    success, message = setup_pi_environment(
-        hostname=REMOTE_HOST,
-        port=REMOTE_PORT,
-        username=REMOTE_USER,
-        password=REMOTE_PASSWORD,
-        local_deb_path=LOCAL_DEB_FILE_PATH,
-        target_folder=TARGET_FOLDER_TO_WATCH,
-        max_delay=MAX_DELAY_SECONDS,
-        grace_period=BOOT_GRACE_PERIOD_SECONDS
-    )
-    
-    print("-" * 30)
-    if success:
-        print(f"✅ Success: {message}")
+수동 실행: 아래 명령어로 스크립트를 직접 실행합니다.
+
+Bash
+
+sudo /etc/watchdog.d/quick_folder_check.sh
+## 3. 출력 메시지 해석 방법
+수동 실행 후 나타나는 메시지를 보면, 왜 Watchdog이 재부팅을 시키는지 바로 알 수 있습니다.
+
+예시 1: 정상 작동일 경우
+=================================================
+[설정] 스크립트 내부 설정값 확인
+  - 감시 폴더: /path/to/your/important/folder
+  - 최대 지연: 300 초
+  - 부팅 유예: 1320 초
+-------------------------------------------------
+[정보] 현재 시스템 업타임: 2500 초
+[상태] 유예 기간이 지났습니다. 폴더 시간 검사를 시작합니다.
+[정보] 폴더 최종 수정 시간 (타임스탬프): 1755100100
+[정보] 현재 시간 (타임스탬프): 1755100250
+[정보] 계산된 시간 차이: 150 초
+[상태] 계산된 시간 차이(150)가 허용 범위 내에 있습니다.
+[결과] ✅ 성공(0)을 반환합니다.
+=================================================
+이 경우는 모든 것이 정상이므로 재부팅되지 않습니다.
+
+예시 2: 재부팅 원인이 되는 실패의 경우
+=================================================
+[설정] 스크립트 내부 설정값 확인
+  - 감시 폴더: /path/to/your/important/folder
+  - 최대 지연: 300 초
+  - 부팅 유예: 1320 초
+-------------------------------------------------
+[정보] 현재 시스템 업타임: 3000 초
+[상태] 유예 기간이 지났습니다. 폴더 시간 검사를 시작합니다.
+[정보] 폴더 최종 수정 시간 (타임스탬프): 1755100100
+[정보] 현재 시간 (타임스탬프): 1755100500
+[정보] 계산된 시간 차이: 400 초
+[상태] 계산된 시간 차이(400)가 최대 허용치(300)를 초과했습니다.
+[결과] ❌ 실패(1)를 반환합니다. (재부팅 원인)
