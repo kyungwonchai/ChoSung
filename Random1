@@ -1,47 +1,157 @@
-네, 두 에러 메시지는 하나의 동일한 원인을 가리키고 있습니다. 바로 스크립트 파일의 '줄 바꿈(Line Endings)' 스타일이 달라서 생기는 문제입니다.
+네, 알겠습니다.
 
-\r: command not found 라는 에러가 이 문제의 가장 확실한 증거입니다.
+Windows 환경에서 스크립트 코드를 복사/붙여넣기 할 때 발생할 수 있는 '줄 바꿈' 문제를 원천적으로 방지하기 위해, 파일 업로드 직후 sed 명령어로 자동 변환하는 로직을 파이썬 스크립트에 추가했습니다.
 
-## 1. 문제의 원인: "보이지 않는 문자 \r"
-컴퓨터는 텍스트 파일에서 줄을 바꿀 때, 눈에 보이지 않는 특수 문자를 사용합니다.
+이 버전을 사용하면 어떤 환경에서 코드를 복사하든 안정적으로 실행됩니다.
 
-Windows 방식: 타자기처럼, 커서를 맨 앞으로 옮기고(\r) 한 줄 아래로 내립니다(\n). 그래서 줄 바꿈 문자가 \r\n 두 개입니다.
+## 최종 자동화 Python 스크립트 (sed 명령어 추가 버전)
+run_sudo_command를 호출하는 부분에 sed 명령어가 한 줄 추가되었습니다.
 
-Linux/Unix 방식: 그냥 한 줄 아래로만 내립니다(\n). 줄 바꿈 문자가 \n 한 개입니다.
+Python
 
-현재 상황:
-아마도 스크립트 코드를 Windows PC(메모장 등)에서 복사/붙여넣기 하면서, 눈에 보이지 않는 \r 문자가 파일 안에 포함된 것으로 보입니다.
+import paramiko
+import io
+import time
+import os
 
-리눅스(라즈베리파이)는 이 \r 문자를 해석하지 못하고, 명령어의 일부로 오해해서 "그런 명령어는 없어! (\r: command not found)" 라고 에러를 내는 것입니다. 이 문제 때문에 스크립트의 if ~ fi 같은 구조가 깨져서 unexpected end of file 에러도 함께 발생하는 것입니다.
+# ===============================================================
+# ▼▼▼ 사용자 설정 (이 부분만 수정하세요) ▼▼▼
+# ===============================================================
+# 라즈베리파이 접속 정보
+REMOTE_HOST = '192.168.0.10'
+REMOTE_PORT = 22
+REMOTE_USER = 'pi'
+REMOTE_PASSWORD = 'your_pi_password'
 
-## 2. 해결 방법: 줄 바꿈 스타일 변환하기
-이 "보이지 않는" \r 문자를 모두 삭제하여 리눅스 방식으로 변환해주면 간단히 해결됩니다. 두 가지 방법 중 하나를 선택해서 실행하세요.
+# 설치할 .deb 파일의 '우분투 머신' 내 로컬 경로
+LOCAL_DEB_FILE_PATH = '/home/your_user/packages/your-package.deb'
 
-방법 1 (가장 추천): dos2unix 사용하기
-이 문제를 해결하기 위해 특별히 만들어진 도구입니다.
+# Watchdog 감시 설정
+TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder"
+MAX_DELAY_SECONDS = 300
+BOOT_GRACE_PERIOD_SECONDS = 1320 # (22 * 60)
+# ===============================================================
 
-dos2unix 설치 (아마 설치되어 있지 않을 겁니다)
+def run_sudo_command(ssh_client, command, password, allow_any_exit=False):
+    """SSH 클라이언트에서 단일 sudo 명령어를 실행하고 결과를 반환합니다."""
+    try:
+        stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=True)
+        stdin.write(password + '\n')
+        stdin.flush()
+        exit_status = stdout.channel.recv_exit_status()
+        stderr_output = stderr.read().decode('utf-8').strip()
+        if not allow_any_exit and exit_status != 0:
+            if "sudo" in stderr_output.lower():
+                 raise Exception(f"Sudo command failed. Check password or sudoers config. Error: {stderr_output}")
+            raise Exception(f"Command '{command}' failed with exit status {exit_status}. Error: {stderr_output}")
+        if "systemctl status" in command:
+            status_output = stdout.read().decode('utf-8').strip()
+            print("--- Service Status ---\n" + status_output + "\n----------------------")
+        return True, f"Command '{command}' executed."
+    except Exception as e:
+        return False, str(e)
 
-Bash
 
-sudo apt-get update
-sudo apt-get install dos2unix
-파일 변환
-아래 명령어를 실행하면 스크립트 파일이 리눅스 방식으로 즉시 변환됩니다.
+def setup_pi_environment(hostname, port, username, password, local_deb_path, target_folder, max_delay, grace_period):
+    """
+    SFTP로 .deb 파일을 직접 복사하여 설치하고 Watchdog을 설정하는 최종 스크립트
+    """
+    if not os.path.exists(local_deb_path):
+        return (False, f"Local file not found at: {local_deb_path}")
 
-Bash
+    ssh_client = None
+    try:
+        print("Connecting to Raspberry Pi...")
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(hostname, port=port, username=username, password=password, timeout=10)
+        sftp = ssh_client.open_sftp()
+        print("Connection successful.")
 
-sudo dos2unix /etc/watchdog.d/quick_folder_check.sh
-방법 2 (대안): sed 사용하기
-dos2unix 설치가 번거롭다면, 리눅스에 기본적으로 내장된 sed 명령어로도 해결할 수 있습니다.
+        # --- .deb 패키지 설치 (Fire and Forget) ---
+        print("\n--- Starting Package Installation (Fire and Forget) ---")
+        deb_filename = os.path.basename(local_deb_path)
+        remote_temp_path = f"/tmp/{deb_filename}"
 
-아래 명령어 한 줄만 실행하세요.
-파일을 직접 열어서 \r을 찾아 모두 삭제해주는 명령어입니다.
+        print(f"Step 1: Uploading {deb_filename} to Pi...")
+        sftp.put(local_deb_path, remote_temp_path)
+        print("Upload complete.")
 
-Bash
+        print(f"Step 2: Executing installation command for {deb_filename}...")
+        install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold {remote_temp_path}"
+        run_sudo_command(ssh_client, install_cmd, password, allow_any_exit=True)
+        
+        print("Command sent. Waiting for 30 seconds for installation to proceed...")
+        time.sleep(30)
+        
+        print("Step 3: Cleaning up temporary file...")
+        run_sudo_command(ssh_client, f"sudo rm {remote_temp_path}", password)
+        print("--- Package Installation Task Finished ---")
+        
 
-sudo sed -i 's/\r$//' /etc/watchdog.d/quick_folder_check.sh
-## 3. 결론 및 다음 단계
-위 두 방법 중 하나로 파일을 변환하신 후, 다시 스크립트를 수동으로 실행해보세요.
+        # --- Watchdog 설정 ---
+        print("\n--- Starting Watchdog Setup ---")
+        check_script_path = "/etc/watchdog.d/quick_folder_check.sh"
+        check_script_content = f"""#!/bin/bash
+TARGET_FOLDER="{target_folder}"
+MAX_DELAY={max_delay}
+GRACE_PERIOD={grace_period}
+UPTIME=$(cut -d' ' -f1 /proc/uptime | cut -d'.' -f1)
+if [ "$UPTIME" -lt "$GRACE_PERIOD" ]; then exit 0; fi
+if [ ! -d "$TARGET_FOLDER" ]; then exit 1; fi
+LAST_MODIFIED=$(stat -c %Y "$TARGET_FOLDER")
+CURRENT_TIME=$(date +%s)
+TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
+if [ $TIME_DIFF -gt $MAX_DELAY ]; then exit 1; else exit 0; fi
+"""
+        sftp.putfo(io.BytesIO(check_script_content.encode('utf-8')), "/tmp/check.sh")
+        run_sudo_command(ssh_client, "sudo mkdir -p /etc/watchdog.d", password)
+        run_sudo_command(ssh_client, f"sudo mv /tmp/check.sh {check_script_path}", password)
+        
+        # ===============================================================
+        # ▼▼▼ [추가] Windows 줄 바꿈 문자(\r) 자동 제거 ▼▼▼
+        # ===============================================================
+        sed_command = f"sudo sed -i 's/\\r$//' {check_script_path}"
+        run_sudo_command(ssh_client, sed_command, password)
+        # ===============================================================
+        
+        run_sudo_command(ssh_client, f"sudo chmod +x {check_script_path}", password)
 
-Bash
+        config_content = f"watchdog-device=/dev/watchdog\nwatchdog-timeout=15\ninterval=10\ntest-binary={check_script_path}\ntest-timeout=5"
+        sftp.putfo(io.BytesIO(config_content.encode('utf-8')), "/tmp/wd.conf")
+        run_sudo_command(ssh_client, "sudo mv /tmp/wd.conf /etc/watchdog.conf", password)
+        run_sudo_command(ssh_client, "sudo chown root:root /etc/watchdog.conf", password)
+        
+        run_sudo_command(ssh_client, "sudo systemctl restart watchdog", password)
+        time.sleep(2)
+        run_sudo_command(ssh_client, "sudo systemctl status watchdog --no-pager -l", password, allow_any_exit=True)
+        print("--- Watchdog Setup Complete ---")
+
+        sftp.close()
+        return (True, "All tasks including package installation attempt completed!")
+
+    except Exception as e:
+        return (False, f"An error occurred: {e}")
+    
+    finally:
+        if ssh_client:
+            ssh_client.close()
+            print("\nConnection closed.")
+
+
+if __name__ == "__main__":
+    success, message = setup_pi_environment(
+        hostname=REMOTE_HOST,
+        port=REMOTE_PORT,
+        username=REMOTE_USER,
+        password=REMOTE_PASSWORD,
+        local_deb_path=LOCAL_DEB_FILE_PATH,
+        target_folder=TARGET_FOLDER_TO_WATCH,
+        max_delay=MAX_DELAY_SECONDS,
+        grace_period=BOOT_GRACE_PERIOD_SECONDS
+    )
+    
+    print("-" * 30)
+    if success:
+        print(f"✅ Success: {message}")
+    else:
