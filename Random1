@@ -1,108 +1,41 @@
-네, 가능합니다.
+네, 개념이 헷갈리시는 것이 당연합니다. Watchdog의 작동 방식을 이해하면 왜 그렇게 되어 있는지 명확해집니다. 아주 쉽게 설명해 드릴게요.
 
-설치 명령어 실행 후 성공/실패 여부를 무시하고, 무조건 30초를 기다린 후 다음 작업을 계속하도록 스크립트를 수정할 수 있습니다.
+핵심은 /dev/watchdog는 설정 파일이 아니라는 것입니다.
 
-복잡했던 재시도 로직을 모두 제거하고, 사용자의 요청대로 "실행하고, 기다리고, 넘어가는" 방식으로 코드를 대폭 단순화했습니다.
+/dev/watchdog는 키보드나 마우스처럼, 하드웨어(CPU)와 직접 통신하는 **'통신 창구(장치 파일)'**입니다. 문서 파일이 아니기 때문에 열어봐도 비어있는 것이 정상입니다.
 
-## 최종 자동화 Python 스크립트 (설치 결과 무시 + 30초 대기)
-setup_pi_environment 함수 내의 패키지 설치 부분이 사용자의 요구에 맞게 변경되었습니다.
+Watchdog 시스템은 크게 세 부분으로 나뉩니다.
 
-Python
+## 1. 하드웨어 Watchdog (/dev/watchdog)
+역할: 하드웨어 타이머 그 자체입니다. CPU 안에 내장된 "만약 나를 주기적으로 건드려주지 않으면, 시스템을 강제 재부팅 시켜버리겠다!"라고 말하는 까다로운 장치입니다.
 
-import paramiko
-import io
-import time
-import os
+비유: 자리를 비우면 짖는 경비견 🐕.
 
-# ===============================================================
-# ▼▼▼ 사용자 설정 (이 부분만 수정하세요) ▼▼▼
-# ===============================================================
-REMOTE_HOST = '192.168.0.10'
-REMOTE_PORT = 22
-REMOTE_USER = 'pi'
-REMOTE_PASSWORD = 'your_pi_password'
-LOCAL_DEB_FILE_PATH = '/home/your_user/packages/your-package.deb'
-TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder"
-MAX_DELAY_SECONDS = 300
-BOOT_GRACE_PERIOD_SECONDS = 1320
-# ===============================================================
+작동 방식: 이 파일에 아무 문자나 한 번 써주면(write), 타이머가 리셋됩니다. ("경비견을 쓰다듬어 주는 행위"). 정해진 시간 동안 아무도 이 파일을 건드리지 않으면, 하드웨어가 직접 시스템 리셋을 실행합니다.
 
-def run_sudo_command(ssh_client, command, password, allow_any_exit=False):
-    # ... (이전과 동일한 코드, 생략)
-    try:
-        stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=True)
-        stdin.write(password + '\n')
-        stdin.flush()
-        exit_status = stdout.channel.recv_exit_status()
-        stderr_output = stderr.read().decode('utf-8').strip()
-        if not allow_any_exit and exit_status != 0:
-            if "sudo" in stderr_output.lower(): raise Exception(f"Sudo command failed. Error: {stderr_output}")
-            raise Exception(f"Command '{command}' failed with exit status {exit_status}. Error: {stderr_output}")
-        if "systemctl status" in command:
-            status_output = stdout.read().decode('utf-8').strip()
-            print("--- Service Status ---\n" + status_output + "\n----------------------")
-        return True, f"Command '{command}' executed."
-    except Exception as e:
-        return False, str(e)
+## 2. Watchdog 데몬 (소프트웨어)
+역할: 바로 이 경비견을 주기적으로 쓰다듬어 주는 역할을 하는 배경 프로그램(서비스)입니다. 이 데몬이 살아있는 동안에는 계속 /dev/watchdog 파일을 건드려주기 때문에 시스템이 재부팅되지 않습니다.
 
+비유: 경비견을 돌보는 경비원 👨‍✈️.
 
-def setup_pi_environment(hostname, port, username, password, local_deb_path, target_folder, max_delay, grace_period):
-    if not os.path.exists(local_deb_path):
-        return (False, f"Local file not found at: {local_deb_path}")
-    ssh_client = None
-    try:
-        print("Connecting to Raspberry Pi...")
-        ssh_client = paramiko.SSHClient()
-        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(hostname, port=port, username=username, password=password, timeout=10)
-        sftp = ssh_client.open_sftp()
-        print("Connection successful.")
+핵심 기능: 그냥 쓰다듬어 주기만 하는 게 아니라, "시스템이 정말 건강한가?"를 먼저 확인하고 건강할 때만 쓰다듬어 줍니다. 이 '건강 체크' 방법이 바로 우리가 만든 테스트 스크립트입니다.
 
-        # ===============================================================
-        # ▼▼▼ [수정된 부분] .deb 패키지 설치 로직 ▼▼▼
-        # ===============================================================
-        print("\n--- Starting Package Installation (Fire and Forget) ---")
-        
-        deb_filename = os.path.basename(local_deb_path)
-        remote_temp_path = f"/tmp/{deb_filename}"
+## 3. Watchdog 설정 파일 (/etc/watchdog.conf)
+역할: 바로 이 경비원에게 내리는 '업무 지침서' 입니다. 지금까지 저희가 파이썬 스크립트로 만들고 수정했던 파일이 바로 이것입니다.
 
-        print(f"Step 1: Uploading {deb_filename} to Pi...")
-        sftp.put(local_deb_path, remote_temp_path)
-        print("Upload complete.")
+비유: 경비원의 업무 규칙서 📜.
 
-        print(f"Step 2: Executing installation command for {deb_filename}...")
-        install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold {remote_temp_path}"
-        
-        # [수정 1] allow_any_exit=True를 사용하여 명령어의 성공/실패 여부를 무시합니다.
-        run_sudo_command(ssh_client, install_cmd, password, allow_any_exit=True)
-        
-        # [수정 2] 명령어 실행 후, 결과와 상관없이 30초 동안 대기합니다.
-        print("Command sent. Waiting for 30 seconds for installation to proceed...")
-        time.sleep(30)
-        
-        # [수정 3] 복잡한 재시도 및 에러 확인 로직을 모두 제거했습니다.
-        
-        print("Step 3: Cleaning up temporary file...")
-        run_sudo_command(ssh_client, f"sudo rm {remote_temp_path}", password)
-        print("--- Package Installation Task Finished ---")
-        # ===============================================================
+설정 내용: 이 지침서에는 다음과 같은 내용이 적혀 있습니다.
 
-        # --- [기존 부분] Watchdog 설정 로직 (변경 없음) ---
-        print("\n--- Starting Watchdog Setup ---")
-        # (이전과 동일한 Watchdog 설정 코드가 여기에 위치합니다)
-        # (생략)
+interval = 10: "경비원님, 10초마다 한 번씩 순찰(체크)하세요."
 
-        sftp.close()
-        return (True, "All tasks including package installation attempt completed!")
+test-binary = /etc/watchdog.d/quick_folder_check.sh: "순찰할 때, 이 스크립트를 실행해서 시스템 상태를 확인하세요."
 
-    except Exception as e:
-        return (False, f"An error occurred: {e}")
-    
-    finally:
-        if ssh_client:
-            ssh_client.close()
-            print("\nConnection closed.")
+watchdog-timeout = 15: "만약 최악의 경우 경비원님과 연락이 끊기면(데몬 다운), 경비견은 15초 뒤에 짖기 시작할 겁니다(재부팅)."
 
+## 결론
+"경비원(watchdog 데몬)은 규칙서(/etc/watchdog.conf)에 따라, 10초마다 순찰 스크립트를 실행해서 이상이 없으면, 경비견(/dev/watchdog)을 쓰다듬어 재부팅을 막는다."
 
-if __name__ == "__main__":
-    # ... (이전과 동일한 main 실행 코드, 생략) ...
+따라서 사용자님께서 개념을 놓치신 것이 아닙니다.
+
+dev/watchdog는 원래 비어있는 게 맞습니다. (하드웨어 통신 창구)
