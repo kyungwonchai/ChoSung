@@ -1,127 +1,111 @@
-네, 알겠습니다. 모든 라즈베리파이의 사용자 이름과 비밀번호가 동일하다면, 스크립트를 훨씬 더 간단하게 만들 수 있습니다.
+, 기억합니다. 자동화 작업을 위해 SSH로 안전하게 접속할 수 있는 전용 계정(pi2)을 만드는 파이썬 스크립트에 대해 이야기했었죠.
 
-IP 주소만 리스트로 관리하고, 사용자 이름과 비밀번호는 한 번만 설정하도록 수정한 최종 코드입니다.
+당시의 핵심 목표는 기존 관리자 계정(pi)을 이용해 원격으로 접속한 뒤, 새로운 관리자 계정(pi2)을 생성하고, 이 계정이 비밀번호 없이 sudo 명령을 실행할 수 있도록 설정하는 것이었습니다.
 
-## 최종 자동화 Python 스크립트 (다중 IP, 단일 계정)
-스크립트 상단의 REMOTE_HOSTS_IPS 리스트에 원하는 만큼 IP 주소를 추가하기만 하면 됩니다.
+아래는 이 모든 과정을 자동화하는 상세한 파이썬 스크립트입니다.
+
+## 'pi2' 계정 생성 및 sudo 권한 부여 자동화 스크립트
+이 스크립트는 원격 라즈베리파이에 접속하여 다음 작업을 순차적으로 수행합니다.
+
+사용자 생성: pi2라는 새로운 사용자를 생성합니다.
+
+비밀번호 설정: 생성된 pi2 계정의 비밀번호를 설정합니다.
+
+관리자 그룹 추가: pi2 계정을 sudo 그룹에 추가하여 관리자 권한을 부여합니다.
+
+sudoers 설정: pi2 계정이 sudo 명령을 사용할 때 비밀번호를 묻지 않도록 /etc/sudoers 파일을 수정합니다.
 
 Python
 
 import paramiko
-import io
 import time
-import os
 
 # ===============================================================
 # ▼▼▼ 사용자 설정 (이 부분만 수정하세요) ▼▼▼
 # ===============================================================
-# [중요] 작업할 라즈베리파이 IP 목록
-REMOTE_HOST_IPS = [
-    '192.168.0.10',
-    '192.168.0.11',
-    '192.168.0.12',
-    '192.168.0.13',
-    # 필요한 만큼 여기에 계속 추가...
-]
-
-# 모든 라즈베리파이의 공통 사용자 정보
+# [접속 정보] 기존에 접속 가능한 라즈베리파이 관리자 계정 정보
+REMOTE_HOST = '192.168.0.10'
 REMOTE_USER = 'pi'
-REMOTE_PASSWORD = 'your_common_password' # 모든 파이에 동일한 비밀번호
+REMOTE_PASSWORD = 'your_pi_password' # 기존 pi 계정의 비밀번호
 
-# 설치할 .deb 파일의 '우분투 머신' 내 로컬 경로
-LOCAL_DEB_FILE_PATH = '/home/your_user/packages/your-package.deb'
-
-# --- Watchdog 시간 설정 ---
-WATCHDOG_INTERVAL = 30             # 소프트웨어가 체크하는 간격 (초)
-
-# Watchdog 감시 설정
-TARGET_FOLDER_TO_WATCH = "/path/to/your/important/folder"
-MAX_DELAY_SECONDS = 300            # 테스트 스크립트가 폴더의 지연을 판정하는 기준
-BOOT_GRACE_PERIOD_SECONDS = 1320   # 부팅 후 무한 재부팅 방지를 위한 유예 기간
+# [신규 계정 정보] 새로 만들 계정의 정보
+NEW_USERNAME = 'pi2'
+NEW_PASSWORD = 'new_password_for_pi2' # pi2 계정에 설정할 새 비밀번호
 # ===============================================================
 
-def run_sudo_command(ssh_client, command, password, allow_any_exit=False):
-    """SSH 클라이언트에서 단일 sudo 명령어를 실행하고 결과를 반환합니다."""
+def run_sudo_command(ssh_client, command, password):
+    """SSH 클라이언트에서 단일 sudo 명령어를 실행하는 헬퍼 함수"""
     try:
         stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=True)
+        # sudo 프롬프트에 비밀번호 입력
         stdin.write(password + '\n')
         stdin.flush()
+        
+        # 명령어 실행이 끝날 때까지 대기
         exit_status = stdout.channel.recv_exit_status()
+        
         stderr_output = stderr.read().decode('utf-8').strip()
-        if not allow_any_exit and exit_status != 0:
-            if "sudo" in stderr_output.lower():
-                 raise Exception(f"Sudo command failed. Check password or sudoers config. Error: {stderr_output}")
-            raise Exception(f"Command '{command}' failed with exit status {exit_status}. Error: {stderr_output}")
-        if "systemctl status" in command:
-            status_output = stdout.read().decode('utf-8').strip()
-            print("--- Service Status ---\n" + status_output + "\n----------------------")
-        return True, f"Command '{command}' executed."
+
+        if exit_status != 0:
+            # 에러 메시지에 'already exists'가 포함되어 있으면 성공으로 간주
+            if 'already exists' in stderr_output:
+                print(f"[알림] 이미 존재하는 항목입니다: {stderr_output}")
+                return True, "Already exists, skipping."
+            raise Exception(f"Command failed with exit status {exit_status}. Error: {stderr_output}")
+            
+        return True, f"Command '{command}' executed successfully."
     except Exception as e:
         return False, str(e)
 
 
-def setup_pi_environment(hostname, username, password, local_deb_path, wd_config):
-    """단일 라즈베리파이에 접속하여 패키지 설치 및 Watchdog 설정을 수행하는 함수"""
-    if not os.path.exists(local_deb_path):
-        return (False, f"Local file not found at: {local_deb_path}")
-
+def create_admin_user(hostname, admin_user, admin_pass, new_user, new_pass):
+    """원격 호스트에 접속하여 새로운 관리자 계정을 생성하고 sudo 권한을 설정하는 메인 함수"""
     ssh_client = None
     print(f"\n{'='*20} Starting setup for {hostname} {'='*20}")
-
     try:
-        print(f"[{hostname}] Connecting...")
+        # 1. 기존 관리자 계정으로 SSH 연결
+        print(f"[{hostname}] Connecting as '{admin_user}'...")
         ssh_client = paramiko.SSHClient()
         ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh_client.connect(hostname=hostname, port=22, username=username, password=password, timeout=10)
-        sftp = ssh_client.open_sftp()
+        ssh_client.connect(hostname=hostname, port=22, username=admin_user, password=admin_pass, timeout=10)
         print(f"[{hostname}] Connection successful.")
 
-        # --- 패키지 설치 ---
-        print(f"[{hostname}] Starting Package Installation...")
-        deb_filename = os.path.basename(local_deb_path)
-        remote_temp_path = f"/tmp/{deb_filename}"
-        sftp.put(local_deb_path, remote_temp_path)
-        install_cmd = f"sudo DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold {remote_temp_path}"
-        run_sudo_command(ssh_client, install_cmd, password, allow_any_exit=True)
-        print(f"[{hostname}] Waiting for 30 seconds...")
-        time.sleep(30)
-        run_sudo_command(ssh_client, f"sudo rm {remote_temp_path}", password)
-        print(f"[{hostname}] Package Installation Task Finished.")
-        
-        # --- Watchdog 설정 ---
-        print(f"[{hostname}] Starting Watchdog Setup...")
-        check_script_path = "/etc/watchdog.d/quick_folder_check.sh"
-        check_script_content = f"""#!/bin/bash
-TARGET_FOLDER="{wd_config['target_folder']}"
-MAX_DELAY={wd_config['max_delay']}
-GRACE_PERIOD={wd_config['grace_period']}
-UPTIME=$(cut -d' ' -f1 /proc/uptime | cut -d'.' -f1)
-if [ "$UPTIME" -lt "$GRACE_PERIOD" ]; then exit 0; fi
-if [ ! -d "$TARGET_FOLDER" ]; then exit 1; fi
-LAST_MODIFIED=$(stat -c %Y "$TARGET_FOLDER")
-CURRENT_TIME=$(date +%s)
-TIME_DIFF=$((CURRENT_TIME - LAST_MODIFIED))
-if [ $TIME_DIFF -gt $MAX_DELAY ]; then exit 1; else exit 0; fi
-"""
-        sftp.putfo(io.BytesIO(check_script_content.encode('utf-8')), "/tmp/check.sh")
-        run_sudo_command(ssh_client, "sudo mkdir -p /etc/watchdog.d", password)
-        run_sudo_command(ssh_client, f"sudo mv /tmp/check.sh {check_script_path}", password)
-        sed_command = f"sudo sed -i 's/\\r$//' {check_script_path}"
-        run_sudo_command(ssh_client, sed_command, password)
-        run_sudo_command(ssh_client, f"sudo chmod +x {check_script_path}", password)
+        # 2. 새로운 사용자 계정 생성
+        # -m : 홈 디렉토리 생성
+        # -s /bin/bash : 기본 쉘을 bash로 설정
+        print(f"[{hostname}] Step 1: Creating new user '{new_user}'...")
+        create_user_cmd = f"sudo useradd -m -s /bin/bash {new_user}"
+        success, msg = run_sudo_command(ssh_client, create_user_cmd, admin_pass)
+        if not success: raise Exception(f"User creation failed: {msg}")
+        print(f"[{hostname}] User '{new_user}' created successfully.")
 
-        config_content = f"interval = {wd_config['interval']}\ntest-binary = {check_script_path}\ntest-timeout = 5"
-        sftp.putfo(io.BytesIO(config_content.strip().encode('utf-8')), "/tmp/wd.conf")
-        run_sudo_command(ssh_client, "sudo mv /tmp/wd.conf /etc/watchdog.conf", password)
-        run_sudo_command(ssh_client, "sudo chown root:root /etc/watchdog.conf", password)
-        
-        run_sudo_command(ssh_client, "sudo systemctl restart watchdog", password)
-        time.sleep(2)
-        run_sudo_command(ssh_client, "sudo systemctl status watchdog --no-pager -l", password, allow_any_exit=True)
-        print(f"[{hostname}] Watchdog Setup Complete.")
+        # 3. 새로운 사용자의 비밀번호 설정
+        # echo '비밀번호' | passwd --stdin 사용자명' 형태로 비밀번호를 파이프로 전달
+        print(f"[{hostname}] Step 2: Setting password for '{new_user}'...")
+        set_pass_cmd = f"echo '{new_user}:{new_pass}' | sudo chpasswd"
+        success, msg = run_sudo_command(ssh_client, set_pass_cmd, admin_pass)
+        if not success: raise Exception(f"Password setting failed: {msg}")
+        print(f"[{hostname}] Password set successfully.")
 
-        sftp.close()
-        return (True, f"Setup for {hostname} completed successfully!")
+        # 4. 새로운 사용자를 'sudo' 그룹에 추가
+        print(f"[{hostname}] Step 3: Adding '{new_user}' to 'sudo' group...")
+        add_to_sudo_cmd = f"sudo usermod -aG sudo {new_user}"
+        success, msg = run_sudo_command(ssh_client, add_to_sudo_cmd, admin_pass)
+        if not success: raise Exception(f"Adding to sudo group failed: {msg}")
+        print(f"[{hostname}] User added to 'sudo' group.")
+
+        # 5. 새로운 사용자가 비밀번호 없이 sudo를 사용하도록 설정
+        # /etc/sudoers.d/에 별도 설정 파일을 만들어 관리하는 것이 안전
+        print(f"[{hostname}] Step 4: Configuring passwordless sudo for '{new_user}'...")
+        sudoers_file_path = f"/etc/sudoers.d/010_{new_user}-nopasswd"
+        sudoers_content = f"{new_user} ALL=(ALL) NOPASSWD: ALL"
+        # echo '설정내용' | sudo tee 파일경로' 형태로 파일 쓰기
+        write_sudoers_cmd = f"echo '{sudoers_content}' | sudo tee {sudoers_file_path}"
+        success, msg = run_sudo_command(ssh_client, write_sudoers_cmd, admin_pass)
+        if not success: raise Exception(f"Sudoers configuration failed: {msg}")
+        print(f"[{hostname}] Passwordless sudo configured successfully.")
+
+        return (True, f"Admin user '{new_user}' created and configured successfully on {hostname}!")
 
     except Exception as e:
         return (False, f"An error occurred on {hostname}: {e}")
@@ -133,29 +117,15 @@ if [ $TIME_DIFF -gt $MAX_DELAY ]; then exit 1; else exit 0; fi
 
 
 if __name__ == "__main__":
-    # Watchdog 설정값은 모든 호스트에 동일하게 적용
-    watchdog_settings = {
-        'interval': WATCHDOG_INTERVAL,
-        'target_folder': TARGET_FOLDER_TO_WATCH,
-        'max_delay': MAX_DELAY_SECONDS,
-        'grace_period': BOOT_GRACE_PERIOD_SECONDS
-    }
+    success, message = create_admin_user(
+        hostname=REMOTE_HOST,
+        admin_user=REMOTE_USER,
+        admin_pass=REMOTE_PASSWORD,
+        new_user=NEW_USERNAME,
+        new_pass=NEW_PASSWORD
+    )
     
-    # 작업 결과를 저장할 리스트
-    results = []
-
-    # ▼▼▼ [수정된 부분] IP 주소 리스트를 순회하며 작업을 반복합니다. ▼▼▼
-    for ip_address in REMOTE_HOST_IPS:
-        success, message = setup_pi_environment(
-            hostname=ip_address,
-            username=REMOTE_USER,
-            password=REMOTE_PASSWORD,
-            local_deb_path=LOCAL_DEB_FILE_PATH,
-            wd_config=watchdog_settings
-        )
-        results.append({'host': ip_address, 'success': success, 'message': message})
-    
-    # --- 최종 결과 출력 ---
-    print(f"\n\n{'='*25} Final Summary {'='*25}")
-    for res in results:
-        status_icon = "✅" if res['success'] else "❌"
+    print("-" * 30)
+    if success:
+        print(f"✅ Success: {message}")
+    else:
