@@ -1,35 +1,121 @@
-아니요, 꼭 pyodbc를 붙여야 하는 건 아니에요! 다행히 다른 대안이 있습니다. 😊
+네, 에이전트 환경에 직접 드라이버를 설치할 수 없는 상황은 정말 난감하죠. IT 보안 정책 때문에 자주 발생하는 문제입니다.
 
-가장 대표적인 대안은 pymssql 라이브러리를 사용하는 것입니다.
+결론부터 말씀드리면, pyodbc나 pymssql 같은 드라이버 설치 없이 SQLAlchemy가 MSSQL에 직접 연결할 수 있는 URL은 존재하지 않습니다. SQLAlchemy는 데이터베이스와의 통신을 위해 반드시 해당 DB에 맞는 드라이버(DBAPI)를 필요로 하기 때문입니다. 비유하자면, SQLAlchemy는 '통역사'이고 드라이버는 '전화기'인데, 전화기 없이 통역을 할 수 없는 것과 같습니다.
 
-pyodbc는 윈도우나 리눅스에 설치된 ODBC 드라이버를 통해 데이터베이스에 연결하는 방식이라 설정이 조금 번거로울 수 있습니다. 반면, pymssql은 파이썬 자체적으로 MSSQL의 통신 프로토콜(TDS)을 구현한 라이브러리라 별도의 드라이버 설치 없이 pip만으로 간단하게 설치하고 연결할 수 있다는 큰 장점이 있습니다.
+하지만 희망을 버리긴 이릅니다. 그 "URL"의 개념을 조금 확장해서, 우회적인 방법으로 원하시는 목표를 달성할 수 있습니다. 가장 현실적이고 안정적인 방법은 중간에 간단한 API 서버를 두는 것입니다.
 
-pyodbc vs pymssql 연결 문자열 비교
-두 라이브러리는 SQLAlchemy와 함께 사용할 때 연결 문자열에서 드라이버 부분만 달라집니다.
+## 해결책: 중간 API 서버를 제작하는 방법 (API Gateway)
+에이전트가 DB에 직접 접속하는 대신, 우리가 만든 API 서버에 접속하도록 하는 방식입니다. 이 API 서버는 드라이버 설치가 자유로운 다른 서버에 위치하며, 에이전트를 대신해 DB 작업을 수행하고 결과만 돌려줍니다.
 
-pyodbc 사용 시 (기존 방식)
+동작 방식
 
-ODBC 드라이버 이름 (ODBC Driver 17 for SQL Server 등)을 정확히 지정해야 합니다.
+[Agent (Ubuntu)]: pyodbc나 pymssql 설치가 불가능한 에이전트입니다.
+
+[API Server]: pymssql 등 드라이버 설치가 가능한 별도의 서버입니다. 여기서 DB 연결을 처리합니다.
+
+[MSSQL DB]: 최종 목적지인 데이터베이스입니다.
+
+흐름도
+[Agent] <--- (HTTP 요청) ---> [API Server (pymssql 설치됨)] <--- (DB 연결) ---> [MSSQL DB]
+
+에이전트는 이제 복잡한 DB 연결 정보 대신, 단순한 HTTP URL 주소만 알면 됩니다. 예를 들어 http://<API서버주소>:5000/query 같은 주소죠.
+
+## 구현 예시 (Python Flask 사용)
+가장 간단하게 만들 수 있는 Flask 예시입니다.
+
+1. API 서버 만들기 (api_server.py)
+이 서버는 pymssql과 sqlalchemy가 설치된 곳에서 실행합니다.
 
 Python
 
-from sqlalchemy import create_engine
+# api_server.py
+# 필요한 라이브러리: pip install Flask sqlalchemy pymssql pandas
+from flask import Flask, request, jsonify
+from sqlalchemy import create_engine, text
+import pandas as pd
 
-# pyodbc를 사용하는 연결 문자열
-db_url_with_pyodbc = "mssql+pyodbc://<user>:<password>@<host>:<port>/<dbname>?driver=ODBC+Driver+17+for+SQL+Server"
-engine_pyodbc = create_engine(db_url_with_pyodbc)
-pymssql 사용 시 (대안)
+# --- DB 연결 정보 ---
+# 실제 환경에서는 환경 변수나 보안 설정 파일을 사용하세요.
+DB_USER = "your_db_user"
+DB_PASSWORD = "your_db_password"
+DB_HOST = "your_mssql_host"
+DB_PORT = "1433"
+DB_NAME = "your_database"
 
-별도의 드라이버 이름 없이 훨씬 간결해집니다.
+# SQLAlchemy 연결 URL (pymssql 사용)
+db_connection_url = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+engine = create_engine(db_connection_url)
+
+# --- Flask 앱 생성 ---
+app = Flask(__name__)
+
+@app.route('/query', methods=['POST'])
+def execute_query():
+    """
+    JSON 형태로 SQL 쿼리를 받아서 실행하고 결과를 JSON으로 반환합니다.
+    """
+    # 요청 본문에서 sql_query 가져오기
+    request_data = request.get_json()
+    if not request_data or 'sql_query' not in request_data:
+        return jsonify({"error": "요청 본문에 'sql_query'가 포함되어야 합니다."}), 400
+
+    sql_query_str = request_data['sql_query']
+
+    try:
+        with engine.connect() as connection:
+            # SQLAlchemy 2.0 스타일로 text()를 사용하여 쿼리 실행
+            # pandas.read_sql을 사용하면 결과를 DataFrame으로 쉽게 변환 가능
+            query_result_df = pd.read_sql(text(sql_query_str), connection)
+            
+            # DataFrame을 JSON 형태로 변환하여 반환
+            result_json = query_result_df.to_dict(orient='records')
+            return jsonify(result_json)
+
+    except Exception as e:
+        # 에러 발생 시 상세 내용 반환
+        return jsonify({"error": f"쿼리 실행 중 오류 발생: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    # 외부에서 접근 가능하도록 0.0.0.0으로 호스트 설정
+    app.run(host='0.0.0.0', port=5000)
+
+2. 에이전트에서 API 호출하기 (agent_client.py)
+이제 드라이버 설치가 불가능한 우분투 에이전트에서는 아래와 같이 간단하게 API를 호출하기만 하면 됩니다. 파이썬 기본 requests 라이브러리 외에는 아무것도 필요 없습니다.
 
 Python
 
-from sqlalchemy import create_engine
+# agent_client.py
+# 에이전트에서는 requests 라이브러리만 있으면 됩니다. (보통 기본 설치됨)
+import requests
+import json
 
-# pymssql을 사용하는 연결 문자열
-db_url_with_pymssql = "mssql+pymssql://<user>:<password>@<host>:<port>/<dbname>"
-engine_pymssql = create_engine(db_url_with_pymssql)
-정리: 언제 무엇을 쓸까요? 🤔
-구분	mssql+pyodbc	mssql+pymssql
-장점	✅ 공식 지원 및 최고 성능: Microsoft가 공식적으로 지원하는 드라이버를 사용해 최신 기능과 성능을 완벽하게 활용할 수 있습니다.	✅ 간편한 설정: pip install pymssql 한 줄이면 끝! OS에 별도 드라이버를 설치할 필요가 없어 개발 환경 구성이 매우 쉽습니다.
-단점	😥 복잡한 설정: 운영체제에 맞는 ODBC 드라이버를 별도로 설치하고 설정해야 하는 번거로움이 있습니다.	😥 성능/기능 제한 가능성: FreeTDS라는 오픈소스 프로젝트 기반이라, 아주 최신의 MSSQL 기능 지원이 늦거나 특정 상황에서 pyodbc보다 성능이 약간 낮을 수 있습니다.
+# 우리가 만든 API 서버의 주소
+API_SERVER_URL = "http://<API서버의_IP주소>:5000/query"
+
+# 실행하고 싶은 SQL 쿼리
+target_sql_query = "SELECT TOP 10 * FROM YourTable;"
+
+# API 서버에 보낼 데이터 (JSON 형식)
+request_payload = {
+    "sql_query": target_sql_query
+}
+
+try:
+    # API 서버에 POST 요청 보내기
+    response = requests.post(API_SERVER_URL, json=request_payload)
+    response.raise_for_status()  # HTTP 오류가 발생하면 예외를 발생시킴
+
+    # 응답 받은 결과를 JSON으로 파싱하여 출력
+    query_results = response.json()
+    
+    print("--- MSSQL 조회 결과 ---")
+    # 예쁘게 출력
+    print(json.dumps(query_results, indent=2, ensure_ascii=False))
+
+except requests.exceptions.RequestException as e:
+    print(f"API 서버 호출 중 오류 발생: {e}")
+
+## 요약 및 장점
+구분	설명
+핵심 아이디어	DB 드라이버 설치가 불가능한 Agent를 대신해, 설치가 가능한 API 서버가 DB 작업을 대행
+Agent가 필요한 것	복잡한 DB 연결 정보 대신 단순한 HTTP URL (http://.../query)
