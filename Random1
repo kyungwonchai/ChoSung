@@ -1,164 +1,17 @@
-네, 알겠습니다. 에이전트의 동작 방식 때문에 반드시 'SQLAlchemy URL 연결 문자열' 형태를 유지해야 하는 상황이시군요. 이 문제는 상당히 까다롭지만 해결 방법이 있습니다.
+네, 맞습니다. mssql:처럼 드라이버(+pyodbc)를 생략하면, SQLAlchemy가 설치된 드라이버 중 기본값으로 지정된 것을 자동으로 찾아 연결합니다.
 
-이 까다로운 제약을 해결하는 유일한 방법은 HTTP 통신을 하는 '커스텀 SQLAlchemy Dialect(방언)'를 직접 만들어 제공하는 것입니다.
+## 동작 원리: "기본 브라우저"와 같은 개념 🤔
+이 원리는 스마트폰에서 링크를 클릭했을 때 어떤 앱으로 열지 결정하는 방식과 매우 유사합니다.
 
-## 개념: '가짜' 데이터베이스 드라이버 만들기
-SQLAlchemy는 dialect+driver://... 형식의 URL을 받으면, driver에 해당하는 라이브러리를 찾아 데이터베이스와 통신을 시작합니다.
+PC나 스마트폰에 크롬, 엣지, 웨일 등 여러 브라우저가 설치되어 있어도, 사용자가 '기본 브라우저'를 하나 지정해두면 링크를 누를 때마다 묻지 않고 해당 브라우저로 바로 열립니다.
 
-mssql+pymssql://... → pymssql 라이브러리 사용
+SQLAlchemy도 마찬가지입니다. 하나의 데이터베이스(Dialect)에 연결할 수 있는 여러 드라이버(DBAPI)가 있을 경우, 미리 정해진 우선순위에 따라 드라이버를 하나씩 확인하고, 가장 먼저 발견되는(즉, 시스템에 설치된) 드라이버를 '기본값'으로 사용해 연결을 시도합니다.
 
-postgresql+psycopg2://... → psycopg2 라이브러리 사용
+## SQLAlchemy의 자동 드라이버 탐색 순서
+mssql: 이라는 연결 문자열을 받으면, SQLAlchemy는 내부적으로 다음과 같은 순서로 동작합니다.
 
-우리는 여기서 driver 부분에 해당하는 우리만의 '가짜' 드라이버(커스텀 Dialect)를 파이썬 코드로 직접 만드는 것입니다. 이 드라이버는 실제 DB와 통신하는 대신, 우리가 이전에 만들었던 API 서버와 HTTP 통신을 하도록 구현합니다.
+mssql Dialect 확인: SQLAlchemy는 mssql이라는 데이터베이스 종류를 인식합니다.
 
-비유하자면, 에이전트(SQLAlchemy)에게 "여기 mssql+apibridge라는 새로운 통역사가 있어. 이 통역사는 DB 대신 웹 API랑 대화하는 특별한 친구야"라고 알려주는 것과 같습니다.
+드라이버 우선순위 목록 조회: SQLAlchemy 내부에는 mssql에 사용할 드라이버의 기본 우선순위가 코드에 정해져 있습니다.
 
-## 해결책: 3단계 구성 요소
-이 솔루션은 3가지 요소로 구성됩니다.
-
-API 서버: 지난 답변에서 만들었던, 실제 DB와 통신하는 서버입니다. (역할 동일)
-
-커스텀 Dialect 파일: 에이전트에게 제공할 단 하나의 파이썬 파일 (mssql_apibridge.py). 이것이 핵심입니다.
-
-최종 URL 문자열: 에이전트에게 제공할 최종 SQLAlchemy URL입니다.
-
-1. API 서버
-이전 답변에서 제시한 api_server.py를 그대로 사용합니다. 이 서버는 어딘가에서 실행되고 있어야 합니다.
-
-2. 커스텀 Dialect 파일 (mssql_apibridge.py)
-아래 코드를 mssql_apibridge.py라는 이름의 파일로 저장하세요. 이 파일은 requests 라이브러리 외에는 아무런 의존성도 없습니다.
-
-Python
-
-# mssql_apibridge.py
-import requests
-from sqlalchemy.engine import create_engine
-from sqlalchemy.engine.default import DefaultDialect
-from sqlalchemy.engine.url import URL
-
-# 가짜 DBAPI 객체를 만듭니다. SQLAlchemy의 구조를 맞추기 위함입니다.
-class APICursor:
-    def __init__(self, api_url):
-        self._api_url = api_url
-        self._results = []
-        self._index = 0
-        # SQLAlchemy가 컬럼 정보를 얻기 위해 사용하는 속성
-        self.description = []
-
-    def execute(self, sql_query, parameters=None):
-        """쿼리 실행 시 실제로는 API 서버에 HTTP 요청을 보냅니다."""
-        payload = {"sql_query": sql_query}
-        try:
-            response = requests.post(self._api_url, json=payload)
-            response.raise_for_status()
-            self._results = response.json()
-
-            # 첫 번째 결과가 있다면, 컬럼 정보를 description에 설정
-            if self._results:
-                self.description = [(key, None, None, None, None, None, None) for key in self._results[0].keys()]
-            else:
-                self.description = []
-            
-            self._index = 0
-
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"API 요청 실패: {e}") from e
-
-    def fetchone(self):
-        """결과에서 한 행을 반환합니다."""
-        if self._index < len(self._results):
-            row = self._results[self._index]
-            self._index += 1
-            # 결과를 튜플 형태로 반환해야 함
-            return tuple(row.values())
-        return None
-
-    def fetchall(self):
-        """모든 결과를 반환합니다."""
-        remaining_rows = [tuple(row.values()) for row in self._results[self._index:]]
-        self._index = len(self._results)
-        return remaining_rows
-
-    def close(self):
-        pass
-
-class APIConnection:
-    def __init__(self, api_url):
-        self._api_url = api_url
-
-    def cursor(self):
-        return APICursor(self._api_url)
-
-    def commit(self):
-        pass
-
-    def rollback(self):
-        pass
-
-    def close(self):
-        pass
-
-# SQLAlchemy가 인식할 커스텀 Dialect 클래스
-class MssqlApiBridgeDialect(DefaultDialect):
-    name = 'mssql.apibridge'  # SQLAlchemy가 이 Dialect를 식별하는 이름
-    driver = 'apibridge'
-    supports_statement_cache = True
-
-    @classmethod
-    def dbapi(cls):
-        # SQLAlchemy가 DBAPI 모듈을 요구할 때, 우리 가짜 객체를 반환하도록 함
-        return APIConnection  
-
-    def create_connect_args(self, url: URL):
-        """URL에서 호스트, 포트 정보를 추출하여 API URL을 만듭니다."""
-        api_url = f"http://{url.host}:{url.port or 80}/query"
-        # connect 함수에 전달될 인자들을 반환
-        return ([api_url], {})
-        
-    def get_schema_names(self, connection, **kw):
-        return []
-
-    def has_table(self, connection, table_name, schema=None):
-        return False
-
-    def get_table_names(self, connection, schema=None, **kw):
-        return []
-
-    def get_columns(self, connection, table_name, schema=None, **kw):
-        return []
-
-    def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        return {'constrained_columns': [], 'name': None}
-
-    def get_foreign_keys(self, connection, table_name, schema=None, **kw):
-        return []
-
-    def get_indexes(self, connection, table_name, schema=None, **kw):
-        return []
-
-# SQLAlchemy가 'mssql.apibridge'를 찾을 수 있도록 등록하는 과정
-# 이 파일이 import되는 시점에 SQLAlchemy의 Dialect 목록에 추가됩니다.
-from sqlalchemy.dialects import registry
-registry.register("mssql.apibridge", __name__, "MssqlApiBridgeDialect")
-3. 에이전트 설정 및 최종 URL
-에이전트가 실행되는 환경에 위에서 만든 mssql_apibridge.py 파일을 복사합니다. (에이전트의 파이썬이 import mssql_apibridge를 할 수 있는 위치)
-
-에이전트에게 아래 형식의 SQLAlchemy URL 문자열을 제공합니다.
-
-mssql+apibridge://<API서버_IP주소>:<API서버_포트>/dummy_database
-예시: API 서버가 10.20.30.40 서버의 5000번 포트에서 실행 중이라면 URL은 다음과 같습니다.
-mssql+apibridge://10.20.30.40:5000/dummy_database
-(맨 뒤 dummy_database 이름은 사용되지 않지만 URL 형식을 위해 필요합니다.)
-
-## 최종 동작 방식
-에이전트가 create_engine("mssql+apibridge://...")를 호출합니다.
-
-SQLAlchemy는 URL의 mssql+apibridge 부분을 보고, 우리가 제공한 mssql_apibridge.py 파일의 MssqlApiBridgeDialect를 로드합니다.
-
-에이전트가 쿼리를 실행하면(pd.read_sql 등), 실제로는 APICursor 객체의 execute 메소드가 호출됩니다.
-
-execute 메소드는 SQL 쿼리를 API 서버로 HTTP POST 요청으로 보냅니다.
-
-API 서버는 DB에서 결과를 받아 JSON으로 응답합니다.
-
-APICursor는 받은 JSON을 SQLAlchemy가 이해하는 형식(튜플 리스트)으로 변환하여 반환합니다.
+1순위: pyodbc
