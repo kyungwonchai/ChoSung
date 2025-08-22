@@ -1,109 +1,219 @@
-## 해결 방법: JSX를 순수 텍스트로 변환하는 전처리기
-이번에는 AST 같은 복잡한 방식 대신, 정규 표현식(Regex)을 사용해 JSX 코드에서 오직 '사람이 읽을 수 있는 텍스트'만 지능적으로 골라내는 훨씬 더 효과적인 전처리기를 드리겠습니다.
-
-? 수정된 preprocess_react_project 전체 코드
-이 코드는 이전 코드를 완전히 대체합니다. 이 스크립트는 JSX 태그는 모두 버리고, 그 안에 들어있는 실제 콘텐츠와 주석만을 추출합니다.
-
-Python
-
 import os
 import re
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import xml.etree.ElementTree as ET
+from datetime import datetime
+import logging
 
-# --- 설정 (이 부분만 수정하세요) ---
-PROJECT_PATH = r"C:\path\to\your\react\project"
-OUTPUT_FILENAME = "_summary_final_preprocessed.txt"
+# --- 로깅 설정 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 메인 코드 ---
+def sanitize_name(name):
+    """파일 및 폴더명으로 사용할 수 없는 문자를 제거하거나 대체합니다."""
+    # 제네릭 <T> 같은 형태를 _T_ 로 변경
+    name = re.sub(r'<', '_', name)
+    name = re.sub(r'>', '_', name)
+    # 윈도우 파일 시스템에서 허용되지 않는 문자 제거
+    return re.sub(r'[\\/*?:"<>|]', '', name).strip()
 
-def extract_meaningful_text_from_jsx(file_content: str) -> str:
-    """정규표현식을 사용해 JSX/TSX 코드에서 의미 있는 텍스트 정보만 추출합니다."""
+def find_matching_brace(code_str, start_pos):
+    """주어진 코드 문자열에서 시작 괄호에 대응하는 닫는 괄호의 위치를 찾습니다."""
+    if code_str[start_pos] != '{':
+        return -1
+
+    brace_count = 1
+    for i in range(start_pos + 1, len(code_str)):
+        if code_str[i] == '{':
+            brace_count += 1
+        elif code_str[i] == '}':
+            brace_count -= 1
+        
+        if brace_count == 0:
+            return i
+    return -1 # 짝을 찾지 못함
+
+def clean_code(code):
+    """코드에서 주석과 빈 줄을 제거합니다."""
+    # 여러 줄 주석 제거 (/* ... */)
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    # 한 줄 주석 제거 (// ...)
+    code = re.sub(r'//.*?$', '', code, flags=re.MULTILINE)
+    # 빈 줄 제거
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    return '\n'.join(lines)
+
+def get_cs_files_from_solution(sln_path):
+    """솔루션(.sln) 파일을 분석하여 포함된 모든 C# 프로젝트(.csproj)의 소스 파일(.cs) 목록을 반환합니다."""
+    cs_files = []
+    sln_dir = os.path.dirname(sln_path)
     
-    meaningful_parts = []
+    try:
+        with open(sln_path, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
 
-    # 1. 모든 종류의 주석 추출 (// 한 줄 주석, /* 여러 줄 주석 */)
-    # 주석 기호 자체는 제거하고 내용만 가져옵니다.
-    comment_pattern = r'/\*[\s\S]*?\*/|//.*'
-    comments = re.findall(comment_pattern, file_content)
-    if comments:
-        meaningful_parts.append("### 주석 ###")
-        for comment in comments:
-            cleaned_comment = comment.replace('//', '').replace('/*', '').replace('*/', '').strip()
-            if cleaned_comment:
-                meaningful_parts.append(cleaned_comment)
-        meaningful_parts.append("-" * 20)
+        # .csproj 파일 경로 찾기
+        project_pattern = re.compile(r'Project\("\{.*?}"\) = ".*?", "(.*?\.csproj)"', re.IGNORECASE)
+        project_paths = project_pattern.findall(content)
 
-    # 2. JSX 태그 사이의 텍스트, 큰따옴표/작은따옴표 안의 UI 텍스트 추출
-    # 예: <p>안녕하세요</p> -> "안녕하세요" 추출
-    # 예: title="부품 특징 분석" -> "부품 특징 분석" 추출
-    text_pattern = r'>([^<]+)<|title="([^"]+)"|label="([^"]+)"|description="([^"]+)"'
-    found_texts = re.findall(text_pattern, file_content)
-    
-    if found_texts:
-        meaningful_parts.append("### UI 텍스트 및 콘텐츠 ###")
-        for group in found_texts:
-            # findall은 튜플 그룹을 반환하므로, 비어있지 않은 항목만 추출
-            for text in group:
-                cleaned_text = text.strip()
-                # 순수 텍스트가 아닌 JSX 변수(예: {variable})는 제외
-                if cleaned_text and '{' not in cleaned_text:
-                    meaningful_parts.append(cleaned_text)
+        for proj_path in project_paths:
+            full_proj_path = os.path.join(sln_dir, proj_path.replace('\\', os.sep))
+            
+            if not os.path.exists(full_proj_path):
+                logging.warning(f"프로젝트 파일을 찾을 수 없습니다: {full_proj_path}")
+                continue
+            
+            proj_dir = os.path.dirname(full_proj_path)
+            
+            # .csproj 파일(XML) 파싱하여 .cs 파일 찾기
+            tree = ET.parse(full_proj_path)
+            root = tree.getroot()
+            
+            # XML 네임스페이스 처리
+            ns = {'ms': root.tag.split('}')[0][1:]} if '}' in root.tag else {}
+            compile_items = root.findall('.//ms:Compile', ns) if ns else root.findall('.//Compile')
 
-    return "\n".join(meaningful_parts)
+            for item in compile_items:
+                include_path = item.get('Include')
+                if include_path and include_path.endswith('.cs'):
+                    full_cs_path = os.path.join(proj_dir, include_path.replace('\\', os.sep))
+                    if os.path.exists(full_cs_path):
+                        cs_files.append(os.path.normpath(full_cs_path))
+    except Exception as e:
+        logging.error(f"솔루션 파일을 처리하는 중 오류 발생: {e}")
+        messagebox.showerror("오류", f"솔루션 파일을 처리하는 중 오류가 발생했습니다.\n{e}")
 
+    return list(set(cs_files)) # 중복 제거
 
-def preprocess_react_project(project_path: str, output_filename: str):
-    """프로젝트 폴더에서 JSX/TSX를 분석하여 의미 있는 텍스트만 추출해 파일로 합칩니다."""
-    if not os.path.isdir(project_path):
-        print(f"오류: '{project_path}'는 유효한 폴더가 아닙니다.")
+def process_solution():
+    """메인 처리 함수: 솔루션 선택부터 함수 추출 및 파일 생성까지 전체 과정을 관장합니다."""
+    root = tk.Tk()
+    root.withdraw() # 메인 윈도우 숨기기
+
+    sln_path = filedialog.askopenfilename(
+        title="분석할 C# 솔루션(.sln) 파일을 선택하세요",
+        filetypes=(("Solution files", "*.sln"), ("All files", "*.*"))
+    )
+
+    if not sln_path:
+        logging.info("파일 선택이 취소되었습니다.")
         return
 
-    print(f"'{project_path}' 폴더에서 최종 전처리를 시작합니다...")
+    logging.info(f"선택된 솔루션: {sln_path}")
+
+    # --- 출력 폴더 설정 ---
+    sln_name = os.path.splitext(os.path.basename(sln_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_base_dir = os.path.join(os.path.dirname(sln_path), f"{sln_name}_Processed_{timestamp}")
     
-    all_meaningful_content = []
-    
-    target_code_extensions = ['.js', '.jsx', 'ts', '.tsx']
-    target_text_extensions = ['.md', '.txt']
-    ignore_items = ['node_modules', '.git', 'build', 'dist', 'public', 'package-lock.json']
+    try:
+        os.makedirs(output_base_dir, exist_ok=True)
+        logging.info(f"출력 폴더 생성: {output_base_dir}")
+    except OSError as e:
+        logging.error(f"출력 폴더를 생성할 수 없습니다: {e}")
+        messagebox.showerror("오류", f"출력 폴더를 생성할 수 없습니다.\n{e}")
+        return
 
-    for root, dirs, files in os.walk(project_path):
-        dirs[:] = [d for d in dirs if d not in ignore_items]
+    # --- C# 파일 목록 가져오기 ---
+    cs_files = get_cs_files_from_solution(sln_path)
+    if not cs_files:
+        logging.warning("솔루션에서 처리할 C# 파일을 찾지 못했습니다.")
+        messagebox.showwarning("결과 없음", "솔루션에서 처리할 C# 파일을 찾지 못했습니다.")
+        return
         
-        for file in files:
-            if file in ignore_items: continue
+    logging.info(f"총 {len(cs_files)}개의 C# 파일을 분석합니다.")
+
+    # --- 각 C# 파일 처리 ---
+    total_functions_extracted = 0
+    for file_path in cs_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
+                original_code = f.read()
+
+            clean_code_str = clean_code(original_code)
             
-            file_path = os.path.join(root, file)
-            relative_path = os.path.relpath(file_path, project_path)
-            header = f"\n\n--- [출처 파일: {relative_path}] ---\n"
+            # 네임스페이스 추출
+            namespace_match = re.search(r'namespace\s+([^{]+)', clean_code_str)
+            current_namespace = namespace_match.group(1).strip() if namespace_match else "NoNamespace"
+
+            # 클래스/인터페이스/구조체 블록 추출
+            # 정규식: (class|interface|struct) 식별자 { ... }
+            class_pattern = re.compile(r'(?:public|internal|private|protected|static|sealed|abstract)\s+.*?(class|interface|struct)\s+([\w\d_<>,\s]+?)\s*[:\w\d\s,<>]*\s*\{')
             
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
+            for class_match in class_pattern.finditer(clean_code_str):
+                class_start_brace_pos = class_match.end() -1
+                class_end_brace_pos = find_matching_brace(clean_code_str, class_start_brace_pos)
+                if class_end_brace_pos == -1:
+                    continue
+                
+                class_name_raw = class_match.group(2).strip()
+                # 제네릭 정의 부분 제거 (예: MyClass<T> -> MyClass)
+                class_name = re.sub(r'<.*?>', '', class_name_raw).strip()
+                class_body = clean_code_str[class_start_brace_pos + 1 : class_end_brace_pos]
+
+                # 함수(메서드, 생성자) 추출
+                # 정규식: (수식어들) 타입 식별자(...) { ... }
+                # 생성자도 포함 (타입 부분이 클래스명과 동일)
+                method_pattern = re.compile(
+                    # 접근제한자, 반환타입 등 (그룹1)
+                    r'((?:public|private|protected|internal|static|virtual|override|async|unsafe|extern|new)\s*.*?)??'
+                    # 함수명 (그룹2) - 클래스명과 같을 수도 있음 (생성자)
+                    r'([\w\d_~]+)\s*'
+                    # 제네릭 및 파라미터 (그룹3)
+                    r'(<.*?>)?\s*\((.*?)\)\s*(?:where\s+.*?)?\s*\{'
+                )
+
+                for method_match in method_pattern.finditer(class_body):
+                    method_start_brace_pos = method_match.end() - 1
+                    method_end_brace_pos = find_matching_brace(class_body, method_start_brace_pos)
+                    if method_end_brace_pos == -1:
+                        continue
                     
-                    meaningful_content = ""
-                    # 코드 파일인 경우, JSX 텍스트 추출
-                    if any(file.endswith(ext) for ext in target_code_extensions):
-                        meaningful_content = extract_meaningful_text_from_jsx(content)
-                    # 텍스트 파일인 경우, 내용 전체를 추가
-                    elif any(file.endswith(ext) for ext in target_text_extensions):
-                        meaningful_content = content
+                    method_name_raw = method_match.group(2).strip()
+                    # 소멸자(~) 처리
+                    method_name = method_name_raw.replace('~', 'Finalizer_')
                     
-                    if meaningful_content.strip(): # 추출된 내용이 있을 때만 추가
-                        all_meaningful_content.append(header + meaningful_content)
+                    # 생성자인 경우 이름을 'Constructor'로 명시
+                    if method_name == class_name:
+                        method_name = "Constructor"
 
-            except Exception as e:
-                print(f"    - 경고: {file_path} 처리 중 오류 - {e}")
+                    method_body_content = class_body[method_start_brace_pos + 1 : method_end_brace_pos].strip()
 
-    # 최종 결과를 파일에 저장
-    output_path = os.path.join(project_path, output_filename)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(all_meaningful_content))
-        
-    print("\n" + "="*50)
-    print("? 최종 전처리 완료!")
-    print(f"HTML/JSX 태그를 모두 제거하고 의미 있는 텍스트만 추출하여 아래 파일에 저장했습니다:")
-    print(f"-> {output_path}")
-    print("="*50)
+                    # --- 파일 및 폴더 생성 ---
+                    s_ns = sanitize_name(current_namespace)
+                    s_class = sanitize_name(class_name)
+                    s_method = sanitize_name(method_name)
+                    
+                    # 파라미터 개수나 타입을 이름에 추가하여 오버로딩 구분
+                    params = method_match.group(4).strip()
+                    if params:
+                        param_count = len(params.split(','))
+                        s_method += f"_Overload{param_count}"
+                    
+                    target_dir_name = f"{s_ns}_{s_class}_{s_method}"
+                    target_dir = os.path.join(output_base_dir, target_dir_name)
+                    os.makedirs(target_dir, exist_ok=True)
+                    
+                    # 속성 파일 작성
+                    prop_file_path = os.path.join(target_dir, "속성.txt")
+                    with open(prop_file_path, 'w', encoding='utf-8') as pf:
+                        pf.write(f"네임스페이스: {current_namespace}\n")
+                        pf.write(f"클래스: {class_name_raw}\n")
+                        pf.write(f"함수명: {method_name_raw}\n")
+                        
+                    # 함수 코드 파일 작성
+                    func_file_path = os.path.join(target_dir, f"{s_method}.cs")
+                    with open(func_file_path, 'w', encoding='utf-8') as ff:
+                        ff.write(method_body_content)
+                    
+                    total_functions_extracted += 1
 
-# --- 스크립트 실행 ---
+        except Exception as e:
+            logging.error(f"{file_path} 파일을 처리하는 중 오류 발생: {e}")
+            continue
+
+    logging.info(f"작업 완료. 총 {total_functions_extracted}개의 함수를 추출했습니다.")
+    messagebox.showinfo("완료", f"분석이 완료되었습니다.\n총 {total_functions_extracted}개의 함수를 추출하여 아래 폴더에 저장했습니다.\n\n{output_base_dir}")
+
 if __name__ == "__main__":
-    preprocess_react_project(PROJECT_PATH, OUTPUT_FILENAME)
+    process_solution()
