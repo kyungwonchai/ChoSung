@@ -1,2 +1,124 @@
-# device_map="auto" 옵션을 삭제하고, 뒤에 .to(device)를 붙여줍니다.
-llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_PATH).to(device)
+# ==============================================================================
+# 이전 단계에서 정의한 모든 함수와 설정은 그대로 사용한다고 가정합니다.
+# (load_data_from_db, 모델/Qdrant 초기화, 데이터 주입 등)
+# ==============================================================================
+import json
+import re
+
+# 도구 1: 이전에 만든 부품 코드 표준화 함수 (이제 LLM의 '도구'가 됩니다)
+def standardize_part_code(input_string: str) -> str:
+    processed_string = "".join(input_string.split())
+    prefix, suffix = (processed_string.split("-", 1) + [""])[:2] if "-" in processed_string else (processed_string[:4], processed_string[4:])
+    formatted_prefix = prefix.zfill(4)[:4]
+    formatted_suffix = suffix.zfill(6)[:6]
+    return f"{formatted_prefix}-{formatted_suffix}"
+
+# 핵심 기능: LLM을 '지능형 라우터'로 사용하는 함수
+def route_question(question: str, llm_generator, llm_tokenizer) -> dict:
+    """사용자 질문의 의도를 파악하여 어떤 작업을 수행할지 결정(라우팅)합니다."""
+    
+    # LLM에게 역할과 선택지를 명확하게 제시하는 프롬프트
+    prompt = f"""당신은 사용자 질문을 분석하여 어떤 작업을 수행해야 할지 결정하는 '지능형 라우터'입니다.
+    질문을 분석하고 다음 세 가지 중 하나의 행동을 JSON 형식으로 결정하세요.
+
+    1. "direct_lookup": 질문에 부품 코드로 보이는 명확한 숫자/문자 조합이 포함된 경우.
+    2. "rag_search": 특정 부품 코드가 아닌, 일반적인 설명이나 자연어 질문인 경우.
+    3. "general_talk": 단순 인사 또는 부품과 관련 없는 대화인 경우.
+
+    만약 "direct_lookup"으로 판단했다면, 질문에서 부품 코드로 보이는 부분을 정확히 추출하여 "part_code" 값으로 포함하세요.
+
+    [질문]
+    {question}
+
+    [JSON 결정]
+    """
+    
+    # Gemma 모델을 사용하여 추론
+    inputs = llm_tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt").to(llm_generator.device)
+    outputs = llm_generator.generate(input_ids=inputs, max_new_tokens=50, pad_token_id=llm_tokenizer.eos_token_id)
+    response_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # LLM의 답변(텍스트)에서 JSON 부분만 추출
+    json_part = response_text.split("[JSON 결정]")[-1].strip()
+    
+    try:
+        # 텍스트를 실제 JSON 객체로 변환
+        decision = json.loads(json_part)
+        return decision
+    except json.JSONDecodeError:
+        # LLM이 JSON 형식을 제대로 만들지 못한 경우, RAG 검색으로 기본 처리
+        return {"intent": "rag_search"}
+
+
+# 새로운 메인 함수: 라우터의 결정에 따라 다른 작업을 수행
+def ask_advanced_system(question: str, qdrant_cli, embed_model, llm_gen, llm_token):
+    # 1. LLM 라우터에게 질문의 의도 파악 맡기기
+    decision = route_question(question, llm_gen, llm_token)
+    intent = decision.get("intent")
+    print(f"--- 의도 분석 결과: {decision} ---")
+
+    # 2. 의도에 따라 작업 분기
+    # Case A: 부품 코드 직접 조회
+    if intent == "direct_lookup" and "part_code" in decision:
+        messy_code = decision["part_code"]
+        # '도구'를 사용하여 코드를 표준화
+        standardized_code = standardize_part_code(messy_code)
+        print(f"표준화된 부품 코드: '{messy_code}' -> '{standardized_code}'")
+        
+        hits = qdrant_cli.scroll(
+            collection_name="parts_db_collection",
+            scroll_filter=models.Filter(must=[models.FieldCondition(key="part_name", match=models.MatchValue(value=standardized_code))]),
+            limit=1
+        )
+        return f"'{standardized_code}' 부품 정보:\n{hits[0][0].payload}" if hits[0] else f"'{standardized_code}' 정보를 찾을 수 없습니다."
+
+    # Case B: RAG 검색
+    elif intent == "rag_search":
+        print("자연어 질문으로 판단하여 RAG 검색을 수행합니다.")
+        # ... (이전 RAG 검색 코드와 동일)
+        question_vector = embed_model.encode('query: ' + question).tolist()
+        hits = qdrant_cli.search(collection_name="parts_db_collection", query_vector=question_vector, limit=1)
+        if not hits: return "관련 정보를 찾을 수 없습니다."
+        
+        context = str(hits[0].payload)
+        messages = [{"role": "user", "content": f"정보: {context}\n\n위 정보를 바탕으로 다음 질문에 답변해줘: {question}"}]
+        prompt = llm_token.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = llm_token.encode(prompt, add_special_tokens=True, return_tensors="pt").to(llm_gen.device)
+        outputs = llm_gen.generate(input_ids=inputs, max_new_tokens=150)
+        answer = llm_token.decode(outputs[0], skip_special_tokens=True).split('<start_of_turn>model')[-1].strip()
+        return answer
+        
+    # Case C: 일반 대화
+    else:
+        return "안녕하세요! 부품 정보에 대해 무엇이든 물어보세요."
+
+# ==============================================================================
+# 5단계: 새로운 메인 실행 블록
+# ==============================================================================
+if __name__ == "__main__":
+    # ... (이전 코드의 모델/DB 초기화 및 데이터 주입 과정은 모두 동일하게 실행)
+    # --- 시스템 초기화 (가정) ---
+    # embedding_model, qdrant_client, llm_model, llm_tokenizer 변수가 준비되었다고 가정
+    
+    # --- 새로운 시스템 테스트 ---
+    print("\n--- 고급 RAG 시스템 테스트 시작 ---")
+    
+    # 테스트 1: 사용자가 대충 입력한 부품 코드 (핵심 기능)
+    test_q1 = "0406 1316 사이즈뭐야"
+    response1 = ask_advanced_system(test_q1, qdrant_client, embedding_model, llm_model, llm_tokenizer)
+    print(f"\n[질문 1]\n{test_q1}")
+    print(f"[답변 1]\n{response1}")
+    
+    # 테스트 2: RAG 검색
+    test_q2 = "Parts Empty Stop을 쓰고 Set count가 Yes인 부품 찾아줘"
+    response2 = ask_advanced_system(test_q2, qdrant_client, embedding_model, llm_model, llm_tokenizer)
+    print(f"\n[질문 2]\n{test_q2}")
+    print(f"[답변 2]\n{response2}")
+    
+    # 테스트 3: 정확한 부품 코드
+    test_q3 = "6HS2-00978A 부품 정보"
+    response3 = ask_advanced_system(test_q3, qdrant_client, embedding_model, llm_model, llm_tokenizer)
+    print(f"\n[질문 3]\n{test_q3}")
+    print(f"[답변 3]\n{response3}")
+
