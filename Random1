@@ -1,4 +1,53 @@
-# 질문 내용만 바꿔서 셀 2를 다시 실행
-my_question = "Parts Empty Stop 쓰는 부품은 뭐지?"
-answer = ask_advanced_system(my_question, qdrant_client, embedding_model, llm_model, llm_tokenizer)
-print(answer)
+# pandas가 import 안되어 있다면 상단에 추가해주세요.
+import pandas as pd
+
+def ask_advanced_system(question: str, qdrant_cli, embed_model, llm_gen, llm_token):
+    # 1. LLM 라우터에게 질문의 의도 파악 맡기기
+    decision = route_question(question, llm_gen, llm_token)
+    intent = decision.get("intent")
+    print(f"--- 의도 분석 결과: {decision} ---")
+
+    # 2. 의도에 따라 작업 분기
+    # ?? 수정된 부분 1: 'part_code' 키 존재 여부도 함께 체크하도록 조건 강화
+    if (intent == "direct_lookup" or "part_code" in decision) and "part_code" in decision:
+        messy_code = decision["part_code"]
+        standardized_code = standardize_part_code(messy_code)
+        print(f"표준화된 부품 코드: '{messy_code}' -> '{standardized_code}'")
+        
+        hits = qdrant_cli.scroll(
+            collection_name="parts_db_collection",
+            scroll_filter=models.Filter(must=[models.FieldCondition(key="part_name", match=models.MatchValue(value=standardized_code))]),
+            limit=1
+        )
+        if hits[0]:
+            result_payload = hits[0][0].payload
+            
+            # ?? 수정된 부분 2: 결과를 DataFrame(표)으로 변환하여 반환
+            # 딕셔너리를 리스트로 감싸서 DataFrame 생성
+            df = pd.DataFrame([result_payload])
+            # 인덱스를 부품 코드로 설정하여 보기 좋게 만듦
+            df.set_index('part_name', inplace=True)
+            return df
+        else:
+            return f"'{standardized_code}' 정보를 찾을 수 없습니다."
+
+    # Case B: RAG 검색 (이전과 동일)
+    elif intent == "rag_search":
+        print("자연어 질문으로 판단하여 RAG 검색을 수행합니다.")
+        # ... (이전 RAG 검색 코드와 동일)
+        question_vector = embed_model.encode('query: ' + question).tolist()
+        hits = qdrant_cli.search(collection_name="parts_db_collection", query_vector=question_vector, limit=1)
+        if not hits: return "관련 정보를 찾을 수 없습니다."
+        
+        context = str(hits[0].payload)
+        messages = [{"role": "user", "content": f"정보: {context}\n\n위 정보를 바탕으로 다음 질문에 답변해줘: {question}"}]
+        prompt = llm_token.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        inputs = llm_token.encode(prompt, add_special_tokens=True, return_tensors="pt").to(llm_gen.device)
+        outputs = llm_gen.generate(input_ids=inputs, max_new_tokens=150)
+        answer = llm_token.decode(outputs[0], skip_special_tokens=True).split('<start_of_turn>model')[-1].strip()
+        return answer
+        
+    # Case C: 일반 대화 (이전과 동일)
+    else:
+        return "안녕하세요! 부품 정보에 대해 무엇이든 물어보세요."
