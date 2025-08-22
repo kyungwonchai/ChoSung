@@ -1,47 +1,191 @@
-import json
+# ==============================================================================
+# 1단계: 필요한 모든 도구 불러오기
+# ==============================================================================
+import time
+from collections import deque
+from urllib.parse import urljoin, urlparse
 
-def route_question(question: str, llm_generator, llm_tokenizer) -> dict:
-    """
-    사용자 질문의 의도를 파악하여 어떤 작업을 수행할지 결정(라우팅)합니다.
-    LLM이 상상력을 발휘하지 못하도록 매우 구체적이고 엄격한 규칙을 제시합니다.
-    """
+# 웹 크롤링 도구
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+
+# 데이터 처리 및 RAG 관련 도구
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from qdrant_client import QdrantClient, models
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+# ==============================================================================
+# 2단계: 설정 및 전역 변수 정의
+# ==============================================================================
+# 학습시킬 리액트 사이트의 시작 URL
+START_URL = "https://react.dev/"
+
+# 이전에 다운로드한 로컬 모델들의 폴더 경로
+EMBEDDING_MODEL_PATH = r"C:\my_google_models\embedding_model"
+LLM_MODEL_PATH = r"C:\my_google_models\llm_model"
+
+# ==============================================================================
+# 3단계: 핵심 기능 함수 정의
+# ==============================================================================
+
+def crawl_react_site(start_url: str) -> dict:
+    """Selenium을 이용해 React 사이트를 크롤링하고 페이지 내용을 반환합니다."""
+    print(f"'{start_url}' 사이트 크롤링을 시작합니다...")
     
-    # LLM에게 역할과 따라야 할 규칙을 명확하게 제시하는 프롬프트
-    prompt = f"""당신은 사용자 질문을 분석하여 JSON 형식으로 작업 계획을 세우는 '지능형 라우터'입니다.
-    아래 규칙을 반드시 따르세요.
+    # WebDriver 설정 (chromedriver를 자동으로 다운로드 및 관리)
+    options = webdriver.ChromeOptions()
+    options.add_argument('--headless')  # 브라우저 창을 띄우지 않고 백그라운드에서 실행
+    options.add_argument('--log-level=3') # 로그 최소화
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
 
-    [규칙]
-    1. 질문에서 하이픈(-)이 있거나 없는 'XXXX-XXXXXX' 형식의 부품 코드가 명확히 보이는지 확인합니다.
-    2. 부품 코드가 보이면, 반드시 "intent"를 "direct_lookup"으로 설정하고, 질문에 보이는 코드 문자열을 그대로 "part_code" 값으로 추출하세요.
-    3. 부품 코드가 명확히 보이지 않으면, "intent"를 "rag_search"로 설정하세요. "part_code" 필드는 절대 포함하지 마세요.
-    4. 단순 인사나 관련 없는 대화는 "intent"를 "general_talk"으로 설정하세요.
+    pages_content = {}
+    urls_to_visit = deque([start_url])
+    visited_urls = set()
+    base_netloc = urlparse(start_url).netloc
 
-    [질문]
-    {question}
+    while urls_to_visit:
+        current_url = urls_to_visit.popleft()
+        if current_url in visited_urls:
+            continue
 
-    [JSON 결정]
-    """
+        print(f"  - 크롤링 중: {current_url}")
+        visited_urls.add(current_url)
+
+        try:
+            driver.get(current_url)
+            # React 콘텐츠가 로드될 시간을 잠시 줍니다.
+            time.sleep(2)
+            
+            # 렌더링이 완료된 페이지의 HTML을 가져옵니다.
+            html_content = driver.page_source
+            pages_content[current_url] = html_content
+            
+            # 페이지 내의 모든 링크를 찾아서 다음 방문할 URL 목록에 추가합니다.
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for a_tag in soup.find_all('a', href=True):
+                link = urljoin(current_url, a_tag['href'])
+                # 외부 사이트 링크는 제외하고, 같은 사이트 내의 링크만 추가합니다.
+                if urlparse(link).netloc == base_netloc and link not in visited_urls:
+                    urls_to_visit.append(link)
+        except Exception as e:
+            print(f"    - 오류 발생: {current_url} 크롤링 실패 - {e}")
+            
+    driver.quit()
+    print(f"크롤링 완료. 총 {len(pages_content)}개의 페이지를 수집했습니다.")
+    return pages_content
+
+
+def process_and_chunk(pages: dict) -> list:
+    """수집된 HTML 페이지들을 정제하고 텍스트를 작은 조각(Chunk)으로 나눕니다."""
+    print("데이터 정제 및 청킹(Chunking)을 시작합니다...")
     
-    # LLM을 사용하여 추론 실행
-    # pad_token_id를 추가하여 생성 길이에 대한 경고 메시지를 줄입니다.
-    inputs = llm_tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt").to(llm_generator.device)
-    outputs = llm_generator.generate(input_ids=inputs, max_new_tokens=50, pad_token_id=llm_tokenizer.eos_token_id)
-    response_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # LangChain의 텍스트 분할기 사용
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,  # 각 청크의 최대 크기
+        chunk_overlap=100 # 청크 간의 중복되는 글자 수
+    )
     
-    # LLM의 답변(텍스트)에서 JSON 부분만 안정적으로 추출
-    # "```json" 과 "```" 사이의 내용을 찾는 방식을 추가하여 안정성 향상
-    try:
-        if "```json" in response_text:
-            json_part = response_text.split("```json")[1].split("```")[0].strip()
-        else:
-            json_part = response_text.split("[JSON 결정]")[-1].strip()
+    all_chunks = []
+    for url, html in pages.items():
+        soup = BeautifulSoup(html, 'html.parser')
+        # main 태그나 article 태그 등 본문이 있는 영역만 추출 (사이트 구조에 맞게 수정)
+        main_content = soup.find('main')
+        text = main_content.get_text(separator=' ', strip=True) if main_content else ""
         
-        # 텍스트를 실제 JSON 객체(딕셔너리)로 변환
-        decision = json.loads(json_part)
-        return decision
-    except (json.JSONDecodeError, IndexError):
-        # LLM이 JSON 형식을 제대로 만들지 못하거나 추출에 실패한 경우,
-        # 안전하게 RAG 검색으로 기본 처리합니다.
-        print(f"경고: LLM의 응답에서 JSON을 파싱하는 데 실패했습니다. 응답: {response_text}")
-        return {"intent": "rag_search"}
+        if text:
+            chunks = text_splitter.split_text(text)
+            for chunk in chunks:
+                # 각 청크에 출처 URL 메타데이터를 포함하여 저장
+                all_chunks.append({"text": chunk, "source": url})
+                
+    print(f"청킹 완료. 총 {len(all_chunks)}개의 텍스트 청크를 생성했습니다.")
+    return all_chunks
+
+
+def ask_website_expert(question: str, qdrant_cli, embed_model, gen_model, gen_tokenizer):
+    """사용자 질문에 대해 웹사이트 내용을 기반으로 답변합니다."""
+    print("\n--- 질문에 대한 답변 생성 중 ---")
+    
+    # 1. 질문을 벡터로 변환 (e5 모델 규칙 적용)
+    question_vector = embed_model.encode('query: ' + question).tolist()
+    
+    # 2. Qdrant에서 관련성 높은 정보(Context) 검색
+    hits = qdrant_cli.search(
+        collection_name="website_content",
+        query_vector=question_vector,
+        limit=3 # 상위 3개의 관련 정보를 참고
+    )
+    if not hits:
+        return "죄송합니다, 해당 질문에 대한 정보를 사이트에서 찾을 수 없습니다."
+    
+    # 3. 검색된 정보를 LLM에게 전달할 '참고 자료' 형태로 가공
+    context = ""
+    sources = set()
+    for hit in hits:
+        context += hit.payload['text'] + "\n\n"
+        sources.add(hit.payload['source'])
+        
+    # 4. Gemma LLM을 이용해 최종 답변 생성
+    messages = [
+        {"role": "user", "content": f"당신은 '{START_URL}' 웹사이트의 전문가입니다. 아래 '참고 자료'만을 바탕으로 '질문'에 대해 한국어로 상세히 답변해주세요. 답변 마지막에는 출처 URL을 명시해주세요.\n\n### 참고 자료:\n{context}\n\n### 질문:\n{question}"}
+    ]
+    prompt = gen_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    inputs = gen_tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").to(gen_model.device)
+    outputs = gen_model.generate(input_ids=inputs, max_new_tokens=512)
+    answer = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    final_answer = answer.split('<start_of_turn>model')[-1].strip()
+    final_answer += f"\n\n출처: {', '.join(sources)}"
+    
+    return final_answer
+
+# ==============================================================================
+# 4단계: 메인 실행 블록
+# ==============================================================================
+if __name__ == "__main__":
+    # --- 1. 데이터 수집 및 처리 ---
+    # 이 과정은 시간이 오래 걸리므로, 한번 실행한 후 결과를 파일로 저장해두고 재사용하는 것이 좋습니다.
+    site_pages = crawl_react_site(START_URL)
+    text_chunks = process_and_chunk(site_pages)
+
+    # --- 2. RAG 시스템 초기화 ---
+    print("\n--- RAG 시스템 초기화 시작 ---")
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
+    qdrant_client = QdrantClient(":memory:")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_PATH)
+    llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_PATH, device_map="auto")
+    print("--- 모든 모델 로드 완료 ---")
+
+    # --- 3. Qdrant에 데이터 주입 ---
+    qdrant_client.recreate_collection(
+        collection_name="website_content",
+        vectors_config=models.VectorParams(size=embedding_model.get_sentence_embedding_dimension(), distance=models.Distance.COSINE)
+    )
+    
+    points_to_ingest = []
+    for i, chunk_data in enumerate(text_chunks):
+        # e5 모델 규칙에 따라 'passage: ' 접두사 추가
+        vector = embedding_model.encode('passage: ' + chunk_data['text']).tolist()
+        points_to_ingest.append(models.PointStruct(id=i, vector=vector, payload=chunk_data))
+
+    qdrant_client.upsert(collection_name="website_content", points=points_to_ingest, wait=True)
+    print(f"--- {len(points_to_ingest)}개의 청크를 Qdrant에 주입 완료. 시스템 준비 완료 ---")
+
+    # --- 4. 시스템 테스트 ---
+    # react.dev 사이트에 대한 질문 예시
+    test_question = "React에서 state를 관리하는 Hook에는 어떤 것들이 있어?"
+    final_response = ask_website_expert(test_question, qdrant_client, embedding_model, llm_model, llm_tokenizer)
+    
+    print("\n" + "="*50)
+    print(f"질문: {test_question}")
+    print(f"답변:\n{final_response}")
+    print("="*50)
 
