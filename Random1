@@ -1,53 +1,47 @@
-# pandas가 import 안되어 있다면 상단에 추가해주세요.
-import pandas as pd
+import json
 
-def ask_advanced_system(question: str, qdrant_cli, embed_model, llm_gen, llm_token):
-    # 1. LLM 라우터에게 질문의 의도 파악 맡기기
-    decision = route_question(question, llm_gen, llm_token)
-    intent = decision.get("intent")
-    print(f"--- 의도 분석 결과: {decision} ---")
+def route_question(question: str, llm_generator, llm_tokenizer) -> dict:
+    """
+    사용자 질문의 의도를 파악하여 어떤 작업을 수행할지 결정(라우팅)합니다.
+    LLM이 상상력을 발휘하지 못하도록 매우 구체적이고 엄격한 규칙을 제시합니다.
+    """
+    
+    # LLM에게 역할과 따라야 할 규칙을 명확하게 제시하는 프롬프트
+    prompt = f"""당신은 사용자 질문을 분석하여 JSON 형식으로 작업 계획을 세우는 '지능형 라우터'입니다.
+    아래 규칙을 반드시 따르세요.
 
-    # 2. 의도에 따라 작업 분기
-    # ?? 수정된 부분 1: 'part_code' 키 존재 여부도 함께 체크하도록 조건 강화
-    if (intent == "direct_lookup" or "part_code" in decision) and "part_code" in decision:
-        messy_code = decision["part_code"]
-        standardized_code = standardize_part_code(messy_code)
-        print(f"표준화된 부품 코드: '{messy_code}' -> '{standardized_code}'")
-        
-        hits = qdrant_cli.scroll(
-            collection_name="parts_db_collection",
-            scroll_filter=models.Filter(must=[models.FieldCondition(key="part_name", match=models.MatchValue(value=standardized_code))]),
-            limit=1
-        )
-        if hits[0]:
-            result_payload = hits[0][0].payload
-            
-            # ?? 수정된 부분 2: 결과를 DataFrame(표)으로 변환하여 반환
-            # 딕셔너리를 리스트로 감싸서 DataFrame 생성
-            df = pd.DataFrame([result_payload])
-            # 인덱스를 부품 코드로 설정하여 보기 좋게 만듦
-            df.set_index('part_name', inplace=True)
-            return df
+    [규칙]
+    1. 질문에서 하이픈(-)이 있거나 없는 'XXXX-XXXXXX' 형식의 부품 코드가 명확히 보이는지 확인합니다.
+    2. 부품 코드가 보이면, 반드시 "intent"를 "direct_lookup"으로 설정하고, 질문에 보이는 코드 문자열을 그대로 "part_code" 값으로 추출하세요.
+    3. 부품 코드가 명확히 보이지 않으면, "intent"를 "rag_search"로 설정하세요. "part_code" 필드는 절대 포함하지 마세요.
+    4. 단순 인사나 관련 없는 대화는 "intent"를 "general_talk"으로 설정하세요.
+
+    [질문]
+    {question}
+
+    [JSON 결정]
+    """
+    
+    # LLM을 사용하여 추론 실행
+    # pad_token_id를 추가하여 생성 길이에 대한 경고 메시지를 줄입니다.
+    inputs = llm_tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt").to(llm_generator.device)
+    outputs = llm_generator.generate(input_ids=inputs, max_new_tokens=50, pad_token_id=llm_tokenizer.eos_token_id)
+    response_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # LLM의 답변(텍스트)에서 JSON 부분만 안정적으로 추출
+    # "```json" 과 "```" 사이의 내용을 찾는 방식을 추가하여 안정성 향상
+    try:
+        if "```json" in response_text:
+            json_part = response_text.split("```json")[1].split("```")[0].strip()
         else:
-            return f"'{standardized_code}' 정보를 찾을 수 없습니다."
+            json_part = response_text.split("[JSON 결정]")[-1].strip()
+        
+        # 텍스트를 실제 JSON 객체(딕셔너리)로 변환
+        decision = json.loads(json_part)
+        return decision
+    except (json.JSONDecodeError, IndexError):
+        # LLM이 JSON 형식을 제대로 만들지 못하거나 추출에 실패한 경우,
+        # 안전하게 RAG 검색으로 기본 처리합니다.
+        print(f"경고: LLM의 응답에서 JSON을 파싱하는 데 실패했습니다. 응답: {response_text}")
+        return {"intent": "rag_search"}
 
-    # Case B: RAG 검색 (이전과 동일)
-    elif intent == "rag_search":
-        print("자연어 질문으로 판단하여 RAG 검색을 수행합니다.")
-        # ... (이전 RAG 검색 코드와 동일)
-        question_vector = embed_model.encode('query: ' + question).tolist()
-        hits = qdrant_cli.search(collection_name="parts_db_collection", query_vector=question_vector, limit=1)
-        if not hits: return "관련 정보를 찾을 수 없습니다."
-        
-        context = str(hits[0].payload)
-        messages = [{"role": "user", "content": f"정보: {context}\n\n위 정보를 바탕으로 다음 질문에 답변해줘: {question}"}]
-        prompt = llm_token.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        
-        inputs = llm_token.encode(prompt, add_special_tokens=True, return_tensors="pt").to(llm_gen.device)
-        outputs = llm_gen.generate(input_ids=inputs, max_new_tokens=150)
-        answer = llm_token.decode(outputs[0], skip_special_tokens=True).split('<start_of_turn>model')[-1].strip()
-        return answer
-        
-    # Case C: 일반 대화 (이전과 동일)
-    else:
-        return "안녕하세요! 부품 정보에 대해 무엇이든 물어보세요."
