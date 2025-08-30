@@ -1,123 +1,51 @@
-# app.py
-# 이 스크립트는 Flask 웹 서버를 실행하여 웹 UI를 제공하고, 
-# Ubuntu 게이트웨이로부터 제어 명령을 받아 LED를 제어하며,
-# WebSocket을 통해 실시간으로 UI를 업데이트합니다.
-import os
-import threading
-from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
-from flask_socketio import SocketIO
-
-# --- 전역 상태 및 로깅 ---
-IS_RASPBERRY_PI = os.uname().machine.startswith(('arm', 'aarch64'))
-EXPECTED_PI_API_KEY = os.getenv("PI_API_KEY", "SUPER_SECRET_KEY_FOR_PI")
-
-def log(message):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {message}")
-
-# --- LED 인덱스 <-> 슬롯 ID 변환 ---
-def ledIndexToSlotId(index):
-    if not (0 <= index < 792): return None
-    SLOTS_PER_LEVEL, LEVELS_PER_RACK, RACKS_IN_A = 12, 3, 8
-    SLOTS_PER_RACK = SLOTS_PER_LEVEL * LEVELS_PER_RACK
-    
-    rack_index_abs = index // SLOTS_PER_RACK
-    slot_in_rack = index % SLOTS_PER_RACK
-    
-    section = 'A' if rack_index_abs < RACKS_IN_A else 'B'
-    rack_num = (rack_index_abs + 1) if section == 'A' else (rack_index_abs - RACKS_IN_A + 1)
-    
-    level_index = slot_in_rack // SLOTS_PER_LEVEL
-    slot_num_in_level = (slot_in_rack % SLOTS_PER_LEVEL) + 1
-    
-    level = {0: 'A', 1: 'B', 2: 'C'}[level_index]
-    
-    rack_id = f"{section}{str(rack_num).zfill(2)}"
-    slot_id_num = str(slot_num_in_level).zfill(2)
-    return f"{rack_id}-{level}-{slot_id_num}"
-
-# --- LED 제어 로직 ---
-class LedController:
-    # ... (이하 코드는 실제/에뮬레이션 환경에 따라 분기)
-    pass
-
-if IS_RASPBERRY_PI:
-    from rpi_ws281x import PixelStrip, Color
-    class LedController:
-        def __init__(self):
-            self.LED_COUNT, self.LED_PIN, self.LED_BRIGHTNESS = 792, 18, 128
-            self.strip = PixelStrip(self.LED_COUNT, self.LED_PIN, 800000, 10, False, self.LED_BRIGHTNESS)
-            self.strip.begin()
-            log("? 실제 LED 컨트롤러 초기화 완료 (Raspberry Pi).")
-            self.turn_off_all()
-
-        def light_up(self, index, duration):
-            if not (0 <= index < self.LED_COUNT):
-                log(f"?? [ERROR] LED 인덱스 {index}가 범위를 벗어남.")
-                return
-            self.turn_off_all()
-            self.strip.setPixelColor(index, Color(255, 180, 0))
-            self.strip.show()
-            threading.Timer(duration, self.turn_off_all).start()
-
-        def turn_off_all(self):
-            for i in range(self.strip.numPixels()):
-                self.strip.setPixelColor(i, Color(0, 0, 0))
-            self.strip.show()
-else: # 에뮬레이션 모드
-    class MockLedController:
-        def __init__(self): log("?? 에뮬레이션 모드로 LED 컨트롤러 초기화 (Not a Raspberry Pi).")
-        def light_up(self, index, duration):
-            log(f"?? [EMULATE] LED {index} 점등 ({duration}초).")
-            threading.Timer(duration, lambda: log(f"? [EMULATE] LED {index} 자동 소등.")).start()
-        def turn_off_all(self): log("? [EMULATE] 모든 LED 소등.")
-
-# --- Flask 웹 서버 및 WebSocket 설정 ---
-# static_folder='.'는 현재 디렉토리에서 정적 파일을 찾으라는 의미입니다.
-app = Flask(__name__, static_folder='.', static_url_path='')
-socketio = SocketIO(app, async_mode='threading') # threading 모드는 개발에 용이
-led_controller = LedController()
-
-# --- API 엔드포인트 ---
-@app.route('/api/v1/light-up', methods=['POST'])
-def handle_light_up_request():
-    data = request.get_json()
-    if not data: return jsonify({"error": "Bad Request"}), 400
-
-    if data.get('apiKey') != EXPECTED_PI_API_KEY:
-        log(f"?? [AUTH] 인증 실패.")
-        return jsonify({"error": "Unauthorized"}), 401
-
-    led_index = data.get('ledIndex')
-    if led_index is None or not isinstance(led_index, int) or led_index < 0:
-        return jsonify({"error": "Invalid 'ledIndex'"}), 400
-
-    log(f"? 인증 성공. LED {led_index} 점등 명령 실행.")
-    led_controller.light_up(index=led_index, duration=11)
-    
-    # WebSocket을 통해 모든 연결된 클라이언트에게 UI 업데이트를 보냅니다.
-    slot_id = ledIndexToSlotId(led_index)
-    if slot_id:
-        socketio.emit('led_update', {'slotId': slot_id})
-        log(f"?? WebSocket으로 UI 업데이트 전송: {slot_id}")
-
-    return jsonify({"status": "success"}), 200
-
-# --- 웹 UI 제공 라우트 ---
-# '/' 경로로 접속하면 index.html을 보여줍니다.
-@app.route('/')
-def index():
-    return app.send_static_file('index.html')
-
-# WebSocket 연결 이벤트 핸들러
-@socketio.on('connect')
-def handle_connect():
-    log(f"???  웹 브라우저 연결됨: {request.sid}")
-
-if __name__ == "__main__":
-    if EXPECTED_PI_API_KEY == "SUPER_SECRET_KEY_FOR_PI":
-        log("?? [WARN] 기본 API 키를 사용 중입니다. 운영 환경에서는 PI_API_KEY 환경변수를 설정하세요.")
-    log("Flask 메인 서버 시작 (웹 UI + API + WebSocket)...")
-    # app.run은 개발용, 운영에서는 gunicorn+eventlet 사용
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SMD Barcode LED Locator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-okaidia.min.css" rel="stylesheet" />
+    <style>
+      /* For a sleek, modern scrollbar in dark mode */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #111827;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #4b5563;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #6b7280;
+      }
+      /* Ensure pre tags with Prism have a consistent font */
+      pre[class*="language-"] {
+        font-family: 'Fira Code', 'D2Coding', monospace;
+        font-size: 14px;
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://esm.sh/react-dom@^19.1.1/",
+    "react/": "https://esm.sh/react@^19.1.1/",
+    "react": "https://esm.sh/react@^19.1.1",
+    "pako": "https://esm.sh/pako@2.1.0/dist/pako.esm.js",
+    "socket.io-client": "https://esm.sh/socket.io-client@4.7.5"
+  }
+}
+</script>
+</head>
+  <body class="bg-gray-900 text-gray-100 font-sans">
+    <div id="root"></div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
