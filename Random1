@@ -1,3 +1,7 @@
+장 중요한 index.html 파일의 내용은 아래와 같습니다. 이 내용을 복사하여 ~/led_controller/index.html 파일을 생성하세요.
+
+html
+Copy
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -49,3 +53,193 @@
     <script type="module" src="/index.tsx"></script>
   </body>
 </html>
+단계 3: GPIO 권한 설정
+필수 사항: `rpi_ws281x` 라이브러리는 하드웨어 GPIO에 직접 접근하므로, 이 라이브러리를 사용하는 스크립트는 항상 sudo (root 권한)로 실행해야 합니다. 운영 배포 가이드의 systemd 설정은 이미 root 사용자로 실행되도록 구성되어 있습니다.
+
+2. 메인 서버 코드 (`app.py`)
+`~/led_controller` 폴더에 아래 내용으로 `app.py` 파일을 생성하세요. 이 코드는 API 서버, 웹 서버, WebSocket 서버의 기능을 모두 포함합니다.
+
+python
+Copy
+# app.py
+# 이 스크립트는 Flask 웹 서버를 실행하여 웹 UI를 제공하고, 
+# Ubuntu 게이트웨이로부터 제어 명령을 받아 LED를 제어하며,
+# WebSocket을 통해 실시간으로 UI를 업데이트합니다.
+import os
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify, send_from_directory
+from flask_socketio import SocketIO
+
+# --- 전역 상태 및 로깅 ---
+IS_RASPBERRY_PI = os.uname().machine.startswith(('arm', 'aarch64'))
+EXPECTED_PI_API_KEY = os.getenv("PI_API_KEY", "SUPER_SECRET_KEY_FOR_PI")
+
+def log(message):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] {message}")
+
+# --- LED 인덱스 <-> 슬롯 ID 변환 ---
+def ledIndexToSlotId(index):
+    if not (0 <= index < 792): return None
+    SLOTS_PER_LEVEL, LEVELS_PER_RACK, RACKS_IN_A = 12, 3, 8
+    SLOTS_PER_RACK = SLOTS_PER_LEVEL * LEVELS_PER_RACK
+    
+    rack_index_abs = index // SLOTS_PER_RACK
+    slot_in_rack = index % SLOTS_PER_RACK
+    
+    section = 'A' if rack_index_abs < RACKS_IN_A else 'B'
+    rack_num = (rack_index_abs + 1) if section == 'A' else (rack_index_abs - RACKS_IN_A + 1)
+    
+    level_index = slot_in_rack // SLOTS_PER_LEVEL
+    slot_num_in_level = (slot_in_rack % SLOTS_PER_LEVEL) + 1
+    
+    level = {0: 'A', 1: 'B', 2: 'C'}[level_index]
+    
+    rack_id = f"{section}{str(rack_num).zfill(2)}"
+    slot_id_num = str(slot_num_in_level).zfill(2)
+    return f"{rack_id}-{level}-{slot_id_num}"
+
+# --- LED 제어 로직 ---
+class LedController:
+    # ... (이하 코드는 실제/에뮬레이션 환경에 따라 분기)
+    pass
+
+if IS_RASPBERRY_PI:
+    from rpi_ws281x import PixelStrip, Color
+    class LedController:
+        def __init__(self):
+            self.LED_COUNT, self.LED_PIN, self.LED_BRIGHTNESS = 792, 18, 128
+            self.strip = PixelStrip(self.LED_COUNT, self.LED_PIN, 800000, 10, False, self.LED_BRIGHTNESS)
+            self.strip.begin()
+            log("? 실제 LED 컨트롤러 초기화 완료 (Raspberry Pi).")
+            self.turn_off_all()
+
+        def light_up(self, index, duration):
+            if not (0 <= index < self.LED_COUNT):
+                log(f"?? [ERROR] LED 인덱스 {index}가 범위를 벗어남.")
+                return
+            self.turn_off_all()
+            self.strip.setPixelColor(index, Color(255, 180, 0))
+            self.strip.show()
+            threading.Timer(duration, self.turn_off_all).start()
+
+        def turn_off_all(self):
+            for i in range(self.strip.numPixels()):
+                self.strip.setPixelColor(i, Color(0, 0, 0))
+            self.strip.show()
+else: # 에뮬레이션 모드
+    class MockLedController:
+        def __init__(self): log("?? 에뮬레이션 모드로 LED 컨트롤러 초기화 (Not a Raspberry Pi).")
+        def light_up(self, index, duration):
+            log(f"?? [EMULATE] LED {index} 점등 ({duration}초).")
+            threading.Timer(duration, lambda: log(f"? [EMULATE] LED {index} 자동 소등.")).start()
+        def turn_off_all(self): log("? [EMULATE] 모든 LED 소등.")
+    led_controller = MockLedController() # For non-Pi environments
+
+# --- Flask 웹 서버 및 WebSocket 설정 ---
+# static_folder='.'는 현재 디렉토리에서 정적 파일을 찾으라는 의미입니다.
+app = Flask(__name__, static_folder='.', static_url_path='')
+socketio = SocketIO(app, async_mode='threading') # threading 모드는 개발에 용이
+led_controller = LedController() if IS_RASPBERRY_PI else MockLedController()
+
+
+# --- API 엔드포인트 ---
+@app.route('/api/v1/light-up', methods=['POST'])
+def handle_light_up_request():
+    data = request.get_json()
+    if not data: return jsonify({"error": "Bad Request"}), 400
+
+    if data.get('apiKey') != EXPECTED_PI_API_KEY:
+        log(f"?? [AUTH] 인증 실패.")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    led_index = data.get('ledIndex')
+    if led_index is None or not isinstance(led_index, int) or led_index < 0:
+        return jsonify({"error": "Invalid 'ledIndex'"}), 400
+
+    log(f"? 인증 성공. LED {led_index} 점등 명령 실행.")
+    led_controller.light_up(index=led_index, duration=11)
+    
+    # WebSocket을 통해 모든 연결된 클라이언트에게 UI 업데이트를 보냅니다.
+    slot_id = ledIndexToSlotId(led_index)
+    if slot_id:
+        socketio.emit('led_update', {'slotId': slot_id})
+        log(f"?? WebSocket으로 UI 업데이트 전송: {slot_id}")
+
+    return jsonify({"status": "success"}), 200
+
+# --- 웹 UI 제공 라우트 ---
+# '/' 경로로 접속하면 index.html을 보여줍니다.
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
+# React Router 등을 사용할 경우, 모든 알 수 없는 경로를 index.html로 리디렉션
+@app.errorhandler(404)
+def not_found(e):
+    # API 요청이 아니면서 경로에 .이 없는 경우 (파일 요청이 아닌 경우)
+    if not request.path.startswith('/api/') and '.' not in request.path:
+        return app.send_static_file('index.html')
+    return e # 원래의 404 에러 반환
+
+# WebSocket 연결 이벤트 핸들러
+@socketio.on('connect')
+def handle_connect():
+    log(f"???  웹 브라우저 연결됨: {request.sid}")
+
+if __name__ == "__main__":
+    if EXPECTED_PI_API_KEY == "SUPER_SECRET_KEY_FOR_PI":
+        log("?? [WARN] 기본 API 키를 사용 중입니다. 운영 환경에서는 PI_API_KEY 환경변수를 설정하세요.")
+    log("Flask 메인 서버 시작 (웹 UI + API + WebSocket)...")
+    # app.run은 개발용, 운영에서는 gunicorn+eventlet 사용
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+핵심 기능
+통합 서버: 단일 코드로 API 엔드포인트, 정적 웹 UI 파일 제공, WebSocket 통신을 모두 처리합니다.
+실시간 UI 업데이트: API 요청으로 LED 상태가 바뀌면, 즉시 WebSocket을 통해 연결된 모든 브라우저에 변경 사항을 전송하여 화면을 동기화합니다.
+자동 에뮬레이션: Pi가 아닌 환경에서 실행 시, 자동으로 하드웨어 제어 코드를 비활성화하고 모든 동작을 콘솔 로그로만 출력하여 테스트를 쉽게 할 수 있습니다.
+3. 운영 배포 및 자동 실행 (systemd + Gunicorn)
+실제 현장 운영을 위해, systemd 서비스를 등록하여 시스템 재부팅 시에도 메인 서버가 `Gunicorn`을 통해 자동으로 실행되도록 설정합니다. Gunicorn은 WebSocket 통신을 위해 `eventlet` 워커를 사용해야 합니다.
+
+1. systemd 서비스 파일 생성
+아래 내용으로 서비스 파일을 생성합니다. 경로를 실제 환경에 맞게 수정해야 합니다.
+
+bash
+Copy
+sudo nano /etc/systemd/system/led_controller.service
+에디터가 열리면 아래 내용을 붙여넣고 저장합니다. `ExecStart` 부분이 WebSocket을 지원하도록 변경되었습니다.
+
+ini
+Copy
+[Unit]
+Description=Main Application Server (Flask + SocketIO) for LED Controller
+After=network.target
+
+[Service]
+# 이 서비스는 GPIO 접근을 위해 반드시 root 권한으로 실행해야 합니다.
+User=root
+
+# 프로젝트 디렉토리 경로 (실제 경로로 수정)
+WorkingDirectory=/home/pi/led_controller
+# 가상환경 경로 (실제 경로로 수정)
+Environment="PATH=/home/pi/led_controller/venv/bin"
+
+# 환경변수로 API 키 설정 (선택 사항)
+Environment="PI_API_KEY=SUPER_SECRET_KEY_FOR_PI"
+
+# Gunicorn을 사용하여 Flask 앱 실행 (eventlet 워커 사용)
+ExecStart=/home/pi/led_controller/venv/bin/gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:5000 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+2. 서비스 활성화 및 시작
+아래 명령어를 실행하여 서비스를 시스템에 등록하고 시작합니다.
+
+bash
+Copy
+sudo systemctl daemon-reload
+sudo systemctl enable led_controller.service
+sudo systemctl start led_controller.service
+sudo systemctl status led_controller.service
+journalctl -u led_controller.service -f
