@@ -1,84 +1,183 @@
-알겠습니다. 두 계정(kw, kwkw)이 생성하는 모든 파일과 디렉토리를 완벽하게 공유하고, 앞으로도 영구적으로 이 설정이 유지되도록 하는 가장 확실한 방법을 단계별로 안내해 드리겠습니다.
+import fitz  # PyMuPDF
+import os
+from collections import defaultdict
 
-아래 코드를 순서대로 실행하시면 됩니다.
+def convert_color(color_int):
+    """
+    PyMuPDF의 정수형 색상 값을 RGB 튜플로 변환합니다.
+    """
+    if color_int is None:
+        return (0, 0, 0)  # 기본값 검은색
+    r = (color_int >> 16) & 0xFF
+    g = (color_int >> 8) & 0xFF
+    b = color_int & 0xFF
+    return (r, g, b)
 
-해결 방법: 공유 그룹 생성 및 자동 권한 설정
-핵심은 kwteam이라는 공유 그룹을 만들고, 두 사용자가 이 그룹에 속하게 하는 것입니다. 그리고 각 사용자의 홈 디렉토리에 setgid 설정을 적용하여, 해당 디렉토리 안에서 새로 생성되는 모든 파일/디렉토리의 소유 그룹이 자동으로 kwteam이 되도록 만듭니다.
+def analyze_pdf_table_structure(pdf_path, output_txt_path, y_threshold=100.0):
+    """
+    PDF의 모든 페이지를 분석하여 그려진 사각형을 '메인 그룹'으로 자동 탐지하고,
+    내부 텍스트를 '소그룹'으로 분류하여 파일로 저장합니다.
 
-1단계: kwteam 그룹 생성 및 사용자 추가
-먼저, 두 계정을 모두 포함할 kwteam이라는 그룹을 생성합니다.
+    :param pdf_path: 분석할 PDF 파일 경로
+    :param output_txt_path: 결과를 저장할 TXT 파일 경로
+    :param y_threshold: 이 y좌표 값보다 큰 영역만 분석합니다.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"오류: PDF 파일을 열 수 없습니다. '{pdf_path}'. 에러 메시지: {e}")
+        return
 
-Bash
+    with open(output_txt_path, 'w', encoding='utf-8') as f:
+        f.write("페이지, 메인그룹ID, 소그룹, 너비, 높이, 텍스트, 색상(RGB), 글자크기\n")
 
-sudo groupadd kwteam
-이제 kw와 kwkw 사용자를 kwteam 그룹에 추가합니다.
+        # 문서의 모든 페이지를 순회
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            
+            # 1. 페이지에 그려진 사각형(그룹 패턴) 탐지
+            drawings = page.get_drawings()
+            group_rects = []
+            min_group_area = 1000  # 너무 작은 사각형은 무시
+            for d in drawings:
+                # 's'는 일반 사각형, 'f'는 채워진 사각형
+                if d['type'] in ['s', 'f']:
+                    rect = d['rect']
+                    # y 임계값과 최소 크기 조건을 만족하는 사각형만 그룹으로 간주
+                    if rect.width * rect.height > min_group_area and rect.y0 > y_threshold:
+                        group_rects.append(rect)
 
-Bash
+            # 탐지된 그룹들을 위에서 아래로, 왼쪽에서 오른쪽으로 정렬
+            group_rects.sort(key=lambda r: (r.y0, r.x0))
 
-sudo usermod -aG kwteam kw
-sudo usermod -aG kwteam kwkw
-?? 중요: 그룹 설정을 시스템에 완전히 적용하려면, 두 계정 모두 로그아웃했다가 다시 로그인하거나 시스템을 재부팅해야 합니다.
+            if not group_rects:
+                print(f"{page_num + 1}페이지에는 y > {y_threshold} 위치에 분석할 사각형 그룹 패턴이 없어 건너뜁니다.")
+                continue
 
-2단계: 기존 파일 및 디렉토리 권한 변경
-이미 생성된 파일과 디렉토리들의 소유 그룹을 kwteam으로 변경하고, 그룹 멤버들이 읽고, 쓰고, 실행할 수 있도록 권한을 부여합니다.
+            print(f"{page_num + 1}페이지 분석 중... {len(group_rects)}개의 메인 그룹을 발견했습니다.")
 
-Bash
+            # 2. 페이지의 모든 텍스트 블록 추출
+            blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_SEARCH)["blocks"]
+            text_blocks = []
+            for block in blocks:
+                if block['bbox'][1] > y_threshold and 'lines' in block and block['lines']:
+                    block_info = {
+                        'bbox': fitz.Rect(block['bbox']), # fitz.Rect 객체로 변환하여 사용
+                        'text': "", 'color': (0, 0, 0), 'size': 0
+                    }
+                    if block['lines']:
+                        line_texts = []
+                        for line in block['lines']:
+                            span_texts = []
+                            for span in line['spans']:
+                                span_texts.append(span['text'])
+                                if not block_info['size']:
+                                    block_info['color'] = convert_color(span['color'])
+                                    block_info['size'] = span['size']
+                            line_texts.append(" ".join(span_texts))
+                        block_info['text'] = " ".join(line_texts).replace('\n', ' ').strip()
+                    
+                    if block_info['text']:
+                        text_blocks.append(block_info)
+            
+            # 3. 텍스트 블록을 그룹에 할당
+            grouped_texts = defaultdict(list)
+            for text_block in text_blocks:
+                for i, group_rect in enumerate(group_rects):
+                    # 텍스트 블록이 그룹 사각형 안에 완전히 포함되는지 확인
+                    if text_block['bbox'] in group_rect:
+                        grouped_texts[i].append(text_block)
+                        break  # 하나의 그룹에 할당되면 다음 텍스트 블록으로 넘어감
 
-# /home/kw 디렉토리와 그 안의 모든 내용의 소유 그룹을 kwteam으로 변경
-sudo chown -R :kwteam /home/kw
+            # 4. 각 그룹을 처리하고 소그룹을 명명하여 파일에 쓰기
+            for group_id, blocks_in_group in grouped_texts.items():
+                if not blocks_in_group:
+                    continue
+                
+                # 그룹 내 블록들을 y좌표(위->아래) 기준으로 정렬
+                blocks_in_group.sort(key=lambda b: b['bbox'].y0)
+                
+                for i, block_info in enumerate(blocks_in_group):
+                    # 위치에 따라 소그룹 이름 부여
+                    if i == 0:
+                        sub_group_name = "타이틀"
+                    else:
+                        sub_group_name = f"내용_{i}"
+                    
+                    rect = block_info['bbox']
+                    width, height = rect.width, rect.height
+                    text, color, size = block_info['text'], block_info['color'], block_info['size']
+                    
+                    # 사용자가 보기 편하도록 그룹ID는 1부터 시작
+                    main_group_id_str = f"그룹_{group_id + 1:03d}"
 
-# /home/kwkw 디렉토리와 그 안의 모든 내용의 소유 그룹을 kwteam으로 변경
-sudo chown -R :kwteam /home/kwkw
+                    output_line = (
+                        f"{page_num + 1}, "
+                        f"{main_group_id_str}, "
+                        f"{sub_group_name}, "
+                        f"너비:{width:.2f}, 높이:{height:.2f}, "
+                        f"텍스트:\"{text}\", "
+                        f"색상:{color}, "
+                        f"크기:{size:.2f}\n"
+                    )
+                    f.write(output_line)
 
-# 두 홈 디렉토리와 그 안의 모든 내용에 그룹 쓰기(w) 및 실행(x) 권한 추가
-sudo chmod -R g+rwx /home/kw
-sudo chmod -R g+rwx /home/kwkw
-3단계: 향후 생성될 파일/디렉토리에 자동 권한 부여 (가장 중요)
-이 단계가 앞으로 생성되는 모든 파일에 대한 공유를 자동화하는 핵심입니다. 홈 디렉토리에 setgid 비트를 설정합니다.
+    doc.close()
+    print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
 
-Bash
 
-sudo chmod g+s /home/kw
-sudo chmod g+s /home/kwkw
-이제 kw 또는 kwkw 사용자가 각자의 홈 디렉토리(/home/kw 또는 /home/kwkw) 아래에 새로운 파일이나 디렉토리를 만들면, 해당 파일/디렉토리의 소유 그룹이 자동으로 kwteam으로 지정됩니다.
+if __name__ == '__main__':
+    # --- 설정 ---
+    pdf_file_path = "example.pdf"
+    output_file_path = "analysis_result.txt"
+    y_coordinate_threshold = 100
+    
+    # --- 실행 ---
+    if not os.path.exists(pdf_file_path):
+        print(f"'{pdf_file_path}'를 찾을 수 없어 테스트용 2페이지 PDF를 생성합니다.")
+        doc = fitz.open()
+        
+        # --- 1페이지 샘플 데이터 생성 ---
+        page1 = doc.new_page()
+        page1.insert_text((50, 80), "이 텍스트는 y좌표 100 미만이라 분석되지 않습니다.", fontsize=10)
+        
+        y_pos = 120
+        # Group 1
+        rect1 = fitz.Rect(40, y_pos - 10, 550, y_pos + 60)
+        page1.draw_rect(rect1, color=(0.8, 0.8, 0.8)) # 그룹을 감싸는 회색 사각형
+        page1.insert_text((50, y_pos), f"P1 메인 그룹 1 타이틀", fontsize=11, color=(0,0,0))
+        page1.insert_text((50, y_pos + 20), f"P1 L-Item 1/A", fontsize=10, color=(0,0,1))
+        page1.insert_text((350, y_pos + 20), f"P1 R-Item 1/X", fontsize=10, color=(1,0,0))
+        page1.insert_text((50, y_pos + 40), f"P1 L-Item 2/B", fontsize=10, color=(0,0,1))
+        y_pos += 90
 
-4단계: 기본 파일 생성 권한(umask) 설정
-파일을 새로 만들 때 그룹 멤버가 바로 수정할 수 있도록 기본 권한을 설정해야 합니다. 각 사용자의 .bashrc 파일에 umask 002 설정을 추가합니다.
+        # Group 2
+        rect2 = fitz.Rect(40, y_pos - 10, 550, y_pos + 40)
+        page1.draw_rect(rect2, color=(0.8, 0.8, 0.8))
+        page1.insert_text((50, y_pos), f"P1 메인 그룹 2 타이틀", fontsize=11, color=(0,0,0))
+        page1.insert_text((50, y_pos + 20), f"이 그룹은 내용이 하나입니다.", fontsize=10, color=(0,0,1))
+        
+        # --- 2페이지 샘플 데이터 생성 ---
+        page2 = doc.new_page()
+        y_pos = 150
 
-kw 사용자로 다음 명령을 실행하세요.
+        # Group 3 (on page 2, left)
+        rect3 = fitz.Rect(40, y_pos - 10, 300, y_pos + 80)
+        page2.draw_rect(rect3, color=(0.9, 0.9, 0.8))
+        page2.insert_text((50, y_pos), f"P2 좌측 그룹", fontsize=11, color=(0,0.5,0))
+        page2.insert_text((50, y_pos + 20), f"P2 L-Item 1/A", fontsize=9, color=(0,0.5,0))
+        page2.insert_text((50, y_pos + 40), f"P2 L-Item 2/B", fontsize=9, color=(0,0.5,0))
+        
+        # Group 4 (on page 2, right)
+        rect4 = fitz.Rect(320, y_pos - 10, 580, y_pos + 80)
+        page2.draw_rect(rect4, color=(0.9, 0.8, 0.9))
+        page2.insert_text((330, y_pos), f"P2 우측 그룹", fontsize=11, color=(0.5,0,0.5))
+        page2.insert_text((330, y_pos + 20), f"P2 R-Item 1/Y", fontsize=9, color=(0.5,0,0.5))
+        page2.insert_text((330, y_pos + 40), f"P2 R-Item 2/Z", fontsize=9, color=(0.5,0,0.5))
+        
+        doc.save(pdf_file_path)
+        doc.close()
+        print("테스트용 PDF 생성이 완료되었습니다.")
+        
+    analyze_pdf_table_structure(pdf_file_path, output_file_path, y_coordinate_threshold)
 
-Bash
-
-echo "umask 002" >> /home/kw/.bashrc
-kwkw 사용자로 다음 명령을 실행하세요.
-
-Bash
-
-echo "umask 002" >> /home/kwkw/.bashrc
-이 설정을 적용하려면 터미널을 새로 열거나 source ~/.bashrc 명령을 실행해야 합니다. (1단계에서 로그아웃/재로그인했다면 이미 적용됩니다.)
-
-? 전체 명령어 요약 (복사해서 바로 사용)
-아래 코드를 터미널에 그대로 붙여넣고 실행하시면 위 모든 과정이 한 번에 처리됩니다.
-
-Bash
-
-# 1. 공유 그룹 생성
-sudo groupadd kwteam
-
-# 2. 사용자들을 그룹에 추가
-sudo usermod -aG kwteam kw
-sudo usermod -aG kwteam kwkw
-
-# 3. 기존 파일/디렉토리 소유 그룹 및 권한 변경
-sudo chown -R :kwteam /home/kw /home/kwkw
-sudo chmod -R g+rwx /home/kw /home/kwkw
-
-# 4. 향후 자동 소유 그룹 설정을 위한 setgid 설정
-sudo chmod g+s /home/kw /home/kwkw
-
-# 5. umask 설정을 각 사용자 프로필에 추가
-echo "umask 002" | sudo tee -a /home/kw/.bashrc /home/kwkw/.bashrc > /dev/null
-
-echo "? 모든 설정이 완료되었습니다."
-echo "?? kw와 kwkw 계정 모두 로그아웃 후 다시 로그인해야 모든 설정이 적용됩니다!"
-이제 두 계정은 어떤 작업을 하든 서로의 파일에 완벽하게 접근하고 수정할 수 있으며, 새로 만드는 모든 파일도 자동으로 공유됩니
