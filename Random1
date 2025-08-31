@@ -1,142 +1,154 @@
 import pdfplumber
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import DBSCAN
 
 # ==============================================================================
-# 데이터 구조 클래스 (출력 형식 변경)
+# 데이터 구조 및 헬퍼 클래스
 # ==============================================================================
+class TextElement:
+    def __init__(self, element: Dict[str, Any]):
+        self.value = element.get('text', '')
+        self.x0, self.top, self.x1, self.bottom = [round(element.get(k, 0), 2) for k in ['x0', 'top', 'x1', 'bottom']]
+        self.data = element
+
+    def __repr__(self):
+        return f"'{self.value}' @ ({self.x0}, {self.top})"
+
 class PartComponent:
-    def __init__(self, page_number: int, part_number_str: str):
+    def __init__(self, page_number: int, part_number_element: TextElement):
         self.page_number = page_number
-        self.part_number = part_number_str
-        # ? 이제 상세 정보는 '라인' 단위의 문자열 리스트로 저장됩니다.
-        self.details_lines: List[str] = []
-
-    def add_line(self, line_text: str):
-        self.details_lines.append(line_text)
-
-# ==============================================================================
-# ? 단어(word) 묶음을 '한 줄'의 텍스트로 재조립하는 함수 ?
-# ==============================================================================
-def reconstruct_lines_from_block(block_words: List[Dict[str, Any]]) -> List[str]:
-    """
-    단어 객체 리스트를 받아, 수직 위치를 기반으로 텍스트 라인 리스트를 반환합니다.
-    """
-    if not block_words:
-        return []
-
-    # 단어를 위->아래, 왼쪽->오른쪽 순으로 정렬
-    sorted_words = sorted(block_words, key=lambda w: (w['top'], w['x0']))
-    
-    lines = []
-    current_line_words = [sorted_words[0]]
-    
-    for i in range(1, len(sorted_words)):
-        prev_word = current_line_words[-1]
-        current_word = sorted_words[i]
-        
-        # 같은 줄에 있는지 판단 (top 좌표가 거의 같으면 같은 줄로 간주)
-        # 허용 오차(tolerance)는 글자 높이의 절반 정도로 설정
-        tolerance = prev_word['bottom'] - prev_word['top'] / 2
-        if abs(current_word['top'] - prev_word['top']) < tolerance:
-            current_line_words.append(current_word)
-        else:
-            # 이전 라인 완성
-            current_line_words.sort(key=lambda w: w['x0']) # 최종적으로 x축 정렬
-            lines.append(" ".join(w['text'] for w in current_line_words))
-            # 새 라인 시작
-            current_line_words = [current_word]
-    
-    # 마지막 라인 추가
-    current_line_words.sort(key=lambda w: w['x0'])
-    lines.append(" ".join(w['text'] for w in current_line_words))
-    
-    return lines
+        self.part_number = part_number_element
+        self.elements: List[TextElement] = []
 
 # ==============================================================================
 # 메인 분석 함수
 # ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
-    all_part_components = []
     part_number_pattern = re.compile(r"^\d{4}-\d{6}$")
+    final_components = []
 
     print(f"PDF 분석 시작: {pdf_path}")
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                print(f"\n--- 페이지 {page_num} 처리 시작 ---")
-                
-                raw_words = page.extract_words(extra_attrs=["size"])
-                sanitized_words = [w for w in raw_words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
-
-                if len(sanitized_words) < 2: continue
-                
-                sorted_words = sorted(sanitized_words, key=lambda w: w['top'])
-
-                # 1단계: K-Means로 그룹 분리 기준 학습
-                gaps = np.array([sorted_words[i+1]['top'] - sorted_words[i]['bottom'] for i in range(len(sorted_words) - 1) if sorted_words[i+1]['top'] > sorted_words[i]['bottom']]).reshape(-1, 1)
-                if len(gaps) < 2: continue
-                kmeans = KMeans(n_clusters=2, random_state=0, n_init='auto').fit(gaps)
-                center1, center2 = kmeans.cluster_centers_.flatten()
-                separation_threshold = gaps[kmeans.labels_ == np.argmax([center1, center2])].min()
-
-                # 2단계: 학습된 기준으로 블록 분리
-                blocks, current_block = [], [sorted_words[0]]
-                for i in range(len(sorted_words) - 1):
-                    gap = sorted_words[i+1]['top'] - sorted_words[i]['bottom']
-                    if gap >= separation_threshold:
-                        blocks.append(current_block)
-                        current_block = [sorted_words[i+1]]
-                    else:
-                        current_block.append(sorted_words[i+1])
-                blocks.append(current_block)
-                print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
-
-                # 3단계: ? 각 블록을 라인 단위로 재조립하고 결과 생성
-                for block in blocks:
-                    found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
-                    if found_part_number_obj:
-                        component = PartComponent(page_num, found_part_number_obj['text'])
-                        
-                        # 블록 내 단어들을 라인으로 재조립
-                        reconstructed_lines = reconstruct_lines_from_block(block)
-                        
-                        for line in reconstructed_lines:
-                            component.add_line(line)
-                        all_part_components.append(component)
-
-        # 최종 결과 출력 (라인 단위로)
-        with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(f"총 {len(all_part_components)}개의 부품을 찾았습니다.\n")
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            print(f"\n--- 페이지 {page_num} 처리 시작 ---")
             
-            page_map = defaultdict(list)
-            for component in all_part_components:
-                page_map[component.page_number].append(component)
+            # --- 공통 준비 단계: 유효한 텍스트 객체 필터링 ---
+            words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
+            sanitized_words = [TextElement(w) for w in words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
+            if not sanitized_words: continue
 
-            for page_num in sorted(page_map.keys()):
-                components_on_page = page_map[page_num]
-                f.write("\n" + "="*25 + f" PAGE {page_num} " + "="*25 + "\n")
-                f.write(f"({len(components_on_page)}개의 부품 발견)\n\n")
-                for i, component in enumerate(components_on_page, 1):
-                    f.write(f"--- {i}. PartNumber: {component.part_number} ---\n")
-                    f.write("Details:\n")
-                    # 라인들을 하나씩 출력
-                    for line in component.details_lines:
-                        f.write(f"\t- {line}\n")
-                    f.write("-" * 60 + "\n")
+            anchors = sorted([w for w in sanitized_words if part_number_pattern.match(w.value)], key=lambda w: w.top)
+            if not anchors: continue
+            
+            print(f"페이지 {page_num}에서 {len(anchors)}개의 부품 코드(기준점)를 찾았습니다.")
 
-        print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
+            # --- 1단계: 표준 규격(Master Template) 학습 ---
+            print("1단계: 표준 영역 규격(Master Template) 학습 시작...")
+            
+            # 1a. 임시 그룹핑 (중간 지점 분할 방식)
+            boundaries = [(anchors[i].bottom + anchors[i+1].top) / 2 for i in range(len(anchors) - 1)]
+            initial_blocks = []
+            for i, anchor in enumerate(anchors):
+                group_top = boundaries[i-1] if i > 0 else 0
+                group_bottom = boundaries[i] if i < len(boundaries) else page.height
+                words_in_group = [w for w in sanitized_words if group_top <= w.top and w.bottom <= group_bottom]
+                if words_in_group:
+                    initial_blocks.append({'anchor': anchor, 'words': words_in_group})
+            
+            # 1b. 각 임시 그룹의 상대 좌표(Offset) 계산
+            offsets = []
+            for block in initial_blocks:
+                anchor = block['anchor']
+                min_x = min(w.x0 for w in block['words'])
+                min_y = min(w.top for w in block['words'])
+                max_x = max(w.x1 for w in block['words'])
+                max_y = max(w.bottom for w in block['words'])
+                
+                offsets.append([anchor.x0 - min_x, anchor.top - min_y, max_x - anchor.x1, max_y - anchor.bottom])
 
-    except Exception as e:
-        print(f"스크립트 실행 중 오류가 발생했습니다: {e}")
-        import traceback; traceback.print_exc()
+            # 1c. 오프셋을 클러스터링하여 최빈값(Master Template) 찾기
+            # eps=2.1: 2픽셀 오차범위 내를 같은 그룹으로 간주
+            clustering = DBSCAN(eps=2.1, min_samples=1).fit(offsets)
+            unique_labels, counts = np.unique(clustering.labels_, return_counts=True)
+            most_frequent_label = unique_labels[counts.argmax()]
+            
+            master_offsets_list = [offsets[i] for i, label in enumerate(clustering.labels_) if label == most_frequent_label]
+            master_template = np.mean(master_offsets_list, axis=0)
+            print(f"학습 완료 -> Master Template (L,T,R,B Offsets): {np.round(master_template, 2)}")
+
+            # --- 2단계: 학습된 규격 적용 및 최종 데이터 추출 ---
+            print("2단계: Master Template을 모든 부품 코드에 적용...")
+            for anchor in anchors:
+                component = PartComponent(page_num, anchor)
+                
+                # 마스터 템플릿을 적용하여 정확한 영역 계산
+                final_x0 = anchor.x0 - master_template[0]
+                final_top = anchor.top - master_template[1]
+                final_x1 = anchor.x1 + master_template[2]
+                final_bottom = anchor.bottom + master_template[3]
+                
+                # 최종 영역 내의 모든 단어 추출
+                final_words = [
+                    w for w in sanitized_words 
+                    if w.x0 >= final_x0 and w.x1 <= final_x1 and w.top >= final_top and w.bottom <= final_bottom
+                ]
+                
+                for word in final_words:
+                    if word is not anchor:
+                        component.elements.append(word)
+                final_components.append(component)
+
+    # --- 3단계: 출력 형식 구성 ---
+    print("\n3단계: 컬럼 기준 설정 및 최종 출력 파일 생성...")
+    if not final_components:
+        print("최종 추출된 부품이 없습니다.")
+        return
+
+    # 3a. 가장 많은 데이터를 가진 부품을 기준으로 컬럼 위치 학습
+    ref_component = max(final_components, key=lambda c: len(c.elements))
+    ref_x_coords = np.array([el.x0 for el in ref_component.elements]).reshape(-1, 1)
+    
+    # x좌표를 클러스터링하여 컬럼 구분 (컬럼 개수는 동적으로 찾을 수 있으나, 여기선 경험적으로 설정)
+    num_columns = min(len(np.unique(ref_x_coords)), 10) # 최대 10개 컬럼으로 가정
+    if num_columns > 0:
+        col_cluster = DBSCAN(eps=5, min_samples=1).fit(ref_x_coords)
+        column_centers = [np.mean(ref_x_coords[col_cluster.labels_ == i]) for i in sorted(np.unique(col_cluster.labels_))]
+    else:
+        column_centers = []
+    
+    print(f"'{ref_component.part_number.value}' 부품을 기준으로 {len(column_centers)}개의 컬럼 학습 완료.")
+    
+    # 3b. 최종 출력
+    with open(output_txt_path, 'w', encoding='utf-8') as f:
+        f.write(f"총 {len(final_components)}개의 부품을 찾았습니다.\n")
+        
+        for component in final_components:
+            f.write("\n" + "="*25 + f" PAGE {component.page_number} / PartNumber: {component.part_number.value} " + "="*25 + "\n")
+            
+            # 각 컬럼에 어떤 요소가 속하는지 매핑
+            component_by_column = defaultdict(list)
+            for el in component.elements:
+                if not column_centers: # 컬럼이 없는 경우
+                    component_by_column[0].append(el)
+                else:
+                    # 가장 가까운 컬럼에 배정
+                    closest_col_index = np.argmin([abs(el.x0 - center) for center in column_centers])
+                    component_by_column[closest_col_index].append(el)
+            
+            # 컬럼 순서대로 정렬하여 출력
+            for col_index in sorted(component_by_column.keys()):
+                elements_in_col = sorted(component_by_column[col_index], key=lambda el: el.top)
+                for el in elements_in_col:
+                    f.write(f"Column {col_index+1} | Pos: ({el.x0}, {el.top}, {el.x1}, {el.bottom}), Size: {el.size}, Color: {el.data.get('non_stroking_color')}, Value: '{el.value}'\n")
+
+    print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
+
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # 필수 라이브러리: pip install scikit-learn numpy
-    pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
+    pdf_file_path = "YOUR_PDF_FILE_PATH.pdf"
     output_file_path = "part_list_final_output.txt"
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
