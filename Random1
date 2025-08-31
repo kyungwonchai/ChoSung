@@ -1,128 +1,139 @@
 import pdfplumber
 import re
 from typing import List, Dict, Any
+import logging
 
-# 각 텍스트 요소의 상세 정보를 담을 데이터 클래스
+# ==============================================================================
+# 1. 로깅 설정: 모든 과정을 파일에 기록하여 원인을 추적합니다.
+# ==============================================================================
+logger = logging.getLogger('pdf_analyzer_debug')
+logger.setLevel(logging.DEBUG)
+
+# 파일 핸들러: debug_log.txt 파일에 모든 로그를 기록합니다.
+fh = logging.FileHandler('debug_log.txt', mode='w', encoding='utf-8')
+fh.setLevel(logging.DEBUG)
+
+# 콘솔 핸들러: 실행 중 화면에는 정보성 메시지만 표시합니다.
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+
+# 로그 형식 설정
+formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s')
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+
+# 로거에 핸들러 추가
+if not logger.handlers:
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+# ==============================================================================
+# 데이터 구조 클래스 (이전과 동일)
+# ==============================================================================
 class TextElement:
     def __init__(self, element: Dict[str, Any]):
         self.value = element.get('text', '')
         self.x0 = round(element.get('x0', 0), 2)
-        self.y0 = round(element.get('y0', 0), 2) # pdfplumber에서는 'top'과 같음
+        self.y0 = round(element.get('y0', 0), 2)
         self.x1 = round(element.get('x1', 0), 2)
-        self.y1 = round(element.get('y1', 0), 2) # pdfplumber에서는 'bottom'과 같음
+        self.y1 = round(element.get('y1', 0), 2)
         self.size = round(element.get('size', 0), 2)
         self.color = element.get('non_stroking_color', (0, 0, 0))
-
     def __repr__(self) -> str:
-        """객체를 문자열로 표현하여 출력 형식을 정의합니다."""
-        return (
-            f"Color: {self.color}, "
-            f"Size: {self.size}, "
-            f"Value: '{self.value}', "
-            f"Position: (x0={self.x0}, y0={self.y0}, x1={self.x1}, y1={self.y1})"
-        )
+        return (f"Value: '{self.value}', Size: {self.size}, Pos: (x0={self.x0}, y0={self.y0})")
 
-# 부품 정보 그룹을 나타내는 클래스
 class PartComponent:
     def __init__(self, page_number: int, part_number_element: TextElement):
         self.page_number = page_number
         self.part_number = part_number_element
         self.related_elements: List[TextElement] = []
-
     def add_element(self, element: TextElement):
-        """그룹에 텍스트 요소를 추가합니다."""
         self.related_elements.append(element)
-
     def __repr__(self) -> str:
-        """최종 출력 형식을 정의합니다."""
-        # 요소들을 시각적 순서(위->아래, 왼쪽->오른쪽)로 정렬하여 출력
         sorted_elements = sorted(self.related_elements, key=lambda e: (e.y0, e.x0))
-        details_str = ",\n\t".join([str(elem) for elem in sorted_elements])
-        return (
-            f"Page: {self.page_number}, PartNumber: {self.part_number.value}\n"
-            f"Details: [\n\t{details_str}\n]"
-        )
+        details_str = ",\n\t".join([f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, y0={e.y0}, x1={e.x1}, y1={e.y1})" for e in sorted_elements])
+        return (f"Page: {self.page_number}, PartNumber: {self.part_number.value}\nDetails: [\n\t{details_str}\n]")
 
+# ==============================================================================
+# 2. 메인 분석 함수 (오류 추적 로직 추가)
+# ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
-    """
-    수직 공백 기반 클러스터링을 사용하여 PDF에서 부품 정보를 분석하고 파일로 저장합니다.
-    """
     all_part_components = []
     part_number_pattern = re.compile(r"^\d{4}-\d{6}$")
 
+    logger.info(f"PDF 분석 시작: {pdf_path}")
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
+                logger.info(f"--- 페이지 {page_num} 처리 시작 ---")
                 page_within_bounds = page.crop((0, 100, page.width, page.height))
                 words = page_within_bounds.extract_words(extra_attrs=["size", "non_stroking_color"])
                 
                 if not words:
+                    logger.warning(f"페이지 {page_num}에서 단어를 찾을 수 없습니다.")
                     continue
+                
+                logger.info(f"페이지 {page_num}에서 {len(words)}개의 단어 객체를 추출했습니다.")
 
-                # 1. 모든 단어를 수직 위치(y0) 기준으로 정렬합니다.
-                sorted_words = sorted(words, key=lambda w: w['y0'])
+                # 'y0' 키 접근 시 오류를 잡기 위한 정렬 함수
+                def safe_sort_key(word_obj):
+                    if 'y0' not in word_obj or word_obj['y0'] is None:
+                        # 결정적 원인: 'y0' 키가 없거나 값이 None인 객체 발견
+                        logger.error(f"!!! 'y0' 키가 없는 객체 발견 !!! -> {word_obj}")
+                        return 0  # 오류 방지를 위해 기본값 0을 반환
+                    return word_obj['y0']
 
-                # 2. 단어들 사이의 수직 간격을 기반으로 블록(그룹)을 나눕니다.
-                blocks = []
+                # 정렬을 시도하며 모든 객체를 검사
+                logger.debug("단어 객체 정렬을 시도합니다...")
+                sorted_words = sorted(words, key=safe_sort_key)
+                logger.info("단어 객체 정렬 완료.")
+
+                # 클러스터링 로직 (이전과 동일)
+                blocks, current_block = [], []
                 if sorted_words:
                     current_block = [sorted_words[0]]
-                    # 일반적인 줄 간격의 1.5배를 그룹 분리 기준으로 설정 (문서에 따라 조정 가능)
-                    line_height_threshold = sorted_words[0]['height'] * 1.5 
-                    
+                    line_height_threshold = sorted_words[0]['height'] * 1.5 if sorted_words[0].get('height', 0) > 0 else 10
+
                     for i in range(len(sorted_words) - 1):
-                        current_word = sorted_words[i]
-                        next_word = sorted_words[i+1]
+                        current_word, next_word = sorted_words[i], sorted_words[i+1]
+                        vertical_gap = safe_sort_key(next_word) - safe_sort_key(current_word)
                         
-                        # y0는 텍스트 상자의 상단 위치입니다.
-                        vertical_gap = next_word['y0'] - current_word['y0']
-                        
-                        # 간격이 임계값보다 크면 새 블록 시작, 아니면 현재 블록에 추가
                         if vertical_gap > line_height_threshold:
                             blocks.append(current_block)
                             current_block = [next_word]
                         else:
                             current_block.append(next_word)
-                    
-                    blocks.append(current_block) # 마지막 블록 추가
-
-                # 3. 나누어진 각 블록을 분석하여 부품 정보를 추출합니다.
-                for block_words in blocks:
+                    blocks.append(current_block)
+                
+                logger.info(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
+                # (이하 분석 로직은 이전과 동일...)
+                for i, block_words in enumerate(blocks):
                     found_part_number_obj = None
                     for word_obj in block_words:
-                        if part_number_pattern.match(word_obj['text']):
+                        if part_number_pattern.match(word_obj.get('text', '')):
                             found_part_number_obj = word_obj
-                            break # 블록 내에서 첫 번째 부품 번호를 찾으면 확정
+                            break
                     
                     if found_part_number_obj:
+                        logger.debug(f"블록 {i+1}에서 부품 번호 '{found_part_number_obj['text']}'를 찾았습니다.")
                         part_element = TextElement(found_part_number_obj)
                         part_component = PartComponent(page_num, part_element)
-                        
                         for word_obj in block_words:
                             part_component.add_element(TextElement(word_obj))
-                        
                         all_part_components.append(part_component)
 
-        # 4. 최종 결과를 텍스트 파일에 저장합니다.
+        # 최종 결과 저장
         with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(f"총 {len(all_part_components)}개의 부품을 찾았습니다.\n")
-            f.write("=" * 60 + "\n")
+            f.write(f"총 {len(all_part_components)}개의 부품을 찾았습니다.\n" + "="*60 + "\n")
             for component in all_part_components:
-                f.write(str(component) + "\n")
-                f.write("-" * 60 + "\n")
-        
-        print(f"분석 완료. 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
+                f.write(str(component) + "\n" + "-"*60 + "\n")
+        logger.info(f"분석 완료. 결과 파일: '{output_txt_path}'")
 
-    except FileNotFoundError:
-        print(f"오류: 파일을 찾을 수 없습니다. 경로를 확인하세요: {pdf_path}")
     except Exception as e:
-        print(f"오류가 발생했습니다: {e}")
+        logger.critical(f"스크립트 실행 중 치명적인 오류 발생: {e}", exc_info=True)
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # 1. 여기에 실제 PDF 파일 경로를 입력하세요.
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
-    
-    # 2. 결과가 저장될 텍스트 파일 경로입니다.
     output_file_path = "part_list_output.txt"
-
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
