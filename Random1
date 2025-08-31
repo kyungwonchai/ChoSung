@@ -1,71 +1,132 @@
 import pdfplumber
-import traceback
+import re
+import statistics
+from typing import List, Dict, Any
+from collections import defaultdict
+import numpy as np
 
-def dump_raw_data_from_pdf(pdf_path: str, output_path: str):
-    """
-    pdfplumber가 추출하는 모든 'word' 객체의 원본 데이터를 텍스트 파일에 기록합니다.
-    분석이나 그룹핑 로직은 일절 포함하지 않습니다.
-    """
-    print(f"'{pdf_path}' 파일의 원본 데이터 추출을 시작합니다...")
-    print(f"결과는 '{output_path}' 파일에 저장됩니다.")
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                f.write(f"PDF 파일 '{pdf_path}' 원본 데이터 분석\n")
-                f.write("="*50 + "\n\n")
+# ==============================================================================
+# 데이터 구조 클래스 (y0/y1 대신 top/bottom 사용)
+# ==============================================================================
+class TextElement:
+    def __init__(self, element: Dict[str, Any]):
+        self.value = element.get('text', '')
+        self.x0 = round(element.get('x0', 0), 2)
+        self.top = round(element.get('top', 0), 2)  # 'y0' 대신 'top'
+        self.x1 = round(element.get('x1', 0), 2)
+        self.bottom = round(element.get('bottom', 0), 2) # 'y1' 대신 'bottom'
+        self.size = round(element.get('size', 0), 2)
+        self.color = element.get('non_stroking_color', (0, 0, 0))
+
+class PartComponent:
+    def __init__(self, page_number: int, part_number_element: TextElement):
+        self.page_number = page_number
+        self.part_number = part_number_element
+        self.related_elements: List[TextElement] = []
+
+    def add_element(self, element: TextElement):
+        self.related_elements.append(element)
+
+    def get_details_string(self) -> str:
+        if not self.related_elements: return "No other details found."
+        # 정렬 기준을 'top', 'x0'으로 변경
+        sorted_elements = sorted(self.related_elements, key=lambda e: (e.top, e.x0))
+        details_list = [
+            f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, top={e.top}, x1={e.x1}, bottom={e.bottom})"
+            for e in sorted_elements
+        ]
+        return ",\n\t".join(details_list)
+
+# ==============================================================================
+# 메인 분석 함수 (모든 y0/y1을 top/bottom으로 교체)
+# ==============================================================================
+def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
+    all_part_components = []
+    part_number_pattern = re.compile(r"^\d{4}-\d{6}$")
+
+    print(f"PDF 분석 시작: {pdf_path}")
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                print(f"\n--- 페이지 {page_num} 처리 시작 ---")
                 
-                for i, page in enumerate(pdf.pages, 1):
-                    f.write(f"=============== PAGE {i} ===============\n")
-                    
-                    try:
-                        # 페이지에서 모든 word 객체를 추출합니다.
-                        words = page.extract_words(extra_attrs=["size", "fontname"])
-                        
-                        if not words:
-                            f.write("-> 이 페이지에서 단어(word) 객체를 찾지 못했습니다.\n\n")
-                            continue
-                        
-                        f.write(f"-> 총 {len(words)}개의 단어(word) 객체를 발견했습니다.\n\n")
-                        
-                        # 추출된 각 word 객체의 정보를 안전하게 기록합니다.
-                        for j, word in enumerate(words, 1):
-                            # .get()을 사용하여 KeyError가 발생하지 않도록 안전하게 값을 가져옵니다.
-                            text_value = word.get('text', 'N/A')
-                            x0 = word.get('x0', 0)
-                            y0 = word.get('y0', None) # None으로 기본값을 설정하여 키 유무를 명확히 확인
-                            x1 = word.get('x1', 0)
-                            y1 = word.get('y1', 0)
-                            
-                            # 'y0' 키의 존재 여부를 명시적으로 확인합니다.
-                            y0_status = "OK" if y0 is not None else "!!! 'y0' KEY MISSING !!!"
-                            
-                            f.write(
-                                f"  - Obj [{j}]:\n"
-                                f"    Value : '{text_value}'\n"
-                                f"    Position: (x0={x0:.2f}, y0={y0 if y0 is not None else 'N/A'}, x1={x1:.2f}, y1={y1:.2f})\n"
-                                f"    Status: {y0_status}\n"
-                                f"    Raw Data: {word}\n\n"
-                            )
-                            
-                    except Exception as page_error:
-                        f.write(f"!!! 페이지 {i} 처리 중 심각한 오류 발생: {page_error} !!!\n")
-                        f.write(traceback.format_exc() + "\n")
-                        
-            print("원본 데이터 추출이 성공적으로 완료되었습니다.")
+                raw_words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
+                
+                # 'top', 'bottom' 키를 가진 유효한 객체만 필터링 (간단하지만 확실한 검증)
+                sanitized_words = [
+                    w for w in raw_words
+                    if 'top' in w and 'bottom' in w and w['bottom'] > w['top']
+                ]
 
-        except Exception as e:
-            error_message = f"!!! PDF 파일 처리 중 치명적인 오류 발생: {e} !!!"
-            print(error_message)
-            f.write(error_message + "\n")
-            f.write(traceback.format_exc())
+                if not sanitized_words:
+                    print(f"페이지 {page_num}에서 유효한 텍스트를 찾지 못했습니다.")
+                    continue
+                
+                print(f"원본 객체 {len(raw_words)}개 -> 유효 텍스트 {len(sanitized_words)}개로 정제 완료.")
+                
+                sorted_words = sorted(sanitized_words, key=lambda w: w['top'])
+
+                # 통계적 그룹핑 로직 (top/bottom 사용)
+                gaps = [
+                    sorted_words[i+1]['top'] - sorted_words[i]['bottom']
+                    for i in range(len(sorted_words) - 1)
+                    if sorted_words[i+1]['top'] > sorted_words[i]['bottom']
+                ]
+                
+                if not gaps:
+                    blocks = [sorted_words]
+                else:
+                    q1, q3 = np.percentile(gaps, [25, 75])
+                    iqr = q3 - q1
+                    separation_threshold = q3 + 1.5 * iqr
+                    blocks, current_block = [], [sorted_words[0]]
+                    for i in range(len(sorted_words) - 1):
+                        gap = sorted_words[i+1]['top'] - sorted_words[i]['bottom']
+                        if gap > separation_threshold:
+                            blocks.append(current_block)
+                            current_block = [sorted_words[i+1]]
+                        else:
+                            current_block.append(sorted_words[i+1])
+                    blocks.append(current_block)
+                
+                print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
+
+                # 블록 처리 및 결과 생성
+                for block in blocks:
+                    found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
+                    if found_part_number_obj:
+                        part_element = TextElement(found_part_number_obj)
+                        component = PartComponent(page_num, part_element)
+                        for word_obj in block:
+                            if word_obj is not found_part_number_obj:
+                                component.add_element(TextElement(word_obj))
+                        all_part_components.append(component)
+
+        # 최종 결과 출력
+        page_map = defaultdict(list)
+        for component in all_part_components:
+            page_map[component.page_number].append(component)
+
+        with open(output_txt_path, 'w', encoding='utf-8') as f:
+            f.write(f"총 {len(all_part_components)}개의 부품을 {len(page_map)}개 페이지에서 찾았습니다.\n")
+            for page_num in sorted(page_map.keys()):
+                components_on_page = page_map[page_num]
+                f.write("\n" + "="*25 + f" PAGE {page_num} " + "="*25 + "\n")
+                f.write(f"({len(components_on_page)}개의 부품 발견)\n\n")
+                for i, component in enumerate(components_on_page, 1):
+                    f.write(f"--- {i}. PartNumber: {component.part_number.value} ---\n")
+                    f.write(f"Details: [\n\t{component.get_details_string()}\n]\n")
+                    f.write("-" * 60 + "\n")
+
+        print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
+
+    except Exception as e:
+        print(f"스크립트 실행 중 오류가 발생했습니다: {e}")
+        import traceback; traceback.print_exc()
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # 1. 실제 PDF 파일 경로를 입력하세요.
-    pdf_file_path = "YOUR_PDF_FILE_PATH.pdf"
-    
-    # 2. 결과가 저장될 파일 이름입니다.
-    output_file_path = "raw_data_dump.txt"
-    
-    dump_raw_data_from_pdf(pdf_file_path, output_file_path)
+    # numpy 라이브러리가 필요합니다: pip install numpy
+    pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
+    output_file_path = "part_list_final_output.txt"
+    analyze_parts_from_pdf(pdf_file_path, output_file_path)
