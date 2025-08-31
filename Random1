@@ -1,20 +1,18 @@
 import pdfplumber
 import re
-import statistics
 from typing import List, Dict, Any
 from collections import defaultdict
-import numpy as np
 
 # ==============================================================================
-# 데이터 구조 클래스 (y0/y1 대신 top/bottom 사용)
+# 데이터 구조 클래스 (변경 없음)
 # ==============================================================================
 class TextElement:
     def __init__(self, element: Dict[str, Any]):
         self.value = element.get('text', '')
         self.x0 = round(element.get('x0', 0), 2)
-        self.top = round(element.get('top', 0), 2)  # 'y0' 대신 'top'
+        self.top = round(element.get('top', 0), 2)
         self.x1 = round(element.get('x1', 0), 2)
-        self.bottom = round(element.get('bottom', 0), 2) # 'y1' 대신 'bottom'
+        self.bottom = round(element.get('bottom', 0), 2)
         self.size = round(element.get('size', 0), 2)
         self.color = element.get('non_stroking_color', (0, 0, 0))
 
@@ -29,7 +27,6 @@ class PartComponent:
 
     def get_details_string(self) -> str:
         if not self.related_elements: return "No other details found."
-        # 정렬 기준을 'top', 'x0'으로 변경
         sorted_elements = sorted(self.related_elements, key=lambda e: (e.top, e.x0))
         details_list = [
             f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, top={e.top}, x1={e.x1}, bottom={e.bottom})"
@@ -38,7 +35,7 @@ class PartComponent:
         return ",\n\t".join(details_list)
 
 # ==============================================================================
-# 메인 분석 함수 (모든 y0/y1을 top/bottom으로 교체)
+# ? '중간 지점 분할' 로직이 적용된 메인 함수 ?
 # ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
     all_part_components = []
@@ -52,57 +49,52 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
                 
                 raw_words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
                 
-                # 'top', 'bottom' 키를 가진 유효한 객체만 필터링 (간단하지만 확실한 검증)
-                sanitized_words = [
-                    w for w in raw_words
-                    if 'top' in w and 'bottom' in w and w['bottom'] > w['top']
-                ]
+                # 'top', 'bottom' 키를 가진 유효한 객체만 필터링
+                sanitized_words = [w for w in raw_words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
 
                 if not sanitized_words:
                     print(f"페이지 {page_num}에서 유효한 텍스트를 찾지 못했습니다.")
                     continue
-                
-                print(f"원본 객체 {len(raw_words)}개 -> 유효 텍스트 {len(sanitized_words)}개로 정제 완료.")
-                
-                sorted_words = sorted(sanitized_words, key=lambda w: w['top'])
 
-                # 통계적 그룹핑 로직 (top/bottom 사용)
-                gaps = [
-                    sorted_words[i+1]['top'] - sorted_words[i]['bottom']
-                    for i in range(len(sorted_words) - 1)
-                    if sorted_words[i+1]['top'] > sorted_words[i]['bottom']
-                ]
-                
-                if not gaps:
-                    blocks = [sorted_words]
-                else:
-                    q1, q3 = np.percentile(gaps, [25, 75])
-                    iqr = q3 - q1
-                    separation_threshold = q3 + 1.5 * iqr
-                    blocks, current_block = [], [sorted_words[0]]
-                    for i in range(len(sorted_words) - 1):
-                        gap = sorted_words[i+1]['top'] - sorted_words[i]['bottom']
-                        if gap > separation_threshold:
-                            blocks.append(current_block)
-                            current_block = [sorted_words[i+1]]
-                        else:
-                            current_block.append(sorted_words[i+1])
-                    blocks.append(current_block)
-                
-                print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
+                # 1. ? 페이지의 모든 부품 번호를 찾아 수직으로 정렬합니다. (기준점 설정)
+                anchors = sorted(
+                    [w for w in sanitized_words if part_number_pattern.match(w.get('text', ''))],
+                    key=lambda w: w['top']
+                )
 
-                # 블록 처리 및 결과 생성
-                for block in blocks:
-                    found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
-                    if found_part_number_obj:
-                        part_element = TextElement(found_part_number_obj)
-                        component = PartComponent(page_num, part_element)
-                        for word_obj in block:
-                            if word_obj is not found_part_number_obj:
-                                component.add_element(TextElement(word_obj))
-                        all_part_components.append(component)
+                if not anchors:
+                    print(f"페이지 {page_num}에서 부품 번호를 찾지 못했습니다.")
+                    continue
+                
+                print(f"페이지 {page_num}에서 {len(anchors)}개의 부품 번호(기준점)를 찾았습니다.")
 
-        # 최종 결과 출력
+                # 2. ? 각 부품 번호 사이의 중간 지점을 찾아 경계선을 설정합니다.
+                boundaries = []
+                for i in range(len(anchors) - 1):
+                    midpoint = (anchors[i]['bottom'] + anchors[i+1]['top']) / 2
+                    boundaries.append(midpoint)
+
+                # 3. ? 설정된 경계선을 기준으로 전체 텍스트를 그룹으로 나눕니다.
+                for i, anchor in enumerate(anchors):
+                    # 그룹의 수직 범위 설정
+                    group_top = boundaries[i-1] if i > 0 else 0
+                    group_bottom = boundaries[i] if i < len(boundaries) else page.height
+                    
+                    # 현재 그룹에 속하는 단어들을 모두 찾습니다.
+                    words_in_group = [
+                        w for w in sanitized_words
+                        if group_top <= w['top'] and w['bottom'] <= group_bottom
+                    ]
+                    
+                    # PartComponent 객체 생성
+                    part_element = TextElement(anchor)
+                    component = PartComponent(page_num, part_element)
+                    for word_obj in words_in_group:
+                        if word_obj is not anchor:
+                            component.add_element(TextElement(word_obj))
+                    all_part_components.append(component)
+
+        # 4. 최종 결과를 페이지별로 출력
         page_map = defaultdict(list)
         for component in all_part_components:
             page_map[component.page_number].append(component)
@@ -126,7 +118,6 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # numpy 라이브러리가 필요합니다: pip install numpy
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
     output_file_path = "part_list_final_output.txt"
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
