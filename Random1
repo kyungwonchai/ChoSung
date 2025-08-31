@@ -1,11 +1,13 @@
 import pdfplumber
 import re
 import numpy as np
-import traceback
+import configparser
+import os
 from typing import List, Dict, Any
+from collections import defaultdict
 
 # ==============================================================================
-# 데이터 구조 및 헬퍼 클래스 (이전과 동일)
+# 데이터 구조 및 헬퍼 클래스
 # ==============================================================================
 class TextElement:
     def __init__(self, element: Dict[str, Any]):
@@ -29,92 +31,164 @@ def find_nearest_element(anchor: TextElement, candidates: List[TextElement]) -> 
     return nearest_element
 
 # ==============================================================================
-# ? 디버깅 로그 생성 메인 함수 ?
+# ? 새로운 핵심 로직: 분리된 식별자 및 라인 재조립 함수 ?
 # ==============================================================================
-def debug_identifier_detection(pdf_path: str, output_log_path: str):
-    print(f"디버깅 시작: '{pdf_path}' 파일을 분석하여 '{output_log_path}'에 로그를 기록합니다.")
+def merge_and_reconstruct(words: List[TextElement]) -> List[TextElement]:
+    """
+    분리된 우하단 식별자를 먼저 합치고, 전체 텍스트를 라인 단위로 재조립합니다.
+    """
+    # --- 1단계: 분리된 우하단 식별자('숫자 X 숫자') 합치기 ---
+    merged_words = []
+    i = 0
+    words.sort(key=lambda w: (w.top, w.x0)) # 정렬 필수
     
-    # --- 패턴 정의 ---
+    while i < len(words):
+        # 'X', 'x', '*'를 찾습니다.
+        if words[i].text in ['x', 'X', '*'] and i > 0 and i < len(words) - 1:
+            prev_word = words[i-1]
+            operator = words[i]
+            next_word = words[i+1]
+            
+            # 좌우 단어가 숫자이고, 가로 20px 이내에 있는지, 세로 위치가 비슷한지 확인
+            if (prev_word.text.isdigit() and next_word.text.isdigit() and
+                (operator.x0 - prev_word.x1) < 20 and (next_word.x0 - operator.x1) < 20 and
+                abs(operator.top - prev_word.top) < 5 and abs(operator.top - next_word.top) < 5):
+                
+                # 새로운 합쳐진 객체 생성
+                combined_text = f"{prev_word.text} {operator.text} {next_word.text}"
+                new_word_obj = {
+                    'text': combined_text,
+                    'x0': prev_word.x0, 'top': operator.top,
+                    'x1': next_word.x1, 'bottom': operator.bottom
+                }
+                # 마지막에 추가했던 좌측 숫자를 제거하고 합쳐진 객체로 대체
+                merged_words.pop() 
+                merged_words.append(TextElement(new_word_obj))
+                i += 2 # 3개 단어를 처리했으므로 인덱스 점프
+                continue
+
+        merged_words.append(words[i])
+        i += 1
+        
+    return merged_words
+
+
+# ==============================================================================
+# 메인 분석 함수
+# ==============================================================================
+def analyze_document_with_learned_spec(pdf_path: str, output_txt_path: str):
+    spec_file = 'pageset.ini'
     material_code_pattern = re.compile(r"^\d{4}-\d{6}$")
     top_left_pattern = re.compile(r"^\d{2}[A-Z]?$")
-    bottom_right_pattern = re.compile(r"^\d+\s?[xX*]\s?\d+$")
-    
-    patterns = {
-        "자재코드": material_code_pattern,
-        "좌상단": top_left_pattern,
-        "우하단": bottom_right_pattern
-    }
+    bottom_right_pattern = re.compile(r"^\d+\s?[xX*]\s?\d+$") # 재조립 후 이 패턴이 매칭됨
 
-    with open(output_log_path, 'w', encoding='utf-8') as f:
+    config = configparser.ConfigParser()
+    master_spec = None
+
+    if os.path.exists(spec_file):
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_num, page in enumerate(pdf.pages, 1):
-                    f.write("\n" + "="*25 + f" PAGE {page_num} " + "="*25 + "\n")
-                    words = [TextElement(w) for w in page.extract_words()]
+            config.read(spec_file)
+            master_spec = {k: config.getfloat('MasterSpec', k) for k in config['MasterSpec']}
+            print(f"'{spec_file}'에서 학습된 규격을 불러왔습니다.")
+        except Exception:
+            master_spec = None
+            
+    if master_spec is None:
+        print("1차 탐색: 문서 전체를 스캔하여 '마스터 규격'을 학습합니다...")
+        all_distances = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                print(f"  - 학습 중... (페이지 {page_num}/{len(pdf.pages)})")
+                raw_words = [TextElement(w) for w in page.extract_words()]
+                
+                # ? 재조립 로직을 학습 단계에서 먼저 적용
+                words = merge_and_reconstruct(raw_words)
+                
+                material_codes = [w for w in words if material_code_pattern.match(w.text)]
+                tl_codes = [w for w in words if top_left_pattern.match(w.text)]
+                br_codes = [w for w in words if bottom_right_pattern.match(w.text)]
+
+                for mc in material_codes:
+                    nearest_tl = find_nearest_element(mc, tl_codes)
+                    nearest_br = find_nearest_element(mc, br_codes)
                     
-                    if not words:
-                        f.write("이 페이지에서 단어를 찾지 못했습니다.\n")
-                        continue
+                    if nearest_tl and nearest_br:
+                        all_distances.append([
+                            nearest_tl.x0 - mc.x0, nearest_tl.top - mc.top,
+                            nearest_br.x1 - mc.x1, nearest_br.bottom - mc.bottom
+                        ])
 
-                    # --- 1차 기록: 모든 단어와 패턴 매칭 결과 ---
-                    f.write("\n--- 1. Raw Word Extraction & Regex Matching ---\n")
-                    f.write(f"총 {len(words)}개의 단어를 추출했습니다.\n\n")
-                    
-                    material_codes, tl_codes, br_codes = [], [], []
-                    
-                    for i, word in enumerate(words):
-                        matched_pattern = "None"
-                        for name, pattern in patterns.items():
-                            if pattern.match(word.text):
-                                matched_pattern = name
-                                if name == "자재코드": material_codes.append(word)
-                                elif name == "좌상단": tl_codes.append(word)
-                                elif name == "우하단": br_codes.append(word)
-                                break # 첫 매칭 후 중단
-                        
-                        f.write(f"  Obj {i+1:03d} | Text: '{word.text}'".ljust(40) + f"| Pos: (x0={word.x0}, top={word.top})".ljust(40) + f"| Matched: {matched_pattern}\n")
-                    
-                    # --- 2차 기록: 최근접 탐색 분석 ---
-                    f.write("\n\n--- 2. Nearest Neighbor Analysis ---\n")
-                    f.write(f"페이지에서 발견된 식별자: 자재코드({len(material_codes)}개), 좌상단({len(tl_codes)}개), 우하단({len(br_codes)}개)\n\n")
+        if not all_distances: raise ValueError("문서 전체에서 유효한 규격 샘플을 찾을 수 없습니다.")
 
-                    if not material_codes:
-                        f.write("분석할 자재코드가 없습니다.\n")
-                        continue
+        distances_arr = np.array(all_distances)
+        q1 = np.percentile(distances_arr, 25, axis=0)
+        q3 = np.percentile(distances_arr, 75, axis=0)
+        iqr = q3 - q1
+        lower_bound, upper_bound = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        filtered_distances = distances_arr[np.all((distances_arr >= lower_bound) & (distances_arr <= upper_bound), axis=1)]
+        
+        avg_distances = np.mean(filtered_distances, axis=0)
+        master_spec = {
+            'dist_tl_x': avg_distances[0], 'dist_tl_y': avg_distances[1],
+            'dist_br_x': avg_distances[2], 'dist_br_y': avg_distances[3]
+        }
+        
+        print("학습 완료. 마스터 규격을 `pageset.ini` 파일에 저장합니다.")
+        config['MasterSpec'] = {k: str(v) for k, v in master_spec.items()}
+        with open(spec_file, 'w') as configfile:
+            config.write(configfile)
 
-                    for i, mc in enumerate(material_codes):
-                        f.write(f"Analyzing Material Code {i+1}: '{mc.text}' at (x0={mc.x0}, top={mc.top})\n")
-                        
-                        # 최근접 좌상단/우하단 찾기
-                        nearest_tl = find_nearest_element(mc, tl_codes)
-                        nearest_br = find_nearest_element(mc, br_codes)
-                        
-                        if nearest_tl:
-                            f.write(f"  -> Nearest TL Found: '{nearest_tl.text}' at (x0={nearest_tl.x0}, top={nearest_tl.top})\n")
-                        else:
-                            f.write("  -> Nearest TL Found: None\n")
-                            
-                        if nearest_br:
-                            f.write(f"  -> Nearest BR Found: '{nearest_br.text}' at (x0={nearest_br.x0}, top={nearest_br.top})\n")
-                        else:
-                            f.write("  -> Nearest BR Found: None\n")
-                            
-                        # 최종 샘플 유효성 판단
-                        if nearest_tl and nearest_br:
-                            f.write("  ==> RESULT: SUCCESS - This is a valid sample for learning.\n\n")
-                        else:
-                            f.write("  ==> RESULT: FAILED - Could not find a valid TL/BR pair.\n\n")
+    print("\n2차 탐색: 학습된 규격을 적용하여 전체 데이터를 추출합니다...")
+    final_results = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            raw_words = [TextElement(w) for w in page.extract_words()]
+            words = merge_and_reconstruct(raw_words) # ? 2차 탐색에서도 동일하게 재조립 적용
+            material_codes = [w for w in words if material_code_pattern.match(w.text)]
+            
+            for mc in material_codes:
+                box_x0, box_top, box_x1, box_bottom = (
+                    mc.x0 + master_spec['dist_tl_x'], mc.top + master_spec['dist_tl_y'],
+                    mc.x1 + master_spec['dist_br_x'], mc.bottom + master_spec['dist_br_y']
+                )
+                
+                words_in_box = [w for w in words if w.x0 >= box_x0 and w.x1 <= box_x1 and w.top >= box_top and w.bottom <= box_bottom]
+                
+                # ? 최종 정보도 라인 단위로 재구성
+                reconstructed_data = " | ".join(sorted([" ".join(w.text for w in line) for y, line in defaultdict(list, [(w.top, line) for w in sorted(words_in_box, key=lambda x: (x.top, x.x0)) for y, line in lines.items() if abs(w.top - y) < 5] or [(w.top, [w]) for _ in [lines := defaultdict(list)]]) for y, line in lines.items()], key=lambda line: float(line.split("' @ (")[1].split(", ")[1].rstrip(')'))))
+                
+                lines = defaultdict(list)
+                for word in sorted(words_in_box, key=lambda w: (w.top, w.x0)):
+                    found = False
+                    for y_key in lines.keys():
+                        if abs(word.top - y_key) < 5:
+                            lines[y_key].append(word)
+                            found = True
+                            break
+                    if not found:
+                        lines[word.top].append(word)
+                
+                full_text_lines = []
+                for y_key in sorted(lines.keys()):
+                    full_text_lines.append(" ".join(w.text for w in lines[y_key]))
+                reconstructed_data = " | ".join(full_text_lines)
+                
+                final_results.append((page_num, mc.text, reconstructed_data))
+    
+    with open(output_txt_path, 'w', encoding='utf-8') as f:
+        f.write(f"--- 학습된 마스터 규격 (from {spec_file}) ---\n")
+        for key, value in master_spec.items():
+            f.write(f"- {key}: {value:.2f}px\n")
+        f.write("-" * 50 + "\n\n")
+        
+        f.write("--- 최종 추출 데이터 ---\n")
+        for page_num, mc_text, data in final_results:
+            f.write(f"페이지: {page_num}, 자재코드: {mc_text}, 정보: [ {data} ]\n")
 
-            print("디버깅 로그 파일 생성이 완료되었습니다.")
-
-        except Exception as e:
-            error_message = f"!!! 치명적인 오류 발생: {e} !!!"
-            print(error_message)
-            f.write(error_message + "\n")
-            f.write(traceback.format_exc())
+    print(f"\n모든 분석 완료! 최종 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf"
-    output_log_path = "debug_log.txt"
-    debug_identifier_detection(pdf_file_path, output_log_path)
+    output_file_path = "part_list_final_output.txt"
+    analyze_document_with_learned_spec(pdf_file_path, output_file_path)
