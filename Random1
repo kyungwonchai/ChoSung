@@ -2,36 +2,16 @@ import pdfplumber
 import re
 import statistics
 from typing import List, Dict, Any
-import logging
+from collections import defaultdict
+import numpy as np
 
 # ==============================================================================
-# 1. 디버깅을 위한 로깅 설정
-# ==============================================================================
-# 콘솔에 출력하지 않고 파일에만 DEBUG 레벨 로그를 기록하도록 설정합니다.
-logger = logging.getLogger('pdf_analyzer_debug')
-logger.setLevel(logging.DEBUG)
-
-# 이전 핸들러가 남아있을 경우를 대비해 초기화
-if logger.hasHandlers():
-    logger.handlers.clear()
-
-# 파일 핸들러: debug_log.txt 파일에 모든 상세 과정을 기록합니다.
-fh = logging.FileHandler('debug_log.txt', mode='w', encoding='utf-8')
-fh.setLevel(logging.DEBUG) # DEBUG 레벨 이상의 모든 로그를 파일에 기록
-formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s')
-fh.setFormatter(formatter)
-logger.addHandler(fh)
-
-# ==============================================================================
-# 데이터 구조 클래스 (이전과 동일)
+# 데이터 구조 클래스 (변경 없음)
 # ==============================================================================
 class TextElement:
     def __init__(self, element: Dict[str, Any]):
         self.value = element.get('text', '')
-        self.x0 = round(element.get('x0', 0), 2)
-        self.y0 = round(element.get('y0', 0), 2)
-        self.x1 = round(element.get('x1', 0), 2)
-        self.y1 = round(element.get('y1', 0), 2)
+        self.x0, self.y0, self.x1, self.y1 = [round(element.get(k, 0), 2) for k in ['x0', 'y0', 'x1', 'y1']]
         self.size = round(element.get('size', 0), 2)
         self.color = element.get('non_stroking_color', (0, 0, 0))
 
@@ -44,107 +24,108 @@ class PartComponent:
     def add_element(self, element: TextElement):
         self.related_elements.append(element)
 
-    def __repr__(self) -> str:
+    def get_details_string(self) -> str:
+        if not self.related_elements: return "No other details found."
         sorted_elements = sorted(self.related_elements, key=lambda e: (e.y0, e.x0))
-        details_str = ",\n\t".join([
-            f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, y0={e.y0}, x1={e.x1}, y1={e.y1})" 
-            for e in sorted_elements
-        ])
-        return (
-            f"Page: {self.page_number}, PartNumber: {self.part_number.value}\n"
-            f"Details: [\n\t{details_str}\n]"
-        )
+        details_list = [f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, y0={e.y0}, x1={e.x1}, y1={e.y1})" for e in sorted_elements]
+        return ",\n\t".join(details_list)
 
 # ==============================================================================
-# 메인 분석 함수 (오류 처리 강화)
+# ? 완전히 새로워진 메인 분석 함수 ?
 # ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
     all_part_components = []
     part_number_pattern = re.compile(r"^\d{4}-\d{6}$")
 
-    logger.info(f"PDF 분석 시작: {pdf_path}")
-    print(f"PDF 분석 시작: {pdf_path}") # 사용자에게 진행 상황을 알리기 위한 콘솔 출력
-
-    # ? 'y0' 키 접근 시 오류를 기록하고 안전하게 처리하는 헬퍼 함수
-    def get_safe_y(word_obj, key):
-        if key not in word_obj or word_obj[key] is None:
-            logger.error(f"!!! '{key}' 키가 없는 비정상 객체 발견 !!! -> {word_obj}")
-            return 0  # 오류 방지를 위해 기본값 0 반환
-        return word_obj[key]
-
+    print(f"PDF 분석 시작: {pdf_path}")
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
-                logger.info(f"--- 페이지 {page_num} 처리 시작 ---")
-                
+                print(f"\n--- 페이지 {page_num} 처리 시작 ---")
                 page_within_bounds = page.crop((0, 100, page.width, page.height))
-                words = page_within_bounds.extract_words(extra_attrs=["size", "non_stroking_color"])
+                raw_words = page_within_bounds.extract_words(extra_attrs=["size", "non_stroking_color"])
                 
-                if not words:
-                    logger.warning(f"페이지 {page_num}에서 단어를 찾지 못했습니다.")
+                # 1. ? 데이터 정제: 좌표가 없거나 비정상적인 '유령 객체'를 완벽히 제거합니다.
+                sanitized_words = [
+                    w for w in raw_words
+                    if w.get('y0', 0) > 100 and w.get('x1', 0) > w.get('x0', 0) and w.get('y1', 0) > w.get('y0', 0)
+                ]
+                
+                if not sanitized_words:
+                    print(f"페이지 {page_num}에서 유효한 텍스트를 찾지 못했습니다.")
                     continue
                 
-                logger.info(f"페이지 {page_num}에서 {len(words)}개의 단어 객체 추출.")
-
-                # 안전한 y좌표 접근을 사용하여 단어 정렬
-                sorted_words = sorted(words, key=lambda w: get_safe_y(w, 'y0'))
-
-                # 표준 줄 간격 계산 (안전한 y좌표 접근 사용)
-                line_gaps = []
-                for i in range(len(sorted_words) - 1):
-                    y0_current = get_safe_y(sorted_words[i], 'y0')
-                    y0_next = get_safe_y(sorted_words[i+1], 'y0')
-                    if abs(y0_current - y0_next) > 5:
-                        gap = y0_next - get_safe_y(sorted_words[i], 'y1')
-                        if gap > 0:
-                            line_gaps.append(gap)
+                print(f"원본 객체 {len(raw_words)}개 -> 유효 객체 {len(sanitized_words)}개로 정제 완료.")
                 
-                median_gap = statistics.median(line_gaps) if line_gaps else 10
-                separation_threshold = median_gap * 1.8 + 2
-                logger.info(f"페이지 {page_num}의 표준 줄 간격: {median_gap:.2f}px, 그룹 분리 임계값: {separation_threshold:.2f}px")
+                sorted_words = sorted(sanitized_words, key=lambda w: w['y0'])
 
-                # 블록 나누기 (안전한 y좌표 접근 사용)
-                blocks, current_block = [], []
-                if sorted_words:
-                    current_block = [sorted_words[0]]
+                # 2. ? 완전 자동 그룹핑: 통계 분석으로 그룹 분리 기준을 자동 산출합니다.
+                gaps = [
+                    sorted_words[i+1]['y0'] - sorted_words[i]['y1']
+                    for i in range(len(sorted_words) - 1)
+                    if sorted_words[i+1]['y0'] > sorted_words[i]['y1']
+                ]
+                
+                if not gaps: # 페이지에 텍스트 블록이 하나만 있는 경우
+                    blocks = [sorted_words]
+                else:
+                    # 통계적 이상치(outlier)를 그룹 분리 기준으로 사용 (IQR 방식)
+                    q1, q3 = np.percentile(gaps, [25, 75])
+                    iqr = q3 - q1
+                    # 일반적인 줄 간격보다 확연히 큰 간격을 자동으로 찾아냄
+                    separation_threshold = q3 + 1.5 * iqr 
+                    
+                    print(f"페이지 {page_num}의 통계적 그룹 분리 임계값 자동 산출: {separation_threshold:.2f}px")
+
+                    blocks, current_block = [], [sorted_words[0]]
                     for i in range(len(sorted_words) - 1):
-                        gap = get_safe_y(sorted_words[i+1], 'y0') - get_safe_y(sorted_words[i], 'y1')
+                        gap = sorted_words[i+1]['y0'] - sorted_words[i]['y1']
                         if gap > separation_threshold:
                             blocks.append(current_block)
                             current_block = [sorted_words[i+1]]
                         else:
                             current_block.append(sorted_words[i+1])
                     blocks.append(current_block)
-                logger.info(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
+                
+                print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
 
-                # 각 블록 처리
+                # 3. 분리된 각 블록을 독립적으로 처리
                 for block in blocks:
                     found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
                     if found_part_number_obj:
                         part_element = TextElement(found_part_number_obj)
                         component = PartComponent(page_num, part_element)
                         for word_obj in block:
-                            component.add_element(TextElement(word_obj))
+                            if word_obj is not found_part_number_obj:
+                                component.add_element(TextElement(word_obj))
                         all_part_components.append(component)
 
-        # 최종 결과 저장
+        # 4. 페이지별로 재구성하여 출력 (이전과 동일)
+        page_map = defaultdict(list)
+        for component in all_part_components:
+            page_map[component.page_number].append(component)
+
         with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(f"총 {len(all_part_components)}개의 부품을 찾았습니다.\n" + "="*60 + "\n")
-            for comp in all_part_components:
-                f.write(str(comp) + "\n" + "-"*60 + "\n")
-        
-        final_message = f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다."
-        logger.info(final_message)
-        print(final_message)
+            f.write(f"총 {len(all_part_components)}개의 부품을 {len(page_map)}개 페이지에서 찾았습니다.\n")
+            for page_num in sorted(page_map.keys()):
+                components_on_page = page_map[page_num]
+                f.write("\n" + "="*25 + f" PAGE {page_num} " + "="*25 + "\n")
+                f.write(f"({len(components_on_page)}개의 부품 발견)\n\n")
+                for i, component in enumerate(components_on_page, 1):
+                    f.write(f"--- {i}. PartNumber: {component.part_number.value} ---\n")
+                    f.write(f"Details: [\n\t{component.get_details_string()}\n]\n")
+                    f.write("-" * 60 + "\n")
+
+        print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
 
     except Exception as e:
-        error_message = f"스크립트 실행 중 예외 발생: {e}"
-        logger.critical(error_message, exc_info=True) # 파일에는 상세한 오류 정보 기록
-        print(error_message) # 콘솔에는 간단한 오류 메시지 표시
-
+        print(f"스크립트 실행 중 오류가 발생했습니다: {e}")
+        import traceback
+        traceback.print_exc()
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
+    # numpy 라이브러리가 필요합니다. 설치되어 있지 않다면: pip install numpy
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
     output_file_path = "part_list_final_output.txt"
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
