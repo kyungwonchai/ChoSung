@@ -31,7 +31,7 @@ class PartComponent:
         return ",\n\t".join(details_list)
 
 # ==============================================================================
-# ? 완전히 새로워진 메인 분석 함수 ?
+# ? 콘텐츠 자동 탐지 기능이 적용된 메인 분석 함수 ?
 # ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
     all_part_components = []
@@ -42,41 +42,57 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
                 print(f"\n--- 페이지 {page_num} 처리 시작 ---")
-                page_within_bounds = page.crop((0, 100, page.width, page.height))
-                raw_words = page_within_bounds.extract_words(extra_attrs=["size", "non_stroking_color"])
                 
-                # 1. ? 데이터 정제: 좌표가 없거나 비정상적인 '유령 객체'를 완벽히 제거합니다.
-                sanitized_words = [
-                    w for w in raw_words
-                    if w.get('y0', 0) > 100 and w.get('x1', 0) > w.get('x0', 0) and w.get('y1', 0) > w.get('y0', 0)
-                ]
+                # 고정된 crop 대신, 페이지 전체의 단어를 일단 추출
+                raw_words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
                 
-                if not sanitized_words:
-                    print(f"페이지 {page_num}에서 유효한 텍스트를 찾지 못했습니다.")
+                if not raw_words:
+                    print(f"페이지 {page_num}에서 단어를 찾을 수 없습니다.")
+                    continue
+
+                # 1. ? 먼저 페이지 전체에서 부품 번호를 모두 찾습니다.
+                part_number_objects = [w for w in raw_words if part_number_pattern.match(w.get('text', ''))]
+
+                if not part_number_objects:
+                    print(f"페이지 {page_num}에서 부품 번호(xxxx-xxxxxx)를 찾지 못해 건너뜁니다.")
                     continue
                 
-                print(f"원본 객체 {len(raw_words)}개 -> 유효 객체 {len(sanitized_words)}개로 정제 완료.")
+                # 2. ? 찾은 부품 번호들의 위치를 기반으로 '콘텐츠 영역'을 동적으로 설정합니다.
+                content_top = min(p['top'] for p in part_number_objects)
+                content_bottom = max(p['bottom'] for p in part_number_objects)
+                # 약간의 여유(padding)를 줍니다.
+                content_top -= 20
+                content_bottom += 20
                 
-                sorted_words = sorted(sanitized_words, key=lambda w: w['y0'])
+                print(f"부품 번호 위치 기반, 콘텐츠 영역 y:[{content_top:.2f} ~ {content_bottom:.2f}] 자동 설정")
 
-                # 2. ? 완전 자동 그룹핑: 통계 분석으로 그룹 분리 기준을 자동 산출합니다.
+                # 3. ? '콘텐츠 영역' 내의 유효한 단어들만 필터링합니다.
+                valid_words = [
+                    w for w in raw_words
+                    if content_top <= w.get('top', 0) and w.get('bottom', 0) <= content_bottom
+                ]
+
+                if not valid_words:
+                    print(f"자동 설정된 콘텐츠 영역 내에서 유효한 텍스트를 찾지 못했습니다.")
+                    continue
+                
+                print(f"콘텐츠 영역 내 {len(valid_words)}개의 유효 단어로 분석을 진행합니다.")
+                
+                sorted_words = sorted(valid_words, key=lambda w: w['y0'])
+
+                # 4. ? 통계적 분석으로 그룹핑을 수행합니다 (이전 로직과 동일).
                 gaps = [
                     sorted_words[i+1]['y0'] - sorted_words[i]['y1']
                     for i in range(len(sorted_words) - 1)
                     if sorted_words[i+1]['y0'] > sorted_words[i]['y1']
                 ]
                 
-                if not gaps: # 페이지에 텍스트 블록이 하나만 있는 경우
+                if not gaps:
                     blocks = [sorted_words]
                 else:
-                    # 통계적 이상치(outlier)를 그룹 분리 기준으로 사용 (IQR 방식)
                     q1, q3 = np.percentile(gaps, [25, 75])
                     iqr = q3 - q1
-                    # 일반적인 줄 간격보다 확연히 큰 간격을 자동으로 찾아냄
-                    separation_threshold = q3 + 1.5 * iqr 
-                    
-                    print(f"페이지 {page_num}의 통계적 그룹 분리 임계값 자동 산출: {separation_threshold:.2f}px")
-
+                    separation_threshold = q3 + 1.5 * iqr
                     blocks, current_block = [], [sorted_words[0]]
                     for i in range(len(sorted_words) - 1):
                         gap = sorted_words[i+1]['y0'] - sorted_words[i]['y1']
@@ -89,7 +105,7 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
                 
                 print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
 
-                # 3. 분리된 각 블록을 독립적으로 처리
+                # 5. 분리된 각 블록을 처리합니다.
                 for block in blocks:
                     found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
                     if found_part_number_obj:
@@ -100,7 +116,7 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
                                 component.add_element(TextElement(word_obj))
                         all_part_components.append(component)
 
-        # 4. 페이지별로 재구성하여 출력 (이전과 동일)
+        # 6. 최종 결과를 페이지별로 출력합니다.
         page_map = defaultdict(list)
         for component in all_part_components:
             page_map[component.page_number].append(component)
@@ -125,7 +141,7 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # numpy 라이브러리가 필요합니다. 설치되어 있지 않다면: pip install numpy
+    # numpy 라이브러리가 필요합니다: pip install numpy
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
     output_file_path = "part_list_final_output.txt"
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
