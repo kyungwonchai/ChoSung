@@ -6,35 +6,58 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 # ==============================================================================
-# 데이터 구조 클래스
+# 데이터 구조 클래스 (출력 형식 변경)
 # ==============================================================================
-class TextElement:
-    def __init__(self, element: Dict[str, Any]):
-        self.value = element.get('text', '')
-        self.x0, self.top, self.x1, self.bottom = [round(element.get(k, 0), 2) for k in ['x0', 'top', 'x1', 'bottom']]
-        self.size = round(element.get('size', 0), 2)
-        self.color = element.get('non_stroking_color', (0, 0, 0))
-
 class PartComponent:
-    def __init__(self, page_number: int, part_number_element: TextElement):
+    def __init__(self, page_number: int, part_number_str: str):
         self.page_number = page_number
-        self.part_number = part_number_element
-        self.related_elements: List[TextElement] = []
+        self.part_number = part_number_str
+        # ? 이제 상세 정보는 '라인' 단위의 문자열 리스트로 저장됩니다.
+        self.details_lines: List[str] = []
 
-    def add_element(self, element: TextElement):
-        self.related_elements.append(element)
-
-    def get_details_string(self) -> str:
-        if not self.related_elements: return "No other details found."
-        sorted_elements = sorted(self.related_elements, key=lambda e: (e.top, e.x0))
-        details_list = [
-            f"Color: {e.color}, Size: {e.size}, Value: '{e.value}', Position: (x0={e.x0}, top={e.top}, x1={e.x1}, bottom={e.bottom})"
-            for e in sorted_elements
-        ]
-        return ",\n\t".join(details_list)
+    def add_line(self, line_text: str):
+        self.details_lines.append(line_text)
 
 # ==============================================================================
-# '2단계 학습 및 적용' 메인 함수
+# ? 단어(word) 묶음을 '한 줄'의 텍스트로 재조립하는 함수 ?
+# ==============================================================================
+def reconstruct_lines_from_block(block_words: List[Dict[str, Any]]) -> List[str]:
+    """
+    단어 객체 리스트를 받아, 수직 위치를 기반으로 텍스트 라인 리스트를 반환합니다.
+    """
+    if not block_words:
+        return []
+
+    # 단어를 위->아래, 왼쪽->오른쪽 순으로 정렬
+    sorted_words = sorted(block_words, key=lambda w: (w['top'], w['x0']))
+    
+    lines = []
+    current_line_words = [sorted_words[0]]
+    
+    for i in range(1, len(sorted_words)):
+        prev_word = current_line_words[-1]
+        current_word = sorted_words[i]
+        
+        # 같은 줄에 있는지 판단 (top 좌표가 거의 같으면 같은 줄로 간주)
+        # 허용 오차(tolerance)는 글자 높이의 절반 정도로 설정
+        tolerance = prev_word['bottom'] - prev_word['top'] / 2
+        if abs(current_word['top'] - prev_word['top']) < tolerance:
+            current_line_words.append(current_word)
+        else:
+            # 이전 라인 완성
+            current_line_words.sort(key=lambda w: w['x0']) # 최종적으로 x축 정렬
+            lines.append(" ".join(w['text'] for w in current_line_words))
+            # 새 라인 시작
+            current_line_words = [current_word]
+    
+    # 마지막 라인 추가
+    current_line_words.sort(key=lambda w: w['x0'])
+    lines.append(" ".join(w['text'] for w in current_line_words))
+    
+    return lines
+
+# ==============================================================================
+# 메인 분석 함수
 # ==============================================================================
 def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
     all_part_components = []
@@ -46,39 +69,21 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
             for page_num, page in enumerate(pdf.pages, 1):
                 print(f"\n--- 페이지 {page_num} 처리 시작 ---")
                 
-                raw_words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
+                raw_words = page.extract_words(extra_attrs=["size"])
                 sanitized_words = [w for w in raw_words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
 
-                if len(sanitized_words) < 2:
-                    print(f"페이지 {page_num}에서 분석할 텍스트가 부족합니다.")
-                    continue
+                if len(sanitized_words) < 2: continue
                 
                 sorted_words = sorted(sanitized_words, key=lambda w: w['top'])
 
-                # --- 1단계: 그룹 '기준' 학습 (Pass 1) ---
-                print("1단계: 페이지 레이아웃의 '그룹 분리 기준'을 학습합니다...")
-                gaps = np.array([
-                    sorted_words[i+1]['top'] - sorted_words[i]['bottom']
-                    for i in range(len(sorted_words) - 1)
-                    if sorted_words[i+1]['top'] > sorted_words[i]['bottom']
-                ]).reshape(-1, 1)
-
-                if len(gaps) < 2:
-                    print("페이지의 줄 간격이 하나뿐이라 그룹핑을 건너뜁니다.")
-                    continue
-
-                # K-Means가 '촘촘한 간격'과 '넓은 간격'을 자동으로 분류
+                # 1단계: K-Means로 그룹 분리 기준 학습
+                gaps = np.array([sorted_words[i+1]['top'] - sorted_words[i]['bottom'] for i in range(len(sorted_words) - 1) if sorted_words[i+1]['top'] > sorted_words[i]['bottom']]).reshape(-1, 1)
+                if len(gaps) < 2: continue
                 kmeans = KMeans(n_clusters=2, random_state=0, n_init='auto').fit(gaps)
-                
                 center1, center2 = kmeans.cluster_centers_.flatten()
-                
-                # '넓은 간격'으로 분류된 값들 중 가장 작은 값을 그룹 분리 기준으로 확정
-                large_gap_cluster_index = np.argmax([center1, center2])
-                separation_threshold = gaps[kmeans.labels_ == large_gap_cluster_index].min()
-                print(f"학습 완료 -> 이 페이지의 그룹 분리 기준: {separation_threshold:.2f}px 이상의 공백")
+                separation_threshold = gaps[kmeans.labels_ == np.argmax([center1, center2])].min()
 
-                # --- 2단계: 학습된 '기준' 적용 (Pass 2) ---
-                print("2단계: 학습된 기준으로 페이지 전체를 그룹핑합니다...")
+                # 2단계: 학습된 기준으로 블록 분리
                 blocks, current_block = [], [sorted_words[0]]
                 for i in range(len(sorted_words) - 1):
                     gap = sorted_words[i+1]['top'] - sorted_words[i]['bottom']
@@ -88,32 +93,39 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
                     else:
                         current_block.append(sorted_words[i+1])
                 blocks.append(current_block)
-                
                 print(f"페이지 {page_num}에서 {len(blocks)}개의 정보 블록을 감지했습니다.")
 
-                # 블록 처리 및 결과 생성
+                # 3단계: ? 각 블록을 라인 단위로 재조립하고 결과 생성
                 for block in blocks:
                     found_part_number_obj = next((w for w in block if part_number_pattern.match(w.get('text', ''))), None)
                     if found_part_number_obj:
-                        part_element = TextElement(found_part_number_obj)
-                        component = PartComponent(page_num, part_element)
-                        for word_obj in block:
-                            if word_obj is not found_part_number_obj: component.add_element(TextElement(word_obj))
+                        component = PartComponent(page_num, found_part_number_obj['text'])
+                        
+                        # 블록 내 단어들을 라인으로 재조립
+                        reconstructed_lines = reconstruct_lines_from_block(block)
+                        
+                        for line in reconstructed_lines:
+                            component.add_line(line)
                         all_part_components.append(component)
 
-        # 최종 결과 출력
-        page_map = defaultdict(list)
-        for component in all_part_components: page_map[component.page_number].append(component)
-
+        # 최종 결과 출력 (라인 단위로)
         with open(output_txt_path, 'w', encoding='utf-8') as f:
-            f.write(f"총 {len(all_part_components)}개의 부품을 {len(page_map)}개 페이지에서 찾았습니다.\n")
+            f.write(f"총 {len(all_part_components)}개의 부품을 찾았습니다.\n")
+            
+            page_map = defaultdict(list)
+            for component in all_part_components:
+                page_map[component.page_number].append(component)
+
             for page_num in sorted(page_map.keys()):
                 components_on_page = page_map[page_num]
                 f.write("\n" + "="*25 + f" PAGE {page_num} " + "="*25 + "\n")
                 f.write(f"({len(components_on_page)}개의 부품 발견)\n\n")
                 for i, component in enumerate(components_on_page, 1):
-                    f.write(f"--- {i}. PartNumber: {component.part_number.value} ---\n")
-                    f.write(f"Details: [\n\t{component.get_details_string()}\n]\n")
+                    f.write(f"--- {i}. PartNumber: {component.part_number} ---\n")
+                    f.write("Details:\n")
+                    # 라인들을 하나씩 출력
+                    for line in component.details_lines:
+                        f.write(f"\t- {line}\n")
                     f.write("-" * 60 + "\n")
 
         print(f"\n분석 완료! 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
@@ -124,6 +136,7 @@ def analyze_parts_from_pdf(pdf_path: str, output_txt_path: str):
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
+    # 필수 라이브러리: pip install scikit-learn numpy
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf" 
     output_file_path = "part_list_final_output.txt"
     analyze_parts_from_pdf(pdf_file_path, output_file_path)
