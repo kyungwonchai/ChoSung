@@ -1,168 +1,184 @@
 import pdfplumber
 import re
-from typing import List, Dict, Any
-from collections import defaultdict
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.cluster import DBSCAN
+import configparser
+import os
+from typing import List, Dict, Any
 
 # ==============================================================================
-# 데이터 구조 클래스 (size, color 속성 복원)
+# 데이터 구조 및 헬퍼 클래스
 # ==============================================================================
 class TextElement:
+    """PDF에서 추출된 텍스트 객체를 다루기 쉽게 감싼 클래스"""
     def __init__(self, element: Dict[str, Any]):
-        self.value = element.get('text', '')
+        self.text = element.get('text', '')
         self.x0, self.top, self.x1, self.bottom = [round(element.get(k, 0), 2) for k in ['x0', 'top', 'x1', 'bottom']]
-        # ? 수정: 누락되었던 size, color 속성 복원
-        self.size = round(element.get('size', 0), 2)
-        self.color = element.get('non_stroking_color', (0, 0, 0))
-        self.data = element
 
-class PartComponent:
-    def __init__(self, page_number: int, part_number_element: TextElement):
-        self.page_number = page_number
-        self.part_number = part_number_element
-        self.elements: List[TextElement] = []
+    def __repr__(self):
+        return f"'{self.text}' @ ({self.x0}, {self.top})"
+
+def find_nearest_element(anchor: TextElement, candidates: List[TextElement]) -> TextElement | None:
+    """앵커로부터 유클리드 거리가 가장 가까운 요소를 찾습니다."""
+    if not candidates:
+        return None
+    
+    anchor_center_x = (anchor.x0 + anchor.x1) / 2
+    anchor_center_y = (anchor.top + anchor.bottom) / 2
+    
+    min_dist = float('inf')
+    nearest_element = None
+    
+    for cand in candidates:
+        cand_center_x = (cand.x0 + cand.x1) / 2
+        cand_center_y = (cand.top + cand.bottom) / 2
+        dist = np.linalg.norm([anchor_center_x - cand_center_x, anchor_center_y - cand_center_y])
+        
+        if dist < min_dist:
+            min_dist = dist
+            nearest_element = cand
+            
+    return nearest_element
+
+def reconstruct_line(words: List[TextElement]) -> str:
+    """단어들을 하나의 텍스트 라인으로 재조립합니다."""
+    if not words: return ""
+    # top 좌표가 비슷한 단어들을 같은 줄로 묶고, x0 좌표 순으로 정렬하여 합칩니다.
+    lines = defaultdict(list)
+    for word in sorted(words, key=lambda w: (w.top, w.x0)):
+        # y좌표 오차 5px 이내를 같은 줄로 간주
+        found_line = False
+        for y_key in lines.keys():
+            if abs(word.top - y_key) < 5:
+                lines[y_key].append(word)
+                found_line = True
+                break
+        if not found_line:
+            lines[word.top].append(word)
+    
+    full_text = []
+    for y_key in sorted(lines.keys()):
+        line_text = " ".join(w.text for w in sorted(lines[y_key], key=lambda w: w.x0))
+        full_text.append(line_text)
+    
+    return " | ".join(full_text) # 여러 줄일 경우 | 문자로 구분
 
 # ==============================================================================
-# 메인 분석 함수 (1단계 그룹핑 로직 개선)
+# 메인 분석 함수
 # ==============================================================================
-def analyze_document_in_two_passes(pdf_path: str, output_txt_path: str):
-    part_number_pattern = re.compile(r"^\d{4}-\d{6}$")
-    
-    print(f"PDF 분석 시작: {pdf_path}")
-    print("1단계: 문서 전체를 스캔하여 '마스터 규격'을 학습합니다...")
+def analyze_document_with_learned_spec(pdf_path: str, output_txt_path: str):
+    # --- 패턴 정의 ---
+    spec_file = 'pageset.ini'
+    material_code_pattern = re.compile(r"^\d{4}-\d{6}$")
+    top_left_pattern = re.compile(r"^\d{2}[A-Z]?$")
+    bottom_right_pattern = re.compile(r"^\d+\s?[xX*]\s?\d+$")
 
-    all_page_offsets = []
-    
-    try:
+    # --- `pageset.ini` 파일 로드 또는 생성 ---
+    config = configparser.ConfigParser()
+    master_spec = None
+
+    if os.path.exists(spec_file):
+        try:
+            config.read(spec_file)
+            master_spec = {
+                'dist_tl_x': config.getfloat('MasterSpec', 'dist_tl_x'),
+                'dist_tl_y': config.getfloat('MasterSpec', 'dist_tl_y'),
+                'dist_br_x': config.getfloat('MasterSpec', 'dist_br_x'),
+                'dist_br_y': config.getfloat('MasterSpec', 'dist_br_y'),
+            }
+            print(f"'{spec_file}'에서 학습된 규격을 불러왔습니다.")
+        except Exception as e:
+            print(f"'{spec_file}' 파일 읽기 오류: {e}. 규격 학습을 다시 시작합니다.")
+            master_spec = None
+            
+    # --- 1차 탐색: `pageset.ini` 파일이 없으면 규격 학습 ---
+    if master_spec is None:
+        print("1차 탐색: 문서 전체를 스캔하여 '마스터 규격'을 학습합니다...")
+        all_distances = []
         with pdfplumber.open(pdf_path) as pdf:
-            # --- 1단계: 표준 규격 학습 (모든 페이지 대상) ---
             for page_num, page in enumerate(pdf.pages, 1):
-                words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
-                sanitized_words = [TextElement(w) for w in words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
-                if len(sanitized_words) < 2: continue
-
-                anchors = sorted([w for w in sanitized_words if part_number_pattern.match(w.value)], key=lambda w: w.top)
-                if not anchors: continue
-
-                # ? 수정: 임시 그룹핑을 K-Means를 사용하여 더 정확하게 수행
-                sorted_all_words = sorted(sanitized_words, key=lambda w: w.top)
-                gaps = np.array([
-                    sorted_all_words[i+1].top - sorted_all_words[i].bottom
-                    for i in range(len(sorted_all_words) - 1)
-                    if sorted_all_words[i+1].top > sorted_all_words[i].bottom
-                ]).reshape(-1, 1)
-
-                if len(gaps) < 2: continue
+                print(f"  - 학습 중... (페이지 {page_num}/{len(pdf.pages)})")
+                words = [TextElement(w) for w in page.extract_words()]
                 
-                kmeans = KMeans(n_clusters=2, random_state=0, n_init='auto').fit(gaps)
-                center1, center2 = kmeans.cluster_centers_.flatten()
-                large_gap_cluster_index = np.argmax([center1, center2])
-                separation_threshold = gaps[kmeans.labels_ == large_gap_cluster_index].min()
+                material_codes = [w for w in words if material_code_pattern.match(w.text)]
+                tl_codes = [w for w in words if top_left_pattern.match(w.text)]
+                br_codes = [w for w in words if bottom_right_pattern.match(w.text)]
 
-                initial_blocks_words, current_block = [], [sorted_all_words[0]]
-                for i in range(len(sorted_all_words) - 1):
-                    gap = sorted_all_words[i+1].top - sorted_all_words[i].bottom
-                    if gap >= separation_threshold:
-                        initial_blocks_words.append(current_block)
-                        current_block = [sorted_all_words[i+1]]
-                    else:
-                        current_block.append(sorted_all_words[i+1])
-                initial_blocks_words.append(current_block)
+                for mc in material_codes:
+                    nearest_tl = find_nearest_element(mc, tl_codes)
+                    nearest_br = find_nearest_element(mc, br_codes)
+                    
+                    if nearest_tl and nearest_br:
+                        dist_tl_x = nearest_tl.x0 - mc.x0
+                        dist_tl_y = nearest_tl.top - mc.top
+                        dist_br_x = nearest_br.x1 - mc.x1
+                        dist_br_y = nearest_br.bottom - mc.bottom
+                        all_distances.append([dist_tl_x, dist_tl_y, dist_br_x, dist_br_y])
 
-                # 정확해진 임시 그룹에서 offset 계산
-                for block_words in initial_blocks_words:
-                    anchor = next((w for w in block_words if part_number_pattern.match(w.value)), None)
-                    if anchor:
-                        min_x = min(w.x0 for w in block_words)
-                        min_y = min(w.top for w in block_words)
-                        max_x = max(w.x1 for w in block_words)
-                        max_y = max(w.bottom for w in block_words)
-                        all_page_offsets.append([anchor.x0 - min_x, anchor.top - min_y, max_x - anchor.x1, max_y - anchor.bottom])
+        if not all_distances:
+            raise ValueError("문서 전체에서 유효한 규격 샘플을 찾을 수 없습니다.")
 
-            if not all_page_offsets:
-                raise ValueError("문서 전체에서 부품 규격을 학습할 수 없습니다.")
+        # 이상치 제거 (IQR 방식)
+        distances_arr = np.array(all_distances)
+        q1 = np.percentile(distances_arr, 25, axis=0)
+        q3 = np.percentile(distances_arr, 75, axis=0)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        
+        filtered_distances = distances_arr[
+            np.all((distances_arr >= lower_bound) & (distances_arr <= upper_bound), axis=1)
+        ]
+        
+        # 평균 계산하여 마스터 규격 확정
+        avg_distances = np.mean(filtered_distances, axis=0)
+        master_spec = {
+            'dist_tl_x': avg_distances[0], 'dist_tl_y': avg_distances[1],
+            'dist_br_x': avg_distances[2], 'dist_br_y': avg_distances[3]
+        }
+        
+        print("학습 완료. 마스터 규격을 `pageset.ini` 파일에 저장합니다.")
+        config['MasterSpec'] = {k: str(v) for k, v in master_spec.items()}
+        with open(spec_file, 'w') as configfile:
+            config.write(configfile)
 
-            # 최빈값(Master Template) 찾기
-            clustering = DBSCAN(eps=2.1, min_samples=1).fit(all_page_offsets)
-            unique_labels, counts = np.unique(clustering.labels_, return_counts=True)
-            most_frequent_label = unique_labels[counts.argmax()]
-            master_offsets_list = [all_page_offsets[i] for i, label in enumerate(clustering.labels_) if label == most_frequent_label]
-            master_template = np.mean(master_offsets_list, axis=0)
+    # --- 2차 탐색: 학습된 규격을 적용하여 데이터 추출 ---
+    print("\n2차 탐색: 학습된 규격을 적용하여 전체 데이터를 추출합니다...")
+    final_results = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            words = [TextElement(w) for w in page.extract_words()]
+            material_codes = [w for w in words if material_code_pattern.match(w.text)]
             
-            # 1차 결과 출력
-            with open(output_txt_path, 'w', encoding='utf-8') as f:
-                f.write("----------1차(표준 규격 학습)--------\n")
-                f.write(f"문서 전체 {len(pdf.pages)}페이지에서 {len(all_page_offsets)}개의 부품 샘플을 분석했습니다.\n")
-                f.write(f"가장 일반적인 형태(샘플 {len(master_offsets_list)}개)의 표준 규격을 학습했습니다.\n")
-                f.write(f"  - 좌측(Left) Offset  : {master_template[0]:.2f} px\n")
-                f.write(f"  - 상단(Top) Offset   : {master_template[1]:.2f} px\n")
-                f.write(f"  - 우측(Right) Offset : {master_template[2]:.2f} px\n")
-                f.write(f"  - 하단(Bottom) Offset: {master_template[3]:.2f} px\n")
-
-            # --- 2단계: 학습된 규격 적용 및 최종 데이터 추출 ---
-            final_components = []
-            for page_num, page in enumerate(pdf.pages, 1):
-                # (2단계 로직은 이전과 동일하게 유지)
-                words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
-                sanitized_words = [TextElement(w) for w in words if 'top' in w and 'bottom' in w and w['bottom'] > w['top']]
-                if not sanitized_words: continue
-                anchors = sorted([w for w in sanitized_words if part_number_pattern.match(w.value)], key=lambda w: w.top)
-                if not anchors: continue
+            for mc in material_codes:
+                # 마스터 규격을 적용하여 최종 영역 계산
+                box_x0 = mc.x0 + master_spec['dist_tl_x']
+                box_top = mc.top + master_spec['dist_tl_y']
+                box_x1 = mc.x1 + master_spec['dist_br_x']
+                box_bottom = mc.bottom + master_spec['dist_br_y']
                 
-                for anchor in anchors:
-                    component = PartComponent(page_num, anchor)
-                    final_x0, final_top, final_x1, final_bottom = (
-                        anchor.x0 - master_template[0], anchor.top - master_template[1],
-                        anchor.x1 + master_template[2], anchor.bottom + master_template[3]
-                    )
-                    final_words = [w for w in sanitized_words if w.x0 >= final_x0 and w.x1 <= final_x1 and w.top >= final_top and w.bottom <= final_bottom]
-                    
-                    for word in final_words:
-                        if word is not anchor: component.elements.append(word)
-                    final_components.append(component)
-            
-            # --- 2차 결과 출력 ---
-            ref_component = max(final_components, key=lambda c: len(c.elements), default=None)
-            column_centers = []
-            if ref_component and ref_component.elements:
-                ref_x_coords = np.array([el.x0 for el in ref_component.elements]).reshape(-1, 1)
-                num_columns = min(len(np.unique(ref_x_coords)), 15)
-                if num_columns > 0:
-                    col_cluster = DBSCAN(eps=5, min_samples=1).fit(ref_x_coords)
-                    column_centers = sorted([np.mean(ref_x_coords[col_cluster.labels_ == i]) for i in sorted(np.unique(col_cluster.labels_))])
-
-            with open(output_txt_path, 'a', encoding='utf-8') as f:
-                f.write("\n\n----------2차(2번째 탐색)--------\n")
-                f.write("학습된 표준 규격을 전체 페이지에 적용하여 추출한 최종 데이터입니다.\n")
+                # 영역 내 모든 단어 추출
+                words_in_box = [w for w in words if w.x0 >= box_x0 and w.x1 <= box_x1 and w.top >= box_top and w.bottom <= box_bottom]
                 
-                for component in final_components:
-                    f.write("\n" + "="*20 + f" PAGE {component.page_number} / PartNumber: {component.part_number.value} " + "="*20 + "\n")
-                    
-                    component_by_column = defaultdict(list)
-                    for el in component.elements:
-                        if not column_centers: component_by_column[0].append(el)
-                        else:
-                            closest_col_index = np.argmin([abs(el.x0 - center) for center in column_centers])
-                            component_by_column[closest_col_index].append(el)
-                    
-                    for col_index in sorted(component_by_column.keys()):
-                        elements_in_col = sorted(component_by_column[col_index], key=lambda el: el.top)
-                        for el in elements_in_col:
-                            # ? 수정: el.color 사용, el.size 사용
-                            f.write(f"Column {col_index+1} | Pos: ({el.x0}, {el.top}, {el.x1}, {el.bottom}), Size: {el.size}, Color: {el.color}, Value: '{el.value}'\n")
+                # 한 줄로 재구성하여 결과 저장
+                reconstructed_data = reconstruct_line(words_in_box)
+                final_results.append((page_num, mc.text, reconstructed_data))
+    
+    # --- 최종 파일 출력 ---
+    with open(output_txt_path, 'w', encoding='utf-8') as f:
+        f.write(f"--- 학습된 마스터 규격 (from {spec_file}) ---\n")
+        for key, value in master_spec.items():
+            f.write(f"- {key}: {value:.2f}px\n")
+        f.write("-" * 50 + "\n\n")
+        
+        f.write("--- 최종 추출 데이터 ---\n")
+        for page_num, mc_text, data in final_results:
+            f.write(f"페이지: {page_num}, 자재코드: {mc_text}, 정보: [ {data} ]\n")
 
-            print(f"\n모든 분석 완료! 최종 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
-            
-    except Exception as e:
-        print(f"스크립트 실행 중 치명적인 오류가 발생했습니다: {e}")
-        import traceback; traceback.print_exc()
+    print(f"\n모든 분석 완료! 최종 결과가 '{output_txt_path}' 파일에 저장되었습니다.")
 
 
 # --- 메인 실행 부분 ---
 if __name__ == "__main__":
-    # 필수 라이브러리: pip install scikit-learn numpy pdfplumber
     pdf_file_path = "YOUR_PDF_FILE_PATH.pdf"
     output_file_path = "part_list_final_output.txt"
-    analyze_document_in_two_passes(pdf_file_path, output_file_path)
+    analyze_document_with_learned_spec(pdf_file_path, output_file_path)
