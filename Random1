@@ -1,79 +1,254 @@
-, 실시간으로 변하는 데이터를 기반으로 특정 조건에 도달했을 때 연쇄적인 액션을 트리거하는 시스템을 직접 구축할 때, 메모리 누수를 포함한 여러 위험 요소를 고려해야 합니다.
+API 기반 작업 큐 시스템 구축 가이드 (Ubuntu, Redis, Nginx, Flask, MSSQL)
+이 가이드에서는 Ubuntu 환경에서 Redis를 메시지 큐로 활용하고, Flask 기반의 API를 통해 작업을 받아 처리하며, Nginx를 리버스 프록시로 설정하는 전체 과정을 안내합니다. 또한, 처리 중인 작업의 상태를 실시간으로 웹에서 모니터링하고, 작업 내역을 MSSQL 2014 데이터베이스에 연동하여 기록하는 방법을 포함합니다.
 
-이를 방지하고 안정적으로 시스템을 구축하기 위한 최적의 패턴은 **'이벤트 기반 아키텍처(Event-Driven Architecture)'**를 채택하고, 각 컴포넌트의 역할을 명확하게 분리하는 것입니다.
+1. 시스템 아키텍처
+요청이 들어오면 Nginx가 이를 받아 Gunicorn으로 실행되고 있는 Flask 애플리케이션에 전달합니다. Flask API는 요청을 받아 유효성을 검사한 후, Redis Queue(RQ)에 작업을 추가합니다. 별도의 RQ 워커 프로세스가 이 큐를 감시하고 있다가 새로운 작업이 들어오면 가져와서 비동기적으로 처리합니다. 작업 처리 과정 및 결과는 MSSQL 데이터베이스에 기록되며, rq-dashboard를 통해 현재 큐의 상태와 작업 내역을 실시간으로 확인할 수 있습니다.
 
-## ?? 최적의 아키텍처 패턴: 레스토랑 주방 시스템
-이 복잡한 과정을 '바쁜 레스토랑의 주방'에 비유하면 이해하기 쉽습니다.
+2. 사전 준비 및 설치
+1. 패키지 업데이트 및 기본 라이브러리 설치
 
-손님 (React 사용자): "이 요리 준비해주세요" 라고 주문합니다. (Ready 버튼 클릭)
+Bash
 
-웨이터 (API 서버): 주문을 받고, 주방의 주문판에 주문서를 붙입니다. (빠르게 응답만 하고 끝)
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-dev build-essential libssl-dev libffi-dev python3-setuptools python3-venv
+2. Redis 설치
 
-주문판 (Redis 작업 큐): 들어온 주문서(작업)들이 순서대로 붙어 있습니다.
+Bash
 
-메인 셰프 (오케스트레이션 Worker): 주문판에서 주문서를 하나 가져와 요리를 시작합니다. (DB 레코드 숫자 감소)
+sudo apt-get install -y redis-server
+설치 후 Redis 서버는 자동으로 실행됩니다. sudo systemctl status redis-server 명령어로 상태를 확인할 수 있습니다.
 
-레시피 북 & 재료 현황판 (메인 DB): 모든 재료의 재고(레코드의 숫자)를 관리하는 원장입니다.
+3. MSSQL ODBC 드라이버 설치
 
-"요리 완성!" 알림 벨 (Redis Pub/Sub): 셰프는 특정 요리(조건 충족)가 완성되면 벨을 울립니다.
+Microsoft의 공식 문서를 참고하여 Ubuntu용 ODBC Driver 17 for SQL Server를 설치합니다.
 
-음식 나르는 직원 (Action Trigger Worker): 벨 소리를 듣고, 완성된 요리를 손님(다른 PC)에게 즉시 전달합니다.
+Bash
 
-이 비유를 실제 시스템 컴포넌트로 구성하면 다음과 같습니다.
+# Microsoft GPG 키 등록
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
 
-React UI: 사용자가 'Ready' 버튼을 누릅니다.
+# Microsoft 제품 리포지토리 등록
+curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
 
-API 서버 (Flask 등): React의 요청을 받습니다. 이 서버의 유일한 역할은 요청을 검증하고, "ID가 OOO인 레코드를 처리하라" 는 간단한 작업 메시지를 만들어 **Redis 작업 큐(LPUSH)**에 넣고 즉시 "접수 완료" 응답을 보내는 것입니다. 절대 이 서버가 직접 DB를 변경하거나 긴 작업을 수행하지 않습니다.
+sudo apt-get update
+sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17
+3. Flask 애플리케이션 및 작업 큐 설정
+1. 프로젝트 구조
 
-메인 DB (MSSQL, PostgreSQL 등): 숫자가 변경되는 레코드를 포함한 모든 데이터의 **원본(Source of Truth)**을 저장하는 데이터베이스입니다.
+/home/user/remain_monitor
+├── venv/
+├── app.py
+├── tasks.py
+└── requirements.txt
+2. 가상 환경 설정 및 라이브러리 설치
 
-오케스트레이션 Worker (별도의 Python 프로세스):
+Bash
 
-Redis 작업 큐를 계속 감시(BRPOP)하다가 작업이 들어오면 가져옵니다.
+cd /home/user/remain_monitor
+python3 -m venv venv
+source venv/bin/activate
 
-메인 DB에 접속하여 트랜잭션을 시작합니다.
+pip install Flask gunicorn flask-rq2 redis rq-dashboard pyodbc
+requirements.txt 파일을 생성하고 위 라이브러리들을 명시해두는 것이 좋습니다.
 
-해당 레코드의 숫자를 1 감소시킵니다.
+3. Flask 애플리케이션 (app.py)
 
-변경된 숫자 값을 다시 읽어옵니다.
+Python
 
-조건 확인: 그 숫자가 지정된 값(예: 0)에 도달했는지 확인합니다.
+from flask import Flask, request, jsonify
+from flask_rq2 import RQ
+import pyodbc
 
-조건 충족 시: Redis의 Pub/Sub 채널에 "OOO 작업 완료, 액션 필요!" 라는 이벤트 메시지를 발행(Publish)합니다. (이것이 '알림 벨' 역할)
+app = Flask(__name__)
 
-트랜잭션을 커밋합니다.
+# Flask-RQ2 설정
+app.config['RQ_REDIS_URL'] = 'redis://localhost:6379/0'
+rq = RQ(app)
 
-액션 트리거 Worker (또 다른 별도의 Python 프로세스):
+# MSSQL 연결 정보 (RemainMonitor DB)
+MSSQL_SERVER = 'your_server_ip_or_hostname'
+MSSQL_DATABASE = 'RemainMonitor'
+MSSQL_USERNAME = 'your_username'
+MSSQL_PASSWORD = 'your_password'
+# ODBC Driver 17 for SQL Server를 사용합니다.
+MSSQL_CONNECTION_STRING = f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={MSSQL_SERVER};DATABASE={MSSQL_DATABASE};UID={MSSQL_USERNAME};PWD={MSSQL_PASSWORD}'
 
-Redis Pub/Sub 채널을 구독(Subscribe)하며 메시지를 기다립니다.
+def get_db_connection():
+    """MSSQL 데이터베이스 연결을 생성합니다."""
+    try:
+        conn = pyodbc.connect(MSSQL_CONNECTION_STRING)
+        return conn
+    except pyodbc.Error as ex:
+        sqlstate = ex.args[0]
+        print(f"Database connection error: {sqlstate}")
+        return None
 
-"액션 필요!" 메시지를 받으면, 해당 내용을 바탕으로 다른 여러 PC에 API 호출, 웹소켓 메시지 전송 등 필요한 최종 액션을 수행합니다.
+# API 엔드포인트: 새로운 작업을 큐에 추가
+@app.route('/add-task', methods=['POST'])
+def add_task():
+    """
+    POST 요청을 받아 작업을 Redis 큐에 추가합니다.
+    요청 본문 예시: {"data": "처리할 데이터"}
+    """
+    data = request.get_json()
+    if not data or 'data' not in data:
+        return jsonify({'error': '데이터가 필요합니다.'}), 400
 
-아키텍처 흐름도
-React → API 서버 → Redis 큐 → 오케스트레이션 Worker ↘?
-????????????????????????????????????????????????????????????↓ DB 업데이트 & 조건 확인
-????????????????????????????????????????????????????????????↓
-?????????????????????????????????????????????????? Redis Pub/Sub → 액션 트리거 Worker → 다른 PC들
+    # tasks.py의 process_data 함수를 큐에 넣습니다.
+    # 두 번째 인자로 전달된 데이터가 process_data 함수의 인자로 사용됩니다.
+    job = rq.get_queue().enqueue('tasks.process_data', data['data'])
 
-## ?? 메모리 누수 위험 및 주요 주의점
-직접 오케스트레이션을 만들 때 메모리 누수는 주로 '상태를 메모리에 저장하려는 시도' 때문에 발생합니다.
+    return jsonify({'job_id': job.id}), 202
 
-위험한 패턴: Stateful 애플리케이션
+if __name__ == '__main__':
+    app.run(debug=True)
+4. 작업 함수 (tasks.py)
 
-만약 API 서버나 Worker가 "ID가 OOO인 작업은 숫자가 3 남았음" 과 같은 상태 정보를 전역 변수나 객체 멤버 등 자신의 메모리에 저장하고 관리하면 매우 위험합니다.
+실제로 비동기적으로 처리될 작업을 정의하는 파일입니다.
 
-프로세스가 재시작되면 이 정보는 모두 사라지며, 여러 개의 Worker를 실행하면 상태가 동기화되지 않습니다.
+Python
 
-처리 완료 후 참조를 제대로 해제하지 않으면, 끝난 작업의 정보가 계속 메모리에 쌓여 누수가 발생합니다.
+import time
+import pyodbc
+from app import get_db_connection # app.py에서 연결 함수 가져오기
 
-주의점 및 해결책 (최적 패턴의 장점)
+def process_data(data_to_process):
+    """
+    시간이 오래 걸리는 작업을 시뮬레이션하고,
+    처리 시작, 완료 상태를 MSSQL에 기록합니다.
+    """
+    job_id = rq.get_current_job().id if rq.get_current_job() else 'N/A'
+    conn = get_db_connection()
+    if not conn:
+        print("작업 실패: 데이터베이스에 연결할 수 없습니다.")
+        return
 
-상태는 외부에 저장 (Stateless Workers): 제안된 아키텍처의 모든 Worker는 상태가 없습니다(Stateless). 모든 상태는 메인 DB와 Redis에 저장됩니다. Worker는 작업을 받아 처리하고 바로 잊어버리므로, 메모리가 쌓일 틈이 없습니다. 이것이 가장 중요한 핵심입니다.
+    cursor = conn.cursor()
 
-짧은 생명주기: 각 작업은 가능한 한 빨리 처리되고 끝나야 합니다. 작업 하나가 너무 오랫동안 메모리나 DB 커넥션을 점유하지 않도록 해야 합니다.
+    try:
+        # 작업 시작 기록
+        # MSSQL 2014는 GETUTCDATE()를 지원합니다.
+        cursor.execute("""
+            INSERT INTO TaskHistory (JobId, Status, Data, StartTime)
+            VALUES (?, ?, ?, GETUTCDATE())
+        """, job_id, 'Processing', str(data_to_process))
+        conn.commit()
 
-자원 해제 확인: DB 커넥션, 파일 핸들 등 사용한 자원은 try...finally 구문이나 with 문을 사용해 반드시 해제해야 합니다. 커넥션 풀을 사용하더라도, 사용한 커넥션을 풀에 확실히 반납해야 합니다.
+        # 실제 작업 수행 (예: 5초 대기)
+        print(f"데이터 처리 시작: {data_to_process}")
+        time.sleep(5)
+        print("데이터 처리 완료.")
 
-블로킹 I/O 사용: "조건이 충족됐나?" 확인하기 위해 DB를 1초마다 계속 쿼리하는(Polling) 방식은 최악의 구조입니다. 시스템에 엄청난 부하를 줍니다. 제안된 구조처럼 Redis의 BRPOP, Pub/Sub 등 효율적인 블로킹(Blocking) 매커니즘을 사용해야 합니다.
+        # 작업 완료 기록
+        cursor.execute("""
+            UPDATE TaskHistory
+            SET Status = ?, EndTime = GETUTCDATE()
+            WHERE JobId = ?
+        """, 'Completed', job_id)
+        conn.commit()
 
-이처럼 각 컴포넌트의 역할을 명확히 나누고, 상태 관리는 DB와 Redis 같은 전문 솔루션에 위임하며, Worker들은 상태 없이(Stateless) 작동하도록 설계하는 것이 메모리 누수를 막고 안정적으로 확장 가능한 시스템을 만드는 최적의 패턴입니다.
+    except Exception as e:
+        # 오류 발생 시 기록
+        print(f"작업 오류 발생: {e}")
+        cursor.execute("""
+            UPDATE TaskHistory
+            SET Status = ?, ErrorMessage = ?, EndTime = GETUTCDATE()
+            WHERE JobId = ?
+        """, 'Failed', str(e), job_id)
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return f"처리 완료: {data_to_process}"
+5. MSSQL 테이블 (TaskHistory)
+
+RemainMonitor 데이터베이스에 아래와 같은 테이블을 미리 생성해야 합니다.
+
+SQL
+
+CREATE TABLE TaskHistory (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    JobId NVARCHAR(255) NOT NULL,
+    Status NVARCHAR(50),
+    Data NVARCHAR(MAX),
+    ErrorMessage NVARCHAR(MAX),
+    StartTime DATETIME,
+    EndTime DATETIME
+);
+4. RQ 워커 및 대시보드 실행
+1. RQ 워커 실행
+
+Flask 애플리케이션과 다른 터미널에서 가상 환경을 활성화한 후, 아래 명령어로 워커를 실행합니다. 워커는 Redis 큐를 감시하며 새로운 작업을 처리합니다.
+
+Bash
+
+source /home/user/remain_monitor/venv/bin/activate
+rq worker
+2. RQ 대시보드 실행
+
+또 다른 터미널에서 아래 명령어로 실시간 모니터링 웹 대시보드를 실행합니다.
+
+Bash
+
+source /home/user/remain_monitor/venv/bin/activate
+rq-dashboard
+이제 웹 브라우저에서 http://<서버_IP>:9181로 접속하면 RQ 대시보드를 통해 큐의 상태, 등록된 작업, 성공/실패 여부 등을 실시간으로 확인할 수 있습니다.
+
+5. Gunicorn 및 Nginx 설정 (배포)
+1. Gunicorn으로 Flask 앱 실행
+
+Gunicorn은 WSGI 서버로, 프로덕션 환경에서 Flask 애플리케이션을 실행하는 데 사용됩니다.
+
+Bash
+
+# 프로젝트 디렉토리로 이동
+cd /home/user/remain_monitor
+source venv/bin/activate
+
+# Gunicorn 실행 (백그라운드에서 실행하려면 nohup 등을 사용)
+gunicorn --workers 3 --bind unix:remain_monitor.sock -m 007 app:app
+--workers 3: 3개의 워커 프로세스를 사용합니다. 서버 사양에 맞게 조절합니다.
+
+--bind unix:remain_monitor.sock: 유닉스 소켓을 통해 Nginx와 통신합니다. IP와 포트(--bind 0.0.0.0:8000)를 사용할 수도 있습니다.
+
+-m 007: 소켓 파일에 대한 권한을 설정하여 Nginx가 접근할 수 있도록 합니다.
+
+2. Nginx 리버스 프록시 설정
+
+Nginx는 외부의 HTTP 요청을 받아 Gunicorn이 실행 중인 내부 소켓으로 전달하는 리버스 프록시 역할을 합니다.
+
+Bash
+
+sudo apt-get install -y nginx
+/etc/nginx/sites-available/remain_monitor 파일을 생성하고 아래 내용을 작성합니다.
+
+Nginx
+
+server {
+    listen 80;
+    server_name your_domain_or_server_ip;
+
+    location / {
+        # Gunicorn 소켓으로 요청을 전달
+        proxy_pass http://unix:/home/user/remain_monitor/remain_monitor.sock;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+생성한 설정을 활성화하고 Nginx를 재시작합니다.
+
+Bash
+
+# 심볼릭 링크 생성
+sudo ln -s /etc/nginx/sites-available/remain_monitor /etc/nginx/sites-enabled
+
+# 기본 설정 파일 링크 제거
+sudo unlink /etc/nginx/sites-enabled/default
+
+# Nginx 설정 테스트
+sudo nginx -t
+
+# Nginx 재시작
