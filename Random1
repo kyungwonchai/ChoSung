@@ -1,254 +1,361 @@
-API 기반 작업 큐 시스템 구축 가이드 (Ubuntu, Redis, Nginx, Flask, MSSQL)
-이 가이드에서는 Ubuntu 환경에서 Redis를 메시지 큐로 활용하고, Flask 기반의 API를 통해 작업을 받아 처리하며, Nginx를 리버스 프록시로 설정하는 전체 과정을 안내합니다. 또한, 처리 중인 작업의 상태를 실시간으로 웹에서 모니터링하고, 작업 내역을 MSSQL 2014 데이터베이스에 연동하여 기록하는 방법을 포함합니다.
+네, 알겠습니다. 요청하신 기능은 안정적인 백그라운드 서비스로 구현하는 것이 가장 중요합니다. Windows 서비스로 등록하여 PC가 켜져 있는 동안 항상 동작하고, 지정된 작업을 주기적으로 수행하며, 외부 요청에 응답하는 소켓 서버를 만들겠습니다.
 
-1. 시스템 아키텍처
-요청이 들어오면 Nginx가 이를 받아 Gunicorn으로 실행되고 있는 Flask 애플리케이션에 전달합니다. Flask API는 요청을 받아 유효성을 검사한 후, Redis Queue(RQ)에 작업을 추가합니다. 별도의 RQ 워커 프로세스가 이 큐를 감시하고 있다가 새로운 작업이 들어오면 가져와서 비동기적으로 처리합니다. 작업 처리 과정 및 결과는 MSSQL 데이터베이스에 기록되며, rq-dashboard를 통해 현재 큐의 상태와 작업 내역을 실시간으로 확인할 수 있습니다.
+전체 코드를 하나의 Python 파일(timestamp_service.py)로 제공해 드리며, 이 파일을 통해 서비스 설치, 실행, 중지, 제거를 모두 관리할 수 있습니다.
 
-2. 사전 준비 및 설치
-1. 패키지 업데이트 및 기본 라이브러리 설치
+주요 기능 및 특징
+Windows 서비스: PC 부팅 시 자동으로 시작하고 안정적으로 백그라운드에서 실행됩니다.
 
-Bash
+주기적 데이터 갱신: 설정된 시간(예: 60초)마다 데이터베이스 조회 및 폴더 시간 값 확인을 수행하여 리소스를 과도하게 사용하지 않습니다.
 
-sudo apt-get update
-sudo apt-get install -y python3-pip python3-dev build-essential libssl-dev libffi-dev python3-setuptools python3-venv
-2. Redis 설치
+안정적인 소켓 서버: 여러 클라이언트의 동시 요청을 처리할 수 있는 스레드 기반 소켓 서버를 내장합니다.
 
-Bash
+자동 오류 처리 및 로깅: 데이터베이스 연결 실패, 공유 폴더 접근 불가 등 오류 발생 시 자동으로 재시도하며, 모든 과정을 파일에 기록하여 문제 추적이 용이합니다.
 
-sudo apt-get install -y redis-server
-설치 후 Redis 서버는 자동으로 실행됩니다. sudo systemctl status redis-server 명령어로 상태를 확인할 수 있습니다.
+간편한 설정: 모든 설정(DB 정보, 소켓 포트 등)을 파일 상단의 CONFIG 딕셔너리에서 쉽게 변경할 수 있습니다.
 
-3. MSSQL ODBC 드라이버 설치
-
-Microsoft의 공식 문서를 참고하여 Ubuntu용 ODBC Driver 17 for SQL Server를 설치합니다.
+1. 사전 준비 사항
+서비스를 실행하기 위해 Python 라이브러리 두 개를 먼저 설치해야 합니다. 관리자 권한으로 명령 프롬프트(CMD)나 PowerShell을 열고 아래 명령어를 실행하세요.
 
 Bash
 
-# Microsoft GPG 키 등록
-curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+pip install pywin32 pyodbc
+pywin32: Python에서 Windows API를 사용하여 서비스를 생성하고 제어하는 데 필요합니다.
 
-# Microsoft 제품 리포지토리 등록
-curl https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+pyodbc: MSSQL 데이터베이스에 연결하는 데 필요합니다. (대부분의 Windows에는 ODBC 드라이버가 이미 설치되어 있습니다.)
 
-sudo apt-get update
-sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17
-3. Flask 애플리케이션 및 작업 큐 설정
-1. 프로젝트 구조
-
-/home/user/remain_monitor
-├── venv/
-├── app.py
-├── tasks.py
-└── requirements.txt
-2. 가상 환경 설정 및 라이브러리 설치
-
-Bash
-
-cd /home/user/remain_monitor
-python3 -m venv venv
-source venv/bin/activate
-
-pip install Flask gunicorn flask-rq2 redis rq-dashboard pyodbc
-requirements.txt 파일을 생성하고 위 라이브러리들을 명시해두는 것이 좋습니다.
-
-3. Flask 애플리케이션 (app.py)
+2. 전체 코드 (timestamp_service.py)
+아래 코드를 timestamp_service.py 라는 이름의 파일로 저장하세요. 코드 상단의 CONFIG 섹션은 반드시 본인 환경에 맞게 수정해야 합니다.
 
 Python
 
-from flask import Flask, request, jsonify
-from flask_rq2 import RQ
+# timestamp_service.py
+
+import socket
+import socketserver
+import threading
+import time
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import pyodbc
 
-app = Flask(__name__)
+# Windows 서비스 관련 모듈
+import win32serviceutil
+import win32service
+import win32event
+import servicemanager
 
-# Flask-RQ2 설정
-app.config['RQ_REDIS_URL'] = 'redis://localhost:6379/0'
-rq = RQ(app)
+# ==============================================================================
+# 설정 (사용자 환경에 맞게 이 부분을 수정하세요)
+# ==============================================================================
+CONFIG = {
+    # --- 데이터베이스 설정 ---
+    'DB_SERVER': 'YOUR_DB_SERVER_ADDRESS',  # 예: '192.168.1.100' 또는 'SERVERNAME\SQLEXPRESS'
+    'DB_NAME': 'bbb',                       # 데이터베이스 이름
+    'DB_USER': 'YOUR_DB_USERNAME',          # DB 사용자 이름
+    'DB_PASSWORD': 'YOUR_DB_PASSWORD',      # DB 비밀번호
+    'DB_TABLE': 'tableccc',                 # 테이블 이름
+    'DB_DRIVER': '{ODBC Driver 17 for SQL Server}', # 설치된 ODBC 드라이버에 맞게 수정
 
-# MSSQL 연결 정보 (RemainMonitor DB)
-MSSQL_SERVER = 'your_server_ip_or_hostname'
-MSSQL_DATABASE = 'RemainMonitor'
-MSSQL_USERNAME = 'your_username'
-MSSQL_PASSWORD = 'your_password'
-# ODBC Driver 17 for SQL Server를 사용합니다.
-MSSQL_CONNECTION_STRING = f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={MSSQL_SERVER};DATABASE={MSSQL_DATABASE};UID={MSSQL_USERNAME};PWD={MSSQL_PASSWORD}'
+    # --- 폴더 경로 설정 ---
+    'REMOTE_BASE_FOLDER': 'othersystem',    # 공유 폴더 최상위 이름
+    'PROVIEWER_FOLDER': 'proviewer',
+    'DATA_FOLDER': 'data',
+    'MACHINE_PREFIX': 'machine',
+    'LANE_PREFIX': 'Lane',
 
-def get_db_connection():
-    """MSSQL 데이터베이스 연결을 생성합니다."""
+    # --- 서비스 및 소켓 설정 ---
+    'SERVICE_NAME': 'TimestampSocketService',
+    'SERVICE_DISPLAY_NAME': 'Timestamp Provider Socket Service',
+    'SOCKET_HOST': '0.0.0.0',               # 모든 IP에서 접속 허용
+    'SOCKET_PORT': 9999,                    # 사용할 포트 번호
+    'CHECK_INTERVAL_SECONDS': 60,           # 데이터 갱신 주기 (초)
+
+    # --- 로깅 설정 ---
+    'LOG_FILE_PATH': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'service.log'),
+    'LOG_LEVEL': logging.INFO
+}
+# ==============================================================================
+
+# 전역 변수: 최신 타임스탬프와 스레드 동기화를 위한 Lock
+latest_timestamp_info = {"value": None}
+lock = threading.Lock()
+stop_event = threading.Event()
+
+# 로거 설정
+def setup_logger():
+    logger = logging.getLogger(CONFIG['SERVICE_NAME'])
+    logger.setLevel(CONFIG['LOG_LEVEL'])
+    handler = RotatingFileHandler(
+        CONFIG['LOG_FILE_PATH'], maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'
+    )
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
+
+logger = setup_logger()
+
+# 1. 자신의 IP 주소 가져오기
+def get_local_ip():
     try:
-        conn = pyodbc.connect(MSSQL_CONNECTION_STRING)
-        return conn
-    except pyodbc.Error as ex:
-        sqlstate = ex.args[0]
-        print(f"Database connection error: {sqlstate}")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception as e:
+        logger.error(f"로컬 IP 주소를 얻는 데 실패했습니다: {e}")
         return None
 
-# API 엔드포인트: 새로운 작업을 큐에 추가
-@app.route('/add-task', methods=['POST'])
-def add_task():
-    """
-    POST 요청을 받아 작업을 Redis 큐에 추가합니다.
-    요청 본문 예시: {"data": "처리할 데이터"}
-    """
-    data = request.get_json()
-    if not data or 'data' not in data:
-        return jsonify({'error': '데이터가 필요합니다.'}), 400
+# 2. DB에서 대상 시스템 IP 주소 조회
+def get_target_ip_from_db(local_ip):
+    conn_str = (
+        f"DRIVER={CONFIG['DB_DRIVER']};"
+        f"SERVER={CONFIG['DB_SERVER']};"
+        f"DATABASE={CONFIG['DB_NAME']};"
+        f"UID={CONFIG['DB_USER']};"
+        f"PWD={CONFIG['DB_PASSWORD']};"
+        "TrustServerCertificate=yes;" # 필요시 추가
+    )
+    try:
+        with pyodbc.connect(conn_str, timeout=5) as conn:
+            cursor = conn.cursor()
+            # SQL Injection 방지를 위해 파라미터화된 쿼리 사용
+            query = f"SELECT TargetIP FROM {CONFIG['DB_TABLE']} WHERE SourceIP = ?"
+            cursor.execute(query, local_ip)
+            row = cursor.fetchone()
+            if row:
+                logger.info(f"DB에서 대상 IP를 성공적으로 조회했습니다: {row[0]}")
+                return row[0]
+            else:
+                logger.warning(f"DB에서 IP '{local_ip}'에 해당하는 대상 IP를 찾지 못했습니다.")
+                return None
+    except Exception as e:
+        logger.error(f"데이터베이스 연결 또는 쿼리 실패: {e}")
+        return None
 
-    # tasks.py의 process_data 함수를 큐에 넣습니다.
-    # 두 번째 인자로 전달된 데이터가 process_data 함수의 인자로 사용됩니다.
-    job = rq.get_queue().enqueue('tasks.process_data', data['data'])
+# 3. 가장 최근 수정된 Lane 폴더의 시간 값 찾기
+def find_latest_lane_folder_mtime(target_ip):
+    try:
+        base_path_str = f"\\\\{target_ip}\\{CONFIG['REMOTE_BASE_FOLDER']}\\{CONFIG['PROVIEWER_FOLDER']}\\{CONFIG['DATA_FOLDER']}"
+        base_path = Path(base_path_str)
 
-    return jsonify({'job_id': job.id}), 202
+        if not base_path.exists():
+            logger.warning(f"경로를 찾을 수 없습니다: {base_path_str}")
+            return None
+
+        # 'machine'으로 시작하고 숫자로 끝나는 폴더 중 가장 큰 숫자 찾기
+        machine_folders = []
+        for p in base_path.iterdir():
+            if p.is_dir() and p.name.startswith(CONFIG['MACHINE_PREFIX']):
+                try:
+                    num_part = int(p.name[len(CONFIG['MACHINE_PREFIX']):])
+                    machine_folders.append((num_part, p))
+                except ValueError:
+                    continue # 숫자로 변환 안되면 무시
+
+        if not machine_folders:
+            logger.warning(f"'{CONFIG['MACHINE_PREFIX']}'로 시작하는 폴더를 찾지 못했습니다.")
+            return None
+
+        latest_machine_folder = max(machine_folders, key=lambda item: item[0])[1]
+        logger.info(f"선택된 Machine 폴더: {latest_machine_folder}")
+        
+        # 선택된 machine 폴더 하위에서 'Lane'으로 시작하는 모든 폴더 찾기
+        lane_folders = list(latest_machine_folder.rglob(f"{CONFIG['LANE_PREFIX']}*"))
+
+        if not lane_folders:
+            logger.warning(f"'{latest_machine_folder}' 하위에서 '{CONFIG['LANE_PREFIX']}'로 시작하는 폴더를 찾지 못했습니다.")
+            return None
+        
+        # 수정 시간이 가장 최신인 폴더 찾기
+        latest_lane_folder = max(lane_folders, key=lambda p: p.stat().st_mtime)
+        m_time = latest_lane_folder.stat().st_mtime
+        
+        logger.info(f"가장 최근 수정된 Lane 폴더: {latest_lane_folder}, 수정 시간: {m_time}")
+        return m_time
+
+    except FileNotFoundError:
+        logger.error(f"공유 폴더에 접근할 수 없습니다: \\\\{target_ip}")
+        return None
+    except Exception as e:
+        logger.error(f"폴더 시간 값을 찾는 중 오류 발생: {e}")
+        return None
+
+# 주기적으로 타임스탬프를 갱신하는 백그라운드 스레드 함수
+def update_timestamp_periodically():
+    logger.info("백그라운드 타임스탬프 갱신 스레드를 시작합니다.")
+    while not stop_event.is_set():
+        local_ip = get_local_ip()
+        if local_ip:
+            target_ip = get_target_ip_from_db(local_ip)
+            if target_ip:
+                timestamp = find_latest_lane_folder_mtime(target_ip)
+                with lock:
+                    latest_timestamp_info['value'] = timestamp
+            else:
+                with lock:
+                    latest_timestamp_info['value'] = None # 대상 IP 못찾으면 초기화
+        else:
+             with lock:
+                latest_timestamp_info['value'] = None # 로컬 IP 못찾으면 초기화
+        
+        stop_event.wait(CONFIG['CHECK_INTERVAL_SECONDS'])
+    logger.info("백그라운드 타임스탬프 갱신 스레드를 종료합니다.")
+
+
+# 소켓 요청을 처리하는 핸들러
+class TimestampRequestHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client_address = self.client_address[0]
+        logger.info(f"클라이언트로부터 연결 요청: {client_address}")
+        try:
+            with lock:
+                current_timestamp = latest_timestamp_info['value']
+            
+            if current_timestamp is not None:
+                # 타임스탬프(float)를 문자열로 변환하여 전송
+                response = str(current_timestamp)
+            else:
+                response = "ERROR: Timestamp not available"
+            
+            self.request.sendall(response.encode('utf-8'))
+            logger.info(f"응답 전송 완료: {response}")
+        except Exception as e:
+            logger.error(f"클라이언트 요청 처리 중 오류 발생: {e}")
+
+# Windows 서비스 클래스
+class SocketTimestampService(win32serviceutil.ServiceFramework):
+    _svc_name_ = CONFIG['SERVICE_NAME']
+    _svc_display_name_ = CONFIG['SERVICE_DISPLAY_NAME']
+    _svc_description_ = "지정된 폴더의 최신 수정 시간을 소켓으로 제공하는 서비스"
+
+    def __init__(self, args):
+        win32serviceutil.ServiceFramework.__init__(self, args)
+        self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
+        self.server = None
+        self.update_thread = None
+
+    def SvcStop(self):
+        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        logger.info(f"{self._svc_name_} 서비스 중지 요청을 받았습니다.")
+        stop_event.set()
+        
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            logger.info("소켓 서버가 정상적으로 종료되었습니다.")
+        
+        if self.update_thread and self.update_thread.is_alive():
+            self.update_thread.join(timeout=5) # 스레드가 끝날 때까지 최대 5초 대기
+            logger.info("업데이트 스레드가 정상적으로 종료되었습니다.")
+            
+        win32event.SetEvent(self.hWaitStop)
+        self.ReportServiceStatus(win32service.SERVICE_STOPPED)
+
+    def SvcDoRun(self):
+        servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
+                              servicemanager.PYS_SERVICE_STARTED,
+                              (self._svc_name_, ''))
+        self.main()
+
+    def main(self):
+        logger.info(f"{self._svc_name_} 서비스를 시작합니다.")
+        
+        # 백그라운드 스레드 시작
+        stop_event.clear()
+        self.update_thread = threading.Thread(target=update_timestamp_periodically)
+        self.update_thread.daemon = True
+        self.update_thread.start()
+        
+        # 소켓 서버 시작
+        socketserver.TCPServer.allow_reuse_address = True
+        try:
+            self.server = socketserver.ThreadingTCPServer(
+                (CONFIG['SOCKET_HOST'], CONFIG['SOCKET_PORT']),
+                TimestampRequestHandler
+            )
+            logger.info(f"소켓 서버가 {CONFIG['SOCKET_HOST']}:{CONFIG['SOCKET_PORT']}에서 실행됩니다.")
+            self.server.serve_forever()
+        except Exception as e:
+            logger.error(f"소켓 서버 실행 실패: {e}")
+            # 서버 시작 실패 시 서비스 중지
+            self.SvcStop()
 
 if __name__ == '__main__':
-    app.run(debug=True)
-4. 작업 함수 (tasks.py)
+    # 명령 프롬프트에서 'python timestamp_service.py install' 등으로 실행
+    win32serviceutil.HandleCommandLine(SocketTimestampService)
 
-실제로 비동기적으로 처리될 작업을 정의하는 파일입니다.
+3. 서비스 설치 및 실행 방법
+반드시 관리자 권한으로 명령 프롬프트(CMD)를 실행하세요.
+
+서비스 설치:
+timestamp_service.py 파일이 있는 디렉토리로 이동한 후, 아래 명령어를 입력합니다.
+
+DOS
+
+python timestamp_service.py install
+서비스 시작:
+설치가 완료되면 서비스를 시작합니다.
+
+DOS
+
+python timestamp_service.py start
+또는 Windows 서비스 관리자(services.msc)에서 Timestamp Provider Socket Service를 찾아 '시작' 버튼을 누를 수도 있습니다. '시작 유형'을 '자동'으로 설정하면 PC가 부팅될 때마다 서비스가 자동으로 시작됩니다.
+
+로그 확인:
+timestamp_service.py 파일과 같은 위치에 service.log 파일이 생성됩니다. 서비스의 모든 동작과 오류가 이 파일에 기록되므로, 정상 작동 여부를 확인하거나 문제가 발생했을 때 원인을 파악하는 데 사용하세요.
+
+서비스 상태 확인:
+
+DOS
+
+python timestamp_service.py status
+서비스 중지:
+
+DOS
+
+python timestamp_service.py stop
+서비스 제거:
+서비스를 완전히 삭제하려면 먼저 중지한 후 아래 명령어를 실행합니다.
+
+DOS
+
+python timestamp_service.py remove
+4. 클라이언트 테스트 코드
+서비스가 잘 동작하는지 확인하기 위한 간단한 클라이언트 예제입니다. 이 코드를 별도의 파일(client_test.py)로 만들어 실행해 보세요.
 
 Python
 
-import time
-import pyodbc
-from app import get_db_connection # app.py에서 연결 함수 가져오기
+# client_test.py
+import socket
+import datetime
 
-def process_data(data_to_process):
-    """
-    시간이 오래 걸리는 작업을 시뮬레이션하고,
-    처리 시작, 완료 상태를 MSSQL에 기록합니다.
-    """
-    job_id = rq.get_current_job().id if rq.get_current_job() else 'N/A'
-    conn = get_db_connection()
-    if not conn:
-        print("작업 실패: 데이터베이스에 연결할 수 없습니다.")
-        return
+# 서비스가 실행 중인 PC의 IP와 포트
+SERVER_IP = '127.0.0.1'  # 서비스와 같은 PC에서 테스트하면 '127.0.0.1'
+SERVER_PORT = 9999      # 서비스 설정과 동일한 포트
 
-    cursor = conn.cursor()
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((SERVER_IP, SERVER_PORT))
+        print(f"{SERVER_IP}:{SERVER_PORT}에 연결 성공")
+        
+        data = s.recv(1024)
+        response_str = data.decode('utf-8')
+        
+        print(f"서버로부터 받은 응답: {response_str}")
 
-    try:
-        # 작업 시작 기록
-        # MSSQL 2014는 GETUTCDATE()를 지원합니다.
-        cursor.execute("""
-            INSERT INTO TaskHistory (JobId, Status, Data, StartTime)
-            VALUES (?, ?, ?, GETUTCDATE())
-        """, job_id, 'Processing', str(data_to_process))
-        conn.commit()
+        if response_str.startswith("ERROR"):
+            print("타임스탬프를 가져오는 데 실패했습니다.")
+        else:
+            timestamp = float(response_str)
+            # 유닉스 타임스탬프를 사람이 읽을 수 있는 시간으로 변환
+            readable_time = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"변환된 시간: {readable_time}")
 
-        # 실제 작업 수행 (예: 5초 대기)
-        print(f"데이터 처리 시작: {data_to_process}")
-        time.sleep(5)
-        print("데이터 처리 완료.")
-
-        # 작업 완료 기록
-        cursor.execute("""
-            UPDATE TaskHistory
-            SET Status = ?, EndTime = GETUTCDATE()
-            WHERE JobId = ?
-        """, 'Completed', job_id)
-        conn.commit()
-
-    except Exception as e:
-        # 오류 발생 시 기록
-        print(f"작업 오류 발생: {e}")
-        cursor.execute("""
-            UPDATE TaskHistory
-            SET Status = ?, ErrorMessage = ?, EndTime = GETUTCDATE()
-            WHERE JobId = ?
-        """, 'Failed', str(e), job_id)
-        conn.commit()
-    finally:
-        cursor.close()
-        conn.close()
-
-    return f"처리 완료: {data_to_process}"
-5. MSSQL 테이블 (TaskHistory)
-
-RemainMonitor 데이터베이스에 아래와 같은 테이블을 미리 생성해야 합니다.
-
-SQL
-
-CREATE TABLE TaskHistory (
-    Id INT IDENTITY(1,1) PRIMARY KEY,
-    JobId NVARCHAR(255) NOT NULL,
-    Status NVARCHAR(50),
-    Data NVARCHAR(MAX),
-    ErrorMessage NVARCHAR(MAX),
-    StartTime DATETIME,
-    EndTime DATETIME
-);
-4. RQ 워커 및 대시보드 실행
-1. RQ 워커 실행
-
-Flask 애플리케이션과 다른 터미널에서 가상 환경을 활성화한 후, 아래 명령어로 워커를 실행합니다. 워커는 Redis 큐를 감시하며 새로운 작업을 처리합니다.
-
-Bash
-
-source /home/user/remain_monitor/venv/bin/activate
-rq worker
-2. RQ 대시보드 실행
-
-또 다른 터미널에서 아래 명령어로 실시간 모니터링 웹 대시보드를 실행합니다.
-
-Bash
-
-source /home/user/remain_monitor/venv/bin/activate
-rq-dashboard
-이제 웹 브라우저에서 http://<서버_IP>:9181로 접속하면 RQ 대시보드를 통해 큐의 상태, 등록된 작업, 성공/실패 여부 등을 실시간으로 확인할 수 있습니다.
-
-5. Gunicorn 및 Nginx 설정 (배포)
-1. Gunicorn으로 Flask 앱 실행
-
-Gunicorn은 WSGI 서버로, 프로덕션 환경에서 Flask 애플리케이션을 실행하는 데 사용됩니다.
-
-Bash
-
-# 프로젝트 디렉토리로 이동
-cd /home/user/remain_monitor
-source venv/bin/activate
-
-# Gunicorn 실행 (백그라운드에서 실행하려면 nohup 등을 사용)
-gunicorn --workers 3 --bind unix:remain_monitor.sock -m 007 app:app
---workers 3: 3개의 워커 프로세스를 사용합니다. 서버 사양에 맞게 조절합니다.
-
---bind unix:remain_monitor.sock: 유닉스 소켓을 통해 Nginx와 통신합니다. IP와 포트(--bind 0.0.0.0:8000)를 사용할 수도 있습니다.
-
--m 007: 소켓 파일에 대한 권한을 설정하여 Nginx가 접근할 수 있도록 합니다.
-
-2. Nginx 리버스 프록시 설정
-
-Nginx는 외부의 HTTP 요청을 받아 Gunicorn이 실행 중인 내부 소켓으로 전달하는 리버스 프록시 역할을 합니다.
-
-Bash
-
-sudo apt-get install -y nginx
-/etc/nginx/sites-available/remain_monitor 파일을 생성하고 아래 내용을 작성합니다.
-
-Nginx
-
-server {
-    listen 80;
-    server_name your_domain_or_server_ip;
-
-    location / {
-        # Gunicorn 소켓으로 요청을 전달
-        proxy_pass http://unix:/home/user/remain_monitor/remain_monitor.sock;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-생성한 설정을 활성화하고 Nginx를 재시작합니다.
-
-Bash
-
-# 심볼릭 링크 생성
-sudo ln -s /etc/nginx/sites-available/remain_monitor /etc/nginx/sites-enabled
-
-# 기본 설정 파일 링크 제거
-sudo unlink /etc/nginx/sites-enabled/default
-
-# Nginx 설정 테스트
-sudo nginx -t
-
-# Nginx 재시작
+except ConnectionRefusedError:
+    print("연결이 거부되었습니다. 서버가 실행 중인지, 방화벽 설정을 확인하세요.")
+except Exception as e:
+    print(f"오류 발생: {e}")
