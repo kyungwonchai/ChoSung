@@ -1,77 +1,75 @@
-아, 제가 완전히 잘못 이해했습니다. 정말 죄송합니다. alias 를 설명한 게 큰 실수였습니다.
+제가 계속 겉도는 답변만 드린 것 같아 정말 죄송합니다. CSS가 안 따라오는 근본적인 원인을 제대로 해결해 드렸어야 했는데, 그러지 못했습니다. 기본 문법을 물어보신 게 아니란 걸 압니다.
 
-지금 말씀하신 상황, 즉 각각 다른 포트에서 이미 실행되고 있는 독립적인 웹 서비스들을 Nginx로 묶는 것이라면, alias는 전혀 필요 없습니다. 100% proxy_pass 만 사용하는 것이 맞습니다.
+다시 처음부터, "왜 Nginx 뒤에서 CSS 경로가 깨지는가" 이 문제 하나에만 집중해서, 확실한 해결책 두 가지를 제시하겠습니다.
 
-제가 제대로 이해한 지금 상황에 맞춰, 처음부터 다시 설명해 드리겠습니다.
+## 문제의 진짜 원인
+Nginx는 요청을 잘 전달했지만, Nginx로부터 응답을 받은 웹 브라우저가 CSS 파일을 엉뚱한 주소로 요청하고 있기 때문입니다.
 
-## 목표: URL 경로에 따라 각 포트로 요청을 정확히 '토스'하기
-Nginx의 역할은 '교통정리'입니다.
+원래 기대한 상황:
 
-http://10.222.111.222/programs 로 온 손님은 👉 8101번 포트 서비스로 안내
+브라우저가 http://서버주소/app/ 요청
 
-http://10.222.111.222/monitor 로 온 손님은 👉 8921번 포트 서비스로 안내
+index.html 도착
 
-이 작업은 proxy_pass만으로 아주 간단하게 할 수 있습니다.
+index.html에 적힌 대로, 브라우저가 http://서버주소/app/static/style.css 요청
 
-## 올바른 Nginx 설정 (your-project.conf)
-이 설정 파일 하나면 모든 게 끝납니다. alias는 없습니다.
+실제 벌어지는 상황:
+
+브라우저가 http://서버주소/app/ 요청
+
+index.html 도착
+
+index.html에 주소가 /static/style.css 라고만 적혀있어서, 브라우저가 http://서버주소/static/style.css 를 요청 (앞에 /app이 빠짐)
+
+Nginx는 /static/ 경로에 대해 아는 바가 없으므로 404 에러 발생 -> 스타일 깨짐
+
+## 해결책 1: 앱(App)이 스스로 주소를 바꾸게 만들기 (가장 확실한 방법)
+이 방법은 각 앱에게 "너는 이제 /app 이라는 경로 아래에서 동작하니까, 모든 주소 앞에 /app을 붙여서 만들어!" 라고 알려주는 정석적인 방법입니다.
+
+React의 경우:
+package.json 파일에 "homepage": "/app" 한 줄을 추가하고 반드시 다시 npm run build 합니다.
+
+Streamlit의 경우:
+실행 명령어에 --server.baseUrlPath /dashboard 옵션을 추가합니다.
+
+Flask의 경우:
+지난번에 설명드린 ProxyFix를 사용하면, HTML 템플릿 안의 url_for('static', ...)가 자동으로 /app/static/... 같은 올바른 전체 경로를 생성해 줍니다.
+
+이 방법이 가장 좋습니다. 앱 자체가 자신의 웹 주소를 정확히 알게 되므로, 나중에 API 요청이나 다른 경로에서도 문제가 생기지 않는 가장 안정적인 방법입니다.
+
+## 해결책 2: Nginx가 강제로 주소를 바꿔치기하기 (앱 수정이 불가능할 때)
+"나는 앱 코드는 절대 건드리고 싶지 않다. Nginx 선에서 100% 해결하고 싶다"고 하실 때 사용하는 최후의 수단입니다. sub_filter 라는 강력한 기능을 사용합니다.
+
+이 기능은 Nginx가 Flask 같은 앱으로부터 받은 HTML 응답을 브라우저에게 보내주기 직전에, 내용을 살짝 열어서 특정 글자를 다른 글자로 강제로 바꿔치기하는 기능입니다.
 
 Nginx
 
-server {
-    listen 80;
-    server_name 10.222.111.222;
+location /app/ {
+    proxy_pass http://127.0.0.1:8101/; # 앱이 실행중인 내부 포트
 
-    # 1. 메인 페이지 (http://10.222.111.222/)
-    # 여기는 실제 파일이 있는 폴더를 가리키므로 'root'를 사용합니다.
-    location / {
-        root /var/www/main-portal; # 메인 index.html이 있는 폴더
-        index index.html;
-    }
+    # --- 이 부분이 핵심입니다 ---
+    # Nginx가 HTML 응답 내용에서 href="/static/ 을 href="/app/static/ 으로,
+    # src="/static/ 을 src="/app/static/ 으로 강제로 바꿔치기합니다.
+    sub_filter 'href="/static/'  'href="/app/static/';
+    sub_filter 'src="/static/'   'src="/app/static/';
 
-    # 2. 첫 번째 서비스 ('/programs' 경로 -> 8101 포트)
-    location /programs/ {
-        # 'http://127.0.0.1:8101/' 로 모든 요청을 넘겨줍니다.
-        # 맨 뒤에 '/'를 붙이면, Nginx가 '/programs/' 부분을 떼고
-        # 순수한 경로만 8101 앱으로 전달합니다. (예: /programs/login -> /login)
-        proxy_pass http://127.0.0.1:8101/;
-
-        # 아래 헤더 설정은 필수입니다. 백엔드 앱이 클라이언트 정보를 알 수 있게 합니다.
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # 3. 두 번째 서비스 ('/monitor' 경로 -> 8921 포트)
-    location /monitor/ {
-        # 위와 동일하게, 8921번 포트로 실행 중인 서비스로 요청을 넘깁니다.
-        proxy_pass http://127.0.0.1:8921/;
-
-        # 필수 헤더 설정
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # 모니터링 툴은 실시간 통신(웹소켓)을 쓸 수 있으니 아래 설정도 추가합니다.
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-    }
+    # 만약 API 경로도 깨진다면 이런 식으로 추가할 수 있습니다.
+    sub_filter 'action="/api/' 'action="/app/api/';
+    
+    # 이 옵션을 켜야 sub_filter가 여러 번 바꿔치기할 수 있습니다.
+    sub_filter_once off;
 }
-## 왜 alias는 틀렸고, 이게 맞는가?
-proxy_pass (정답): 실행 중인 프로그램 (포트 O) 에게 요청을 중계할 때 사용합니다. 지금 사용자님 상황에 100% 해당합니다.
+이 방법의 장점:
 
-alias (오답): 단순 파일 폴더 (포트 X) 와 URL을 연결할 때 사용합니다. 제가 완전히 잘못 짚었습니다.
+앱 코드를 단 한 줄도 건드릴 필요가 없습니다.
 
-## 해야 할 일
-위 설정 내용을 /etc/nginx/sites-available/your-project.conf 와 같은 파일에 복사하고 저장합니다.
+이 방법의 단점:
 
-sudo ln -s /etc/nginx/sites-available/your-project.conf /etc/nginx/sites-enabled/ 명령어로 설정을 활성화합니다.
+바꿔야 할 경로(/static/, /images/, /api/ 등)가 많아지면 Nginx 설정이 지저분해집니다.
 
-sudo nginx -t 로 문법 오류가 없는지 확인합니다.
+미세한 성능 저하가 있을 수 있습니다.
 
-sudo systemctl reload nginx 로 설정을 적용합니다.
+## 결론
+가장 먼저 시도할 것: 해결책 1입니다. 각 앱의 공식적인 방법으로 '기본 경로(base path)'를 설정하는 것이 가장 깔끔하고 안정적입니다.
 
-이렇게 하면 Nginx는 각 앱의 내부 경로가 어떻게 생겼는지 전혀 신경 쓰지 않고, 그저 정해진 URL 경로에 따라 올바른 포트로 요청을 '토스'해주는 역할만 완벽하게 수행할 겁니다.
+최후의 수단: 소스 코드를 전혀 수정할 수 없는 외부 앱을 서비스할 때는 **해결책 2 (sub_filter)**가 유용합니다.
