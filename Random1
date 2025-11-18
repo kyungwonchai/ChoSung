@@ -1,104 +1,211 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+"""
+modbus_blind_scanner.py
 
-# --- [ 사용자 설정 ] ---
+인터넷이 안되고 pyserial 라이브러리만 설치된 환경에서
+분실된 Modbus Map을 가진 장치(배터리)를 스캔하는 스크립트.
+시리얼 포트 설정, 슬레이브 ID, 기능 코드, 주소를 모두 순회(Brute-force)합니다.
 
-# 1. 탐색을 시작할 기본 폴더 경로
-# (주의: '/mnt/smdpg' 폴더가 실제로 마운트되어 있어야 합니다.)
-SEARCH_DIR = "/mnt/smdpg"
+실행: python3 modbus_blind_scanner.py
+"""
 
-# 2. 파일/폴더 이름이 반드시 시작해야 하는 '필수 문자열'
-# (예: "PROJECT_A", "DATA", "BACKUP" 등)
-REQUIRED_PREFIX = "여기에_필수_문자열을_입력하세요" 
+import serial
+import struct
+import time
+import sys
 
-# --- [ 설정 끝 ] ---
+# --- Modbus CRC16 계산 함수 ---
+# pyserial만 사용해야 하므로 CRC 계산 함수를 내장합니다.
+def calculate_crc(data: bytes) -> int:
+    """Modbus RTU CRC16 계산"""
+    crc = 0xFFFF
+    for char in data:
+        crc ^= char
+        for _ in range(8):
+            if crc & 0x0001:
+                crc >>= 1
+                crc ^= 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+# --- 스캔할 파라미터 설정 ---
+
+# 라즈베리파이에서 USB to RS485가 연결된 포트 (여러 개 시도)
+SERIAL_PORTS = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyAMA0']
+
+# 일반적인 Baud rate
+BAUD_RATES = [9600, 19200, 38400, 57600, 115200]
+
+# Parity (N: None, E: Even, O: Odd)
+PARITIES = {
+    'N': serial.PARITY_NONE,
+    'E': serial.PARITY_EVEN,
+    'O': serial.PARITY_ODD,
+}
+
+# Stop bits
+STOP_BITS = [serial.STOPBITS_ONE, serial.STOPBITS_TWO]
+
+# 스캔할 슬레이브 ID (1~10)
+SLAVE_IDS = list(range(1, 11))
+
+# 스캔할 기능 코드 (03: Read Holding, 04: Read Input)
+FUNCTION_CODES = [3, 4]
+
+# 한 번에 읽을 레지스터 수
+REGISTERS_TO_READ = 8
+
+# 스캔할 주소 범위 (0 ~ 100, REGISTERS_TO_READ 간격으로)
+ADDRESS_RANGE = range(0, 101, REGISTERS_TO_READ)
+
+# 응답 대기 시간 (초)
+RESPONSE_TIMEOUT = 0.5
+
+# 로그 파일명
+LOG_FILE = "modbus_scan_log.txt"
 
 
-def search_files():
-    """
-    지정된 디렉토리에서 조건에 맞는 파일과 폴더를 재귀적으로 탐색합니다.
-    """
-    print(f"--- 탐색 시작: '{SEARCH_DIR}' ---")
-    print(f"--- 조건 1: 이름이 '{REQUIRED_PREFIX}'(으)로 시작")
-    print(f"--- 조건 2: (조건1 제외 후) '_' 앞 숫자가 2 또는 3")
-    print("-" * 40)
+def log_finding(message: str):
+    """파일과 콘솔에 로그 기록"""
+    print(message)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+    except IOError as e:
+        print(f"로그 파일 쓰기 실패: {e}")
 
+def run_scan():
+    """모든 파라미터 조합으로 모드버스 스캔 시작"""
+    log_finding(f"--- Modbus 블라인드 스캔 시작 ---")
+    log_finding(f"결과는 {LOG_FILE} 파일에 저장됩니다.")
+    log_finding(f"이 작업은 매우 오래 걸릴 수 있습니다...")
+
+    total_attempts = 0
     found_count = 0
 
-    # SEARCH_DIR이 존재하는지 확인
-    if not os.path.exists(SEARCH_DIR):
-        print(f"[오류] 지정된 폴더를 찾을 수 없습니다: {SEARCH_DIR}")
-        print("폴더가 올바르게 마운트되었는지 확인하세요.")
-        return
-
-    # os.walk()로 모든 하위 디렉토리와 파일을 탐색합니다.
-    # dirpath: 현재 폴더 경로
-    # dirnames: 현재 폴더 안의 하위 폴더 목록
-    # filenames: 현재 폴더 안의 파일 목록
-    for dirpath, dirnames, filenames in os.walk(SEARCH_DIR, topdown=True):
-        
-        # 폴더와 파일을 합쳐서 한 번에 검사
-        all_items = dirnames + filenames
-        
-        for item_name in all_items:
-            
-            # --- 조건 1: 파일/폴더 이름이 사용자가 지정한 문자열로 시작하는가? ---
-            if not item_name.startswith(REQUIRED_PREFIX):
-                continue  # 아니면 다음 파일/폴더로 넘어감
-
-            # --- 조건 1 통과 ---
-            
-            # 이제 나머지 문자열을 분석합니다.
-            # 예: REQUIRED_PREFIX="MY_APP", item_name="MY_APP_2_file.txt"
-            # remaining_str = "_2_file.txt"
-            remaining_str = item_name[len(REQUIRED_PREFIX):]
-
-            # 맨 앞의 '_'가 있다면 제거합니다.
-            # (예: "_2_file.txt" -> "2_file.txt")
-            if remaining_str.startswith('_'):
-                remaining_str = remaining_str[1:]
-            else:
-                # (예: "MY_APP2_file.txt" 처럼 '_'가 없는 경우는 제외)
-                continue
-
-            # --- 조건 2: 나머지 문자열이 '_'를 포함하고, 그 앞부분이 2 또는 3인가? ---
-            
-            # '_'가 없으면(예: "MY_APP_config.txt") 비교 대상이 없으므로 제외
-            if '_' not in remaining_str:
-                continue
-
-            try:
-                # 나머지 문자열을 첫 번째 '_' 기준으로 분리
-                # (예: "2_file.txt" -> "2")
-                prefix_num_str = remaining_str.split('_', 1)[0]
-                
-                # 숫자로 변환 시도
-                prefix_num = int(prefix_num_str)
-                
-                # 숫자가 2 또는 3인지 확인
-                if prefix_num in (2, 3):
+    for port in SERIAL_PORTS:
+        for baud in BAUD_RATES:
+            for parity_char, parity_val in PARITIES.items():
+                for stopbits in STOP_BITS:
                     
-                    # --- 모든 조건 만족! ---
-                    full_path = os.path.join(dirpath, item_name)
-                    print(full_path)
-                    found_count += 1
+                    settings_str = f"Port: {port}, Baud: {baud}, 8{parity_char}{stopbits}"
+                    print(f"\n--- [시도 중] {settings_str} ---")
                     
-            except ValueError:
-                # int() 변환 실패 시 (예: "MY_APP_ADMIN_file.txt")
-                # 이 경우는 숫자가 아니므로 무시하고 계속 진행
-                continue
-            except Exception as e:
-                # 기타 예외 처리
-                print(f"[경고] 파일 처리 중 오류 발생: {item_name} ({e})")
+                    ser = None
+                    try:
+                        # 시리얼 포트 열기
+                        ser = serial.Serial(
+                            port=port,
+                            baudrate=baud,
+                            parity=parity_val,
+                            stopbits=stopbits,
+                            bytesize=serial.EIGHTBITS,
+                            timeout=RESPONSE_TIMEOUT
+                        )
+                    except serial.SerialException as e:
+                        print(f"  포트 열기 실패: {e}")
+                        # 다음 포트로 이동 (이 포트로는 더 이상 시도 불가)
+                        break 
+                    except Exception as e:
+                        print(f"  알 수 없는 포트 오류: {e}")
+                        break
 
-    print("-" * 40)
-    print(f"--- 총 {found_count}개의 항목을 찾았습니다. ---")
+                    try:
+                        for slave_id in SLAVE_IDS:
+                            for func_code in FUNCTION_CODES:
+                                for start_addr in ADDRESS_RANGE:
+                                    
+                                    total_attempts += 1
+                                    if total_attempts % 100 == 0:
+                                        print(f"  {total_attempts}회 시도 중... (유효 응답 {found_count}건)")
+
+                                    # 1. Modbus RTU 요청 프레임 생성 (CRC 제외)
+                                    # [Slave ID][Func Code][Start Addr HI][Start Addr LO][Qty HI][Qty LO]
+                                    request_pdu = struct.pack(
+                                        '>BBHH', 
+                                        slave_id, 
+                                        func_code, 
+                                        start_addr, 
+                                        REGISTERS_TO_READ
+                                    )
+                                    
+                                    # 2. CRC 계산 (Little-endian으로 추가)
+                                    crc = calculate_crc(request_pdu)
+                                    request_frame = request_pdu + struct.pack('<H', crc)
+
+                                    try:
+                                        # 3. 요청 전송
+                                        ser.flushInput()
+                                        ser.flushOutput()
+                                        ser.write(request_frame)
+                                        
+                                        # 4. 응답 수신
+                                        # 최소 응답 길이: ID(1) + FC(1) + CRC(2) = 4
+                                        # 에러 응답 길이: ID(1) + FC(1) + Err(1) + CRC(2) = 5
+                                        response = ser.read(5 + REGISTERS_TO_READ * 2) 
+
+                                        # 5. 응답 분석
+                                        if len(response) < 4:
+                                            # 타임아웃 (응답 없음)
+                                            continue
+
+                                        # 5-1. 응답 CRC 검증
+                                        response_crc = struct.unpack('<H', response[-2:])[0]
+                                        calculated_crc = calculate_crc(response[:-2])
+
+                                        if response_crc != calculated_crc:
+                                            # CRC 불일치 (데이터 깨짐 또는 잘못된 응답)
+                                            continue
+
+                                        # 5-2. CRC 일치! - 유의미한 데이터 발견
+                                        found_count += 1
+                                        
+                                        # 에러 코드 확인 (기능 코드 0x80 비트)
+                                        if response[1] == (func_code | 0x80):
+                                            # [유의미한 에러]
+                                            # ID, 시리얼 설정은 맞았으나 주소 등이 틀렸다는 의미!
+                                            error_code = response[2]
+                                            msg = (f"[발견!] 유효한 에러 응답 (ID/설정 일치 가능성 높음)\n"
+                                                   f"  > 설정: {settings_str}\n"
+                                                   f"  > 요청: ID={slave_id}, FC={func_code}, Addr={start_addr}, Qty={REGISTERS_TO_READ}\n"
+                                                   f"  > 응답: {response.hex()}\n"
+                                                   f"  > 에러 코드: {error_code} (1:Illegal Function, 2:Illegal Data Address)")
+                                            log_finding(msg)
+                                        
+                                        elif response[0] == slave_id and response[1] == func_code:
+                                            # [성공!]
+                                            # 정상 데이터 수신
+                                            byte_count = response[2]
+                                            data = response[3:-2]
+                                            
+                                            msg = (f"[성공!] 유효한 데이터 수신\n"
+                                                   f"  > 설정: {settings_str}\n"
+                                                   f"  > 요청: ID={slave_id}, FC={func_code}, Addr={start_addr}, Qty={REGISTERS_TO_READ}\n"
+                                                   f"  > 응답 (Hex): {response.hex()}\n"
+                                                   f"  > 데이터 (Hex): {data.hex()} (길이: {byte_count} 바이트)")
+                                            log_finding(msg)
+                                        
+                                        else:
+                                            # CRC는 맞았으나 ID/FC가 불일치 (다른 장치의 응답일 수 있음)
+                                            pass
+
+                                    except Exception as e:
+                                        print(f"  데이터 R/W 중 오류: {e}")
+                                        # 오류 발생 시 현재 시리얼 설정은 중단
+                                        break
+                    
+                    finally:
+                        if ser and ser.is_open:
+                            ser.close()
+
+    log_finding("--- 모드버스 스캔 완료 ---")
 
 if __name__ == "__main__":
-    if REQUIRED_PREFIX == "여기에_필수_문자열을_입력하세요":
-        print("[!!!] 스크립트 오류: 'REQUIRED_PREFIX' 값을 수정해야 합니다.")
-        print("스크립트 파일을 열어 'USER_SETTINGS' 부분을 수정해주세요.")
-    else:
-        search_files()
+    try:
+        run_scan()
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 스캔이 중지되었습니다.")
+        sys.exit(0)
