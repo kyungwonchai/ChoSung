@@ -1,59 +1,369 @@
-RPA(Robotic Process Automation) 환경에서는 브라우저 버전이 조금만 바뀌어도 Selector(선택자)나 좌표가 틀어져서 스크립트가 멈추기 때문에 업데이트 차단은 필수입니다.
+단계: 핵심 로직 (app.py) 설명
+이 코드는 Github에서 내용을 '가져오기'만 하고, 원본을 수정하는 기능은 아예 배제했습니다. 가져온 데이터는 경원님의 MSSQL 2014에 INSERT만 수행하여 히스토리를 쌓습니다.
 
-오페라는 업데이트 강박이 심한 브라우저라 단순히 설정에서 끄는 옵션이 없습니다. **파일 시스템 레벨에서 물리적으로 실행을 막는 방법(일명 '가짜 파일 대치법')**이 가장 확실합니다.
+기능 1 (Fetch): GitHub API로 원시(Raw) 텍스트를 가져와서 DB에 저장 후 화면에 뿌립니다.
 
-다음 단계를 순서대로 진행해 주세요.
+기능 2 (Search): DB에 쌓인 로그를 LIKE 검색으로 조회합니다.
 
-1단계: 업데이트 실행 파일 무력화 (가장 중요)
-오페라가 업데이트를 하려고 해도 실행할 파일이 없게 만들고, 다시 다운로드도 못 하게 막는 방법입니다.
+파일명: app.py
 
-오페라 설치 폴더로 이동합니다.
+Python
 
-보통 다음 경로에 있습니다. (탐색기 주소창에 복사해서 넣으세요)
+import os
+import pyodbc
+import requests
+from flask import Flask, render_template, request, jsonify
+from datetime import datetime
 
-%LocalAppData%\Programs\Opera
+app = Flask(__name__)
 
-또는 C:\Users\사용자명\AppData\Local\Programs\Opera
+# ==========================================
+# [설정] MSSQL 및 GitHub 정보 수정 필수
+# ==========================================
+DB_CONFIG = {
+    'driver': '{ODBC Driver 17 for SQL Server}', # 혹은 설치된 드라이버 버전에 맞게
+    'server': '192.168.0.xxx,1433', # MSSQL 서버 IP 및 포트
+    'database': 'YOUR_DB_NAME',     # 사용할 데이터베이스 이름
+    'uid': 'YOUR_ID',               # 접속 ID
+    'pwd': 'YOUR_PASSWORD'          # 접속 비번
+}
 
-폴더 내부에 숫자로 된 버전 폴더 (예: 106.0.4998.28)가 보일 겁니다. 가장 최신 버전 폴더로 들어갑니다.
+# Private Repo라면 토큰 필수, Public이면 비워도 됨
+GITHUB_TOKEN = "YOUR_GITHUB_TOKEN" 
+# ==========================================
 
-opera_autoupdate.exe 파일을 찾습니다.
+def get_db_connection():
+    conn_str = f"DRIVER={DB_CONFIG['driver']};SERVER={DB_CONFIG['server']};DATABASE={DB_CONFIG['database']};UID={DB_CONFIG['uid']};PWD={DB_CONFIG['pwd']}"
+    return pyodbc.connect(conn_str)
 
-이 파일의 이름을 opera_autoupdate.exe.bak 등으로 바꿉니다. (이제 업데이트 프로그램 실행 불가)
+# 서버 시작 시 테이블이 없으면 자동 생성 (로그 저장용)
+def init_db():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # 단순히 조회 이력을 쌓는 테이블입니다.
+        query = '''
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MyCodeHistory' AND xtype='U')
+        CREATE TABLE MyCodeHistory (
+            ID INT IDENTITY(1,1) PRIMARY KEY,
+            RepoInfo NVARCHAR(255),
+            FilePath NVARCHAR(255),
+            CodeContent NVARCHAR(MAX),
+            SavedAt DATETIME DEFAULT GETDATE()
+        )
+        '''
+        cursor.execute(query)
+        conn.commit()
+        conn.close()
+        print(">> DB 테이블 체크/생성 완료")
+    except Exception as e:
+        print(f">> DB 접속 오류 (정보를 확인하세요): {e}")
 
-[핵심] 같은 자리에 새 폴더를 하나 만들고, 폴더 이름을 **opera_autoupdate.exe**라고 짓습니다.
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-원리: 오페라가 파일이 없어진 걸 눈치채고 다시 다운로드하려 해도, 같은 이름의 '폴더'가 이미 자리 잡고 있어서 파일을 덮어쓰지 못합니다.
+# [핵심] 깃허브에서 가져오기 + DB 저장 (단방향)
+@app.route('/fetch', methods=['POST'])
+def fetch_code():
+    data = request.json
+    owner = data.get('owner')
+    repo = data.get('repo')
+    path = data.get('path')
+    
+    # GitHub Raw API URL 구성
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {'Accept': 'application/vnd.github.v3.raw'}
+    if GITHUB_TOKEN:
+        headers['Authorization'] = f'token {GITHUB_TOKEN}'
 
-2단계: 작업 스케줄러 삭제 (확인 사살)
-윈도우는 주기적으로 업데이트를 체크하도록 스케줄을 걸어둡니다. 이걸 삭제해야 합니다.
+    try:
+        # 1. 깃허브 내용 가져오기
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        content = resp.text
+        
+        # 2. DB에 '읽기 전용'으로 기록 (Insert Only)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "INSERT INTO MyCodeHistory (RepoInfo, FilePath, CodeContent, SavedAt) VALUES (?, ?, ?, GETDATE())"
+        cursor.execute(sql, (f"{owner}/{repo}", path, content))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'status': 'ok', 'content': content})
+    except Exception as e:
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
 
-Win 키 + R을 눌러 실행창을 열고 taskschd.msc 입력 후 엔터.
+# [핵심] DB 라이크 검색
+@app.route('/search')
+def search_code():
+    keyword = request.args.get('q', '')
+    if not keyword: return jsonify([])
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 내용(Content)이나 파일명(Path)에 키워드가 있는 경우 검색
+    sql = """
+    SELECT TOP 20 ID, RepoInfo, FilePath, SavedAt 
+    FROM MyCodeHistory 
+    WHERE CodeContent LIKE ? OR FilePath LIKE ? 
+    ORDER BY SavedAt DESC
+    """
+    param = f"%{keyword}%"
+    cursor.execute(sql, (param, param))
+    
+    results = []
+    for row in cursor.fetchall():
+        results.append({
+            'id': row.ID,
+            'repo': row.RepoInfo,
+            'path': row.FilePath,
+            'date': row.SavedAt.strftime('%Y-%m-%d %H:%M')
+        })
+    conn.close()
+    return jsonify(results)
 
-왼쪽 메뉴에서 **'작업 스케줄러 라이브러리'**를 클릭합니다.
+# [핵심] 검색된 기록 상세보기
+@app.route('/history/<int:id>')
+def get_history(id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT CodeContent FROM MyCodeHistory WHERE ID = ?", (id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'content': row.CodeContent})
+    return jsonify({'error': 'Not found'}), 404
 
-오른쪽 목록에서 Opera scheduled Autoupdate 로 시작하는 항목을 모두 찾습니다.
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=5000)
+3단계: UI (templates/index.html) 설명
+요청하신 다크 모드 + 그라데이션 디자인입니다.
 
-마우스 우클릭 후 [사용 안 함] 또는 **[삭제]**를 선택합니다.
+배경: 짙은 남색~보라 계열의 그라데이션 (linear-gradient)을 사용하여 고급스러운 느낌을 줬습니다.
 
-3단계: 바로가기 실행 옵션 추가 (안전장치)
-바탕화면이나 작업 표시줄에 있는 오페라 실행 아이콘을 수정합니다.
+카드: 반투명한 검은색 배경(rgba)을 사용하여 배경과 어우러지게 했습니다.
 
-오페라 아이콘 우클릭 -> 속성(Properties).
+가독성: 코드는 어두운 테마의 에디터 느낌으로 출력됩니다.
 
-대상(Target) 입력칸의 맨 뒤에 한 칸 띄우고 다음 명령어를 추가합니다.
+경로: templates/index.html (반드시 templates 폴더 안에 생성)
 
---disable-update
+HTML
 
-예시: C:\...\launcher.exe --disable-update
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Kyungwon's Code Vault</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* [디자인] 고급스러운 다크 그라데이션 배경 */
+        body {
+            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        /* [디자인] 카드 스타일: 반투명 글래스모피즘 효과 */
+        .card {
+            background-color: rgba(30, 30, 40, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+        .card-header {
+            background-color: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            font-weight: bold;
+            color: #4facfe; /* 포인트 컬러 */
+        }
+        
+        /* 입력 폼 스타일 */
+        .form-control {
+            background-color: #2b2b3b;
+            border: 1px solid #444;
+            color: #fff;
+        }
+        .form-control:focus {
+            background-color: #3b3b4b;
+            color: #fff;
+            border-color: #4facfe;
+            box-shadow: 0 0 0 0.25rem rgba(79, 172, 254, 0.25);
+        }
 
-적용 -> 확인.
+        /* 코드 뷰어 영역 */
+        pre {
+            background-color: #1a1a1a;
+            color: #a9b7c6;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            max-height: 700px;
+            overflow: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
 
-요약 및 주의사항
-**1단계(폴더 이름 바꾸기 트릭)**만 제대로 해도 99% 막힙니다.
+        /* 검색 결과 리스트 */
+        .list-group-item {
+            background-color: transparent;
+            border-color: rgba(255, 255, 255, 0.1);
+            color: #ccc;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .list-group-item:hover {
+            background-color: rgba(79, 172, 254, 0.2);
+            color: #fff;
+        }
 
-이 방법을 쓰면 오페라 메뉴에서 '업데이트 확인'을 눌러도 오류가 나며 진행되지 않습니다. (정상입니다)
+        /* 버튼 스타일 */
+        .btn-primary {
+            background: linear-gradient(to right, #4facfe 0%, #00f2fe 100%);
+            border: none;
+            color: #000;
+            font-weight: bold;
+        }
+        .btn-success {
+            background: linear-gradient(to right, #43e97b 0%, #38f9d7 100%);
+            border: none;
+            color: #000;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+<div class="container py-5">
+    <h2 class="text-center mb-4" style="color:#fff; text-shadow: 0 2px 4px rgba(0,0,0,0.5);">
+        🔍 GitHub Code Fetcher & History
+    </h2>
+    
+    <div class="row">
+        <div class="col-lg-4 mb-4">
+            <div class="card mb-4">
+                <div class="card-header">GitHub 가져오기 (Read Only)</div>
+                <div class="card-body">
+                    <div class="mb-2">
+                        <input type="text" id="owner" class="form-control mb-2" placeholder="User (e.g. microsoft)">
+                        <input type="text" id="repo" class="form-control mb-2" placeholder="Repo (e.g. vscode)">
+                        <input type="text" id="path" class="form-control mb-2" placeholder="File Path (e.g. README.md)">
+                    </div>
+                    <button class="btn btn-primary w-100" onclick="fetchGithub()">🚀 가져오기 & 저장</button>
+                </div>
+            </div>
 
-주의: 보안 업데이트도 막히므로, RPA가 돌아가는 폐쇄적인 환경이 아니라 일반 웹 서핑용이라면 주기적으로 수동 업데이트를 고려해야 합니다.
+            <div class="card h-100">
+                <div class="card-header">DB History 검색</div>
+                <div class="card-body d-flex flex-column">
+                    <div class="input-group mb-3">
+                        <input type="text" id="keyword" class="form-control" placeholder="내용 검색..." onkeyup="if(event.key==='Enter') searchDB()">
+                        <button class="btn btn-success" onclick="searchDB()">검색</button>
+                    </div>
+                    <div id="resultList" class="list-group list-group-flush overflow-auto" style="max-height: 400px;">
+                        <div class="text-center text-muted mt-3">검색 결과가 없습니다.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-이제 오페라가 멋대로 업데이트되어 RPA가 멈추는 일은 없을 것입니다.
+        <div class="col-lg-8">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>📜 Code Viewer</span>
+                    <button class="btn btn-sm btn-light" onclick="copyCode()">📋 복사하기</button>
+                </div>
+                <div class="card-body">
+                    <pre id="codeView">// 파일 내용이 여기에 표시됩니다.</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // GitHub 가져오기
+    async function fetchGithub() {
+        const data = {
+            owner: document.getElementById('owner').value,
+            repo: document.getElementById('repo').value,
+            path: document.getElementById('path').value
+        };
+        
+        if(!data.owner || !data.repo || !data.path) {
+            alert('정보를 모두 입력해주세요.'); return;
+        }
+
+        try {
+            const res = await fetch('/fetch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            const json = await res.json();
+            
+            if(json.status === 'ok') {
+                document.getElementById('codeView').innerText = json.content;
+            } else {
+                alert('오류: ' + json.msg);
+            }
+        } catch (e) { alert('서버 통신 오류'); }
+    }
+
+    // DB 검색
+    async function searchDB() {
+        const q = document.getElementById('keyword').value;
+        const res = await fetch(`/search?q=${encodeURIComponent(q)}`);
+        const list = await res.json();
+        
+        const container = document.getElementById('resultList');
+        container.innerHTML = '';
+        
+        if(list.length === 0) {
+            container.innerHTML = '<div class="text-center text-muted mt-3">결과 없음</div>';
+            return;
+        }
+
+        list.forEach(item => {
+            const el = document.createElement('a');
+            el.className = 'list-group-item list-group-item-action';
+            el.innerHTML = `
+                <div class="d-flex w-100 justify-content-between">
+                    <small class="text-info">${item.repo}</small>
+                    <small class="text-muted" style="font-size:0.7em">${item.date}</small>
+                </div>
+                <p class="mb-1 text-truncate">${item.path}</p>
+            `;
+            el.onclick = () => loadHistory(item.id);
+            container.appendChild(el);
+        });
+    }
+
+    // 히스토리 불러오기
+    async function loadHistory(id) {
+        const res = await fetch(`/history/${id}`);
+        const json = await res.json();
+        if(json.content) {
+            document.getElementById('codeView').innerText = json.content;
+        }
+    }
+
+    // 클립보드 복사
+    function copyCode() {
+        const text = document.getElementById('codeView').innerText;
+        navigator.clipboard.writeText(text).then(() => {
+            alert('코드가 복사되었습니다! ✨');
+        });
+    }
+</script>
+</body>
+</html>
+실행 방법
+폴더를 하나 만들고 위 **app.py**와 **templates/index.html**을 저장하세요.
+
+터미널에서 경원님의 가상환경을 켭니다: source /home/myvenv1/bin/activate
+
+실행합니다: python app.py
+
+이제 웹에서 편하게 깃허브 코드를 당겨오고, 자동으로 백업된 내용을 언제든 그라데이션 UI에서 검색해보실 수 있습니다. 혹시 Nginx 포트 연결(예: 8028) 설정이 추가로 필요하시면 말씀해주세요.
