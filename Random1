@@ -1,369 +1,141 @@
-단계: 핵심 로직 (app.py) 설명
-이 코드는 Github에서 내용을 '가져오기'만 하고, 원본을 수정하는 기능은 아예 배제했습니다. 가져온 데이터는 경원님의 MSSQL 2014에 INSERT만 수행하여 히스토리를 쌓습니다.
+사용자가 겪고 있는 apt update 실패는 사내 프록시 환경에서 1) apt.conf 설정 꼬임, 2) 환경 변수 불일치, 3) SSL 인증서 검증 실패(MITM 프록시 특성) 가 복합적으로 작용했을 가능성이 큽니다.
 
-기능 1 (Fetch): GitHub API로 원시(Raw) 텍스트를 가져와서 DB에 저장 후 화면에 뿌립니다.
+요청하신 대로 백업 -> 기존 설정 초기화 -> 강력한 프록시 강제 적용 -> SSL 검증 우회 -> 연결 테스트까지 한 번에 수행하는 One-Shot Python 스크립트를 작성했습니다.
 
-기능 2 (Search): DB에 쌓인 로그를 LIKE 검색으로 조회합니다.
-
-파일명: app.py
+🛠️ 해결 스크립트: fix_apt_proxy.py
+이 스크립트는 반드시 sudo 권한으로 실행해야 합니다. /etc/apt/ 디렉토리를 건드리기 때문입니다.
 
 Python
 
 import os
-import pyodbc
-import requests
-from flask import Flask, render_template, request, jsonify
-from datetime import datetime
-
-app = Flask(__name__)
+import sys
+import shutil
+import subprocess
+import datetime
 
 # ==========================================
-# [설정] MSSQL 및 GitHub 정보 수정 필수
+# [설정 영역] 사용자 프록시 정보
+# 포트가 있다면 :8080 처럼 뒤에 붙여주세요.
+# 입력하신 정보: http://10.244.111.111
 # ==========================================
-DB_CONFIG = {
-    'driver': '{ODBC Driver 17 for SQL Server}', # 혹은 설치된 드라이버 버전에 맞게
-    'server': '192.168.0.xxx,1433', # MSSQL 서버 IP 및 포트
-    'database': 'YOUR_DB_NAME',     # 사용할 데이터베이스 이름
-    'uid': 'YOUR_ID',               # 접속 ID
-    'pwd': 'YOUR_PASSWORD'          # 접속 비번
-}
+PROXY_HOST = "10.244.111.111"
+PROXY_PORT = ""  # 포트가 있다면 "8080" 처럼 문자열로 입력 (없으면 비워둠)
+PROXY_PROTOCOL = "http"
 
-# Private Repo라면 토큰 필수, Public이면 비워도 됨
-GITHUB_TOKEN = "YOUR_GITHUB_TOKEN" 
-# ==========================================
+# 전체 프록시 주소 조합
+if PROXY_PORT:
+    FULL_PROXY_URL = f"{PROXY_PROTOCOL}://{PROXY_HOST}:{PROXY_PORT}/"
+else:
+    FULL_PROXY_URL = f"{PROXY_PROTOCOL}://{PROXY_HOST}/"
 
-def get_db_connection():
-    conn_str = f"DRIVER={DB_CONFIG['driver']};SERVER={DB_CONFIG['server']};DATABASE={DB_CONFIG['database']};UID={DB_CONFIG['uid']};PWD={DB_CONFIG['pwd']}"
-    return pyodbc.connect(conn_str)
+def log(msg):
+    print(f"[LOG] {msg}")
 
-# 서버 시작 시 테이블이 없으면 자동 생성 (로그 저장용)
-def init_db():
+def run_command(cmd, shell=False):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # 단순히 조회 이력을 쌓는 테이블입니다.
-        query = '''
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MyCodeHistory' AND xtype='U')
-        CREATE TABLE MyCodeHistory (
-            ID INT IDENTITY(1,1) PRIMARY KEY,
-            RepoInfo NVARCHAR(255),
-            FilePath NVARCHAR(255),
-            CodeContent NVARCHAR(MAX),
-            SavedAt DATETIME DEFAULT GETDATE()
-        )
-        '''
-        cursor.execute(query)
-        conn.commit()
-        conn.close()
-        print(">> DB 테이블 체크/생성 완료")
-    except Exception as e:
-        print(f">> DB 접속 오류 (정보를 확인하세요): {e}")
+        result = subprocess.run(cmd, shell=shell, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def main():
+    # 1. 루트 권한 확인
+    if os.geteuid() != 0:
+        print("❌ 이 스크립트는 sudo 권한으로 실행해야 합니다.")
+        print("   사용법: sudo python3 fix_apt_proxy.py")
+        sys.exit(1)
 
-# [핵심] 깃허브에서 가져오기 + DB 저장 (단방향)
-@app.route('/fetch', methods=['POST'])
-def fetch_code():
-    data = request.json
-    owner = data.get('owner')
-    repo = data.get('repo')
-    path = data.get('path')
+    log("🔍 시스템 진단 및 프록시 복구 시작...")
+    log(f"   타겟 프록시: {FULL_PROXY_URL}")
+
+    # 2. 기존 설정 백업 (/etc/apt/apt.conf 및 conf.d)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = f"/etc/apt/backup_{timestamp}"
     
-    # GitHub Raw API URL 구성
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    headers = {'Accept': 'application/vnd.github.v3.raw'}
-    if GITHUB_TOKEN:
-        headers['Authorization'] = f'token {GITHUB_TOKEN}'
+    if os.path.exists("/etc/apt/apt.conf"):
+        os.makedirs(backup_dir, exist_ok=True)
+        shutil.copy("/etc/apt/apt.conf", backup_dir)
+        log(f"📦 기존 apt.conf를 {backup_dir}로 백업했습니다.")
 
+    # 3. 충돌 가능성 있는 파일 정리 (apt.conf.d 내의 프록시 관련 파일)
+    # 꼬여있는 설정을 방지하기 위해 99proxy 같은 파일이 있다면 백업 후 삭제
+    proxy_configs = ["/etc/apt/apt.conf.d/99proxy", "/etc/apt/apt.conf.d/proxy.conf", "/etc/apt/apt.conf.d/01proxy"]
+    for config in proxy_configs:
+        if os.path.exists(config):
+            shutil.move(config, f"{backup_dir}/{os.path.basename(config)}.bak")
+            log(f"🧹 충돌 방지를 위해 {config} 파일을 치웠습니다.")
+
+    # 4. 새 apt.conf 작성 (가장 강력한 강제 설정)
+    # Acquire::https::Verify-Peer "false"; -> 사내 인증서 문제 해결의 핵심
+    apt_conf_content = f"""
+# Generated by Fix Script
+Acquire::http::Proxy "{FULL_PROXY_URL}";
+Acquire::https::Proxy "{FULL_PROXY_URL}";
+Acquire::ftp::Proxy "{FULL_PROXY_URL}";
+Acquire::http::Pipeline-Depth "0";
+Acquire::http::No-Cache "true";
+Acquire::BrokenProxy "true";
+# 사내망 SSL/TLS 인증서 문제 무시 (보안상 권장은 아니나 업데이트 해결 우선)
+Acquire::https::Verify-Peer "false";
+Acquire::https::Verify-Host "false";
+"""
+    
     try:
-        # 1. 깃허브 내용 가져오기
-        resp = requests.get(url, headers=headers)
-        resp.raise_for_status()
-        content = resp.text
-        
-        # 2. DB에 '읽기 전용'으로 기록 (Insert Only)
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        sql = "INSERT INTO MyCodeHistory (RepoInfo, FilePath, CodeContent, SavedAt) VALUES (?, ?, ?, GETDATE())"
-        cursor.execute(sql, (f"{owner}/{repo}", path, content))
-        conn.commit()
-        conn.close()
-        
-        return jsonify({'status': 'ok', 'content': content})
+        with open("/etc/apt/apt.conf", "w") as f:
+            f.write(apt_conf_content)
+        log("✅ /etc/apt/apt.conf 파일을 새로 작성했습니다.")
     except Exception as e:
-        return jsonify({'status': 'error', 'msg': str(e)}), 500
+        log(f"❌ 설정 파일 작성 실패: {e}")
+        sys.exit(1)
 
-# [핵심] DB 라이크 검색
-@app.route('/search')
-def search_code():
-    keyword = request.args.get('q', '')
-    if not keyword: return jsonify([])
+    # 5. 환경 변수 일시적 주입 (현재 세션에서의 실행을 위해)
+    os.environ["http_proxy"] = FULL_PROXY_URL
+    os.environ["https_proxy"] = FULL_PROXY_URL
+    os.environ["HTTP_PROXY"] = FULL_PROXY_URL
+    os.environ["HTTPS_PROXY"] = FULL_PROXY_URL
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # 내용(Content)이나 파일명(Path)에 키워드가 있는 경우 검색
-    sql = """
-    SELECT TOP 20 ID, RepoInfo, FilePath, SavedAt 
-    FROM MyCodeHistory 
-    WHERE CodeContent LIKE ? OR FilePath LIKE ? 
-    ORDER BY SavedAt DESC
-    """
-    param = f"%{keyword}%"
-    cursor.execute(sql, (param, param))
-    
-    results = []
-    for row in cursor.fetchall():
-        results.append({
-            'id': row.ID,
-            'repo': row.RepoInfo,
-            'path': row.FilePath,
-            'date': row.SavedAt.strftime('%Y-%m-%d %H:%M')
-        })
-    conn.close()
-    return jsonify(results)
+    log("⚡ 현재 세션에 환경 변수를 주입했습니다.")
 
-# [핵심] 검색된 기록 상세보기
-@app.route('/history/<int:id>')
-def get_history(id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT CodeContent FROM MyCodeHistory WHERE ID = ?", (id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return jsonify({'content': row.CodeContent})
-    return jsonify({'error': 'Not found'}), 404
+    # 6. 연결 테스트 (Google로 curl 시도 - 타임아웃 3초)
+    log("📡 프록시 서버 연결 테스트 중...")
+    success, output = run_command(f"curl -I --proxy {FULL_PROXY_URL} --connect-timeout 3 http://google.com", shell=True)
+    if success:
+        log("✅ 프록시를 통한 외부 연결이 확인되었습니다.")
+    else:
+        log("⚠️ [주의] 프록시 연결 테스트가 실패했습니다. IP나 포트를 다시 확인해보세요.")
+        log(f"   에러 내용: {output.strip()}")
+        # 연결이 안 되어도 apt 설정은 적용되었으므로 진행은 해봅니다.
 
-if __name__ == '__main__':
-    init_db()
-    app.run(host='0.0.0.0', port=5000)
-3단계: UI (templates/index.html) 설명
-요청하신 다크 모드 + 그라데이션 디자인입니다.
+    # 7. apt update 실행
+    log("🚀 apt update를 실행합니다...")
+    success, output = run_command("apt-get update", shell=True)
 
-배경: 짙은 남색~보라 계열의 그라데이션 (linear-gradient)을 사용하여 고급스러운 느낌을 줬습니다.
+    if success:
+        print("\n" + "="*40)
+        print("🎉 성공! apt update가 정상적으로 완료되었습니다.")
+        print("="*40)
+    else:
+        print("\n" + "="*40)
+        print("❌ 실패. 여전히 문제가 있습니다.")
+        print(f"오류 로그:\n{output}")
+        print("="*40)
+        print("Tip: 프록시 주소 뒤에 포트번호(예: 8080)가 빠진 것은 아닌지 확인하세요.")
 
-카드: 반투명한 검은색 배경(rgba)을 사용하여 배경과 어우러지게 했습니다.
+if __name__ == "__main__":
+    main()
+📋 사용 방법
+위 코드를 fix_apt_proxy.py라는 이름으로 저장합니다.
 
-가독성: 코드는 어두운 테마의 에디터 느낌으로 출력됩니다.
+터미널에서 아래 명령어로 실행합니다.
 
-경로: templates/index.html (반드시 templates 폴더 안에 생성)
+Bash
 
-HTML
+sudo python3 fix_apt_proxy.py
+💡 주요 처리 내용 (Logic)
+설정 파일 완전 초기화 (/etc/apt/apt.conf): 기존에 사용자가 건드렸을지 모르는 설정을 백업 후 덮어씁니다.
 
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>Kyungwon's Code Vault</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        /* [디자인] 고급스러운 다크 그라데이션 배경 */
-        body {
-            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
-            color: #e0e0e0;
-            min-height: 100vh;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        
-        /* [디자인] 카드 스타일: 반투명 글래스모피즘 효과 */
-        .card {
-            background-color: rgba(30, 30, 40, 0.85);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-        }
-        .card-header {
-            background-color: rgba(0, 0, 0, 0.2);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            font-weight: bold;
-            color: #4facfe; /* 포인트 컬러 */
-        }
-        
-        /* 입력 폼 스타일 */
-        .form-control {
-            background-color: #2b2b3b;
-            border: 1px solid #444;
-            color: #fff;
-        }
-        .form-control:focus {
-            background-color: #3b3b4b;
-            color: #fff;
-            border-color: #4facfe;
-            box-shadow: 0 0 0 0.25rem rgba(79, 172, 254, 0.25);
-        }
+SSL 검증 비활성화 (Verify-Peer "false"): 사내망 프록시는 보통 HTTPS 패킷을 까보기 위해 자체 인증서를 씁니다. 우분투에 해당 인증서가 없으면 막히는데, 이 옵션으로 그 검사를 강제 패스시킵니다.
 
-        /* 코드 뷰어 영역 */
-        pre {
-            background-color: #1a1a1a;
-            color: #a9b7c6;
-            padding: 15px;
-            border-radius: 8px;
-            border: 1px solid #333;
-            max-height: 700px;
-            overflow: auto;
-            font-family: 'Consolas', 'Monaco', monospace;
-        }
+Pipeline-Depth 0: 오래된 프록시 서버가 파이프라이닝 요청을 처리 못해 연결을 끊는 것을 방지합니다.
 
-        /* 검색 결과 리스트 */
-        .list-group-item {
-            background-color: transparent;
-            border-color: rgba(255, 255, 255, 0.1);
-            color: #ccc;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .list-group-item:hover {
-            background-color: rgba(79, 172, 254, 0.2);
-            color: #fff;
-        }
-
-        /* 버튼 스타일 */
-        .btn-primary {
-            background: linear-gradient(to right, #4facfe 0%, #00f2fe 100%);
-            border: none;
-            color: #000;
-            font-weight: bold;
-        }
-        .btn-success {
-            background: linear-gradient(to right, #43e97b 0%, #38f9d7 100%);
-            border: none;
-            color: #000;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-<div class="container py-5">
-    <h2 class="text-center mb-4" style="color:#fff; text-shadow: 0 2px 4px rgba(0,0,0,0.5);">
-        🔍 GitHub Code Fetcher & History
-    </h2>
-    
-    <div class="row">
-        <div class="col-lg-4 mb-4">
-            <div class="card mb-4">
-                <div class="card-header">GitHub 가져오기 (Read Only)</div>
-                <div class="card-body">
-                    <div class="mb-2">
-                        <input type="text" id="owner" class="form-control mb-2" placeholder="User (e.g. microsoft)">
-                        <input type="text" id="repo" class="form-control mb-2" placeholder="Repo (e.g. vscode)">
-                        <input type="text" id="path" class="form-control mb-2" placeholder="File Path (e.g. README.md)">
-                    </div>
-                    <button class="btn btn-primary w-100" onclick="fetchGithub()">🚀 가져오기 & 저장</button>
-                </div>
-            </div>
-
-            <div class="card h-100">
-                <div class="card-header">DB History 검색</div>
-                <div class="card-body d-flex flex-column">
-                    <div class="input-group mb-3">
-                        <input type="text" id="keyword" class="form-control" placeholder="내용 검색..." onkeyup="if(event.key==='Enter') searchDB()">
-                        <button class="btn btn-success" onclick="searchDB()">검색</button>
-                    </div>
-                    <div id="resultList" class="list-group list-group-flush overflow-auto" style="max-height: 400px;">
-                        <div class="text-center text-muted mt-3">검색 결과가 없습니다.</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-lg-8">
-            <div class="card h-100">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                    <span>📜 Code Viewer</span>
-                    <button class="btn btn-sm btn-light" onclick="copyCode()">📋 복사하기</button>
-                </div>
-                <div class="card-body">
-                    <pre id="codeView">// 파일 내용이 여기에 표시됩니다.</pre>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<script>
-    // GitHub 가져오기
-    async function fetchGithub() {
-        const data = {
-            owner: document.getElementById('owner').value,
-            repo: document.getElementById('repo').value,
-            path: document.getElementById('path').value
-        };
-        
-        if(!data.owner || !data.repo || !data.path) {
-            alert('정보를 모두 입력해주세요.'); return;
-        }
-
-        try {
-            const res = await fetch('/fetch', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(data)
-            });
-            const json = await res.json();
-            
-            if(json.status === 'ok') {
-                document.getElementById('codeView').innerText = json.content;
-            } else {
-                alert('오류: ' + json.msg);
-            }
-        } catch (e) { alert('서버 통신 오류'); }
-    }
-
-    // DB 검색
-    async function searchDB() {
-        const q = document.getElementById('keyword').value;
-        const res = await fetch(`/search?q=${encodeURIComponent(q)}`);
-        const list = await res.json();
-        
-        const container = document.getElementById('resultList');
-        container.innerHTML = '';
-        
-        if(list.length === 0) {
-            container.innerHTML = '<div class="text-center text-muted mt-3">결과 없음</div>';
-            return;
-        }
-
-        list.forEach(item => {
-            const el = document.createElement('a');
-            el.className = 'list-group-item list-group-item-action';
-            el.innerHTML = `
-                <div class="d-flex w-100 justify-content-between">
-                    <small class="text-info">${item.repo}</small>
-                    <small class="text-muted" style="font-size:0.7em">${item.date}</small>
-                </div>
-                <p class="mb-1 text-truncate">${item.path}</p>
-            `;
-            el.onclick = () => loadHistory(item.id);
-            container.appendChild(el);
-        });
-    }
-
-    // 히스토리 불러오기
-    async function loadHistory(id) {
-        const res = await fetch(`/history/${id}`);
-        const json = await res.json();
-        if(json.content) {
-            document.getElementById('codeView').innerText = json.content;
-        }
-    }
-
-    // 클립보드 복사
-    function copyCode() {
-        const text = document.getElementById('codeView').innerText;
-        navigator.clipboard.writeText(text).then(() => {
-            alert('코드가 복사되었습니다! ✨');
-        });
-    }
-</script>
-</body>
-</html>
-실행 방법
-폴더를 하나 만들고 위 **app.py**와 **templates/index.html**을 저장하세요.
-
-터미널에서 경원님의 가상환경을 켭니다: source /home/myvenv1/bin/activate
-
-실행합니다: python app.py
-
-이제 웹에서 편하게 깃허브 코드를 당겨오고, 자동으로 백업된 내용을 언제든 그라데이션 UI에서 검색해보실 수 있습니다. 혹시 Nginx 포트 연결(예: 8028) 설정이 추가로 필요하시면 말씀해주세요.
+다음 단계: 혹시 스크립트 실행 후 Connect timeout이나 Connection refused가 뜬다면, 알려주신 IP(10.244.111.111) 뒤에 **포트 번호(예: 8080, 3128)**가 필요한지 전산팀 공지나 동료 PC 설정을 확인해봐야 합니다. 필요하면 스크립트 상단의 PROXY_PORT 변수만 수정해서 다시 돌리세요
