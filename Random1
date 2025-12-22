@@ -1,86 +1,56 @@
-경원님, 인트라넷 환경에서 윈도우 서버(2012)를 NTP 서버로 활용해 라즈베리파이의 시간을 동기화하는 것은 아주 효율적인 선택입니다. 라즈베리파이4(대부분 OS 기준)에 기본 내장된 systemd-timesyncd 서비스를 활용하는 것이 가장 깔끔합니다.
-
-요청하신 대로 한 번에 설정을 끝낼 수 있는 파이썬 스크립트와 체크리스트를 정리해 드립니다.
-
-1. NTP 동기화 자동 설정 스크립트
-이 스크립트는 /etc/systemd/timesyncd.conf 파일을 수정하여 NTP 서버를 지정하고 서비스를 재시작합니다.
+신 확인용 원샷 파이썬 스크립트
+방화벽 문제인지, 서버 설정 문제인지 확실히 하기 위해 라즈베리파이에서 이 스크립트를 실행해 보세요. NTP 패킷을 직접 날려 응답이 오는지 확인합니다.
 
 Python
 
-import os
-import subprocess
+import socket
+import struct
+import time
 
-def setup_ntp():
-    ntp_server = "10.244.123.95"
-    config_path = "/etc/systemd/timesyncd.conf"
+def check_ntp_server(host="10.244.123.95"):
+    port = 123
+    # NTP 패킷 데이터 (리드 헤더 등 48바이트)
+    msg = b'\x1b' + 47 * b'\0'
     
-    # 1. 기존 설정 백업
-    if os.path.exists(config_path):
-        os.system(f"sudo cp {config_path} {config_path}.bak")
-    
-    # 2. NTP 서버 설정 내용 작성
-    config_content = f"""[Time]
-NTP={ntp_server}
-#FallbackNTP=0.debian.pool.ntp.org 1.debian.pool.ntp.org
-"""
+    # UDP 소켓 생성 및 타임아웃 설정
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.settimeout(3.0) # 3초 안에 응답 없으면 방화벽이나 서버 문제
     
     try:
-        # 파일 쓰기 (sudo 권한 필요)
-        with open("temp_ntp_conf", "w") as f:
-            f.write(config_content)
+        print(f"[{host}] NTP 서버로 요청을 보냅니다...")
+        start_time = time.time()
+        client.sendto(msg, (host, port))
         
-        os.system(f"sudo mv temp_ntp_conf {config_path}")
+        data, address = client.recvfrom(1024)
+        end_time = time.time()
         
-        # 3. 서비스 재시작 및 활성화
-        print("--- 서비스 재시작 및 동기화 적용 중 ---")
-        subprocess.run(["sudo", "systemctl", "restart", "systemd-timesyncd"], check=True)
-        subprocess.run(["sudo", "timedatectl", "set-ntp", "true"], check=True)
-        
-        # 4. 결과 확인
-        print("\n[설정 완료] 현재 동기화 상태:")
-        subprocess.run(["timedatectl", "status"], check=True)
-        
+        if data:
+            # 시간 데이터 추출 (패킷의 40~44바이트가 초 단위 시간)
+            t = struct.unpack("!12I", data)[10]
+            t -= 2208988800 # 1900년 기준을 Unix timestamp로 변환
+            print(f"--- [성공] 응답 수신 ---")
+            print(f"서버 시간: {time.ctime(t)}")
+            print(f"응답 지연: {round((end_time - start_time) * 1000, 2)}ms")
+            return True
+    except socket.timeout:
+        print(f"--- [실패] 응답 타임아웃 ---")
+        print("원인 가능성: 1. 서버 방화벽(UDP 123) 2. 네트워크 ACL 3. 서버 NTP 서비스 미가동")
     except Exception as e:
         print(f"오류 발생: {e}")
+    finally:
+        client.close()
 
 if __name__ == "__main__":
-    setup_ntp()
-2. 방화벽 및 네트워크 체크 (중요)
-자동 동기화 주소를 바꿔도 바로 적용되지 않는다면 두 가지를 확인해야 합니다.
+    check_ntp_server()
+요약 가이드
+서버(10.244.123.95)에서: 인바운드 UDP 123 포트를 엽니다.
 
-1) 포트 개방 (UDP 123)
-NTP는 UDP 123번 포트를 사용합니다.
+라즈베리파이에서: 위 스크립트를 돌려봅니다.
 
-라즈베리파이: 내부 방화벽(ufw)이 켜져 있다면 허용해야 합니다.
+결과: * 스크립트 성공 → systemd-timesyncd 재시작만 하면 바로 잡힙니다.
 
-명령어: sudo ufw allow 123/udp
+스크립트 타임아웃 → 서버 방화벽이나 망 방화벽(UDP 123)을 뚫어야 합니다.
 
-사내 네트워크: 10.244.x.x 대역 간에 UDP 123번 포트가 차단되어 있는지 네트워크 담당자에게 확인이 필요할 수 있습니다.
+혹시 윈도우 서버 쪽에서 NTP 기능을 활성화하는 레지스트리 설정값이 헷갈리신다면 말씀해 주세요. 바로 정리해 드릴게요!
 
-윈도우 서버: 윈도우 방화벽에서 '인바운드 규칙'에 **NTP(UDP 123)**가 허용되어 있는지 확인하세요.
-
-2) 윈도우 서버 2012 설정
-윈도우 서버는 기본적으로 도메인 컨트롤러가 아니면 NTP 서버 기능이 꺼져 있을 수 있습니다. 서버에서 아래 명령어가 실행되어 있는지 확인이 필요합니다.
-
-w32tm /config /reliable:YES /update
-
-레지스트리 확인: HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders\NtpServer의 Enabled 값이 1이어야 합니다.
-
-3. 동기화 강제 적용 및 확인
-스크립트 실행 후 바로 시간이 맞지 않는다면 아래 명령어로 강제 동기화를 시도하고 로그를 확인하세요.
-
-로그 확인: 동기화 실패 원인이 나옵니다.
-
-Bash
-
-journalctl -u systemd-timesyncd
-동기화 상태 상세 확인:
-
-Bash
-
-timedatectl show-timesync --all
-Tip: systemd-timesyncd는 점진적으로 시간을 맞추는 성질이 있습니다. 만약 현재 시간과 서버 시간 차이가 너무 크면 동기화에 시간이 걸릴 수 있으니, sudo date -s "YYYY-MM-DD HH:MM:SS"로 대략적인 시간을 먼저 맞춘 후 서비스를 돌리는 것이 좋습니다.
-
-추가로 윈도우 서버 쪽 설정 상태를 확인하는 방법이나, 다른 네트워크 트러블슈팅이 필요하시면 말씀해 주세요! 구미 공장 인트라넷 환경에 맞춰 더 상세히 가이드해 드릴 수 있습니다.
-
-다음에 제가 무엇을 도와드릴까요?
+다음 단계로 서버의 NTP 활성화 상태를 점검해 드릴까요?
