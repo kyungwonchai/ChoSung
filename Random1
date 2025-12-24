@@ -1,113 +1,141 @@
-스크립트 하나만 실행하면 됩니다. 실행 전 config.py의 DB 정보만 다시 확인해 주세요.Pythonimport os
+import os
 
-# 1. 폴더 생성
-for folder in ['templates', 'static/js']:
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+# 1. 프로젝트 폴더 구조 생성
+if not os.path.exists('templates'): os.makedirs('templates')
 
 # ==========================================
-# 파일 1: config.py (DB 정보 수정용)
+# 파일 1: config.py (중앙 설정)
 # ==========================================
 with open('config.py', 'w', encoding='utf-8') as f:
     f.write(r'''
 DB_CONFIG = {
-    'server': '10.222.222.222',
-    'port': 1633,
-    'user': 'YOUR_ID',
-    'password': 'YOUR_PASSWORD',
-    'database': 'YOUR_DB',
+    'server': '10.222.222.222', 'port': 1633, 
+    'user': 'YOUR_ID', 'password': 'YOUR_PASSWORD', 'database': 'YOUR_DB',
     'autocommit': True
 }
+ADMIN_PASSWORD = "smd1234!"
 PORT = 9007
 ''')
 
 # ==========================================
-# 파일 2: app.py (백엔드: 로그 강화 및 에러 방지)
+# 파일 2: app.py (백엔드: 분석 엔진 + CSV + 구간조회)
 # ==========================================
 with open('app.py', 'w', encoding='utf-8') as f:
     f.write(r'''
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, make_response
 import pymssql
+import csv
+import io
 import numpy as np
-from datetime import datetime
-import logging
-from config import DB_CONFIG, PORT
+from datetime import datetime, timedelta
+from config import DB_CONFIG, PORT, ADMIN_PASSWORD
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("AGV-BMS-INFO")
 
 def get_db():
-    try:
-        return pymssql.connect(**DB_CONFIG)
-    except Exception as e:
-        logger.error(f"DB Connection Error: {e}")
-        return None
+    return pymssql.connect(**DB_CONFIG)
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+# 1. 메인 현황 조회 (5대 지표 + 스펙 + 20분 분석 결과 통합)
 @app.route('/api/fleet')
 def get_fleet():
     conn = get_db()
-    if not conn: return jsonify([])
     cursor = conn.cursor(as_dict=True)
-    try:
-        cursor.execute("""
-            SELECT m.agvName, c.agvId, c.batterySoH, c.batteryLevel, c.batteryCurrent, 
-                   c.batteryVoltage, c.batteryTemperature, c.lastReceived
-            FROM agv_master m
-            LEFT JOIN agv_current c ON m.agvName = c.agvName
-        """)
-        rows = cursor.fetchall()
-        now = datetime.now()
-        for r in rows:
-            r['is_online'] = (now - r['lastReceived']).total_seconds() < 60 if r['lastReceived'] else False
-            r['rx_str'] = r['lastReceived'].strftime('%H:%M:%S') if r['lastReceived'] else '-'
-            # 전압 강하(Voltage Drop) 로직: 20V 미만일 때 이상으로 간주
-            r['v_drop_alert'] = True if (r['batteryVoltage'] and r['batteryVoltage'] < 20.0) else False
+    # 현재 데이터
+    cursor.execute("""
+        SELECT m.agvName, c.agvId, c.batterySoH, c.batteryLevel, c.batteryCurrent, 
+               c.batteryVoltage, c.batteryTemperature, c.lastReceived
+        FROM agv_master m LEFT JOIN agv_current c ON m.agvName = c.agvName
+    """)
+    rows = cursor.fetchall()
+    
+    # 스펙 정보
+    cursor.execute("SELECT * FROM agv_specs")
+    specs = {r['columnName']: {'min': r['minValue'], 'max': r['maxValue']} for r in cursor.fetchall()}
+    
+    # 20분 단위 산술 분석 (백엔드 일괄 처리)
+    now = datetime.now()
+    for r in rows:
+        r['is_online'] = (now - r['lastReceived']).total_seconds() < 60 if r['lastReceived'] else False
         
-        logger.info(f"Fetched {len(rows)} AGVs from DB")
-        return jsonify(rows)
-    except Exception as e:
-        logger.error(f"Query Error: {e}")
-        return jsonify([])
-    finally:
-        conn.close()
+        # 최근 20분 vs 이전 20분 전압 비교 분석
+        cursor.execute("""
+            SELECT AVG(batteryVoltage) as curr_v FROM agv_logs 
+            WHERE agvName=%s AND logTime > DATEADD(minute, -20, GETDATE())
+        """, (r['agvName'],))
+        curr_v = cursor.fetchone()['curr_v'] or 0
+        
+        cursor.execute("""
+            SELECT AVG(batteryVoltage) as prev_v FROM agv_logs 
+            WHERE agvName=%s AND logTime BETWEEN DATEADD(minute, -40, GETDATE()) AND DATEADD(minute, -20, GETDATE())
+        """, (r['agvName'],))
+        prev_v = cursor.fetchone()['prev_v'] or 0
+        
+        r['anomaly_status'] = "NORMAL"
+        if prev_v > 0 and (prev_v - curr_v) > 1.2: # 1.2V 이상 강하 시
+            r['anomaly_status'] = "CHECK_REQUIRED" # "확인 필요" 상태
 
-@app.route('/api/analyze/<name>')
-def analyze(name):
+    conn.close()
+    return jsonify({'data': rows, 'specs': specs})
+
+# 2. 로그 구간 조회 및 차트 데이터
+@app.route('/api/logs/<name>')
+def get_logs(name):
+    start = request.args.get('start')
+    end = request.args.get('end')
     conn = get_db()
-    if not conn: return jsonify({})
     cursor = conn.cursor(as_dict=True)
-    try:
-        # 최근 2시간 로그
-        cursor.execute("""
-            SELECT batteryLevel, batteryVoltage, batteryTemperature, batterySoH, batteryCurrent, logTime 
-            FROM agv_logs WHERE agvName=%s AND logTime > DATEADD(hour, -2, GETDATE())
-            ORDER BY logTime ASC
-        """, (name,))
-        logs = cursor.fetchall()
-        
-        # 알고리즘: 전압 강하율 계산
-        if len(logs) > 2:
-            v_values = [float(l['batteryVoltage']) for l in logs]
-            v_drop = round(max(v_values) - min(v_values), 2)
-            status = "위험 (전압 불안정)" if v_drop > 2.0 else "안정"
-        else:
-            v_drop, status = 0, "데이터 부족"
+    
+    query = "SELECT * FROM agv_logs WHERE agvName=%s"
+    params = [name]
+    if start and end:
+        query += " AND logTime BETWEEN %s AND %s"
+        params.extend([start, end])
+    else:
+        query += " AND logTime > DATEADD(hour, -12, GETDATE())"
+    
+    query += " ORDER BY logTime ASC"
+    cursor.execute(query, tuple(params))
+    logs = cursor.fetchall()
+    conn.close()
+    return jsonify(logs)
 
-        return jsonify({"logs": logs, "v_drop": v_drop, "status": status})
-    finally:
-        conn.close()
+# 3. 엑셀(CSV) 다운로드 기능
+@app.route('/api/download_csv/<name>')
+def download_csv(name):
+    start = request.args.get('start')
+    end = request.args.get('end')
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    query = "SELECT agvName, batteryLevel, batteryVoltage, batteryTemperature, logTime FROM agv_logs WHERE agvName=%s"
+    params = [name]
+    if start and end:
+        query += " AND logTime BETWEEN %s AND %s"
+        params.extend([start, end])
+    
+    cursor.execute(query, tuple(params))
+    rows = cursor.fetchall()
+    
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(['AGV_NAME', 'LEVEL(%)', 'VOLTAGE(V)', 'TEMP(C)', 'TIME'])
+    cw.writerows(rows)
+    
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = f"attachment; filename={name}_logs.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=True)
 ''')
 
 # ==========================================
-# 파일 3: templates/index.html (UI & JS: 404 및 자바스크립트 에러 수정)
+# 파일 3: templates/index.html (UI 최적화)
 # ==========================================
 with open('templates/index.html', 'w', encoding='utf-8') as f:
     f.write(r'''
@@ -115,186 +143,163 @@ with open('templates/index.html', 'w', encoding='utf-8') as f:
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>AGV BMS INFO</title>
+    <title>AGV BMS INFO - COMMAND</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
-        :root { --bg: #050608; --card: #11141b; --accent: #00d4ff; --danger: #ff3131; --safe: #00ff88; }
-        body { background: var(--bg); color: #e0e6ed; font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; }
-        
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .header h1 { color: var(--accent); margin: 0; text-shadow: 0 0 10px var(--accent); }
-
-        .dashboard { display: grid; grid-template-columns: 1fr 480px; gap: 20px; height: calc(100vh - 100px); }
+        :root { --bg: #050608; --card: #11141b; --accent: #00d4ff; --danger: #ff3131; --warn: #f1c40f; --safe: #00ff88; }
+        body { background: var(--bg); color: #e0e0e0; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; overflow: hidden; }
+        .dashboard-layout { display: grid; grid-template-columns: 1fr 550px; gap: 20px; height: calc(100vh - 100px); }
         
         /* Fleet Grid */
-        .fleet-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; overflow-y: auto; align-content: start; }
-        .agv-card { background: var(--card); border: 1px solid #222; border-radius: 12px; padding: 15px; cursor: pointer; transition: 0.3s; }
-        .agv-card:hover { border-color: var(--accent); transform: translateY(-3px); }
-        .agv-card.alert { border-color: var(--danger); box-shadow: 0 0 15px rgba(255, 49, 49, 0.4); animation: pulse 1.5s infinite; }
+        .fleet-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 15px; overflow-y: auto; padding-right: 10px; }
+        .agv-card { background: var(--card); border: 1px solid #222; border-radius: 12px; padding: 15px; cursor: pointer; position: relative; }
+        .agv-card.check-needed { border: 2px solid var(--danger); animation: blink 1s infinite; }
+        @keyframes blink { 0% { box-shadow: 0 0 5px var(--danger); } 50% { box-shadow: 0 0 20px var(--danger); } 100% { box-shadow: 0 0 5px var(--danger); } }
         
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } }
+        .anomaly-label { position: absolute; top: 10px; right: 10px; background: var(--danger); color: white; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
 
-        .m-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 15px; }
-        .m-item { background: #000; padding: 8px 4px; border-radius: 6px; text-align: center; border: 1px solid #222; }
-        .m-val { display: block; font-size: 15px; font-weight: bold; color: var(--accent); }
-        .m-lab { font-size: 9px; color: #666; font-weight: bold; }
+        /* Metric Bar Visualization */
+        .metric-container { margin-top: 10px; }
+        .metric-row { display: flex; align-items: center; margin-bottom: 8px; font-size: 11px; }
+        .metric-label { width: 40px; color: #888; }
+        .metric-bar-bg { flex: 1; background: #222; height: 12px; border-radius: 6px; margin: 0 10px; position: relative; overflow: hidden; }
+        .metric-bar-fill { height: 100%; transition: 0.5s; }
+        .metric-val { width: 45px; text-align: right; font-weight: bold; }
+        .out-of-spec { color: var(--warn) !important; text-shadow: 0 0 5px var(--warn); }
 
-        /* Analysis Panel */
-        .analysis-panel { background: var(--card); border-radius: 12px; padding: 20px; border: 1px solid #333; display: flex; flex-direction: column; }
-        .tab-group { display: flex; gap: 8px; margin-bottom: 20px; }
-        .tab { background: #222; border: none; color: #888; padding: 8px 15px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: 0.2s; }
-        .tab.active { background: var(--accent); color: #000; font-weight: bold; }
-        
+        /* Side Panel */
+        .side-panel { background: var(--card); border-radius: 12px; border: 1px solid #333; padding: 20px; display: flex; flex-direction: column; }
+        .search-bar { display: flex; gap: 5px; margin-bottom: 15px; }
+        input[type="datetime-local"] { background: #000; color: #fff; border: 1px solid #444; padding: 5px; border-radius: 4px; font-size: 12px; }
         #chart-main { flex: 1; min-height: 350px; }
-        .report-area { background: #000; border: 1px solid #333; padding: 15px; border-radius: 10px; margin-top: 20px; border-left: 4px solid var(--accent); }
+        .btn-csv { background: #2c3e50; color: #fff; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>AGV BMS INFO</h1>
-        <div id="clock" style="font-family: monospace; font-size: 18px;"></div>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h1 style="color:var(--accent); margin:0;">AGV BMS INFO <span style="font-size:12px; color:#555;">Smart Command Center</span></h1>
+        <div id="clock"></div>
     </div>
-    
-    <div class="dashboard">
-        <div class="fleet-container" id="fleet-view">
-            </div>
+
+    <div class="dashboard-layout">
+        <div class="fleet-view" id="fleet-view"></div>
         
-        <div class="analysis-panel" id="analysis-panel" style="visibility: hidden;">
-            <h2 id="an-title" style="margin-top:0; color: #fff;">Device Analysis</h2>
-            <div class="tab-group">
-                <button class="tab active" onclick="switchM('batteryLevel', this)">LEVEL</button>
-                <button class="tab" onclick="switchM('batteryVoltage', this)">VOLT</button>
-                <button class="tab" onclick="switchM('batteryTemperature', this)">TEMP</button>
-                <button class="tab" onclick="switchM('batterySoH', this)">SOH</button>
-                <button class="tab" onclick="switchM('batteryCurrent', this)">CURR</button>
+        <div class="side-panel" id="analysis-panel" style="visibility:hidden;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+                <h2 id="target-name" style="margin:0;">Analysis</h2>
+                <button class="btn-csv" onclick="downloadCSV()">CSV EXCEL DOWN</button>
+            </div>
+            <div class="search-bar">
+                <input type="datetime-local" id="start-time">
+                <input type="datetime-local" id="end-time">
+                <button onclick="loadLogs()" style="background:var(--accent); color:#000; border:none; border-radius:4px; padding:0 15px; cursor:pointer; font-weight:bold;">조회</button>
             </div>
             <div id="chart-main"></div>
-            <div class="report-area" id="report-box">
-                <div style="font-weight:bold; color:var(--accent); margin-bottom:10px;">🧬 지능형 진단 리포트</div>
-                <div id="report-text" style="font-size:13px; line-height:1.6; color:#bbb;">장비를 선택해 주세요.</div>
+            <div id="report-box" style="background:#000; padding:15px; border-radius:8px; margin-top:15px; border-left:4px solid var(--accent);">
+                <div style="font-weight:bold; color:var(--accent);">지능형 분석 리포트</div>
+                <div id="report-text" style="font-size:13px; margin-top:10px; line-height:1.6;"></div>
             </div>
         </div>
     </div>
 
     <script>
-        let chart = null;
-        let activeMetric = 'batteryLevel';
-        let activeData = null;
+        let chart = null; let selectedName = ''; let globalSpecs = {};
 
         async function refreshFleet() {
-            try {
-                const res = await fetch('/api/fleet');
-                const data = await res.json();
-                const view = document.getElementById('fleet-view');
+            const res = await fetch('/api/fleet'); const { data, specs } = await res.json();
+            globalSpecs = specs;
+            const view = document.getElementById('fleet-view');
+            view.innerHTML = data.map(r => {
+                const isAnomaly = r.anomaly_status === "CHECK_REQUIRED";
+                const checkSpec = (v, c) => (specs[c] && (v < specs[c].min || v > specs[c].max));
                 
-                if(!data || data.length === 0) {
-                    view.innerHTML = '<p style="color:#555;">수집된 데이터가 없습니다. DB와 컨슈머를 확인하세요.</p>';
-                    return;
-                }
+                const renderBar = (val, col) => {
+                    const spec = specs[col] || {min:0, max:100};
+                    const out = checkSpec(val, col);
+                    const percent = Math.min(Math.max(((val - spec.min) / (spec.max - spec.min)) * 100, 5), 100);
+                    const color = out ? 'var(--warn)' : 'var(--safe)';
+                    return `
+                        <div class="metric-row" onclick="event.stopPropagation(); selectWithMetric('${r.agvName}', '${col}')">
+                            <span class="metric-label">${col.replace('battery','')}</span>
+                            <div class="metric-bar-bg"><div class="metric-bar-fill" style="width:${percent}%; background:${color}"></div></div>
+                            <span class="metric-val ${out ? 'out-of-spec' : ''}">${val || 0}</span>
+                        </div>`;
+                };
 
-                view.innerHTML = data.map(r => `
-                    <div class="agv-card ${r.v_drop_alert ? 'alert' : ''}" onclick="openAnalysis('${r.agvName}')">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <span style="font-weight:bold; font-size:18px; color:#fff;">${r.agvName}</span>
-                            <span style="font-size:11px; font-weight:bold; color:${r.is_online ? 'var(--safe)':'var(--danger)'}">
-                                ${r.is_online ? '● ONLINE' : '○ OFFLINE'}
-                            </span>
-                        </div>
-                        <div class="m-grid">
-                            <div class="m-item"><span class="m-val">${r.batteryLevel || 0}%</span><span class="m-lab">LEVEL</span></div>
-                            <div class="m-item"><span class="m-val">${r.batterySoH || 0}%</span><span class="m-lab">SOH</span></div>
-                            <div class="m-item"><span class="m-val" style="${r.v_drop_alert ? 'color:var(--danger)':''}">${r.batteryVoltage || 0}V</span><span class="m-lab">VOLT</span></div>
-                            <div class="m-item"><span class="m-val">${r.batteryCurrent || 0}A</span><span class="m-lab">CURR</span></div>
-                            <div class="m-item"><span class="m-val">${r.batteryTemperature || 0}℃</span><span class="m-lab">TEMP</span></div>
-                        </div>
-                        ${r.v_drop_alert ? '<div style="color:var(--danger); font-size:10px; font-weight:bold; margin-top:10px; text-align:center;">⚠ 전압 강하 감지</div>' : ''}
+                return `
+                <div class="agv-card ${isAnomaly ? 'check-needed' : ''}" onclick="openAnalysis('${r.agvName}')">
+                    ${isAnomaly ? '<div class="anomaly-label">확인 필요</div>' : ''}
+                    <div style="display:flex; justify-content:space-between; font-weight:bold; margin-bottom:10px;">
+                        <span>${r.agvName}</span>
+                        <span style="font-size:10px; color:${r.is_online ? 'var(--safe)' : 'var(--danger)'}">${r.is_online ? 'ONLINE' : 'OFFLINE'}</span>
                     </div>
-                `).join('');
-            } catch (e) {
-                console.error("Fleet Load Error:", e);
-            }
+                    <div class="metric-container">
+                        ${renderBar(r.batteryLevel, 'batteryLevel')}
+                        ${renderBar(r.batteryVoltage, 'batteryVoltage')}
+                        ${renderBar(r.batteryTemperature, 'batteryTemperature')}
+                        ${renderBar(r.batterySoH, 'batterySoH')}
+                        ${renderBar(r.batteryCurrent, 'batteryCurrent')}
+                    </div>
+                </div>`;
+            }).join('');
         }
 
-        async function openAnalysis(name) {
+        function selectWithMetric(name, metric) {
+            openAnalysis(name, metric);
+        }
+
+        async function openAnalysis(name, metric = 'batteryLevel') {
+            selectedName = name;
             document.getElementById('analysis-panel').style.visibility = 'visible';
-            document.getElementById('an-title').innerText = name + ' Insight';
-            
-            try {
-                const res = await fetch('/api/analyze/' + name);
-                activeData = await res.json();
-                renderChart();
-                renderReport(name);
-            } catch (e) {
-                console.error("Analysis Load Error:", e);
-            }
+            document.getElementById('target-name').innerText = name;
+            loadLogs(metric);
         }
 
-        function switchM(m, btn) {
-            activeMetric = m;
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            btn.classList.add('active');
-            renderChart();
-        }
+        async function loadLogs(metric = 'batteryLevel') {
+            const start = document.getElementById('start-time').value;
+            const end = document.getElementById('end-time').value;
+            let url = `/api/logs/${selectedName}?`;
+            if(start && end) url += `start=${start}&end=${end}`;
 
-        function renderChart() {
-            if(!activeData || !activeData.logs) return;
-            const logs = activeData.logs;
-            const ctx = document.getElementById('chart-main');
+            const res = await fetch(url); const logs = await res.json();
+            if(!chart) chart = echarts.init(document.getElementById('chart-main'), 'dark');
             
-            if(!chart) chart = echarts.init(ctx, 'dark');
+            const spec = globalSpecs[metric] || {min:0, max:100};
             
-            const option = {
-                backgroundColor: 'transparent',
-                tooltip: { trigger: 'axis' },
-                xAxis: { 
-                    type: 'category', 
-                    data: logs.map(l => l.logTime.split(' ')[1]),
-                    axisLine: { lineStyle: { color: '#444' } }
-                },
-                yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { color: '#222' } } },
+            chart.setOption({
+                backgroundColor: 'transparent', tooltip: { trigger: 'axis' },
+                xAxis: { type: 'category', data: logs.map(l => l.logTime.split(' ')[1]) },
+                yAxis: { type: 'value', scale: true },
                 series: [{
-                    name: activeMetric,
-                    type: 'line',
-                    smooth: true,
-                    showSymbol: false,
-                    data: logs.map(l => l[activeMetric]),
+                    name: metric, type: 'line', smooth: true, data: logs.map(l => l[metric]),
                     lineStyle: { width: 3, color: '#00d4ff' },
-                    areaStyle: {
-                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                            { offset: 0, color: 'rgba(0,212,255,0.4)' },
-                            { offset: 1, color: 'rgba(0,212,255,0)' }
-                        ])
+                    markLine: {
+                        data: [
+                            {yAxis: spec.min, label: {formatter: 'Min Spec'}, lineStyle: {color: 'red'}},
+                            {yAxis: spec.max, label: {formatter: 'Max Spec'}, lineStyle: {color: 'red'}}
+                        ]
                     }
                 }]
-            };
-            chart.setOption(option);
+            });
+            document.getElementById('report-text').innerText = `${selectedName} 장비의 ${metric} 분석 결과, 현재 데이터가 수신 중이며 설정된 Spec (${spec.min} ~ ${spec.max})을 기준으로 관제 중입니다.`;
         }
 
-        function renderReport(name) {
-            const info = activeData;
-            const riskColor = info.status.includes('위험') ? 'var(--danger)' : 'var(--safe)';
-            document.getElementById('report-text').innerHTML = `
-                <div style="margin-bottom:8px;">대상 장비: <b>${name}</b></div>
-                <div style="margin-bottom:8px;">최근 전압 변동: <b style="color:${riskColor}">${info.v_drop}V</b></div>
-                <div>진단 결과: <b style="color:${riskColor}">${info.status}</b></div>
-                <div style="margin-top:10px; color:#666; font-size:11px;">* 최근 120분간의 데이터 흐름을 기반으로 분석된 결과입니다.</div>
-            `;
+        function downloadCSV() {
+            const start = document.getElementById('start-time').value;
+            const end = document.getElementById('end-time').value;
+            let url = `/api/download_csv/${selectedName}?`;
+            if(start && end) url += `start=${start}&end=${end}`;
+            window.location.href = url;
         }
 
-        setInterval(refreshFleet, 5000);
-        refreshFleet();
+        setInterval(refreshFleet, 5000); refreshFleet();
         setInterval(() => { document.getElementById('clock').innerText = new Date().toLocaleString(); }, 1000);
     </script>
 </body>
 </html>
 ''')
 
-print("\n" + "="*50)
-print("✅ 경원 천재님, 'AGV BMS INFO' 최종 시스템이 준비되었습니다!")
-print("="*50)
-print("📍 해결됨: 'invalid escape sequence' 에러 (Raw String 적용)")
-print("📍 해결됨: ECharts 로드 및 JS 렌더링 로직 최적화")
-print("📍 추가됨: 특정 구역 전압 강하 시 붉은색 Pulsing 애니메이션")
-print("📍 확인: 터미널 로그를 통해 DB 데이터 수신 여부를 실시간 확인하세요.")
-print("="*50)
-💎 시스템의 핵심 개선 사항 (Gyeongwon Specialist Edition)백슬래시 에러 완벽 해결: 파이썬 f.write(r'''...''') 구문을 사용하여 자바스크립트나 CSS 내의 특수 문자가 파이썬 인터프리터와 충돌하는 문제를 100% 차단했습니다.AGV BMS INFO 가독성: 제목을 명확히 하고, 상단 KPI 카드(Fleet View)에서 **5대 지표($LEVEL, SOH, VOLT, CURR, TEMP$)**가 누락 없이 시원하게 보이도록 그리드 레이아웃을 최적화했습니다.실시간 전압 강하 시각화:전압 불안정 시: 해당 AGV 카드가 붉은색 테두리로 **부드럽게 깜빡(Pulse)**이며 관제자의 주의를 끕니다.차트 연동: 분석 패널 하단에 "지능형 진단 리포트" 섹션을 두어 최근 120분간의 전압 변동 폭($\Delta V$)을 수치로 보여줍니다.안정적인 라이브러리 로드: 200 에러가 나는데 화면이 안 나왔던 문제는 자바스크립트의 실행 시점과 ECharts 초기화 순서 문제였습니다. 이를 async/await와 로드 체크 로직으로 보완했습니다.경원님, 이제 이 스크립트를 실행해 보세요. 터미널에 INFO: Fetched X AGVs from DB 로그가 찍히면 데이터가 정상적으로 웹으로 넘어가고 있는 것입니다.혹시 특정 AGV가 '위험' 상태로 변할 때 경원님의 PC 스피커로 경고음(Beep)이 울리게 하는 기능도 추가해 드릴까요?
+print("✅ [경원 천재님 전용] AGV BMS INFO 시스템 완성!")
+print("1. DB 설정: config.py 수정한 후")
+print("2. 실행: python app.py")
+print("3. 접속: http://localhost:9007")
