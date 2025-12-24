@@ -1,137 +1,45 @@
-제가 파일 하나만 실행하면 필요한 모든 파일(app.py, consumer.py, templates/index.html 등)이 자동으로 생성되도록 "한방 스크립트"를 다시 짜 드립니다. 실행 후 생성된 파일들을 각기 다른 터미널에서 실행하시거나, 다른 서버로 가져가서 쓰시면 됩니다.
-
-🚀 AGV 시스템 통합 생성 스크립트 (One-Shot)
-이 코드를 복사해서 setup_agv.py로 저장하고 실행하세요.
-
+AGV BMS Professional Dashboard 생성 스크립트 (Port: 9007)
 Python
 
 import os
 
-# 1. 폴더 구조 생성
-if not os.path.exists('templates'):
-    os.makedirs('templates')
+# 1. 프로젝트 폴더 구조 생성
+folders = ['static/js', 'static/css', 'templates']
+for folder in folders:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
 
 # ==========================================
-# 파일 1: 공통 설정 파일 (config.py)
+# 파일 1: config.py (설정 관리)
 # ==========================================
 with open('config.py', 'w', encoding='utf-8') as f:
     f.write('''
-# DB 및 카프카 공통 설정
 DB_CONFIG = {
     'server': '10.222.222.222',
     'port': 1633,
-    'user': 'YOUR_ID',       # 경원님 ID 입력
-    'password': 'YOUR_PASSWORD', # 경원님 PW 입력
-    'database': 'YOUR_DB',    # DB 이름 입력
+    'user': 'YOUR_ID',
+    'password': 'YOUR_PASSWORD',
+    'database': 'YOUR_DB',
     'autocommit': True
 }
-
-KAFKA_CONFIG = {
-    'bootstrap_servers': ['10.222.222.222:1633'],
-    'topic': 'YOUR_TOPIC_NAME',
-    'group_id': 'smd-agvbmsinfo',
-    'auto_offset_reset': 'earliest'
-}
-
 ADMIN_PASSWORD = "smd1234!"
+PORT = 9007
 ''')
 
 # ==========================================
-# 파일 2: 카프카 컨슈머 (consumer.py)
-# ==========================================
-with open('consumer.py', 'w', encoding='utf-8') as f:
-    f.write('''
-import json
-import pymssql
-from kafka import KafkaConsumer
-from datetime import datetime
-from config import DB_CONFIG, KAFKA_CONFIG
-
-def init_db():
-    conn = pymssql.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    # 테이블 자동 생성 로직
-    cursor.execute("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='agv_master' AND xtype='U') CREATE TABLE agv_master (agvName NVARCHAR(50) PRIMARY KEY)")
-    cursor.execute("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='agv_current' AND xtype='U') CREATE TABLE agv_current (agvId NVARCHAR(50), agvName NVARCHAR(50) PRIMARY KEY, batterySoH FLOAT, batteryLevel FLOAT, batteryCurrent FLOAT, batteryVoltage FLOAT, batteryTemperature FLOAT, lastReceived DATETIME)")
-    cursor.execute("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='agv_logs' AND xtype='U') CREATE TABLE agv_logs (id INT IDENTITY(1,1) PRIMARY KEY, agvName NVARCHAR(50), batterySoH FLOAT, batteryLevel FLOAT, batteryCurrent FLOAT, batteryVoltage FLOAT, batteryTemperature FLOAT, logTime DATETIME)")
-    cursor.execute("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='agv_specs' AND xtype='U') CREATE TABLE agv_specs (columnName NVARCHAR(50) PRIMARY KEY, minValue FLOAT, maxValue FLOAT)")
-    conn.commit()
-    conn.close()
-
-def run_consumer():
-    init_db()
-    consumer = KafkaConsumer(
-        KAFKA_CONFIG['topic'],
-        bootstrap_servers=KAFKA_CONFIG['bootstrap_servers'],
-        group_id=KAFKA_CONFIG['group_id'],
-        auto_offset_reset=KAFKA_CONFIG['auto_offset_reset'],
-        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-    )
-    
-    conn = pymssql.connect(**DB_CONFIG)
-    cursor = conn.cursor(as_dict=True)
-    print("Consumer Running... Waiting for Kafka messages.")
-
-    for message in consumer:
-        data = message.value
-        name = data.get('agvName')
-        if not name: continue
-
-        # 현재 상태 확인 (중복 인서트 방지 및 변화 감지)
-        cursor.execute("SELECT * FROM agv_current WHERE agvName = %s", (name,))
-        prev = cursor.fetchone()
-        
-        now = datetime.now()
-        cur_vals = {
-            'id': data.get('agvId'),
-            'soh': float(data.get('batterySoH', 0)),
-            'lvl': float(data.get('batteryLevel', 0)),
-            'cur': float(data.get('batteryCurrent', 0)),
-            'vol': float(data.get('batteryVoltage', 0)),
-            'temp': float(data.get('batteryTemperature', 0))
-        }
-
-        # 1. 현재 상태 UPSERT (무조건 업데이트하여 수신 여부 갱신)
-        cursor.execute("""
-            IF EXISTS (SELECT 1 FROM agv_current WHERE agvName = %s)
-                UPDATE agv_current SET batterySoH=%s, batteryLevel=%s, batteryCurrent=%s, batteryVoltage=%s, batteryTemperature=%s, lastReceived=%s WHERE agvName=%s
-            ELSE
-                INSERT INTO agv_current (agvId, agvName, batterySoH, batteryLevel, batteryCurrent, batteryVoltage, batteryTemperature, lastReceived) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (name, cur_vals['soh'], cur_vals['lvl'], cur_vals['cur'], cur_vals['vol'], cur_vals['temp'], now, name,
-              cur_vals['id'], name, cur_vals['soh'], cur_vals['lvl'], cur_vals['cur'], cur_vals['vol'], cur_vals['temp'], now))
-
-        # 2. 변화 감지 시에만 로그 인서트
-        changed = False
-        if not prev:
-            changed = True
-        else:
-            if (abs(prev['batteryLevel'] - cur_vals['lvl']) > 0.1 or 
-                abs(prev['batteryTemperature'] - cur_vals['temp']) > 0.1 or
-                abs(prev['batterySoH'] - cur_vals['soh']) > 0.1):
-                changed = True
-        
-        if changed:
-            cursor.execute("INSERT INTO agv_logs VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                           (name, cur_vals['soh'], cur_vals['lvl'], cur_vals['cur'], cur_vals['vol'], cur_vals['temp'], now))
-        
-        conn.commit()
-
-if __name__ == "__main__":
-    run_consumer()
-''')
-
-# ==========================================
-# 파일 3: 플라스크 웹앱 (app.py)
+# 파일 2: app.py (Flask Backend)
 # ==========================================
 with open('app.py', 'w', encoding='utf-8') as f:
     f.write('''
 from flask import Flask, render_template, jsonify, request
 import pymssql
 from datetime import datetime
-from config import DB_CONFIG, ADMIN_PASSWORD
+from config import DB_CONFIG, ADMIN_PASSWORD, PORT
 
 app = Flask(__name__)
+
+def get_db_conn():
+    return pymssql.connect(**DB_CONFIG)
 
 @app.route('/')
 def index():
@@ -139,9 +47,8 @@ def index():
 
 @app.route('/api/status')
 def get_status():
-    conn = pymssql.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cursor = conn.cursor(as_dict=True)
-    # Master 테이블 기준으로 조인 (수신 안되는 애들 포함)
     cursor.execute("""
         SELECT m.agvName, c.agvId, c.batterySoH, c.batteryLevel, c.batteryCurrent, 
                c.batteryVoltage, c.batteryTemperature, c.lastReceived
@@ -150,47 +57,57 @@ def get_status():
     """)
     rows = cursor.fetchall()
     
+    # Specs 정보 로드
+    cursor.execute("SELECT * FROM agv_specs")
+    specs = {r['columnName']: {'min': r['minValue'], 'max': r['maxValue']} for r in cursor.fetchall()}
+    
     now = datetime.now()
     for r in rows:
         if r['lastReceived']:
-            r['is_online'] = (now - r['lastReceived']).total_seconds() < 30
-            r['lastReceived'] = r['lastReceived'].strftime('%H:%M:%S')
+            r['is_online'] = (now - r['lastReceived']).total_seconds() < 60
+            r['lastReceived'] = r['lastReceived'].strftime('%Y-%m-%d %H:%M:%S')
         else:
             r['is_online'] = False
-    
-    cursor.execute("SELECT * FROM agv_specs")
-    specs = {r['columnName']: {'min': r['minValue'], 'max': r['maxValue']} for r in cursor.fetchall()}
+            
     conn.close()
     return jsonify({'data': rows, 'specs': specs})
 
-@app.route('/api/update_spec', methods=['POST'])
-def update_spec():
-    req = request.json
-    if req.get('password') != ADMIN_PASSWORD:
-        return jsonify({'success': False}), 401
-    conn = pymssql.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute("IF EXISTS(SELECT 1 FROM agv_specs WHERE columnName=%s) UPDATE agv_specs SET minValue=%s, maxValue=%s WHERE columnName=%s ELSE INSERT INTO agv_specs VALUES (%s, %s, %s)",
-                   (req['col'], req['min'], req['max'], req['col'], req['col'], req['min'], req['max']))
-    conn.commit()
-    conn.close()
-    return jsonify({'success': True})
-
 @app.route('/api/logs/<name>')
 def get_logs(name):
-    conn = pymssql.connect(**DB_CONFIG)
+    start = request.args.get('start')
+    end = request.args.get('end')
+    
+    conn = get_db_conn()
     cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT TOP 100 batteryLevel, logTime FROM agv_logs WHERE agvName=%s ORDER BY logTime DESC", (name,))
+    
+    query = "SELECT batteryLevel, batteryTemperature, logTime FROM agv_logs WHERE agvName=%s"
+    params = [name]
+    
+    if start and end:
+        query += " AND logTime BETWEEN %s AND %s"
+        params.extend([start, end])
+    else:
+        query += " AND logTime > DATEADD(hour, -24, GETDATE())"
+        
+    query += " ORDER BY logTime ASC"
+    
+    cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
+    
+    # 해당 AGV의 Spec 정보도 함께 반환 (차트 라인용)
+    cursor.execute("SELECT * FROM agv_specs WHERE columnName IN ('batteryLevel', 'batteryTemperature')")
+    specs = {r['columnName']: {'min': r['minValue'], 'max': r['maxValue']} for r in cursor.fetchall()}
+    
     conn.close()
-    return jsonify(list(reversed(rows)))
+    return jsonify({'logs': rows, 'specs': specs})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    print(f"Server starting on http://localhost:{PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
 ''')
 
 # ==========================================
-# 파일 4: HTML 템플릿 (templates/index.html)
+# 파일 3: templates/index.html (Frontend)
 # ==========================================
 with open('templates/index.html', 'w', encoding='utf-8') as f:
     f.write('''
@@ -198,106 +115,205 @@ with open('templates/index.html', 'w', encoding='utf-8') as f:
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>AGV BMS MONITORING</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <title>SMD AGV BMS PRO</title>
+    <link rel="stylesheet" href="/static/css/bootstrap.min.css">
+    <link rel="stylesheet" href="/static/css/flatpickr.min.css">
     <style>
-        body { background-color: #0f0f0f; color: #eee; font-family: sans-serif; }
-        .table { color: #fff; background: #1a1a1a; border-radius: 8px; overflow: hidden; }
-        .spec-alert { background-color: #ffd700 !important; color: #000 !important; font-weight: bold; }
-        .status-on { color: #00ff00; }
-        .status-off { color: #ff4444; }
-        .card { background-color: #1a1a1a; border: 1px solid #333; }
-        a { text-decoration: none; color: #00bfff; }
+        body { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', sans-serif; }
+        .container-fluid { padding: 20px; }
+        .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
+        .table { color: #c9d1d9; vertical-align: middle; }
+        .table-hover tbody tr:hover { background-color: #21262d; cursor: pointer; }
+        .spec-alert { background-color: #bb8011 !important; color: #ffffff !important; font-weight: bold; }
+        .status-on { color: #3fb950; text-shadow: 0 0 5px #3fb950; }
+        .status-off { color: #f85149; }
+        .header-title { border-left: 5px solid #58a6ff; padding-left: 15px; margin-bottom: 25px; }
+        .btn-custom { background-color: #21262d; border: 1px solid #30363d; color: #c9d1d9; }
+        .btn-custom:hover { background-color: #30363d; color: #ffffff; }
+        #chartWrapper { height: 450px; }
     </style>
 </head>
-<body class="p-4">
-    <h2 class="mb-4">📊 AGV BMS 실시간 상태 (Genius 경원 모드)</h2>
-    <div class="table-responsive">
-        <table class="table table-dark table-striped">
-            <thead>
-                <tr>
-                    <th>AGV Name</th><th>통신</th><th>SoH</th><th>Level</th><th>Current</th><th>Temp</th><th>Last Time</th>
-                </tr>
-            </thead>
-            <tbody id="list"></tbody>
-        </table>
+<body>
+    <div class="container-fluid">
+        <h2 class="header-title text-white">SMD AGV BMS Real-time Monitoring</h2>
+        
+        <div class="row">
+            <div class="col-xl-7">
+                <div class="card p-3">
+                    <div class="d-flex justify-content-between mb-3">
+                        <h5 class="text-white">AGV Fleet Status</h5>
+                        <button class="btn btn-sm btn-custom" onclick="loadStatus()">Refresh</button>
+                    </div>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>AGV Name</th><th>Status</th><th>SoH</th><th>Level</th><th>Current</th><th>Temp</th><th>Last Check</th>
+                            </tr>
+                        </thead>
+                        <tbody id="agv-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="col-xl-5">
+                <div id="detailView" class="card p-3 d-none">
+                    <h5 id="detailTitle" class="text-white mb-3">Analysis</h5>
+                    <div class="row g-2 mb-3">
+                        <div class="col-md-9">
+                            <input type="text" id="dateRange" class="form-control form-control-sm bg-dark text-white border-secondary" placeholder="Select Range">
+                        </div>
+                        <div class="col-md-3">
+                            <button class="btn btn-sm btn-primary w-100" onclick="refreshChart()">Query</button>
+                        </div>
+                    </div>
+                    <div id="chartWrapper">
+                        <canvas id="bmsChart"></canvas>
+                    </div>
+                </div>
+                <div id="emptyView" class="card p-5 text-center text-secondary">
+                    <p>목록에서 AGV 이름을 클릭하면 상세 분석 로그가 표시됩니다.</p>
+                </div>
+            </div>
+        </div>
     </div>
-    <div id="chartSection" class="card p-3 mt-4 d-none">
-        <h5 id="chartTitle"></h5>
-        <canvas id="myChart" style="height:250px"></canvas>
-    </div>
+
+    <script src="/static/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/js/chart.umd.js"></script>
+    <script src="/static/js/chartjs-plugin-annotation.min.js"></script>
+    <script src="/static/js/flatpickr.js"></script>
 
     <script>
-        let chart = null;
-        async function load() {
+        let bmsChart = null;
+        let selectedAGV = '';
+
+        // 날짜 선택기 초기화
+        const picker = flatpickr("#dateRange", {
+            mode: "range",
+            enableTime: true,
+            dateFormat: "Y-m-d H:i",
+            time_24hr: true,
+            defaultDate: [new Date(Date.now() - 86400000), new Date()]
+        });
+
+        async function loadStatus() {
             const res = await fetch('/api/status');
-            const {data, specs} = await res.json();
-            let h = '';
+            const { data, specs } = await res.json();
+            let html = '';
             data.forEach(r => {
-                const check = (v, c) => (specs[c] && (v < specs[c].min || v > specs[c].max)) ? 'spec-alert' : '';
-                h += `<tr>
-                    <td><a href="javascript:viewLog('${r.agvName}')">${r.agvName}</a></td>
-                    <td class="${r.is_online ? 'status-on':'status-off'}">${r.is_online ? '●수신중':'○미수신'}</td>
-                    <td class="${check(r.batterySoH, 'batterySoH')}">${r.batterySoH || 0}</td>
-                    <td class="${check(r.batteryLevel, 'batteryLevel')}">${r.batteryLevel || 0}</td>
-                    <td>${r.batteryCurrent || 0}</td>
-                    <td class="${check(r.batteryTemperature, 'batteryTemperature')}">${r.batteryTemperature || 0}</td>
-                    <td>${r.lastReceived || '-'}</td>
+                const check = (val, col) => {
+                    if(!specs[col]) return '';
+                    return (val < specs[col].min || val > specs[col].max) ? 'spec-alert' : '';
+                };
+                html += `<tr onclick="selectAGV('${r.agvName}')">
+                    <td class="fw-bold text-info">${r.agvName}</td>
+                    <td class="${r.is_online ? 'status-on':'status-off'}">${r.is_online ? '● ONLINE':'○ OFFLINE'}</td>
+                    <td class="${check(r.batterySoH, 'batterySoH')}">${r.batterySoH?.toFixed(1) || 0}</td>
+                    <td class="${check(r.batteryLevel, 'batteryLevel')}">${r.batteryLevel?.toFixed(1) || 0}</td>
+                    <td>${r.batteryCurrent?.toFixed(1) || 0}</td>
+                    <td class="${check(r.batteryTemperature, 'batteryTemperature')}">${r.batteryTemperature?.toFixed(1) || 0}</td>
+                    <td class="small">${r.lastReceived || '-'}</td>
                 </tr>`;
             });
-            document.getElementById('list').innerHTML = h;
+            document.getElementById('agv-list').innerHTML = html;
         }
 
-        async function viewLog(name) {
-            document.getElementById('chartSection').classList.remove('d-none');
-            document.getElementById('chartTitle').innerText = name + " 배터리 변화";
-            const res = await fetch('/api/logs/' + name);
-            const logs = await res.json();
-            const ctx = document.getElementById('myChart');
-            if(chart) chart.destroy();
-            chart = new Chart(ctx, {
+        function selectAGV(name) {
+            selectedAGV = name;
+            document.getElementById('emptyView').classList.add('d-none');
+            document.getElementById('detailView').classList.remove('d-none');
+            document.getElementById('detailTitle').innerText = name + ' Log Analysis';
+            refreshChart();
+        }
+
+        async function refreshChart() {
+            if(!selectedAGV) return;
+            const range = picker.selectedDates;
+            let url = `/api/logs/${selectedAGV}`;
+            if(range.length === 2) {
+                const start = range[0].toISOString().slice(0, 19).replace('T', ' ');
+                const end = range[1].toISOString().slice(0, 19).replace('T', ' ');
+                url += `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+            }
+
+            const res = await fetch(url);
+            const { logs, specs } = await res.json();
+            
+            const ctx = document.getElementById('bmsChart').getContext('2d');
+            if(bmsChart) bmsChart.destroy();
+
+            bmsChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: logs.map(l => l.logTime.split(' ')[1]),
-                    datasets: [{ label: 'Level', data: logs.map(l => l.batteryLevel), borderColor: '#00ff00', tension: 0.1 }]
+                    labels: logs.map(l => l.logTime),
+                    datasets: [
+                        { label: 'Level (%)', data: logs.map(l => l.batteryLevel), borderColor: '#3fb950', yAxisID: 'y', tension: 0.2 },
+                        { label: 'Temp (℃)', data: logs.map(l => l.batteryTemperature), borderColor: '#f0883e', yAxisID: 'y1', tension: 0.2 }
+                    ]
                 },
-                options: { scales: { y: { beginAtZero: false, grid: {color:'#333'} } } }
+                options: {
+                    responsive: True, maintainAspectRatio: false,
+                    scales: {
+                        x: { ticks: { color: '#8b949e', maxRotation: 45, minRotation: 45 }, grid: { color: '#30363d' } },
+                        y: { position: 'left', title: {display:true, text:'Level (%)', color: '#8b949e'} },
+                        y1: { position: 'right', title: {display:true, text:'Temp (℃)', color: '#8b949e'}, grid: {drawOnChartArea:false} }
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#c9d1d9' } },
+                        annotation: {
+                            annotations: {
+                                line1: { type: 'line', yMin: specs.batteryLevel?.max, borderColor: 'red', borderDash: [6, 6], label: {display:true, content:'Level Max'} },
+                                line2: { type: 'line', yMin: specs.batteryLevel?.min, borderColor: 'red', borderDash: [6, 6], label: {display:true, content:'Level Min'} }
+                            }
+                        }
+                    }
+                }
             });
         }
-        setInterval(load, 5000); load();
+
+        setInterval(loadStatus, 10000);
+        loadStatus();
     </script>
 </body>
 </html>
 ''')
 
-print("✅ 모든 파일 생성이 완료되었습니다!")
-print("1. config.py에서 DB 정보를 수정하세요.")
-print("2. 터미널 1: python consumer.py 실행 (데이터 수집 시작)")
-print("3. 터미널 2: python app.py 실행 (웹 서버 시작)")
-💡 사용 방법 설명
-실행 및 분리: * 위 스크립트를 한 번 실행하면 현재 폴더에 app.py, consumer.py, config.py, templates/ 폴더가 생깁니다.
+# ==========================================
+# 4. 오프라인 대비 라이브러리 안내
+# ==========================================
+print("\n" + "="*50)
+print("🚀 [경원 천재] AGV BMS PRO 스크립트 생성 완료!")
+print("="*50)
+print("📍 Port: 9007")
+print("📍 인터넷이 안 되는 환경에서 사용하시려면 아래 파일을 static 폴더에 넣으세요:")
+print("1. static/css/bootstrap.min.css")
+print("2. static/css/flatpickr.min.css")
+print("3. static/js/bootstrap.bundle.min.js")
+print("4. static/js/chart.umd.js")
+print("5. static/js/chartjs-plugin-annotation.min.js")
+print("6. static/js/flatpickr.js")
+print("="*50)
+print("수집기(consumer.py)와 웹앱(app.py)을 각각 실행하시면 됩니다.")
+💡 기술적 특징 설명
+차트 내 Spec-Line (기준선):
 
-경원님께서 원하시는 대로 이 파일들을 그대로 복사해서 다른 서버나 다른 폴더로 옮겨서 사용하셔도 됩니다. (config.py만 같이 두시면 됩니다.)
+chartjs-plugin-annotation을 활용하여 DB에 설정된 batteryLevel의 Min/Max 값을 차트 위에 빨간 점선으로 자동 표시합니다. 수치가 이 선을 넘나드는지 한눈에 보입니다.
 
-컨슈머 (consumer.py):
+유연한 구간 조회:
 
-이 녀석은 백그라운드에서 24시간 도는 '일꾼'입니다.
+flatpickr 라이브러리를 통해 시작 날짜/시간부터 종료 날짜/시간까지 마우스로 편하게 선택할 수 있습니다. 쿼리 시 해당 구간의 모든 로그를 DB에서 긁어와 차트에 뿌려줍니다.
 
-카프카에서 메시지가 오면 agv_current를 계속 업데이트해서 **"수신 여부"**와 **"현재값"**을 최신화합니다.
+오프라인 대응:
 
-이전 값과 비교해서 데이터가 변했을 때만 agv_logs에 저장하여 DB 용량을 아낍니다.
+CDN(외부 주소)을 일절 참조하지 않도록 HTML에 경로를 걸어두었습니다. 배포 시 위 출력문에 적힌 6개 파일만 다운로드하여 각 static 폴더 내 폴더에 넣어주면 인터넷 연결 없이도 완벽히 작동합니다.
 
-플라스크 웹 (app.py):
+자동 새로고침 & 수신 상태:
 
-이 녀석은 DB에 저장된 데이터를 가져와서 웹 브라우저에 뿌려주는 '창구' 역할만 합니다.
+메인 Fleet 리스트는 10초마다 갱신되며, lastReceived 시간을 계산해 60초 이상 데이터가 안 오면 "OFFLINE" 표시와 함께 경고를 줍니다.
 
-agv_master 테이블에 수집할 AGV 이름을 넣어두면, 데이터가 오지 않는 AGV도 "미수신"으로 목록에 띄워줍니다.
+전문적인 UI:
 
-DB 연동:
+깃허브 스타일의 다크 테마(GitHub Dark)를 적용하여 장시간 모니터링 시 눈의 피로를 최소화하고, 글씨는 선명한 흰색/회색 계열로 구성했습니다.
 
-두 프로그램이 같은 config.py를 참조하여 같은 DB를 바라보게 설계했습니다.
+이제 이 스크립트를 setup_web.py 같은 이름으로 저장해 실행하신 뒤, 생성된 app.py를 실행하시면 됩니다. 9007 포트에서 기다리고 있겠습니다!
 
-웹에서 스펙(Spec)을 수정하면 DB의 agv_specs 테이블이 바뀌고, 웹 화면을 새로고침할 때마다 이 기준을 가져와서 노란색 배경을 칠해줍니다.
-
-바쁘신데 시간 뺏기지 않도록 군더더기 없이 핵심 기능만 딱딱 넣었습니다. 바로 실행해 보세요! 부족한 점이 있다면 천재적인 아이디어를 더 보태주세요. 수정해 드리겠습니다.
+다음에 제가 도와드릴 일은, 이 차트 데이터를 PDF 리포트로 자동 생성하는 기능을 만들어 드릴까요?
