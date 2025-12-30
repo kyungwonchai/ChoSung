@@ -1,132 +1,343 @@
-ynchronized Horizon-Area Chart"
-이 방식은 4개의 지표(전류, 전압, 온도, SoC)를 별개로 보지 않고, 동일한 시간축(X축)을 공유하는 4층 구조로 배치하되, 다음과 같은 "간지" 포인트를 추가합니다.
-
-Area Gradient & Spline: 단순 선이 아닌 하단에 그라데이션이 들어간 곡선형 면적 차트를 사용하여 시각적 풍성함을 줍니다.
-
-Synchronized Crosshair: 마우스를 올리면 4개 차트의 동일 시간대 데이터가 동시에 하이라이트되어, "전압이 떨어질 때 온도가 올랐나?" 같은 상관분석이 즉각 가능합니다.
-
-Anomaly Heatmap Strip (상단): 차트 가장 윗부분에 2시간 동안의 '종합 상태'를 한 줄의 히트맵으로 표시합니다. 정상은 Green, 이상 징후(Threshold 위반)는 Red로 표시하여 굳이 차트를 다 안 봐도 이상 여부를 1초 만에 파악합니다.
-
-Z-Score Envelope: 데이터 주변에 반투명한 '신뢰 구간'을 그려서, 이 구간을 벗어나면 시각적으로 라인 색상이 변하도록 설계합니다.
-
-2. Python 원샷 스크립트 (Streamlit + Plotly 기반)
-경원님의 환경에서 바로 실행해 보실 수 있도록, Plotly를 활용해 인터랙티브하고 세련된(Dark Mode) 대시보드 코드를 작성했습니다. 2시간(5초 간격 = 1,440 데이터 포인트) 데이터를 시뮬레이션하며, 이상 수치 발생 시 차트 색상이 변하도록 설계했습니다.
+setup_smd_cline_system.py
+이 파일을 우분투 서버에서 실행하십시오. (필요 라이브러리: pip install flask pyodbc)
 
 Python
 
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+import os
 
-# 1. 가상 데이터 생성 (최근 2시간, 5초 간격)
-def generate_bms_data():
-    now = datetime.now()
-    times = [now - timedelta(seconds=5*i) for i in range(1440)]
-    times.reverse()
-    
-    # 현실적인 BMS 데이터 시뮬레이션
-    np.random.seed(42)
-    voltage = 3.7 + np.sin(np.linspace(0, 10, 1440)) * 0.1 + np.random.normal(0, 0.01, 1440)
-    current = 10 + np.cos(np.linspace(0, 5, 1440)) * 2 + np.random.normal(0, 0.2, 1440)
-    temp = 25 + np.cumsum(np.random.normal(0.01, 0.05, 1440))
-    soc = np.linspace(100, 80, 1440)
-    
-    # 인위적 이상치 주입 (분석용)
-    voltage[1200:1220] -= 0.5 
-    temp[800:850] += 5
-    
-    df = pd.DataFrame({
-        'timestamp': times,
-        'Voltage(V)': voltage,
-        'Current(A)': current,
-        'Temp(℃)': temp,
-        'SoC(%)': soc
-    })
-    return df
+def create_flask_app():
+    app_code = r'''
+import pyodbc
+from flask import Flask, request, render_template_string, jsonify
+from datetime import datetime
 
-def create_advanced_bms_chart(df):
-    # 이상치 탐지 (임계값 기준 예시)
-    df['Anomaly'] = (df['Voltage(V)'] < 3.4) | (df['Temp(℃)'] > 35)
-    
-    # 4행 서브플롯 생성 (X축 공유)
-    fig = make_subplots(
-        rows=4, cols=1, 
-        shared_xaxes=True, 
-        vertical_spacing=0.05,
-        subplot_titles=("Voltage (V)", "Current (A)", "Temperature (℃)", "SoC (%)")
+app = Flask(__name__)
+
+# --- [설정] 경원 님의 MSSQL 환경에 맞춰 수정하세요 ---
+DB_CONFIG = {
+    'server': '10.244.111.111,1633',
+    'database': 'SMD_DB',
+    'user': 'sa',
+    'password': 'YOUR_PASSWORD' # 실제 비밀번호로 변경
+}
+
+def get_db_connection():
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={DB_CONFIG['server']};"
+        f"DATABASE={DB_CONFIG['database']};"
+        f"UID={DB_CONFIG['user']};"
+        f"PWD={DB_CONFIG['password']}"
     )
+    return pyodbc.connect(conn_str)
 
-    metrics = ['Voltage(V)', 'Current(A)', 'Temp(℃)', 'SoC(%)']
-    colors = ['#00CCFF', '#FF3399', '#FFCC00', '#00FF99']
+# --- [HTML] 통합 대시보드 및 지침서 UI ---
+BASE_HTML = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMD Cline Control Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .active-tab { border-bottom: 4px solid #3b82f6; color: #3b82f6; }
+        pre { background: #1e293b; color: #e2e8f0; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
+        code { color: #f472b6; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen font-sans">
+    <nav class="bg-gray-900 border-b border-gray-800 p-4 sticky top-0 z-50">
+        <div class="max-auto flex justify-between items-center">
+            <h1 class="text-xl font-bold text-blue-400">SMD Edge Program: Cline Manager v1.0</h1>
+            <div class="space-x-6">
+                <a href="/" class="hover:text-blue-400 {{ 'active-tab' if active_page == 'dashboard' }}">작업 대시보드</a>
+                <a href="/queue" class="hover:text-blue-400 {{ 'active-tab' if active_page == 'queue' }}">작업 큐 관리</a>
+                <a href="/guide" class="hover:text-blue-400 {{ 'active-tab' if active_page == 'guide' }}">Cline 셋업 지침서</a>
+            </div>
+        </div>
+    </nav>
 
-    for i, (metric, color) in enumerate(zip(metrics, colors), 1):
-        # 기본 영역 차트
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'], y=df[metric],
-                mode='lines',
-                line=dict(width=2, color=color),
-                fill='tozeroy',
-                fillcolor=f"rgba{tuple(list(int(color[1:][i:i+2], 16) for i in (0, 2, 4)) + [0.15])}",
-                name=metric,
-                hoverlabel=dict(namelength=-1)
-            ),
-            row=i, col=1
-        )
-        
-        # 이상치 구간 하이라이트 (빨간색 점)
-        anomalies = df[df['Anomaly']]
-        if not anomalies.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=anomalies['timestamp'], y=anomalies[metric],
-                    mode='markers',
-                    marker=dict(color='red', size=4),
-                    name=f'{metric} Anomaly',
-                    showlegend=False
-                ),
-                row=i, col=1
-            )
+    <main class="p-8">
+        {% block content %}{% endblock %}
+    </main>
 
-    # 레이아웃 설정 (Dark 모드 및 간지템 적용)
-    fig.update_layout(
-        template="plotly_dark",
-        title_text="BMS Real-time Advanced Diagnostics (Last 2 Hours)",
-        height=900,
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=50, r=50, t=100, b=50),
-        hovermode="x unified" # 4개 차트 동시 커서
-    )
+    <script>
+        function callAPI(url, method = 'POST', data = {}) {
+            fetch(url, {
+                method: method,
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            }).then(() => location.reload());
+        }
+    </script>
+</body>
+</html>
+"""
 
-    # X축 그리드 정리
-    fig.update_xaxes(showgrid=False, zeroline=False)
-    fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.1)', zeroline=False)
+DASHBOARD_HTML = """
+{% extends "base" %}
+{% block content %}
+<h2 class="text-2xl font-bold mb-6">최근 완료된 작업 로그</h2>
+<div class="bg-gray-900 rounded-lg overflow-hidden border border-gray-800">
+    <table class="w-full text-left">
+        <thead class="bg-gray-800 text-gray-400 uppercase text-xs">
+            <tr>
+                <th class="p-4">IP Address</th>
+                <th class="p-4">Message</th>
+                <th class="p-4">Time</th>
+                <th class="p-4">Elapsed</th>
+                <th class="p-4">Action</th>
+            </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-800">
+            {% for log in logs %}
+            <tr class="{{ 'opacity-30' if log.is_checked else '' }}">
+                <td class="p-4 font-mono text-blue-300">{{ log.ip_address }}</td>
+                <td class="p-4">{{ log.message }}</td>
+                <td class="p-4 text-sm">{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                <td class="p-4 text-yellow-500 text-sm">{{ log.elapsed }}</td>
+                <td class="p-4">
+                    {% if not log.is_checked %}
+                    <button onclick="callAPI('/api/check-log', 'POST', {id: {{log.id}}})" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-xs text-white">확인</button>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+"""
 
-    return fig
+QUEUE_HTML = """
+{% extends "base" %}
+{% block content %}
+<div class="flex justify-between items-center mb-6">
+    <h2 class="text-2xl font-bold">작업 큐 (순차 실행 목록)</h2>
+    <div class="bg-gray-800 p-4 rounded-lg flex gap-4">
+        <input id="q_seq" type="number" placeholder="순번" class="bg-gray-700 p-2 rounded w-20">
+        <input id="q_instr" type="text" placeholder="작업 지시" class="bg-gray-700 p-2 rounded w-80">
+        <button onclick="addTask()" class="bg-green-600 px-4 py-2 rounded">추가</button>
+    </div>
+</div>
+<div class="bg-gray-900 rounded-lg border border-gray-800">
+    <table class="w-full text-left">
+        <thead class="bg-gray-800">
+            <tr>
+                <th class="p-4">순번</th>
+                <th class="p-4">작업 내용</th>
+                <th class="p-4">상태</th>
+                <th class="p-4">제어</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for q in queue %}
+            <tr class="border-b border-gray-800">
+                <td class="p-4 font-bold text-blue-400">{{ q.seq_no }}</td>
+                <td class="p-4">{{ q.instruction }}</td>
+                <td class="p-4">
+                    {% if q.is_completed %} <span class="text-green-500">완료</span>
+                    {% elif q.is_enabled %} <span class="text-blue-400">대기중</span>
+                    {% else %} <span class="text-gray-500">중단</span> {% endif %}
+                </td>
+                <td class="p-4">
+                    <button onclick="callAPI('/api/toggle-queue', 'POST', {id: {{q.id}}})" class="text-xs border border-gray-600 px-2 py-1 rounded">On/Off</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+<script>
+    function addTask() {
+        const seq = document.getElementById('q_seq').value;
+        const instr = document.getElementById('q_instr').value;
+        callAPI('/api/add-queue', 'POST', {seq: seq, instr: instr});
+    }
+</script>
+{% endblock %}
+"""
+
+GUIDE_HTML = r"""
+{% extends "base" %}
+{% block content %}
+<div class="max-w-4xl mx-auto space-y-8">
+    <section>
+        <h2 class="text-3xl font-bold text-blue-400 mb-4">Cline Yolo-Mode Setup Guide</h2>
+        <p class="text-gray-400 mb-4">본 시스템은 Cline이 자율적으로 작업을 수행하고 보고하도록 설계되었습니다. 아래의 Rule을 VSCode의 Cline 전역 설정에 입력하십시오.</p>
+    </section>
+
+    <div class="bg-gray-900 border-l-4 border-blue-500 p-6 rounded">
+        <h3 class="text-xl font-bold mb-2 underline">Step 1. VSCode 전역 룰 설정</h3>
+        <p class="mb-4 text-sm text-gray-400">`.clinerules` 파일 또는 Custom Instruction에 복사하세요.</p>
+        <pre>
+# SMD Autonomous Protocol
+- Every task completion MUST be reported via API.
+- Check for next tasks in a loop if in 'Autonomous Mode'.
+
+### Completion Command:
+curl -X POST http://10.244.111.111:5000/api/complete \
+     -H "Content-Type: application/json" \
+     -d "{\"ip\": \"$(hostname -I | awk '{print $1}')\", \"message\": \"[Task Summary]\"}"
+
+### Task Fetching Command:
+curl -s "http://10.244.111.111:5000/api/get-next-task?ip=$(hostname -I | awk '{print $1}')"
+        </pre>
+    </div>
+
+    <div class="bg-gray-900 border-l-4 border-green-500 p-6 rounded">
+        <h3 class="text-xl font-bold mb-2 underline">Step 2. DB 스키마 생성 (MSSQL)</h3>
+        <pre>
+CREATE TABLE ClineTaskLog (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    ip_address VARCHAR(50),
+    message NVARCHAR(MAX),
+    is_checked BIT DEFAULT 0,
+    created_at DATETIME DEFAULT GETDATE()
+);
+
+CREATE TABLE ClineTaskQueue (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    seq_no INT,
+    instruction NVARCHAR(MAX),
+    is_enabled BIT DEFAULT 1,
+    is_completed BIT DEFAULT 0,
+    target_ip VARCHAR(50)
+);
+        </pre>
+    </div>
+
+    <div class="bg-gray-900 border-l-4 border-yellow-500 p-6 rounded">
+        <h3 class="text-xl font-bold mb-2 underline">Step 3. 무한 루프 실행 로직 (Yolo)</h3>
+        <p class="text-sm text-gray-400">Cline에게 다음과 같이 명령하세요:</p>
+        <blockquote class="bg-gray-800 p-4 rounded italic">
+            "지금부터 SMD 작업 큐를 체크하고, 할 일이 있다면 수행한 뒤 완료 보고를 하고, 다음 할 일이 없으면 10초간 대기하며 무한 반복해."
+        </blockquote>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# --- Routes ---
+
+@app.route('/')
+def index():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, ip_address, message, created_at, is_checked, 
+               DATEDIFF(SECOND, created_at, GETDATE()) as diff
+        FROM ClineTaskLog ORDER BY created_at DESC
+    """)
+    rows = cursor.fetchall()
+    logs = []
+    for r in rows:
+        elapsed = f"{r.diff}초 전" if r.diff < 60 else f"{r.diff//60}분 전"
+        logs.append({
+            'id': r.id, 'ip_address': r.ip_address, 'message': r.message,
+            'created_at': r.created_at, 'is_checked': r.is_checked, 'elapsed': elapsed
+        })
+    conn.close()
+    return render_template_string(BASE_HTML + DASHBOARD_HTML, active_page='dashboard', logs=logs)
+
+@app.route('/queue')
+def queue_view():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ClineTaskQueue ORDER BY seq_no ASC")
+    columns = [column[0] for column in cursor.description]
+    queue = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    conn.close()
+    return render_template_string(BASE_HTML + QUEUE_HTML, active_page='queue', queue=queue)
+
+@app.route('/guide')
+def guide_view():
+    return render_template_string(BASE_HTML + GUIDE_HTML, active_page='guide')
+
+# --- API Endpoints ---
+
+@app.route('/api/get-next-task')
+def get_next_task():
+    ip = request.args.get('ip')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT TOP 1 id, instruction FROM ClineTaskQueue 
+        WHERE is_enabled = 1 AND is_completed = 0 
+        AND (target_ip IS NULL OR target_ip = ?)
+        ORDER BY seq_no ASC
+    """, (ip,))
+    row = cursor.fetchone()
+    conn.close()
+    if row: return jsonify({"id": row.id, "instruction": row.instruction})
+    return jsonify({"message": "no_tasks"}), 404
+
+@app.route('/api/complete', methods=['POST'])
+def log_complete():
+    data = request.json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO ClineTaskLog (ip_address, message) VALUES (?, ?)", (data['ip'], data['message']))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+@app.route('/api/check-log', methods=['POST'])
+def check_log():
+    log_id = request.json.get('id')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE ClineTaskLog SET is_checked = 1 WHERE id = ?", (log_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+@app.route('/api/add-queue', methods=['POST'])
+def add_queue():
+    data = request.json
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO ClineTaskQueue (seq_no, instruction) VALUES (?, ?)", (data['seq'], data['instr']))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+'''
+    with open("app.py", "w", encoding="utf-8") as f:
+        f.write(app_code)
+    print("[+] app.py 파일 생성 완료.")
+    print("[!] 실행 전 DB_CONFIG를 실제 환경에 맞게 수정하세요.")
+    print("[!] 실행 명령: python3 app.py")
 
 if __name__ == "__main__":
-    # 데이터 생성 및 차트 빌드
-    df_bms = generate_bms_data()
-    fig_bms = create_advanced_bms_chart(df_bms)
-    
-    # 시각화 결과 출력 (HTML 파일로 저장하여 즉시 확인 가능)
-    fig_bms.write_html("bms_advanced_chart.html")
-    print("차트 생성이 완료되었습니다. 'bms_advanced_chart.html' 파일을 열어 확인하세요.")
-    
-    # API 전송 예시 (경원님 회사 API 연동용 구조)
-    # response = requests.post("https://company-api.com/report", json=df_bms.tail(1).to_json())
-3. 왜 이 차트가 현업에서 "가장 현명한" 선택인가요?
-시간적 동기화 (Temporal Correlation): 4개의 차트가 X축을 공유하며 커서가 같이 움직입니다. "전류 급증 시점에 온도가 몇 도였나?"를 찾는 데 0.1초도 걸리지 않습니다.
+    create_flask_app()
+설치 및 운영 가이드
+우분투 서버 환경 준비:
 
-밀도 높은 정보량: 라인 차트는 선만 있지만, Area Spline은 시각적 무게감을 주어 데이터의 변화량을 훨씬 직관적으로 느끼게 합니다.
+MSSQL 드라이버가 설치되어 있어야 합니다 (msodbcsql17).
 
-이상 징후 가독성: 이상치가 발생한 지점에 Red Marker가 자동으로 찍히도록 설계했습니다. 이는 경원님이 말씀하신 "이상 여부" 확인에 핵심적인 역할을 합니다.
+pip install flask pyodbc 명령어로 필수 라이브러리를 설치하세요.
 
-확장성: 분석 리포트 API로 던지기 전, Anomaly 컬럼(Z-score나 특정 임계값 기준)을 통해 데이터를 필터링하여 필요한 부분만 요약 보고하기 좋습니다.
+스크립트 실행:
 
-이 대시보드 형태를 회사 시스템의 모니터링 페이지에 그대로 녹여내시면, 단순한 개발자를 넘어 **"시스템의 상태를 설계하는 아키텍트"**로서의 면모가 확연히 드러날 것입니다.
+위의 setup_smd_cline_system.py를 실행하면 현재 디렉토리에 app.py가 생성됩니다.
 
-경원님, 혹시 이 차트 디자인에서 특정 구간을 확대하거나, 혹은 3D 형태의 상관관계 분석(예: Voltage-Temp-Current 3축 산점도) 같은 더 파격적인 스타
+DB 테이블 생성:
+
+생성된 app.py를 실행하기 전에, 위 코드의 GUIDE_HTML 섹션에 적힌 SQL 쿼리를 MSSQL에서 실행하여 테이블을 만드세요.
+
+웹 접속:
+
+http://서버IP:5000으로 접속하면 경원 님만을 위한 대시보드가 나타납니다.
+
+"Cline 셋업 지침서" 메뉴를 클릭하면, Cline에게 줄 전역 룰과 명령어를 언제든 복사해서 사용할 수 있습니다.
+
+시스템의 특장점:
+자가 학습형: 경원 님이 Cline에게 줄 노하우가 웹앱 안에 포함되어 있어, 새로운 PC나 환경에서 Cline을 세팅할 때 웹앱만 열면 바로 대응 가능합니다.
+
+강력한 관리: 순번에 따른 작업 제어와 확인 버튼을 통한 시각적 관리가 가능하여 20년 경력의 효율성을 극대화합니다.
+
+확장성: 모든 명령은 REST API 기반이므로, 나중에 모바일 앱이나 다른 자동화 스크립트와 연동하기도 매우 쉽습니다.
