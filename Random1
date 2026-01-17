@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 
 base_dir = "dbbatch1"
 for sd in ["templates", "static", "reports"]:
@@ -16,17 +17,20 @@ from datetime import datetime, timedelta
 from sqlalchemy import func
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v36.db?check_same_thread=False'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v37.db?check_same_thread=False'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'kw_v36_final_architecture'
+app.config['SECRET_KEY'] = 'kw_v37_final_fix'
 db = SQLAlchemy(app)
 
-# --- Template Filters ---
+# --- Template Filters (Registered Correctly) ---
 @app.template_filter('from_json')
-def from_json_filter(value): return json.loads(value)
+def from_json_filter(value):
+    try: return json.loads(value)
+    except: return {}
 
 @app.template_filter('to_b64')
-def to_b64_filter(value): return base64.b64encode(json.dumps(value).encode()).decode()
+def to_b64_filter(value):
+    return base64.b64encode(json.dumps(value).encode()).decode()
 
 # --- Models ---
 class DBConnection(db.Model):
@@ -61,7 +65,7 @@ class DBHealth(db.Model):
 
 with app.app_context(): db.create_all()
 
-# --- Engines (20 Parallel Workers) ---
+# --- Dual-Engine (20 Multi-Threads) ---
 q_db, q_cmd = queue.Queue(), queue.Queue()
 status_mon = {
     "db": [{"state": "IDLE", "alias": "-", "info": "-", "start": 0} for _ in range(10)],
@@ -82,11 +86,15 @@ def db_worker(wid):
                     st_time = time.time(); res, msg = "SUCCESS", "Completed"
                     try:
                         if c.db_type == 'mysql':
-                            conn = pymysql.connect(host=c.host, port=int(c.port), user=c.user, password=c.pw, database=t.db_name, autocommit=True, read_timeout=1800)
-                            with conn.cursor() as cur: cur.callproc(t.proc_name); [cur.nextset() for _ in iter(cur.nextset, False)]
-                        else:
+                            conn = pymysql.connect(host=c.host, port=int(c.port), user=c.user, password=c.pw, database=t.db_name, autocommit=True, connect_timeout=5, read_timeout=1800)
+                            with conn.cursor() as cur:
+                                cur.callproc(t.proc_name)
+                                while cur.nextset(): pass
+                        else: # MSSQL
                             conn = pymssql.connect(server=c.host, port=str(c.port), user=c.user, password=c.pw, database=t.db_name, timeout=1800)
-                            with conn.cursor() as cur: cur.execute(f"SET NOCOUNT ON; EXEC {t.proc_name}"); [cur.nextset() for _ in iter(cur.nextset, False)]
+                            with conn.cursor() as cur:
+                                cur.execute(f"SET NOCOUNT ON; EXEC {t.proc_name}")
+                                while cur.nextset(): pass
                             conn.commit()
                     except Exception as e: res, msg = "FAIL", str(e)
                     finally: 
@@ -104,7 +112,7 @@ def cmd_worker(wid):
             try:
                 t = db.session.get(CmdTask, item['id'])
                 if t:
-                    status_mon['cmd'][wid].update({"state": "BUSY", "alias": t.app_name, "info": "Running", "start": time.time()})
+                    status_mon['cmd'][wid].update({"state": "BUSY", "alias": t.app_name, "info": "CMD", "start": time.time()})
                     st_time = time.time()
                     try:
                         subprocess.run(t.full_cmd, shell=True, check=True, timeout=1800, capture_output=True)
@@ -120,53 +128,39 @@ for i in range(10):
     threading.Thread(target=db_worker, args=(i,), daemon=True).start()
     threading.Thread(target=cmd_worker, args=(i,), daemon=True).start()
 
-# --- Analysis & Report Logic ---
-def analyze_all_dbs():
+# --- Batch Maintenance ---
+def daily_maintenance():
     with app.app_context():
+        # Retention: Delete logs older than 7 days
+        limit = datetime.now() - timedelta(days=7)
+        TaskLog.query.filter(TaskLog.created_at < limit).delete()
+        # DB Health Deep Scan
         for c in DBConnection.query.all():
-            health_info = {"heavy_tables": []}
+            h_info = {"heavy_tables": []}
             try:
                 if c.db_type == 'mysql':
                     conn = pymysql.connect(host=c.host, port=c.port, user=c.user, password=c.pw, connect_timeout=5)
                     with conn.cursor(pymysql.cursors.DictCursor) as cur:
-                        cur.execute("SELECT table_schema, table_name, (data_length+index_length)/1024 as size_kb FROM information_schema.TABLES ORDER BY size_kb DESC LIMIT 10")
-                        health_info['heavy_tables'] = cur.fetchall()
+                        cur.execute("SELECT table_name, (data_length+index_length)/1024 as size_kb FROM information_schema.TABLES WHERE table_schema NOT IN ('information_schema','performance_schema','mysql') ORDER BY size_kb DESC LIMIT 10")
+                        h_info['heavy_tables'] = cur.fetchall()
                     conn.close()
-                else:
+                else: # MSSQL
                     conn = pymssql.connect(server=c.host, port=str(c.port), user=c.user, password=c.pw, login_timeout=5)
                     with conn.cursor(as_dict=True) as cur:
                         cur.execute("SELECT TOP 10 t.name as table_name, SUM(a.total_pages) * 8 as size_kb FROM sys.tables t JOIN sys.indexes i ON t.object_id = i.object_id JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id JOIN sys.allocation_units a ON p.partition_id = a.container_id GROUP BY t.name ORDER BY size_kb DESC")
-                        health_info['heavy_tables'] = cur.fetchall()
+                        h_info['heavy_tables'] = cur.fetchall()
                     conn.close()
-                db.session.add(DBHealth(conn_alias=c.alias, data_json=json.dumps(health_info)))
-                db.session.commit()
+                db.session.add(DBHealth(conn_alias=c.alias, data_json=json.dumps(h_info)))
             except: pass
-
-def generate_html_report():
-    with app.app_context():
-        end = datetime.now(); start = end - timedelta(days=7)
-        logs = TaskLog.query.filter(TaskLog.created_at >= start).all()
-        report_name = f"report_{end.strftime('%Y%m%d')}.html"
-        html = f"<html><head><style>body{{background:#000;color:#fff;font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;margin:20px 0;}} th,td{{border:1px solid #333;padding:12px;}} th{{background:#111;color:#00d4ff;}}</style></head><body><h1>Enterprise Batch Report ({end.strftime('%Y-%m-%d')})</h1>"
-        html += "<table><tr><th>App Name</th><th>Type</th><th>Status</th><th>Avg Sec</th><th>Count</th></tr>"
-        # Summary logic here...
-        html += "</table><p>Generated by Master Pro v36</p></body></html>"
-        with open(os.path.join("reports", report_name), "w", encoding="utf-8") as f: f.write(html)
+        db.session.commit()
 
 # --- Scheduler ---
 sch = BackgroundScheduler(); sch.start()
-def daily_batch():
-    with app.app_context():
-        limit = datetime.now() - timedelta(days=7)
-        TaskLog.query.filter(TaskLog.created_at < limit).delete()
-        db.session.commit()
-    analyze_all_dbs()
-    generate_html_report()
-
-sch.add_job(daily_batch, 'cron', hour=0, minute=0)
+sch.add_job(daily_maintenance, 'cron', hour=0, minute=0)
 
 def sync_jobs():
-    sch.remove_all_jobs(); sch.add_job(daily_batch, 'cron', hour=0, minute=0)
+    for job in sch.get_jobs():
+        if job.id not in ['daily_maint']: sch.remove_job(job.id)
     with app.app_context():
         for x in DBTask.query.all(): sch.add_job(lambda x_id=x.id: q_db.put({'id':x_id}), 'interval', seconds=x.interval, id=f'db_{x.id}')
         for x in CmdTask.query.all(): sch.add_job(lambda x_id=x.id: q_cmd.put({'id':x_id}), 'interval', seconds=x.interval, id=f'cmd_{x.id}')
@@ -176,17 +170,9 @@ def sync_jobs():
 def index(): return render_template('dashboard.html')
 
 @app.route('/analysis')
-def analysis_view():
-    return render_template('analysis.html', health=DBHealth.query.order_by(DBHealth.created_at.desc()).limit(10).all())
-
-@app.route('/reports')
-def reports_list():
-    files = os.listdir("reports")
-    return render_template('reports.html', files=sorted(files, reverse=True))
-
-@app.route('/reports/view/<f>')
-def report_view(f):
-    with open(os.path.join("reports", f), "r", encoding="utf-8") as file: return file.read()
+def analysis():
+    health = DBHealth.query.order_by(DBHealth.created_at.desc()).limit(15).all()
+    return render_template('analysis.html', health=health)
 
 @app.route('/settings')
 def settings():
@@ -216,7 +202,7 @@ def api_save():
     return redirect(url_for('settings'))
 
 @app.route('/api/export')
-def export_txt():
+def api_export():
     si = io.StringIO(); cw = csv.writer(si)
     cw.writerow(["[CONN]"]); cw.writerow(["alias", "db_type", "host", "port", "user", "pw"])
     for x in DBConnection.query.all(): cw.writerow([x.alias, x.db_type, x.host, x.port, x.user, x.pw])
@@ -224,12 +210,12 @@ def export_txt():
     for x in DBTask.query.all(): cw.writerow([x.app_name, x.content, x.description, x.db_name, x.proc_name, x.interval, x.conn_info.alias])
     cw.writerow(["[CMDTASK]"]); cw.writerow(["app_name", "content", "description", "full_cmd", "interval"])
     for x in CmdTask.query.all(): cw.writerow([x.app_name, x.content, x.description, x.full_cmd, x.interval])
-    return Response(si.getvalue(), mimetype="text/plain", headers={"Content-disposition": "attachment; filename=architect_v36.txt"})
+    return Response(si.getvalue(), mimetype="text/plain", headers={"Content-disposition": "attachment; filename=architect_v37.txt"})
 
 @app.route('/api/import', methods=['POST'])
-def import_txt():
-    file = request.files['file']
-    lines = file.stream.read().decode("utf-8").splitlines(); mode = None
+def api_import():
+    f = request.files['file']
+    lines = f.stream.read().decode("utf-8").splitlines(); mode = None
     for row in csv.reader(lines):
         if not row: continue
         if row[0].startswith("["): mode = row[0]; continue
@@ -280,16 +266,16 @@ if __name__ == '__main__':
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>MASTER ARCHITECT v36</title>
+    <title>PRO MASTER ARCHITECT v37</title>
     <style>
         * { color: #FFFFFF !important; background-color: #000000 !important; border-color: #333 !important; box-sizing: border-box; }
         html, body { margin: 0; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
-        .navbar { height: 70px; border-bottom: 3px solid #00d4ff !important; padding: 0 40px; display: flex; justify-content: space-between; align-items: center; }
+        .navbar { height: 70px; border-bottom: 3.5px solid #00d4ff !important; padding: 0 40px; display: flex; justify-content: space-between; align-items: center; }
         .nav-links a { text-decoration: none; margin-left: 30px; font-weight: 900; font-size: 1.2rem; }
         .container { display: flex; height: calc(100vh - 70px); }
-        .sidebar { width: 450px; border-right: 3px solid #333 !important; padding: 20px; overflow-y: auto; background: #080808 !important; }
-        .main { flex: 1; padding: 20px; overflow-y: auto; }
-        .card { border: 2px solid #444 !important; border-radius: 12px; padding: 15px; margin-bottom: 20px; background: #0a0a0a !important; }
+        .sidebar { width: 480px; border-right: 3px solid #333 !important; padding: 20px; overflow-y: auto; background: #080808 !important; }
+        .main { flex: 1; padding: 25px; overflow-y: auto; }
+        .card { border: 2px solid #444 !important; border-radius: 15px; padding: 20px; margin-bottom: 25px; background: #0a0a0a !important; }
         .form-control, .form-select, textarea { width: 100%; border: 2.5px solid #00d4ff !important; padding: 10px; margin-bottom: 10px; border-radius: 8px; font-weight: bold; }
         .btn { cursor: pointer; border-radius: 8px; padding: 12px; font-weight: 900; border: none; width: 100%; margin-bottom: 8px; font-size: 1rem; }
         .btn-primary { background: #0d47a1 !important; } .btn-warning { background: #ffaa00 !important; color: #000 !important; }
@@ -300,8 +286,8 @@ if __name__ == '__main__':
 </head>
 <body>
     <div class="navbar">
-        <div style="font-size:2rem; font-weight:900;">🚀 PRO MASTER <span style="color:#00d4ff">v36</span></div>
-        <div class="nav-links"><a href="/">DASHBOARD</a><a href="/analysis">DB HEALTH</a><a href="/reports">REPORTS</a><a href="/settings">SETTINGS</a></div>
+        <div style="font-size:2rem; font-weight:900;">🚀 PRO MASTER <span style="color:#00d4ff">v37</span></div>
+        <div class="nav-links"><a href="/">DASHBOARD</a><a href="/analysis">DB HEALTH</a><a href="/settings">SETTINGS</a></div>
     </div>
     <div class="container">{% block content %}{% endblock %}</div>
 </body>
@@ -313,12 +299,12 @@ if __name__ == '__main__':
 <div class="sidebar">
     <h4 style="color:#ffaa00 !important;">DB WORKERS (10)</h4>
     <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="db-workers"></div>
-    <h4 style="color:#cc33ff !important; margin-top:25px;">CMD WORKERS (10)</h4>
+    <h4 style="color:#cc33ff !important; margin-top:20px;">CMD WORKERS (10)</h4>
     <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="cmd-workers"></div>
 </div>
 <div class="main">
     <div class="card">
-        <h3 style="color:#00ff00 !important;">📑 REAL-TIME HISTORY</h3>
+        <h3 style="color:#00ff00 !important;">📑 REAL-TIME HISTORY (TOP 100)</h3>
         <table class="table">
             <thead><tr><th>TIME</th><th>APP</th><th>STATUS</th><th>MSG</th><th>SEC</th></tr></thead>
             <tbody id="log-list"></tbody>
@@ -349,7 +335,7 @@ if __name__ == '__main__':
 {% block content %}
 <div class="main" style="width:100%;">
     <div class="card">
-        <h2>🔍 DB DEEP SCAN (부하 테이블 분석)</h2>
+        <h2>🔍 DB DEEP SCAN (24H 자동 분석 결과)</h2>
         {% for h in health %}
         <div class="card" style="border-color:#555 !important;">
             <h3 style="color:#00d4ff !important;">Connection: {{ h.conn_alias }} ({{ h.created_at }})</h3>
@@ -368,28 +354,12 @@ if __name__ == '__main__':
 </div>
 {% endblock %}
 """,
-    "templates/reports.html": """
-{% extends 'layout.html' %}
-{% block content %}
-<div class="main" style="width:100%;">
-    <div class="card">
-        <h2>📂 WEEKLY ANALYTICS REPORTS</h2>
-        {% for f in files %}
-        <div class="card" style="display:flex; justify-content:space-between; flex-direction:row; align-items:center;">
-            <span>📄 {{ f }}</span>
-            <a href="/reports/view/{{ f }}" target="_blank" class="btn btn-warning" style="width:150px;">REPORT OPEN</a>
-        </div>
-        {% endfor %}
-    </div>
-</div>
-{% endblock %}
-""",
     "templates/settings.html": """
 {% extends 'layout.html' %}
 {% block content %}
 <div class="sidebar">
-    <div class="card"><h3 style="color:#00d4ff !important;">📦 SYNC</h3>
-        <a href="/api/export" class="btn btn-info">Export (.txt)</a>
+    <div class="card"><h3>📦 DATA SYNC</h3>
+        <a href="/api/export" class="btn btn-info">Export All (.txt)</a>
         <form action="/api/import" method="POST" enctype="multipart/form-data"><input type="file" name="file" required><button type="submit" class="btn btn-primary mt-1">Import</button></form>
     </div>
     <div class="card"><h4>1. DB CONNECTION</h4>
@@ -443,6 +413,6 @@ def create_files():
     for filename, content in files.items():
         path = os.path.join(base_dir, filename)
         with open(path, "w", encoding="utf-8") as f: f.write(content.strip())
-    print(f"Project v36 Ultimate Edition Ready. Port 12828.")
+    print(f"Project v37 ARCHITECT FINAL COMPLETE. Port 12828.")
 
 if __name__ == "__main__": create_files()
