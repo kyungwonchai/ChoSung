@@ -1,1 +1,165 @@
+import os
+import json
+import subprocess
+from flask import Flask, render_template_string, jsonify
 
+app = Flask(__name__)
+
+# --- UI (Tailwind CSS Dark Mode) ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>PM2 Log Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        body { background-color: #020617; color: #f8fafc; font-family: 'Pretendard', sans-serif; }
+        .log-area { 
+            background-color: #000000; 
+            border: 1px solid #1e293b; 
+            font-family: 'Fira Code', 'Courier New', monospace; 
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .status-online { color: #4ade80; }
+        .status-offline { color: #f87171; }
+    </style>
+</head>
+<body class="h-screen flex flex-col p-6">
+    <div class="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+        <h1 class="text-2xl font-bold tracking-tighter text-sky-400">SERVER DASHBOARD <span class="text-slate-500 font-light">| PM2 Logs</span></h1>
+        <div class="text-sm text-slate-400">Port: <span class="text-orange-400">30000</span></div>
+    </div>
+
+    <div class="grid grid-cols-12 gap-6 flex-1 overflow-hidden">
+        <div class="col-span-3 bg-slate-900/50 rounded-xl p-4 border border-slate-800 overflow-y-auto">
+            <h2 class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-4">Processes</h2>
+            <div id="app-list" class="space-y-2"></div>
+        </div>
+
+        <div class="col-span-9 flex flex-col">
+            <div class="flex items-center justify-between mb-2">
+                <h3 id="current-app" class="text-lg font-medium text-sky-300 italic underline decoration-sky-500/30">Select an application...</h3>
+                <div class="flex gap-2">
+                    <button onclick="fetchLogs()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded transition">Refresh</button>
+                    <button onclick="autoRefreshToggle()" id="auto-btn" class="text-xs bg-slate-800 px-3 py-1.5 rounded transition text-slate-400">Auto: OFF</button>
+                </div>
+            </div>
+            <div id="log-window" class="log-area flex-1 p-5 rounded-xl text-sm leading-relaxed overflow-y-auto">Select a process from the left to view real-time logs...</div>
+        </div>
+    </div>
+
+    <script>
+        let selectedApp = "";
+        let autoRefresh = false;
+        let refreshInterval;
+
+        async function loadApps() {
+            try {
+                const res = await fetch('/api/apps');
+                const apps = await res.json();
+                const listDiv = document.getElementById('app-list');
+                listDiv.innerHTML = apps.map(app => `
+                    <div onclick="selectApp('${app.name}')" class="group cursor-pointer p-3 rounded-lg border border-transparent hover:border-slate-700 hover:bg-slate-800/50 transition">
+                        <div class="flex justify-between items-center">
+                            <span class="font-medium text-slate-200 group-hover:text-white underline-offset-4">${app.name}</span>
+                            <span class="text-[10px] ${app.status === 'online' ? 'status-online' : 'status-offline'}">● ${app.status.toUpperCase()}</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) { console.error("Apps load error", e); }
+        }
+
+        function selectApp(name) {
+            selectedApp = name;
+            document.getElementById('current-app').innerText = "> " + name;
+            fetchLogs();
+        }
+
+        async function fetchLogs() {
+            if (!selectedApp) return;
+            try {
+                const res = await fetch(\`/api/logs/\${selectedApp}\`);
+                const data = await res.json();
+                const logWindow = document.getElementById('log-window');
+                
+                // Colorize common terms
+                let logContent = data.logs
+                    .replace(/ERROR/g, '<span class="text-red-500 font-bold">ERROR</span>')
+                    .replace(/INFO/g, '<span class="text-blue-400">INFO</span>')
+                    .replace(/SUCCESS/g, '<span class="text-green-400">SUCCESS</span>')
+                    .replace(/WARNING/g, '<span class="text-yellow-400">WARNING</span>');
+
+                logWindow.innerHTML = logContent || "No logs found in the file.";
+                logWindow.scrollTop = logWindow.scrollHeight;
+            } catch (e) { console.error("Logs fetch error", e); }
+        }
+
+        function autoRefreshToggle() {
+            autoRefresh = !autoRefresh;
+            const btn = document.getElementById('auto-btn');
+            if (autoRefresh) {
+                btn.innerText = "Auto: ON";
+                btn.classList.add('text-sky-400', 'bg-sky-900/20');
+                refreshInterval = setInterval(fetchLogs, 3000);
+            } else {
+                btn.innerText = "Auto: OFF";
+                btn.classList.remove('text-sky-400', 'bg-sky-900/20');
+                clearInterval(refreshInterval);
+            }
+        }
+
+        setInterval(loadApps, 10000);
+        loadApps();
+    </script>
+</body>
+</html>
+"""
+
+# --- Backend Logic ---
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/apps')
+def get_apps():
+    try:
+        # pm2 jlist 명령어로 JSON 데이터 획득
+        result = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        apps = [{"name": app['name'], "status": app['pm2_env']['status']} for app in data]
+        return jsonify(apps)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/logs/<app_name>')
+def get_logs(app_name):
+    try:
+        # 1. 해당 앱의 로그 파일 경로 찾기
+        result = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        
+        target_app = next((app for app in data if app['name'] == app_name), None)
+        if not target_app:
+            return jsonify({"logs": "Application not found."})
+
+        log_path = target_app['pm2_env'].get('pm_out_log_path')
+        
+        # 2. 로그 파일 읽기 (마지막 100줄)
+        if log_path and os.path.exists(log_path):
+            # tail 명령어를 사용하는 것이 가장 효율적
+            tail_res = subprocess.run(['tail', '-n', '100', log_path], capture_output=True, text=True)
+            return jsonify({"logs": tail_res.stdout})
+        else:
+            return jsonify({"logs": f"Log file not found at: {log_path}"})
+
+    except Exception as e:
+        return jsonify({"logs": f"Error reading logs: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    # 외부 접속 허용 및 포트 30000 설정
+    app.run(host='0.0.0.0', port=30000)
