@@ -18,12 +18,11 @@ from flask_sqlalchemy import SQLAlchemy
 from apscheduler.schedulers.background import BackgroundScheduler
 import queue, threading, time, pymysql, pymssql, subprocess, json, csv, io
 from datetime import datetime, timedelta
-from sqlalchemy import func
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v33.db?check_same_thread=False'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v34.db?check_same_thread=False'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'kw_v33_architect_final'
+app.config['SECRET_KEY'] = 'kw_v34_ultimate'
 db = SQLAlchemy(app)
 
 # --- Models ---
@@ -77,13 +76,17 @@ def db_worker(wid):
                     st_time = time.time(); res_msg = "Completed"; res = "SUCCESS"
                     try:
                         if c.db_type == 'mysql':
-                            conn = pymysql.connect(host=c.host, port=int(c.port), user=c.user, password=c.pw, database=t.db_name, autocommit=True, read_timeout=1800)
-                            with conn.cursor() as cur: cur.callproc(t.proc_name); [cur.nextset() for _ in iter(cur.nextset, False)]
+                            conn = pymysql.connect(host=c.host, port=int(c.port), user=c.user, password=c.pw, database=t.db_name, autocommit=True, connect_timeout=5, read_timeout=1800)
+                            with conn.cursor() as cur:
+                                cur.callproc(t.proc_name)
+                                while cur.nextset(): pass
                         else:
                             conn = pymssql.connect(server=c.host, port=str(c.port), user=c.user, password=c.pw, database=t.db_name, timeout=1800)
-                            with conn.cursor() as cur: cur.execute(f"SET NOCOUNT ON; EXEC {t.proc_name}"); [cur.nextset() for _ in iter(cur.nextset, False)]
+                            with conn.cursor() as cur:
+                                cur.execute(f"SET NOCOUNT ON; EXEC {t.proc_name}")
+                                while cur.nextset(): pass
                             conn.commit()
-                    except Exception as e: res = "FAIL"; res_msg = str(e)
+                    except Exception as e: res, res_msg = "FAIL", str(e)
                     finally: 
                         if conn: conn.close()
                     db.session.add(TaskLog(type="DB", alias=t.app_name, status=res, message=res_msg, elapsed=round(time.time()-st_time, 2)))
@@ -115,7 +118,7 @@ for i in range(10):
     threading.Thread(target=db_worker, args=(i,), daemon=True).start()
     threading.Thread(target=cmd_worker, args=(i,), daemon=True).start()
 
-# --- Scheduler (Auto Delete 1 week logs) ---
+# --- Scheduler ---
 sch = BackgroundScheduler(); sch.start()
 def cleanup_logs():
     with app.app_context():
@@ -125,7 +128,7 @@ def cleanup_logs():
 sch.add_job(cleanup_logs, 'cron', hour=0, minute=0)
 
 def update_job(jtype, tid, sec):
-    jid = f"{jtype}_{tid}"; 
+    jid = f"{jtype}_{tid}"
     if sch.get_job(jid): sch.remove_job(jid)
     t_q = q_db if jtype == 'db' else q_cmd
     sch.add_job(lambda: t_q.put({'id': tid}), 'interval', seconds=sec, id=jid)
@@ -142,8 +145,7 @@ def sync_all():
 def index(): return render_template('dashboard.html')
 
 @app.route('/analysis')
-def analysis():
-    return render_template('analysis.html')
+def analysis(): return render_template('analysis.html')
 
 @app.route('/settings')
 def settings_page():
@@ -160,7 +162,8 @@ def api_save():
             if not sid: db.session.add(c)
         elif act == 'save_db_task':
             t = db.session.get(DBTask, int(sid)) if sid else DBTask()
-            t.conn_id, t.app_name, t.content, t.description = int(request.form['conn_id']), request.form['app_name'], request.form['content'], request.form['description']
+            t.conn_id = int(request.form['conn_id'])
+            t.app_name, t.content, t.description = request.form['app_name'], request.form['content'], request.form['description']
             t.db_name, t.proc_name, t.interval = request.form['db_name'], request.form['proc_name'], int(request.form['interval'])
             if not sid: db.session.add(t); db.session.commit(); q_db.put({'id': t.id})
             update_job('db', t.id, t.interval)
@@ -191,60 +194,39 @@ def delete_item(type, id):
     if item: db.session.delete(item); db.session.commit()
     return redirect(url_for('settings_page'))
 
-# --- Enterprise Export/Import ---
+# --- Export/Import ---
 @app.route('/api/export')
 def export_txt():
-    si = io.StringIO()
-    cw = csv.writer(si)
-    # Connections
-    cw.writerow(["[CONN]"])
-    cw.writerow(["alias", "db_type", "host", "port", "user", "pw"])
+    si = io.StringIO(); cw = csv.writer(si)
+    cw.writerow(["[CONN]"]); cw.writerow(["alias", "db_type", "host", "port", "user", "pw"])
     for c in DBConnection.query.all(): cw.writerow([c.alias, c.db_type, c.host, c.port, c.user, c.pw])
-    # DB Tasks
-    cw.writerow(["[DBTASK]"])
-    cw.writerow(["app_name", "content", "description", "db_name", "proc_name", "interval", "conn_alias"])
+    cw.writerow(["[DBTASK]"]); cw.writerow(["app_name", "content", "description", "db_name", "proc_name", "interval", "conn_alias"])
     for t in DBTask.query.all(): cw.writerow([t.app_name, t.content, t.description, t.db_name, t.proc_name, t.interval, t.conn_info.alias])
-    # CMD Tasks
-    cw.writerow(["[CMDTASK]"])
-    cw.writerow(["app_name", "content", "description", "full_cmd", "interval"])
+    cw.writerow(["[CMDTASK]"]); cw.writerow(["app_name", "content", "description", "full_cmd", "interval"])
     for t in CmdTask.query.all(): cw.writerow([t.app_name, t.content, t.description, t.full_cmd, t.interval])
-    
-    return Response(si.getvalue(), mimetype="text/plain", headers={"Content-disposition": "attachment; filename=enterprise_backup.txt"})
+    return Response(si.getvalue(), mimetype="text/plain", headers={"Content-disposition": "attachment; filename=architect_backup.txt"})
 
 @app.route('/api/import', methods=['POST'])
 def import_txt():
     file = request.files['file']
     if not file: return "Error", 400
-    lines = file.stream.read().decode("utf-8").splitlines()
-    mode = None
+    lines = file.stream.read().decode("utf-8").splitlines(); mode = None
     for row in csv.reader(lines):
         if not row: continue
         if row[0] == "[CONN]": mode = "C"; continue
         elif row[0] == "[DBTASK]": mode = "D"; continue
         elif row[0] == "[CMDTASK]": mode = "P"; continue
-        if row[0] in ["alias", "app_name"]: continue # Skip headers
-        
+        if row[0] in ["alias", "app_name"]: continue
         if mode == "C":
             if not DBConnection.query.filter_by(alias=row[0]).first():
                 db.session.add(DBConnection(alias=row[0], db_type=row[1], host=row[2], port=int(row[3]), user=row[4], pw=row[5]))
         elif mode == "D":
             conn = DBConnection.query.filter_by(alias=row[6]).first()
-            if conn:
-                db.session.add(DBTask(app_name=row[0], content=row[1], description=row[2], db_name=row[3], proc_name=row[4], interval=int(row[5]), conn_id=conn.id))
+            if conn: db.session.add(DBTask(app_name=row[0], content=row[1], description=row[2], db_name=row[3], proc_name=row[4], interval=int(row[5]), conn_id=conn.id))
         elif mode == "P":
             db.session.add(CmdTask(app_name=row[0], content=row[1], description=row[2], full_cmd=row[3], interval=int(row[4])))
     db.session.commit(); sync_all()
     return redirect(url_for('settings_page'))
-
-# --- Analysis API ---
-@app.route('/api/analysis_data')
-def api_analysis():
-    # Metrics: Top Failing Apps, Avg Time by App, Anomaly List
-    seven_days = datetime.now() - timedelta(days=7)
-    stats = db.session.query(TaskLog.alias, func.avg(TaskLog.elapsed), func.count(TaskLog.id)).filter(TaskLog.status=='SUCCESS').group_name(TaskLog.alias).all()
-    # Simple Anomaly: Elapsed > Avg * 2
-    anomalies = TaskLog.query.filter(TaskLog.created_at > seven_days).order_by(TaskLog.created_at.desc()).limit(50).all()
-    return jsonify({"summary": stats, "logs": [l.alias for l in anomalies]})
 
 @app.route('/api/status')
 def api_status():
@@ -254,7 +236,7 @@ def api_status():
 @app.route('/api/logs')
 def api_logs():
     logs = TaskLog.query.order_by(TaskLog.created_at.desc()).limit(100).all()
-    return jsonify([{"alias": l.alias, "status": l.status, "msg": l.message[:60], "elapsed": l.elapsed, "at": l.created_at.strftime('%H:%M:%S')} for l in logs])
+    return jsonify([{"alias": l.alias, "status": l.status, "msg": l.message[:60], "elapsed": l.elapsed, "at": l.created_at.strftime('%Y-%m-%d %H:%M:%S')} for l in logs])
 
 if __name__ == '__main__':
     with app.app_context(): sync_all()
@@ -265,25 +247,20 @@ if __name__ == '__main__':
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>DB BATCH v33 MASTER</title>
+    <title>MASTER PRO v34</title>
     <style>
         * { color: #FFFFFF !important; background-color: #000000 !important; border-color: #333 !important; box-sizing: border-box; }
         html, body { margin: 0; padding: 0; font-family: 'Segoe UI', monospace; height: 100vh; overflow: hidden; }
         .navbar { height: 70px; border-bottom: 3.5px solid #00d4ff !important; padding: 0 40px; display: flex; justify-content: space-between; align-items: center; }
-        .nav-brand { font-size: 2.2rem; font-weight: 900; }
-        .nav-links a { text-decoration: none; margin-left: 30px; font-weight: 900; font-size: 1.2rem; }
+        .nav-links a { text-decoration: none; margin-left: 30px; font-weight: 900; font-size: 1.3rem; }
         .container { display: flex; height: calc(100vh - 70px); width: 100%; }
         .sidebar { width: 480px; border-right: 3px solid #333 !important; padding: 20px; overflow-y: auto; background: #080808 !important; }
-        .main-content { flex: 1; padding: 25px; overflow-y: auto; }
-        .card { border: 1.5px solid #444 !important; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
-        .form-control, .form-select, textarea { 
-            width: 100%; border: 2.5px solid #00d4ff !important; padding: 10px; margin-bottom: 10px; border-radius: 8px; font-weight: 900; font-size: 1rem;
-        }
+        .main-content { flex: 1; padding: 20px; overflow-y: auto; }
+        .card { border: 2px solid #444 !important; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
+        .form-control, .form-select, textarea { width: 100%; border: 2.5px solid #00d4ff !important; padding: 10px; margin-bottom: 10px; border-radius: 8px; font-weight: 900; font-size: 1rem; }
         .btn { cursor: pointer; border-radius: 10px; padding: 12px; font-weight: 900; border: none; font-size: 1rem; width: 100%; margin-bottom: 8px; }
         .btn-primary { background-color: #0d47a1 !important; }
         .btn-warning { background-color: #ffaa00 !important; color: #000 !important; }
-        .btn-info { background-color: #00838f !important; }
-        .worker-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
         .worker-box { border: 1px solid #444 !important; padding: 5px; text-align: center; font-size: 0.7rem; border-radius: 5px; }
         .worker-box.busy { background: #500 !important; border-color: #f00 !important; }
         .worker-box.idle { background: #030 !important; border-color: #0f0 !important; }
@@ -294,7 +271,7 @@ if __name__ == '__main__':
 </head>
 <body>
     <div class="navbar">
-        <div class="nav-brand">🚀 MASTER PRO <span style="color:#00d4ff">v33</span></div>
+        <div style="font-size:2rem; font-weight:900;">🚀 ARCHITECT MASTER <span style="color:#00d4ff">v34</span></div>
         <div class="nav-links"><a href="/">DASHBOARD</a><a href="/analysis">ANALYSIS</a><a href="/settings">SETTINGS</a></div>
     </div>
     <div class="container">{% block content %}{% endblock %}</div>
@@ -306,32 +283,23 @@ if __name__ == '__main__':
 {% block content %}
 <div class="sidebar">
     <h4 style="color:#ffaa00 !important;">DB WORKERS (10)</h4>
-    <div class="worker-grid" id="db-workers"></div>
+    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="db-workers"></div>
     <h4 style="color:#cc33ff !important; margin-top:20px;">CMD WORKERS (10)</h4>
-    <div class="worker-grid" id="cmd-workers"></div>
-    <div class="card" style="margin-top:20px;">
-        <h4 style="color:#00d4ff !important;">QUEUE WAIT</h4>
-        <div class="d-flex justify-content-between"><span>DB Q:</span><b id="q-db" class="text-warning">0</b></div>
-        <div class="d-flex justify-content-between"><span>CMD Q:</span><b id="q-cmd" class="text-warning">0</b></div>
-    </div>
+    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="cmd-workers"></div>
 </div>
 <div class="main-content">
     <div class="card">
         <h3 style="color:#00ff00 !important;">📑 REAL-TIME EXECUTION HISTORY</h3>
-        <div class="overflow-auto" style="max-height: calc(100vh - 250px);">
-            <table class="table">
-                <thead><tr><th>TIME</th><th>APP</th><th>STATE</th><th>MSG</th><th>SEC</th></tr></thead>
-                <tbody id="log-list"></tbody>
-            </table>
-        </div>
+        <table class="table">
+            <thead><tr><th>TIME</th><th>APP</th><th>STATE</th><th>REASON</th><th>SEC</th></tr></thead>
+            <tbody id="log-list"></tbody>
+        </table>
     </div>
 </div>
 <script>
     function update() {
         const now = Date.now() / 1000;
         fetch('/api/status').then(r=>r.json()).then(d=>{
-            document.getElementById('q-db').innerText = d.q_count.db;
-            document.getElementById('q-cmd').innerText = d.q_count.cmd;
             const dr = (id, data) => {
                 document.getElementById(id+'-workers').innerHTML = data.map((w, i) => {
                     const el = w.state === 'BUSY' ? (now - w.start).toFixed(1) + 's' : 'IDLE';
@@ -350,30 +318,26 @@ if __name__ == '__main__':
     "templates/analysis.html": """
 {% extends 'layout.html' %}
 {% block content %}
-<div class="main-content" style="padding-top:0; width:100%;">
+<div class="main-content" style="width:100%; padding-top:0;">
     <div class="card" style="border-color:#00ff00 !important;">
-        <h2 style="color:#00ff00 !important;">📊 7-DAY ANOMALY DETECTION (변칙 탐지)</h2>
-        <p style="color:#888 !important;">※ 최근 1주일 로그 분석: 평균 소요 시간의 2배를 초과하거나 실패율이 높은 앱을 선별합니다.</p>
-        <div id="analysis-results">서버 데이터를 불러오는 중...</div>
+        <h2 style="color:#00ff00 !important;">📊 7-DAY PERFORMANCE ANALYSIS</h2>
+        <div id="analysis-results">불러오는 중...</div>
     </div>
 </div>
 <script>
     fetch('/api/logs').then(r=>r.json()).then(logs => {
-        // Simple client-side stats for immediate feedback
         const apps = {};
         logs.forEach(l => {
             if(!apps[l.alias]) apps[l.alias] = {sum:0, count:0, fails:0};
             if(l.status === 'SUCCESS') { apps[l.alias].sum += l.elapsed; apps[l.alias].count++; }
             else { apps[l.alias].fails++; }
         });
-        let html = '<table class="table"><thead><tr><th>앱 이름</th><th>7일 평균</th><th>실패 건수</th><th>상태</th></tr></thead><tbody>';
+        let html = '<table class="table"><thead><tr><th>APP</th><th>AVG SEC</th><th>FAILS</th><th>STATUS</th></tr></thead><tbody>';
         Object.keys(apps).forEach(a => {
-            const avg = (apps[a].sum / apps[a].count).toFixed(2);
-            const status = apps[a].fails > 0 ? '<b style="color:red !important;">RISK</b>' : '<b style="color:green !important;">STABLE</b>';
-            html += `<tr><td>${a}</td><td>${avg}s</td><td>${apps[a].fails}건</td><td>${status}</td></tr>`;
+            const avg = (apps[a].sum / (apps[a].count || 1)).toFixed(2);
+            html += `<tr><td>${a}</td><td>${avg}s</td><td>${apps[a].fails}</td><td>${apps[a].fails > 0 ? 'RISK':'OK'}</td></tr>`;
         });
-        html += '</tbody></table>';
-        document.getElementById('analysis-results').innerHTML = html;
+        document.getElementById('analysis-results').innerHTML = html + '</tbody></table>';
     });
 </script>
 {% endblock %}
@@ -383,65 +347,57 @@ if __name__ == '__main__':
 {% block content %}
 <div class="sidebar">
     <div class="card">
-        <h3 style="color:#00d4ff !important;">📦 EXPORT / IMPORT</h3>
-        <a href="/api/export" class="btn btn-info">모든 설정 백업 (.txt)</a>
-        <form action="/api/import" method="POST" enctype="multipart/form-data" style="margin-top:10px;">
-            <input type="file" name="file" class="form-control" required>
-            <button type="submit" class="btn btn-primary">백업 파일 가져오기</button>
-        </form>
+        <h3 style="color:#00d4ff !important;">📦 DATA SYNC</h3>
+        <a href="/api/export" class="btn btn-info">Backup (.txt)</a>
+        <form action="/api/import" method="POST" enctype="multipart/form-data"><input type="file" name="file" required><button type="submit" class="btn btn-primary mt-2">Import</button></form>
     </div>
-    <div id="form-c" class="card">
-        <h3 style="color:#00d4ff !important;">1. DB 프로파일</h3>
+    <div class="card">
+        <h4 style="color:#00d4ff !important;">1. DB PROFILE</h4>
         <form action="/api/save" method="POST"><input type="hidden" name="action" value="save_conn"><input type="hidden" name="id" id="cid">
             <input type="text" name="alias" id="ca" class="form-control" placeholder="별칭" required>
             <select name="db_type" id="ct" class="form-select"><option value="mysql">MySQL</option><option value="mssql">MSSQL</option></select>
-            <input type="text" name="host" id="ch" class="form-control" placeholder="IP" required><input type="number" name="port" id="cp" class="form-control" placeholder="Port" value="3306">
+            <input type="text" name="host" id="ch" class="form-control" placeholder="IP" required><input type="number" name="port" id="cp" class="form-control" value="3306">
             <input type="text" name="user" id="cu" class="form-control" placeholder="ID" required><input type="password" name="pw" id="cw" class="form-control" placeholder="PW" required>
-            <button type="submit" class="btn btn-primary">저장/수정</button>
+            <button type="submit" class="btn btn-primary">SAVE</button>
         </form>
     </div>
-    <div id="form-d" class="card">
-        <h3 style="color:#ffaa00 !important;">2. DB 배치</h3>
+    <div class="card">
+        <h4 style="color:#ffaa00 !important;">2. DB BATCH</h4>
         <form action="/api/save" method="POST"><input type="hidden" name="action" value="save_db_task"><input type="hidden" name="id" id="did">
-            <input type="text" name="app_name" id="da" class="form-control" placeholder="앱 이름" required>
-            <select name="conn_id" id="dc" class="form-select" required><option value="">-- 프로파일 --</option>{% for c in conns %}<option value="{{ c.id }}">{{ c.alias }}</option>{% endfor %}</select>
-            <input type="text" name="content" id="dn" class="form-control" placeholder="내용">
-            <textarea name="description" id="ds" class="form-control" placeholder="설명" rows="2"></textarea>
-            <input type="text" name="db_name" id="dbn" class="form-control" placeholder="디비명" required><input type="text" name="proc_name" id="dpn" class="form-control" placeholder="프로시저" required>
-            <input type="number" name="interval" id="di" class="form-control" placeholder="주기(초)" required>
-            <button type="submit" class="btn btn-warning">저장/수정</button>
+            <input type="text" name="app_name" id="da" class="form-control" placeholder="App Name" required>
+            <select name="conn_id" id="dc" class="form-select" required><option value="">-- Profile --</option>{% for c in conns %}<option value="{{ c.id }}">{{ c.alias }}</option>{% endfor %}</select>
+            <input type="text" name="content" id="dcn" class="form-control" placeholder="Content">
+            <textarea name="description" id="dds" class="form-control" placeholder="Description" rows="2"></textarea>
+            <input type="text" name="db_name" id="dbn" class="form-control" placeholder="DB Name" required><input type="text" name="proc_name" id="dpn" class="form-control" placeholder="Procedure" required>
+            <input type="number" name="interval" id="di" class="form-control" placeholder="Sec" required><button type="submit" class="btn btn-warning">SAVE</button>
+        </form>
+    </div>
+    <div class="card">
+        <h4 style="color:#ffffff !important;">3. APP(CMD) BATCH</h4>
+        <form action="/api/save" method="POST"><input type="hidden" name="action" value="save_cmd_task"><input type="hidden" name="id" id="pid">
+            <input type="text" name="app_name" id="pa" class="form-control" placeholder="App Name" required>
+            <input type="text" name="content" id="pcn" class="form-control" placeholder="Content">
+            <textarea name="description" id="pds" class="form-control" placeholder="Description" rows="2"></textarea>
+            <textarea name="full_cmd" id="pcmd" class="form-control" placeholder="Execution Command" rows="3" required></textarea>
+            <input type="number" name="interval" id="pi" class="form-control" placeholder="Sec" required><button type="submit" class="btn btn-light" style="background:#fff !important; color:#000 !important;">SAVE</button>
         </form>
     </div>
 </div>
 <div class="main-content">
     <div class="card">
-        <h3 style="color:#00d4ff !important;">GRID MANAGEMENT (EDIT 클릭 시 로드)</h3>
+        <h3>GRID MANAGEMENT (Edit Click to Load)</h3>
         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
-            <div>
-                <h4>DB TASKS</h4>
-                {% for t in dbtasks %}<div class="card d-flex justify-content-between align-items-center" style="flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('dbtask', {{ t.id }})">EDIT</button><a href="/del/dbtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}
-            </div>
-            <div>
-                <h4>CMD TASKS</h4>
-                {% for t in cmdtasks %}<div class="card d-flex justify-content-between align-items-center" style="flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('cmdtask', {{ t.id }})">EDIT</button><a href="/del/cmdtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}
-            </div>
+            <div><h4>DB TASKS</h4>{% for t in dbtasks %}<div class="card" style="display:flex; justify-content:space-between; flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('dbtask', {{ t.id }})">EDIT</button><a href="/del/dbtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}</div>
+            <div><h4>APP TASKS</h4>{% for t in cmdtasks %}<div class="card" style="display:flex; justify-content:space-between; flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('cmdtask', {{ t.id }})">EDIT</button><a href="/del/cmdtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}</div>
         </div>
     </div>
 </div>
 <script>
     function edit(type, id) {
         fetch('/api/get/' + type + '/' + id).then(r=>r.json()).then(d => {
-            if(type === 'conn') {
-                document.getElementById('cid').value = d.id; document.getElementById('ca').value = d.alias;
-                document.getElementById('ct').value = d.db_type; document.getElementById('ch').value = d.host;
-                document.getElementById('cp').value = d.port; document.getElementById('cu').value = d.user;
-                document.getElementById('cw').value = d.pw;
-            } else if(type === 'dbtask') {
-                document.getElementById('did').value = d.id; document.getElementById('da').value = d.app_name;
-                document.getElementById('dc').value = d.conn_id; document.getElementById('dn').value = d.content;
-                document.getElementById('ds').value = d.description; document.getElementById('dbn').value = d.db_name;
-                document.getElementById('dpn').value = d.proc_name; document.getElementById('di').value = d.interval;
-            }
+            if(type === 'conn') { document.getElementById('cid').value = d.id; document.getElementById('ca').value = d.alias; document.getElementById('ct').value = d.db_type; document.getElementById('ch').value = d.host; document.getElementById('cp').value = d.port; document.getElementById('cu').value = d.user; document.getElementById('cw').value = d.pw; }
+            else if(type === 'dbtask') { document.getElementById('did').value = d.id; document.getElementById('da').value = d.app_name; document.getElementById('dc').value = d.conn_id; document.getElementById('dcn').value = d.content; document.getElementById('dds').value = d.description; document.getElementById('dbn').value = d.db_name; document.getElementById('dpn').value = d.proc_name; document.getElementById('di').value = d.interval; }
+            else if(type === 'cmdtask') { document.getElementById('pid').value = d.id; document.getElementById('pa').value = d.app_name; document.getElementById('pcn').value = d.content; document.getElementById('pds').value = d.description; document.getElementById('pcmd').value = d.full_cmd; document.getElementById('pi').value = d.interval; }
             window.scrollTo(0,0);
         });
     }
@@ -455,7 +411,7 @@ def create_files():
         path = os.path.join(base_dir, filename)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content.strip())
-    print(f"Project 'dbbatch1' v33 ARCHITECT EDITION Complete. Port 12828.")
+    print(f"Project 'dbbatch1' v34 ULTIMATE Ready. Port 12828.")
 
 if __name__ == "__main__":
     create_folders(); create_files()
