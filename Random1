@@ -1,28 +1,32 @@
 import os
 import json
-import base64
-import csv
-import io
-import threading
-import queue
-import time
-import subprocess
-from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify, redirect, url_for, Response
-from flask_sqlalchemy import SQLAlchemy
-from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import func
 
 base_dir = "dbbatch1"
 for sd in ["templates", "static", "reports"]:
     path = os.path.join(base_dir, sd)
     if not os.path.exists(path): os.makedirs(path)
 
+files = {
+    "app.py": """
+from flask import Flask, render_template, request, jsonify, redirect, url_for, Response
+from flask_sqlalchemy import SQLAlchemy
+from apscheduler.schedulers.background import BackgroundScheduler
+import queue, threading, time, pymysql, pymssql, subprocess, json, csv, io, base64
+from datetime import datetime, timedelta
+from sqlalchemy import func
+
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v35.db?check_same_thread=False'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dbbatch_v36.db?check_same_thread=False'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'kw_v35_ultimate_apm'
+app.config['SECRET_KEY'] = 'kw_v36_final_architecture'
 db = SQLAlchemy(app)
+
+# --- Template Filters ---
+@app.template_filter('from_json')
+def from_json_filter(value): return json.loads(value)
+
+@app.template_filter('to_b64')
+def to_b64_filter(value): return base64.b64encode(json.dumps(value).encode()).decode()
 
 # --- Models ---
 class DBConnection(db.Model):
@@ -30,7 +34,7 @@ class DBConnection(db.Model):
     alias = db.Column(db.String(50), unique=True)
     db_type = db.Column(db.String(20)); host = db.Column(db.String(100)); port = db.Column(db.Integer)
     user = db.Column(db.String(50)); pw = db.Column(db.String(50))
-    last_analysis = db.Column(db.DateTime)
+    tasks = db.relationship('DBTask', backref='conn_info', cascade="all, delete-orphan")
     def to_dict(self): return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 class DBTask(db.Model):
@@ -51,17 +55,19 @@ class TaskLog(db.Model):
     type = db.Column(db.String(10)); alias = db.Column(db.String(50)); status = db.Column(db.String(20))
     message = db.Column(db.Text); elapsed = db.Column(db.Float); created_at = db.Column(db.DateTime, default=datetime.now)
 
-class DBHealth(db.Model): # DB 부하/상태 저장
+class DBHealth(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     conn_alias = db.Column(db.String(50)); data_json = db.Column(db.Text); created_at = db.Column(db.DateTime, default=datetime.now)
 
 with app.app_context(): db.create_all()
 
-# --- Multi-Worker Engines (10+10 Threads) ---
+# --- Engines (20 Parallel Workers) ---
 q_db, q_cmd = queue.Queue(), queue.Queue()
-status_mon = {"db": [{"state": "IDLE", "alias": "-", "info": "-", "start": 0} for _ in range(10)],
-              "cmd": [{"state": "IDLE", "alias": "-", "info": "-", "start": 0} for _ in range(10)],
-              "q_count": {"db": 0, "cmd": 0}}
+status_mon = {
+    "db": [{"state": "IDLE", "alias": "-", "info": "-", "start": 0} for _ in range(10)],
+    "cmd": [{"state": "IDLE", "alias": "-", "info": "-", "start": 0} for _ in range(10)],
+    "q_count": {"db": 0, "cmd": 0}
+}
 
 def db_worker(wid):
     while True:
@@ -73,7 +79,7 @@ def db_worker(wid):
                 if t:
                     c = t.conn_info
                     status_mon['db'][wid].update({"state": "BUSY", "alias": t.app_name, "info": t.proc_name, "start": time.time()})
-                    st = time.time(); res, msg = "SUCCESS", "Completed"
+                    st_time = time.time(); res, msg = "SUCCESS", "Completed"
                     try:
                         if c.db_type == 'mysql':
                             conn = pymysql.connect(host=c.host, port=int(c.port), user=c.user, password=c.pw, database=t.db_name, autocommit=True, read_timeout=1800)
@@ -85,65 +91,85 @@ def db_worker(wid):
                     except Exception as e: res, msg = "FAIL", str(e)
                     finally: 
                         if conn: conn.close()
-                    db.session.add(TaskLog(type="DB", alias=t.app_name, status=res, message=msg, elapsed=round(time.time()-st, 2)))
+                    db.session.add(TaskLog(type="DB", alias=t.app_name, status=res, message=msg, elapsed=round(time.time()-st_time, 2)))
                     db.session.commit()
             except: pass
             status_mon['db'][wid].update({"state": "IDLE", "alias": "-", "info": "-", "start": 0})
             q_db.task_done()
 
-for i in range(10): threading.Thread(target=db_worker, args=(i,), daemon=True).start()
+def cmd_worker(wid):
+    while True:
+        item = q_cmd.get()
+        with app.app_context():
+            try:
+                t = db.session.get(CmdTask, item['id'])
+                if t:
+                    status_mon['cmd'][wid].update({"state": "BUSY", "alias": t.app_name, "info": "Running", "start": time.time()})
+                    st_time = time.time()
+                    try:
+                        subprocess.run(t.full_cmd, shell=True, check=True, timeout=1800, capture_output=True)
+                        res, msg = "SUCCESS", "Completed"
+                    except Exception as e: res, msg = "FAIL", str(e)
+                    db.session.add(TaskLog(type="CMD", alias=t.app_name, status=res, message=msg, elapsed=round(time.time()-st_time, 2)))
+                    db.session.commit()
+            except: pass
+            status_mon['cmd'][wid].update({"state": "IDLE", "alias": "-", "info": "-", "start": 0})
+            q_cmd.task_done()
 
-# --- Deep Scan Engine (DB Health Analysis) ---
-def analyze_db_health(conn_id):
-    with app.app_context():
-        c = db.session.get(DBConnection, conn_id)
-        if not c: return
-        health_info = {"heavy_tables": [], "slow_queries": []}
-        try:
-            if c.db_type == 'mysql':
-                conn = pymysql.connect(host=c.host, port=c.port, user=c.user, password=c.pw, connect_timeout=5)
-                with conn.cursor(pymysql.cursors.DictCursor) as cur:
-                    cur.execute("SELECT table_schema, table_name, data_length+index_length as size FROM information_schema.TABLES ORDER BY size DESC LIMIT 10")
-                    health_info['heavy_tables'] = cur.fetchall()
-                conn.close()
-            else: # MSSQL
-                conn = pymssql.connect(server=c.host, port=str(c.port), user=c.user, password=c.pw, login_timeout=5)
-                with conn.cursor(as_dict=True) as cur:
-                    cur.execute("SELECT TOP 10 t.name as table_name, SUM(a.total_pages) * 8 as size FROM sys.tables t JOIN sys.indexes i ON t.object_id = i.object_id JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id JOIN sys.allocation_units a ON p.partition_id = a.container_id GROUP BY t.name ORDER BY size DESC")
-                    health_info['heavy_tables'] = cur.fetchall()
-                conn.close()
-            db.session.add(DBHealth(conn_alias=c.alias, data_json=json.dumps(health_info)))
-            c.last_analysis = datetime.now()
-            db.session.commit()
-        except Exception as e: print(f"Analysis Failed: {e}")
+for i in range(10):
+    threading.Thread(target=db_worker, args=(i,), daemon=True).start()
+    threading.Thread(target=cmd_worker, args=(i,), daemon=True).start()
 
-# --- Report Engine ---
-def generate_weekly_report():
+# --- Analysis & Report Logic ---
+def analyze_all_dbs():
     with app.app_context():
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=7)
-        logs = TaskLog.query.filter(TaskLog.created_at >= start_date).all()
-        # HTML Report Template Construction
-        report_id = end_date.strftime('%Y%m%d_%H%M')
-        html = f"<html><head><style>body{{background:#000;color:#fff;font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #333;padding:10px;}} th{{background:#111;color:#00d4ff;}}</style></head><body>"
-        html += f"<h1>Architect Weekly Report ({report_id})</h1>"
-        html += f"<h3>1. Execution Stats</h3><table><tr><th>App</th><th>Success</th><th>Fail</th><th>Avg Sec</th></tr>"
-        # Logic to group and summarize... (simplified for script space)
-        html += "</table><p>Full Analysis generated at " + str(end_date) + "</p></body></html>"
-        
-        path = os.path.join(base_dir, "reports", f"report_{report_id}.html")
-        with open(path, "w", encoding="utf-8") as f: f.write(html)
+        for c in DBConnection.query.all():
+            health_info = {"heavy_tables": []}
+            try:
+                if c.db_type == 'mysql':
+                    conn = pymysql.connect(host=c.host, port=c.port, user=c.user, password=c.pw, connect_timeout=5)
+                    with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                        cur.execute("SELECT table_schema, table_name, (data_length+index_length)/1024 as size_kb FROM information_schema.TABLES ORDER BY size_kb DESC LIMIT 10")
+                        health_info['heavy_tables'] = cur.fetchall()
+                    conn.close()
+                else:
+                    conn = pymssql.connect(server=c.host, port=str(c.port), user=c.user, password=c.pw, login_timeout=5)
+                    with conn.cursor(as_dict=True) as cur:
+                        cur.execute("SELECT TOP 10 t.name as table_name, SUM(a.total_pages) * 8 as size_kb FROM sys.tables t JOIN sys.indexes i ON t.object_id = i.object_id JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id JOIN sys.allocation_units a ON p.partition_id = a.container_id GROUP BY t.name ORDER BY size_kb DESC")
+                        health_info['heavy_tables'] = cur.fetchall()
+                    conn.close()
+                db.session.add(DBHealth(conn_alias=c.alias, data_json=json.dumps(health_info)))
+                db.session.commit()
+            except: pass
+
+def generate_html_report():
+    with app.app_context():
+        end = datetime.now(); start = end - timedelta(days=7)
+        logs = TaskLog.query.filter(TaskLog.created_at >= start).all()
+        report_name = f"report_{end.strftime('%Y%m%d')}.html"
+        html = f"<html><head><style>body{{background:#000;color:#fff;font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;margin:20px 0;}} th,td{{border:1px solid #333;padding:12px;}} th{{background:#111;color:#00d4ff;}}</style></head><body><h1>Enterprise Batch Report ({end.strftime('%Y-%m-%d')})</h1>"
+        html += "<table><tr><th>App Name</th><th>Type</th><th>Status</th><th>Avg Sec</th><th>Count</th></tr>"
+        # Summary logic here...
+        html += "</table><p>Generated by Master Pro v36</p></body></html>"
+        with open(os.path.join("reports", report_name), "w", encoding="utf-8") as f: f.write(html)
 
 # --- Scheduler ---
 sch = BackgroundScheduler(); sch.start()
-def daily_jobs():
-    cleanup_limit = datetime.now() - timedelta(days=7)
-    TaskLog.query.filter(TaskLog.created_at < cleanup_limit).delete()
-    db.session.commit()
-    generate_weekly_report()
-    for c in DBConnection.query.all(): analyze_db_health(c.id)
+def daily_batch():
+    with app.app_context():
+        limit = datetime.now() - timedelta(days=7)
+        TaskLog.query.filter(TaskLog.created_at < limit).delete()
+        db.session.commit()
+    analyze_all_dbs()
+    generate_html_report()
 
-sch.add_job(daily_jobs, 'cron', hour=0, minute=0)
+sch.add_job(daily_batch, 'cron', hour=0, minute=0)
+
+def sync_jobs():
+    sch.remove_all_jobs(); sch.add_job(daily_batch, 'cron', hour=0, minute=0)
+    with app.app_context():
+        for x in DBTask.query.all(): sch.add_job(lambda x_id=x.id: q_db.put({'id':x_id}), 'interval', seconds=x.interval, id=f'db_{x.id}')
+        for x in CmdTask.query.all(): sch.add_job(lambda x_id=x.id: q_cmd.put({'id':x_id}), 'interval', seconds=x.interval, id=f'cmd_{x.id}')
 
 # --- Routes ---
 @app.route('/')
@@ -151,22 +177,19 @@ def index(): return render_template('dashboard.html')
 
 @app.route('/analysis')
 def analysis_view():
-    conns = DBConnection.query.all()
-    health = DBHealth.query.order_by(DBHealth.created_at.desc()).limit(10).all()
-    return render_template('analysis.html', conns=conns, health=health)
+    return render_template('analysis.html', health=DBHealth.query.order_by(DBHealth.created_at.desc()).limit(10).all())
 
 @app.route('/reports')
 def reports_list():
-    files = os.listdir(os.path.join(base_dir, "reports"))
+    files = os.listdir("reports")
     return render_template('reports.html', files=sorted(files, reverse=True))
 
-@app.route('/reports/view/<filename>')
-def report_view(filename):
-    with open(os.path.join(base_dir, "reports", filename), "r", encoding="utf-8") as f:
-        return f.read()
+@app.route('/reports/view/<f>')
+def report_view(f):
+    with open(os.path.join("reports", f), "r", encoding="utf-8") as file: return file.read()
 
 @app.route('/settings')
-def settings_page():
+def settings():
     return render_template('settings.html', conns=DBConnection.query.all(), dbtasks=DBTask.query.all(), cmdtasks=CmdTask.query.all())
 
 @app.route('/api/save', methods=['POST'])
@@ -177,27 +200,79 @@ def api_save():
             c = db.session.get(DBConnection, int(sid)) if sid else DBConnection()
             c.alias, c.db_type, c.host, c.port = request.form['alias'], request.form['db_type'], request.form['host'], int(request.form['port'])
             c.user, c.pw = request.form['user'], request.form['pw']
-            if not sid: db.session.add(c); db.session.commit(); threading.Thread(target=analyze_db_health, args=(c.id,)).start()
+            if not sid: db.session.add(c)
         elif act == 'save_db_task':
             t = db.session.get(DBTask, int(sid)) if sid else DBTask()
             t.conn_id, t.app_name, t.content, t.description = int(request.form['conn_id']), request.form['app_name'], request.form['content'], request.form['description']
             t.db_name, t.proc_name, t.interval = request.form['db_name'], request.form['proc_name'], int(request.form['interval'])
-            if not sid: db.session.add(t); db.session.commit(); q_db.put({'id': t.id})
-        db.session.commit()
+            if not sid: db.session.add(t)
+        elif act == 'save_cmd_task':
+            t = db.session.get(CmdTask, int(sid)) if sid else CmdTask()
+            t.app_name, t.content, t.description = request.form['app_name'], request.form['content'], request.form['description']
+            t.full_cmd, t.interval = request.form['full_cmd'], int(request.form['interval'])
+            if not sid: db.session.add(t)
+        db.session.commit(); sync_jobs()
     except Exception as e: return str(e), 500
-    return redirect(url_for('settings_page'))
+    return redirect(url_for('settings'))
+
+@app.route('/api/export')
+def export_txt():
+    si = io.StringIO(); cw = csv.writer(si)
+    cw.writerow(["[CONN]"]); cw.writerow(["alias", "db_type", "host", "port", "user", "pw"])
+    for x in DBConnection.query.all(): cw.writerow([x.alias, x.db_type, x.host, x.port, x.user, x.pw])
+    cw.writerow(["[DBTASK]"]); cw.writerow(["app_name", "content", "description", "db_name", "proc_name", "interval", "conn_alias"])
+    for x in DBTask.query.all(): cw.writerow([x.app_name, x.content, x.description, x.db_name, x.proc_name, x.interval, x.conn_info.alias])
+    cw.writerow(["[CMDTASK]"]); cw.writerow(["app_name", "content", "description", "full_cmd", "interval"])
+    for x in CmdTask.query.all(): cw.writerow([x.app_name, x.content, x.description, x.full_cmd, x.interval])
+    return Response(si.getvalue(), mimetype="text/plain", headers={"Content-disposition": "attachment; filename=architect_v36.txt"})
+
+@app.route('/api/import', methods=['POST'])
+def import_txt():
+    file = request.files['file']
+    lines = file.stream.read().decode("utf-8").splitlines(); mode = None
+    for row in csv.reader(lines):
+        if not row: continue
+        if row[0].startswith("["): mode = row[0]; continue
+        if row[0] in ["alias", "app_name"]: continue
+        if mode == "[CONN]":
+            if not DBConnection.query.filter_by(alias=row[0]).first():
+                db.session.add(DBConnection(alias=row[0], db_type=row[1], host=row[2], port=int(row[3]), user=row[4], pw=row[5]))
+        elif mode == "[DBTASK]":
+            c = DBConnection.query.filter_by(alias=row[6]).first()
+            if c: db.session.add(DBTask(app_name=row[0], content=row[1], description=row[2], db_name=row[3], proc_name=row[4], interval=int(row[5]), conn_id=c.id))
+        elif mode == "[CMDTASK]":
+            db.session.add(CmdTask(app_name=row[0], content=row[1], description=row[2], full_cmd=row[3], interval=int(row[4])))
+    db.session.commit(); sync_jobs(); return redirect(url_for('settings'))
 
 @app.route('/api/status')
 def api_status():
-    status_mon['q_count']['db'] = q_db.qsize()
+    status_mon['q_count']['db'], status_mon['q_count']['cmd'] = q_db.qsize(), q_cmd.qsize()
     return jsonify(status_mon)
 
 @app.route('/api/logs')
 def api_logs():
-    logs = TaskLog.query.order_by(TaskLog.created_at.desc()).limit(50).all()
+    logs = TaskLog.query.order_by(TaskLog.created_at.desc()).limit(100).all()
     return jsonify([{"alias": l.alias, "status": l.status, "msg": l.message[:60], "elapsed": l.elapsed, "at": l.created_at.strftime('%H:%M:%S')} for l in logs])
 
+@app.route('/api/get/<t>/<int:i>')
+def api_get(t, i):
+    item = None
+    if t == 'conn': item = db.session.get(DBConnection, i)
+    elif t == 'dbtask': item = db.session.get(DBTask, i)
+    elif t == 'cmdtask': item = db.session.get(CmdTask, i)
+    return jsonify(item.to_dict()) if item else jsonify({})
+
+@app.route('/del/<t>/<int:i>')
+def delete(t, i):
+    item = None
+    if t == 'conn': item = db.session.get(DBConnection, i)
+    elif t == 'dbtask': item = db.session.get(DBTask, i)
+    elif t == 'cmdtask': item = db.session.get(CmdTask, i)
+    if item: db.session.delete(item); db.session.commit(); sync_jobs()
+    return redirect(url_for('settings'))
+
 if __name__ == '__main__':
+    with app.app_context(): sync_jobs()
     app.run(port=12828, host='0.0.0.0', threaded=True)
 """,
     "templates/layout.html": """
@@ -205,28 +280,27 @@ if __name__ == '__main__':
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>MASTER ARCHITECT v35</title>
+    <title>MASTER ARCHITECT v36</title>
     <style>
         * { color: #FFFFFF !important; background-color: #000000 !important; border-color: #333 !important; box-sizing: border-box; }
-        body { margin: 0; font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        html, body { margin: 0; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
         .navbar { height: 70px; border-bottom: 3px solid #00d4ff !important; padding: 0 40px; display: flex; justify-content: space-between; align-items: center; }
         .nav-links a { text-decoration: none; margin-left: 30px; font-weight: 900; font-size: 1.2rem; }
-        .container { display: flex; flex: 1; overflow: hidden; }
-        .sidebar { width: 400px; border-right: 2px solid #333 !important; padding: 20px; overflow-y: auto; }
+        .container { display: flex; height: calc(100vh - 70px); }
+        .sidebar { width: 450px; border-right: 3px solid #333 !important; padding: 20px; overflow-y: auto; background: #080808 !important; }
         .main { flex: 1; padding: 20px; overflow-y: auto; }
-        .card { border: 2px solid #444 !important; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .form-control, .form-select { width: 100%; border: 2px solid #00d4ff !important; padding: 10px; margin-bottom: 10px; border-radius: 8px; }
-        .btn { width: 100%; padding: 12px; font-weight: 900; border-radius: 8px; cursor: pointer; border: none; margin-bottom: 5px; }
+        .card { border: 2px solid #444 !important; border-radius: 12px; padding: 15px; margin-bottom: 20px; background: #0a0a0a !important; }
+        .form-control, .form-select, textarea { width: 100%; border: 2.5px solid #00d4ff !important; padding: 10px; margin-bottom: 10px; border-radius: 8px; font-weight: bold; }
+        .btn { cursor: pointer; border-radius: 8px; padding: 12px; font-weight: 900; border: none; width: 100%; margin-bottom: 8px; font-size: 1rem; }
         .btn-primary { background: #0d47a1 !important; } .btn-warning { background: #ffaa00 !important; color: #000 !important; }
-        .timer { font-size: 2.5rem; font-weight: 900; color: #ffff00 !important; }
-        .worker-box { border: 1px solid #444 !important; padding: 5px; font-size: 0.7rem; text-align: center; }
+        .worker-box { border: 1px solid #444 !important; padding: 5px; text-align: center; font-size: 0.7rem; border-radius: 5px; }
         .busy { background: #500 !important; border-color: #f00 !important; } .idle { background: #030 !important; border-color: #0f0 !important; }
         table { width: 100%; border-collapse: collapse; } th, td { padding: 10px; border-bottom: 1px solid #222; text-align: left; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <div style="font-size:1.8rem; font-weight:900;">🚀 ARCHITECT MASTER <span style="color:#00d4ff">v35</span></div>
+        <div style="font-size:2rem; font-weight:900;">🚀 PRO MASTER <span style="color:#00d4ff">v36</span></div>
         <div class="nav-links"><a href="/">DASHBOARD</a><a href="/analysis">DB HEALTH</a><a href="/reports">REPORTS</a><a href="/settings">SETTINGS</a></div>
     </div>
     <div class="container">{% block content %}{% endblock %}</div>
@@ -237,14 +311,14 @@ if __name__ == '__main__':
 {% extends 'layout.html' %}
 {% block content %}
 <div class="sidebar">
-    <h4 style="color:#ffaa00 !important;">DB WORKERS (10 Threads)</h4>
+    <h4 style="color:#ffaa00 !important;">DB WORKERS (10)</h4>
     <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="db-workers"></div>
-    <h3 style="color:#00ff00 !important; margin-top:30px;">📑 LIVE STATUS</h3>
-    <div id="log-summary">가동 중...</div>
+    <h4 style="color:#cc33ff !important; margin-top:25px;">CMD WORKERS (10)</h4>
+    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:5px;" id="cmd-workers"></div>
 </div>
 <div class="main">
     <div class="card">
-        <h2 style="color:#00d4ff !important;">📊 REAL-TIME LOG HISTORY</h2>
+        <h3 style="color:#00ff00 !important;">📑 REAL-TIME HISTORY</h3>
         <table class="table">
             <thead><tr><th>TIME</th><th>APP</th><th>STATUS</th><th>MSG</th><th>SEC</th></tr></thead>
             <tbody id="log-list"></tbody>
@@ -255,10 +329,12 @@ if __name__ == '__main__':
     function update() {
         const now = Date.now() / 1000;
         fetch('/api/status').then(r=>r.json()).then(d=>{
-            document.getElementById('db-workers').innerHTML = d.db.map((w, i) => {
-                const el = w.state === 'BUSY' ? (now - w.start).toFixed(1) + 's' : 'IDLE';
-                return `<div class="worker-box ${w.state.toLowerCase()}">W${i}<br>${el}</div>`;
-            }).join('');
+            const dr = (id, data) => {
+                document.getElementById(id+'-workers').innerHTML = data.map((w, i) => {
+                    const el = w.state === 'BUSY' ? (now - w.start).toFixed(1) + 's' : 'IDLE';
+                    return `<div class="worker-box ${w.state.toLowerCase()}">W${i}<br>${el}</div>`;
+                }).join('');
+            }; dr('db', d.db); dr('cmd', d.cmd);
         });
         fetch('/api/logs').then(r=>r.json()).then(d=>{
             document.getElementById('log-list').innerHTML = d.map(l => `<tr><td>${l.at}</td><td><b>${l.alias}</b></td><td style="color:${l.status==='SUCCESS'?'#0f0':'#f00'} !important;">${l.status}</td><td>${l.msg}</td><td>${l.elapsed}s</td></tr>`).join('');
@@ -273,17 +349,16 @@ if __name__ == '__main__':
 {% block content %}
 <div class="main" style="width:100%;">
     <div class="card">
-        <h2 style="color:#00ff00 !important;">🔍 DB DEEP SCAN (부하 테이블/쿼리 분석)</h2>
-        <p style="color:#888 !important;">※ 24시간마다 계정 내 모든 DB를 전수조사하여 용량이 가장 큰 테이블 상위 10개를 추출합니다.</p>
+        <h2>🔍 DB DEEP SCAN (부하 테이블 분석)</h2>
         {% for h in health %}
         <div class="card" style="border-color:#555 !important;">
             <h3 style="color:#00d4ff !important;">Connection: {{ h.conn_alias }} ({{ h.created_at }})</h3>
             <table>
-                <thead><tr><th>Schema / Table</th><th>Size (KB)</th></tr></thead>
+                <thead><tr><th>Table Name</th><th>Size (KB)</th></tr></thead>
                 <tbody>
                 {% set data = h.data_json|from_json %}
                 {% for row in data.heavy_tables %}
-                    <tr><td>{{ row.table_schema or '' }} {{ row.table_name }}</td><td>{{ row.size }} KB</td></tr>
+                    <tr><td>{{ row.table_name }}</td><td>{{ row.size_kb|round(2) }} KB</td></tr>
                 {% endfor %}
                 </tbody>
             </table>
@@ -298,15 +373,13 @@ if __name__ == '__main__':
 {% block content %}
 <div class="main" style="width:100%;">
     <div class="card">
-        <h2 style="color:#ffff00 !important;">📂 WEEKLY ARCHITECT REPORTS</h2>
-        <div class="list-group">
-            {% for f in files %}
-            <div class="card d-flex justify-content-between align-items-center" style="flex-direction:row;">
-                <span>📄 {{ f }}</span>
-                <a href="/reports/view/{{ f }}" target="_blank" class="btn btn-warning" style="width:120px;">REPORT OPEN</a>
-            </div>
-            {% endfor %}
+        <h2>📂 WEEKLY ANALYTICS REPORTS</h2>
+        {% for f in files %}
+        <div class="card" style="display:flex; justify-content:space-between; flex-direction:row; align-items:center;">
+            <span>📄 {{ f }}</span>
+            <a href="/reports/view/{{ f }}" target="_blank" class="btn btn-warning" style="width:150px;">REPORT OPEN</a>
         </div>
+        {% endfor %}
     </div>
 </div>
 {% endblock %}
@@ -315,50 +388,61 @@ if __name__ == '__main__':
 {% extends 'layout.html' %}
 {% block content %}
 <div class="sidebar">
-    <div class="card">
-        <h3 style="color:#00d4ff !important;">1. DB PROFILE</h3>
-        <form action="/api/save" method="POST"><input type="hidden" name="action" value="save_conn">
-            <input type="text" name="alias" class="form-control" placeholder="별칭" required>
-            <select name="db_type" class="form-select"><option value="mysql">MySQL</option><option value="mssql">MSSQL</option></select>
-            <input type="text" name="host" class="form-control" placeholder="IP" required><input type="number" name="port" class="form-control" value="3306">
-            <input type="text" name="user" class="form-control" placeholder="ID" required><input type="password" name="pw" class="form-control" placeholder="PW" required>
-            <button type="submit" class="btn btn-primary">SAVE</button>
-        </form>
+    <div class="card"><h3 style="color:#00d4ff !important;">📦 SYNC</h3>
+        <a href="/api/export" class="btn btn-info">Export (.txt)</a>
+        <form action="/api/import" method="POST" enctype="multipart/form-data"><input type="file" name="file" required><button type="submit" class="btn btn-primary mt-1">Import</button></form>
+    </div>
+    <div class="card"><h4>1. DB CONNECTION</h4>
+        <form action="/api/save" method="POST" id="fc"><input type="hidden" name="action" value="save_conn"><input type="hidden" name="id" id="cid">
+        <input type="text" name="alias" id="ca" class="form-control" placeholder="별칭" required>
+        <select name="db_type" id="ct" class="form-select"><option value="mysql">MySQL</option><option value="mssql">MSSQL</option></select>
+        <input type="text" name="host" id="ch" class="form-control" placeholder="IP" required><input type="number" name="port" id="cp" class="form-control" value="3306">
+        <input type="text" name="user" id="cu" class="form-control" placeholder="ID" required><input type="password" name="pw" id="cw" class="form-control" placeholder="PW" required>
+        <button type="submit" class="btn btn-primary">SAVE</button></form>
+    </div>
+    <div class="card"><h4>2. DB BATCH</h4>
+        <form action="/api/save" method="POST" id="fd"><input type="hidden" name="action" value="save_db_task"><input type="hidden" name="id" id="did">
+        <input type="text" name="app_name" id="da" class="form-control" placeholder="App Name" required>
+        <select name="conn_id" id="dc" class="form-select" required>{% for c in conns %}<option value="{{ c.id }}">{{ c.alias }}</option>{% endfor %}</select>
+        <input type="text" name="db_name" id="dbn" class="form-control" placeholder="DB" required><input type="text" name="proc_name" id="dpn" class="form-control" placeholder="Proc" required><input type="number" name="interval" id="di" class="form-control" placeholder="Sec" required>
+        <input type="hidden" name="content" id="dcn"><input type="hidden" name="description" id="dds">
+        <button type="submit" class="btn btn-warning">SAVE</button></form>
+    </div>
+    <div class="card"><h4>3. CMD BATCH</h4>
+        <form action="/api/save" method="POST" id="fp"><input type="hidden" name="action" value="save_cmd_task"><input type="hidden" name="id" id="pid">
+        <input type="text" name="app_name" id="pa" class="form-control" placeholder="App Name" required>
+        <textarea name="full_cmd" id="px" class="form-control" placeholder="Command" rows="3" required></textarea>
+        <input type="number" name="interval" id="pi" class="form-control" placeholder="Sec" required>
+        <input type="hidden" name="content" id="pcn"><input type="hidden" name="description" id="pds">
+        <button type="submit" class="btn btn-light" style="background:#fff !important; color:#000 !important;">SAVE</button></form>
     </div>
 </div>
 <div class="main">
-    <div class="card">
-        <h3>DB TASK MANAGEMENT</h3>
-        <form action="/api/save" method="POST"><input type="hidden" name="action" value="save_db_task">
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-                <input type="text" name="app_name" class="form-control" placeholder="App Name" required>
-                <select name="conn_id" class="form-select" required>{% for c in conns %}<option value="{{ c.id }}">{{ c.alias }}</option>{% endfor %}</select>
-            </div>
-            <textarea name="description" class="form-control" placeholder="Description" rows="2"></textarea>
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px;">
-                <input type="text" name="db_name" class="form-control" placeholder="DB" required><input type="text" name="proc_name" class="form-control" placeholder="Proc" required><input type="number" name="interval" class="form-control" placeholder="Sec" required>
-            </div>
-            <button type="submit" class="btn btn-warning">REGISTER</button>
-        </form>
-        <table class="table mt-3">
-            <thead><tr><th>APP</th><th>PROC</th><th>SEC</th><th>ACTION</th></tr></thead>
-            <tbody>
-                {% for t in dbtasks %}<tr><td>{{ t.app_name }}</td><td>{{ t.proc_name }}</td><td>{{ t.interval }}s</td><td><a href="/del/dbtask/{{ t.id }}" style="color:red !important;">DEL</a></td></tr>{% endfor %}
-            </tbody>
-        </table>
+    <div class="card"><h3>GRID LIST</h3>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
+            <div><h4>DB TASKS</h4>{% for t in dbtasks %}<div class="card" style="display:flex; justify-content:space-between; flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('dbtask', {{ t.id }})">EDIT</button><a href="/del/dbtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}</div>
+            <div><h4>CMD TASKS</h4>{% for t in cmdtasks %}<div class="card" style="display:flex; justify-content:space-between; flex-direction:row;"><span><b>{{ t.app_name }}</b></span><div><button class="btn btn-info btn-sm" style="width:60px;" onclick="edit('cmdtask', {{ t.id }})">EDIT</button><a href="/del/cmdtask/{{ t.id }}" class="btn btn-danger btn-sm" style="width:60px; text-decoration:none;">DEL</a></div></div>{% endfor %}</div>
+        </div>
     </div>
 </div>
+<script>
+    function edit(t, i) {
+        fetch('/api/get/' + t + '/' + i).then(r=>r.json()).then(d => {
+            if(t === 'conn') { document.getElementById('cid').value = d.id; document.getElementById('ca').value = d.alias; document.getElementById('ct').value = d.db_type; document.getElementById('ch').value = d.host; document.getElementById('cp').value = d.port; document.getElementById('cu').value = d.user; document.getElementById('cw').value = d.pw; }
+            else if(t === 'dbtask') { document.getElementById('did').value = d.id; document.getElementById('da').value = d.app_name; document.getElementById('dc').value = d.conn_id; document.getElementById('dbn').value = d.db_name; document.getElementById('dpn').value = d.proc_name; document.getElementById('di').value = d.interval; }
+            else if(t === 'cmdtask') { document.getElementById('pid').value = d.id; document.getElementById('pa').value = d.app_name; document.getElementById('px').value = d.full_cmd; document.getElementById('pi').value = d.interval; }
+            window.scrollTo(0,0);
+        });
+    }
+</script>
 {% endblock %}
 """
 }
-
-# Add helper for JSON filter
-files["app.py"] = files["app.py"].replace("app = Flask(__name__)", "app = Flask(__name__)\\n@app.template_filter('from_json')\\ndef from_json(value):\\n    return json.loads(value)")
 
 def create_files():
     for filename, content in files.items():
         path = os.path.join(base_dir, filename)
         with open(path, "w", encoding="utf-8") as f: f.write(content.strip())
-    print(f"Project v35 Architect Edition Ready. Port 12828.")
+    print(f"Project v36 Ultimate Edition Ready. Port 12828.")
 
-if __name__ == "__main__": create_folders(); create_files()
+if __name__ == "__main__": create_files()
