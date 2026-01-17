@@ -1,1 +1,128 @@
+import os
+import json
+import subprocess
+import shutil
+from flask import Flask, render_template_string, jsonify
 
+app = Flask(__name__)
+
+# --- 설정부 ---
+VIEWER_PORT = 30000
+LOG_RETAIN_DAYS = 1  # 로그 보관 일수
+EXCLUDE_FILES = ['master_manager.py'] # 등록에서 제외할 파일
+
+def get_pm2_path():
+    pm2_bin = shutil.which('pm2')
+    return pm2_bin if pm2_bin else "pm2"
+
+PM2_EXEC = get_pm2_path()
+
+def setup_environment():
+    print("[*] 환경 설정 중...")
+    # 1. pm2-logrotate 설치 및 설정
+    subprocess.run([PM2_EXEC, 'install', 'pm2-logrotate'], check=False)
+    subprocess.run([PM2_EXEC, 'set', 'pm2-logrotate:retain', str(LOG_RETAIN_DAYS)], check=False)
+    subprocess.run([PM2_EXEC, 'set', 'pm2-logrotate:max_size', '10M'], check=False)
+    
+    # 2. 현재 폴더의 모든 .py 파일을 PM2에 등록
+    files = [f for f in os.listdir('.') if f.endswith('.py') and f not in EXCLUDE_FILES]
+    print(f"[*] 총 {len(files)}개의 앱 탐색됨. PM2 등록 시작...")
+    
+    for f in files:
+        app_name = f.replace('.py', '')
+        # 자동 재시작, 지수 백오프(에러 시 대기시간 증가), 로그 경로 설정 포함
+        cmd = [
+            PM2_EXEC, 'start', f,
+            '--name', app_name,
+            '--interpreter', 'python3',
+            '--restart-delay', '3000',
+            '--exp-backoff-restart-delay', '100',
+            '--max-memory-restart', '300M',
+            '--merge-logs'
+        ]
+        subprocess.run(cmd)
+    
+    print("[*] 모든 프로세스 등록 완료.")
+
+# --- Flask Dashboard Logic (이전 개선 버전 통합) ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>MASTER DASHBOARD</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #050505; color: #d1d5db; }
+        .log-area { background-color: #000; font-family: 'Fira Code', monospace; border: 1px solid #262626; }
+        .active-app { border-left: 4px solid #0ea5e9; background-color: #171717; }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+    <nav class="h-14 border-b border-neutral-800 flex items-center px-6 bg-black justify-between">
+        <h1 class="text-white font-bold text-lg">PM2 AUTO-MANAGER <span class="text-blue-500">30000</span></h1>
+        <div id="stat" class="text-xs text-neutral-500">Checking...</div>
+    </nav>
+    <div class="flex flex-1 overflow-hidden">
+        <aside class="w-64 border-r border-neutral-800 overflow-y-auto bg-black" id="app-list"></aside>
+        <main class="flex-1 flex flex-col p-4 bg-[#0a0a0a]">
+            <div id="log-header" class="mb-2 font-bold text-sky-400">프로세스를 선택하세요</div>
+            <div id="log-window" class="log-area flex-1 p-4 overflow-y-auto text-sm whitespace-pre-wrap"></div>
+        </main>
+    </div>
+    <script>
+        let selectedApp = "";
+        async function loadApps() {
+            const r = await fetch('/api/apps');
+            const apps = await r.json();
+            const list = document.getElementById('app-list');
+            list.innerHTML = apps.map(app => `
+                <div onclick="selectApp('${app.name}')" class="p-3 cursor-pointer border-b border-neutral-900 \${selectedApp === app.name ? 'active-app' : ''}">
+                    <div class="flex justify-between text-xs">
+                        <span class="font-bold">\${app.name}</span>
+                        <span class="\${app.status === 'online' ? 'text-green-500' : 'text-red-500'}">●</span>
+                    </div>
+                </div>
+            `).join('');
+            document.getElementById('stat').innerText = apps.length + " Apps Running";
+        }
+        function selectApp(name) { selectedApp = name; document.getElementById('log-header').innerText = "> " + name; fetchLogs(); }
+        async function fetchLogs() {
+            if(!selectedApp) return;
+            const r = await fetch('/api/logs/' + selectedApp);
+            const data = await r.json();
+            const win = document.getElementById('log-window');
+            win.innerText = data.logs;
+            win.scrollTop = win.scrollHeight;
+        }
+        setInterval(loadApps, 5000);
+        setInterval(fetchLogs, 3000);
+        loadApps();
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index(): return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/apps')
+def get_apps():
+    res = subprocess.run([PM2_EXEC, 'jlist'], capture_output=True, text=True)
+    data = json.loads(res.stdout)
+    return jsonify([{"name": a['name'], "status": a['pm2_env']['status']} for a in data])
+
+@app.route('/api/logs/<app_name>')
+def get_logs(app_name):
+    res = subprocess.run([PM2_EXEC, 'jlist'], capture_output=True, text=True)
+    target = next((a for a in json.loads(res.stdout) if a['name'] == app_name), None)
+    if not target: return jsonify({"logs": "Not Found"})
+    log_path = target['pm2_env'].get('pm_out_log_path')
+    if os.path.exists(log_path):
+        tail = subprocess.run(['tail', '-n', '100', log_path], capture_output=True, text=True)
+        return jsonify({"logs": tail.stdout})
+    return jsonify({"logs": "Log file empty"})
+
+if __name__ == '__main__':
+    setup_environment()
+    app.run(host='0.0.0.0', port=VIEWER_PORT)
