@@ -1,1 +1,296 @@
+import os
 
+# ==============================================================================
+# [1] 서버 애플리케이션 코드 (app.py)
+# ==============================================================================
+server_code = r'''
+import os
+import sys
+import pymssql
+from flask import Flask, render_template, request, jsonify, Response
+
+# ------------------------------------------------------------------------------
+# [설정] DB 및 서버 포트
+# ------------------------------------------------------------------------------
+class Config:
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = ''
+    DB_PASSWORD = ''
+    DB_NAME = 'SMD_DB'
+    WEB_PORT = 12233
+
+# ------------------------------------------------------------------------------
+# [DB 매니저]
+# ------------------------------------------------------------------------------
+class DBManager:
+    @staticmethod
+    def get_conn():
+        try:
+            return pymssql.connect(server=Config.DB_HOST, port=Config.DB_PORT, 
+                                   user=Config.DB_USER, password=Config.DB_PASSWORD, 
+                                   database=Config.DB_NAME, charset='utf8')
+        except Exception as e:
+            print(f"[DB Error] {e}")
+            return None
+
+    @staticmethod
+    def execute(query, args=(), fetch=False):
+        conn = DBManager.get_conn()
+        if not conn: return None
+        try:
+            with conn.cursor(as_dict=True) as cursor:
+                cursor.execute(query, args)
+                if fetch: return cursor.fetchall()
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"[Query Error] {e}")
+            return None
+        finally:
+            conn.close()
+
+# ------------------------------------------------------------------------------
+# [모델 & 서비스]
+# ------------------------------------------------------------------------------
+class ProjectService:
+    @staticmethod
+    def save(subject, pc_type, content):
+        # 프로젝트 메타 저장
+        check = DBManager.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
+        if check:
+            DBManager.execute("UPDATE TB_CLINE_PROJECTS SET ContentText=%s, PCType=%s WHERE Subject=%s", (content, pc_type, subject))
+        else:
+            DBManager.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, ContentText) VALUES (%s, %s, %s)", (subject, pc_type, content))
+        
+        # 명령어 큐 재설정 (기존 미완료 삭제 후 재생성)
+        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0", (subject,))
+        cmds = [line.strip() for line in content.split('\n') if line.strip()]
+        for cmd in cmds:
+            DBManager.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subject, cmd))
+
+    @staticmethod
+    def get_script(host_url, subject, pc_type):
+        # 클라이언트용 파이썬 스크립트 텍스트 생성
+        # 주의: 이 문자열은 클라이언트에게 전송될 소스코드임
+        return f"""
+import os, sys, requests, time
+
+SERVER = "{host_url}"
+SUBJECT = "{subject}"
+PC_TYPE = "{pc_type}"
+
+def log(m): print(f"[BRIDGE] {{m}}")
+
+def req(ep, data=None):
+    try:
+        url = f"{{SERVER}}{{ep}}"
+        if data: r = requests.post(url, json=data, timeout=5)
+        else: r = requests.get(url, timeout=5)
+        return r.json() if r.status_code == 200 else None
+    except: return None
+
+def main():
+    if not os.path.exists(SUBJECT): os.makedirs(SUBJECT)
+    cwd = os.path.join(os.getcwd(), SUBJECT)
+    
+    # Handshake
+    req('/api/handshake', {{'subject': SUBJECT, 'path': cwd}})
+    log(f"Ready. Type 'go' to fetch commands for {{SUBJECT}}")
+
+    while True:
+        try:
+            cmd_in = input(f"({{SUBJECT}}) > ").strip()
+            if cmd_in.lower() in ['go', 'do', '고']:
+                res = req('/api/next', {{'subject': SUBJECT}})
+                if res and res.get('status') == 'ok':
+                    print("\\n" + "="*40)
+                    print(res['command'])
+                    print("="*40 + "\\n >> Run above command.\\n")
+                elif res and res.get('status') == 'done':
+                    log("All tasks completed.")
+                else:
+                    log("No commands or server error.")
+            elif cmd_in in ['exit', 'quit']: break
+        except KeyboardInterrupt: break
+
+if __name__ == '__main__': main()
+"""
+
+# ------------------------------------------------------------------------------
+# [웹 컨트롤러]
+# ------------------------------------------------------------------------------
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/list')
+def api_list():
+    rows = DBManager.execute("SELECT Subject, PCType, IsActive FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch=True)
+    return jsonify(rows if rows else [])
+
+@app.route('/api/save', methods=['POST'])
+def api_save():
+    d = request.json
+    ProjectService.save(d['subject'], d['pc_type'], d['content'])
+    return jsonify({'msg': 'Saved'})
+
+@app.route('/api/delete', methods=['POST'])
+def api_delete():
+    subj = request.json['subject']
+    DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subj,))
+    DBManager.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subj,))
+    return jsonify({'msg': 'Deleted'})
+
+@app.route('/get_script/<subject>')
+def get_script_route(subject):
+    host = request.host_url.rstrip('/')
+    row = DBManager.execute("SELECT PCType FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
+    pc_type = row[0]['PCType'] if row else 'Default'
+    code = ProjectService.get_script(host, subject, pc_type)
+    return Response(code, mimetype='text/plain')
+
+# --- Client API ---
+@app.route('/api/handshake', methods=['POST'])
+def client_handshake():
+    d = request.json
+    DBManager.execute("UPDATE TB_CLINE_PROJECTS SET LocalPath=%s WHERE Subject=%s", (d['path'], d['subject']))
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/next', methods=['POST'])
+def client_next():
+    subj = request.json['subject']
+    # 이전 작업 완료 처리
+    DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subj,))
+    # 다음 작업 조회
+    row = DBManager.execute("SELECT TOP 1 LogID, CommandText FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subj,), fetch=True)
+    
+    if row:
+        cmd_id, cmd_text = row[0]['LogID'], row[0]['CommandText']
+        DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (cmd_id,))
+        return jsonify({'status': 'ok', 'command': cmd_text})
+    else:
+        return jsonify({'status': 'done'})
+
+if __name__ == '__main__':
+    print(f"Starting Server on {Config.WEB_PORT}...")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT)
+'''
+
+# ==============================================================================
+# [2] HTML 템플릿 코드 (templates/index.html)
+# ==============================================================================
+html_code = r'''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Cline Bridge</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #eee; }
+        .wrap { display: flex; gap: 20px; }
+        .box { background: white; padding: 20px; border-radius: 8px; flex: 1; }
+        input, textarea, select { width: 100%; margin-bottom: 10px; padding: 8px; box-sizing: border-box;}
+        button { padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }
+        .script-view { background: #333; color: #fff; padding: 15px; margin-top: 20px; display: none; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h2>Cline Bridge Manager</h2>
+    <div class="wrap">
+        <div class="box">
+            <h3>등록 / 수정</h3>
+            <input id="subj" placeholder="주제 (ID)">
+            <select id="pc"><option>Windows</option><option>Ubuntu</option><option>RPi</option></select>
+            <textarea id="cont" rows="10" placeholder="명령어 입력 (줄바꿈 구분)"></textarea>
+            <button onclick="save()">저장</button>
+        </div>
+        <div class="box" style="flex: 2;">
+            <h3>목록</h3>
+            <table><tbody id="list"></tbody></table>
+            <div id="codeParams" class="script-view"></div>
+        </div>
+    </div>
+    <script>
+        async function load() {
+            const res = await fetch('/api/list');
+            const data = await res.json();
+            document.getElementById('list').innerHTML = data.map(r => `
+                <tr>
+                    <td>${r.PCType}</td><td>${r.Subject}</td>
+                    <td><button onclick="view('${r.Subject}')">스크립트 보기</button> 
+                        <button onclick="del('${r.Subject}')" style="background:red">삭제</button></td>
+                </tr>`).join('');
+        }
+        async function save() {
+            await fetch('/api/save', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({subject:document.getElementById('subj').value, pc_type:document.getElementById('pc').value, content:document.getElementById('cont').value})
+            });
+            load();
+        }
+        async function del(s) {
+            if(confirm('삭제?')) { await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subject:s})}); load(); }
+        }
+        function view(s) {
+            const cmd = `curl -s "http://${location.host}/get_script/${s}" | python3`;
+            const div = document.getElementById('codeParams');
+            div.style.display = 'block';
+            div.innerText = cmd;
+            window.getSelection().selectAllChildren(div);
+        }
+        load();
+    </script>
+</body>
+</html>
+'''
+
+# ==============================================================================
+# [3] 패키지 의존성 파일 (requirements.txt)
+# ==============================================================================
+req_code = """
+flask
+pymssql
+requests
+"""
+
+# ==============================================================================
+# [4] 파일 생성 로직
+# ==============================================================================
+def create_system():
+    base_dir = "ClineBridge_System"
+    templates_dir = os.path.join(base_dir, "templates")
+
+    # 1. 폴더 생성
+    if not os.path.exists(templates_dir):
+        os.makedirs(templates_dir)
+        print(f"[OK] 폴더 생성: {templates_dir}")
+
+    # 2. app.py 생성
+    with open(os.path.join(base_dir, "app.py"), "w", encoding="utf-8") as f:
+        f.write(server_code.strip())
+    print(f"[OK] 파일 생성: app.py")
+
+    # 3. index.html 생성
+    with open(os.path.join(templates_dir, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html_code.strip())
+    print(f"[OK] 파일 생성: templates/index.html")
+
+    # 4. requirements.txt 생성
+    with open(os.path.join(base_dir, "requirements.txt"), "w", encoding="utf-8") as f:
+        f.write(req_code.strip())
+    print(f"[OK] 파일 생성: requirements.txt")
+
+    print("\n" + "="*50)
+    print(" [설치 완료] 다음 단계를 수행하세요:")
+    print(f" 1. cd {base_dir}")
+    print(" 2. pip install -r requirements.txt")
+    print(" 3. python app.py")
+    print("="*50)
+
+if __name__ == "__main__":
+    create_system()
