@@ -1,165 +1,537 @@
+데이터베이스 스크립트 (MSSQL)
+기존 테이블을 보완하여 스크립트 템플릿 테이블과 명령어 관리를 강화했습니다.
+
+SQL
+
+-- 1. 프로젝트 마스터 (PC 정보 및 상태)
+CREATE TABLE TB_CLINE_PROJECTS (
+    ProjectID INT IDENTITY(1,1) PRIMARY KEY,
+    Subject NVARCHAR(200) NOT NULL UNIQUE,
+    PCType NVARCHAR(50), 
+    LocalPath NVARCHAR(500),
+    CreatedAt DATETIME DEFAULT GETDATE()
+);
+
+-- 2. 명령어 큐 (개별 명령 관리, 상태 관리)
+CREATE TABLE TB_CLINE_COMMANDS (
+    LogID INT IDENTITY(1,1) PRIMARY KEY,
+    Subject NVARCHAR(200) NOT NULL, -- FK to TB_CLINE_PROJECTS.Subject
+    CommandText NVARCHAR(MAX),
+    Status INT DEFAULT 0, -- 0:대기, 1:진행중, 2:완료
+    ResultLog NVARCHAR(MAX),
+    CreatedAt DATETIME DEFAULT GETDATE(),
+    CompletedAt DATETIME
+);
+CREATE INDEX IDX_CLINE_CMD_SUBJ ON TB_CLINE_COMMANDS(Subject, Status);
+
+-- 3. [NEW] 클라이언트 스크립트 템플릿 관리 (웹에서 수정 가능)
+CREATE TABLE TB_CLINE_TEMPLATES (
+    TemplateID INT IDENTITY(1,1) PRIMARY KEY,
+    TemplateName NVARCHAR(50) UNIQUE,
+    ScriptContent NVARCHAR(MAX), -- 파이썬 클라이언트 코드 원본
+    LastUpdated DATETIME DEFAULT GETDATE()
+);
+
+-- 기본 템플릿 데이터 삽입 (초기값)
+INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Default', 
+'import os, sys, requests, time
+
+# [SERVER_INJECTED_CONFIG]
+
+def main():
+    if not os.path.exists(SUBJECT): os.makedirs(SUBJECT)
+    # ... (Web에서 수정 가능한 영역) ...
+    print(f"[{PC_TYPE}] Client Started for {SUBJECT}")
+    # ...
+');
+3. 시스템 생성기 (One-Shot Generator)
+이 파이썬 코드를 실행하면 완벽한 구조의 폴더와 파일들이 생성됩니다.
+
+파일명: setup_enterprise.py
+
+Python
+
 import os
-import json
-import subprocess
-from flask import Flask, render_template_string, jsonify
 
-app = Flask(__name__)
+# ==============================================================================
+# [A] 설정 파일 (config/config.py)
+# ==============================================================================
+config_py = """
+import os
 
-# --- UI (Tailwind CSS Dark Mode) ---
-HTML_TEMPLATE = """
+class Config:
+    # 데이터베이스 설정
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = ''
+    DB_PASSWORD = ''
+    DB_NAME = 'SMD_DB'
+    
+    # 웹 서버 설정
+    WEB_PORT = 12233
+    SECRET_KEY = os.urandom(24)
+    
+    # 보안 설정 (접근 허용 IP)
+    ALLOWED_IPS = ['10.244.120.24', '10.244.8.3', '127.0.0.1'] 
+    # 주의: 127.0.0.1은 로컬 테스트용으로 포함했습니다. 필요 없으면 삭제하십시오.
+"""
+
+# ==============================================================================
+# [B] 데이터 접근 계층 (app/dao.py)
+# ==============================================================================
+dao_py = """
+import pymssql
+from config.config import Config
+
+class DBManager:
+    @staticmethod
+    def get_connection():
+        return pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT, 
+            user=Config.DB_USER, password=Config.DB_PASSWORD, 
+            database=Config.DB_NAME, charset='utf8'
+        )
+
+    @staticmethod
+    def execute_query(query, args=(), fetch_one=False, fetch_all=False):
+        conn = DBManager.get_connection()
+        result = None
+        try:
+            with conn.cursor(as_dict=True) as cursor:
+                cursor.execute(query, args)
+                if fetch_one:
+                    result = cursor.fetchone()
+                elif fetch_all:
+                    result = cursor.fetchall()
+                else:
+                    conn.commit()
+                    result = True
+        except Exception as e:
+            print(f"[DB Error] {str(e)}")
+            raise e
+        finally:
+            conn.close()
+        return result
+
+class ProjectDAO:
+    def get_all(self):
+        return DBManager.execute_query("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch_all=True)
+    
+    def upsert(self, subject, pc_type):
+        chk = DBManager.execute_query("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch_one=True)
+        if chk:
+            DBManager.execute_query("UPDATE TB_CLINE_PROJECTS SET PCType=%s WHERE Subject=%s", (pc_type, subject))
+        else:
+            DBManager.execute_query("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType) VALUES (%s, %s)", (subject, pc_type))
+
+    def delete(self, subject):
+        DBManager.execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subject,))
+        DBManager.execute_query("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,))
+        
+    def update_path(self, subject, path):
+        DBManager.execute_query("UPDATE TB_CLINE_PROJECTS SET LocalPath=%s WHERE Subject=%s", (path, subject))
+
+class CommandDAO:
+    def get_by_subject(self, subject):
+        return DBManager.execute_query("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (subject,), fetch_all=True)
+
+    def add(self, subject, cmd):
+        DBManager.execute_query("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subject, cmd))
+
+    def update_status(self, log_id, status):
+        sql = "UPDATE TB_CLINE_COMMANDS SET Status=%s" + (", CompletedAt=GETDATE()" if status==2 else "") + " WHERE LogID=%s"
+        DBManager.execute_query(sql, (status, log_id))
+
+    def delete(self, log_id):
+        DBManager.execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (log_id,))
+
+    def get_next_pending(self, subject):
+        return DBManager.execute_query("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subject,), fetch_one=True)
+
+    def complete_running(self, subject):
+        DBManager.execute_query("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subject,))
+
+class TemplateDAO:
+    def get_template(self):
+        row = DBManager.execute_query("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch_one=True)
+        # DB에 없으면 기본값 반환
+        if not row:
+            return None
+        return row['ScriptContent']
+
+    def save_template(self, content):
+        # 단일 템플릿 관리라고 가정 (Upsert logic)
+        cnt = DBManager.execute_query("SELECT COUNT(*) as C FROM TB_CLINE_TEMPLATES", fetch_one=True)['C']
+        if cnt > 0:
+            DBManager.execute_query("UPDATE TB_CLINE_TEMPLATES SET ScriptContent=%s, LastUpdated=GETDATE()", (content,))
+        else:
+            DBManager.execute_query("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Default', %s)", (content,))
+"""
+
+# ==============================================================================
+# [C] 뷰/컨트롤러 계층 (app/routes.py)
+# ==============================================================================
+routes_py = """
+from flask import Blueprint, render_template, request, jsonify, Response, abort
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+from config.config import Config
+
+bp = Blueprint('main', __name__)
+project_dao = ProjectDAO()
+command_dao = CommandDAO()
+template_dao = TemplateDAO()
+
+# --- Middleware: IP Restriction ---
+@bp.before_request
+def check_ip():
+    # request.remote_addr가 프록시 환경이면 X-Forwarded-For를 써야할 수도 있음
+    client_ip = request.remote_addr
+    if client_ip not in Config.ALLOWED_IPS:
+        abort(403, description=f"Access Denied for IP: {client_ip}")
+
+# --- UI Views ---
+@bp.route('/')
+def dashboard():
+    projects = project_dao.get_all()
+    return render_template('dashboard.html', projects=projects)
+
+@bp.route('/project/<subject>')
+def project_detail(subject):
+    # 해당 프로젝트의 명령어 목록 관리 페이지
+    cmds = command_dao.get_by_subject(subject)
+    return render_template('detail.html', subject=subject, commands=cmds)
+
+@bp.route('/settings')
+def settings():
+    # 클라이언트 스크립트 템플릿 수정 페이지
+    current_script = template_dao.get_template()
+    if not current_script:
+        # Default Fallback
+        current_script = \"\"\"import os, sys, requests, time
+# [SERVER_INJECTED_CONFIG]
+
+def main():
+    if not os.path.exists(SUBJECT): os.makedirs(SUBJECT)
+    print(f"[{PC_TYPE}] Project: {SUBJECT} Started.")
+    # Add your logic here...
+\"\"\"
+    return render_template('settings.html', script=current_script)
+
+# --- API Endpoints (AJAX) ---
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    data = request.json
+    project_dao.upsert(data['subject'], data['pc_type'])
+    return jsonify({'msg': 'Project Created'})
+
+@bp.route('/api/project/<subject>', methods=['DELETE'])
+def delete_project(subject):
+    project_dao.delete(subject)
+    return jsonify({'msg': 'Deleted'})
+
+@bp.route('/api/command', methods=['POST'])
+def add_command():
+    data = request.json
+    command_dao.add(data['subject'], data['command'])
+    return jsonify({'msg': 'Command Added'})
+
+@bp.route('/api/command/<int:log_id>', methods=['DELETE'])
+def delete_command(log_id):
+    command_dao.delete(log_id)
+    return jsonify({'msg': 'Command Deleted'})
+
+@bp.route('/api/template', methods=['POST'])
+def save_template():
+    content = request.json['content']
+    template_dao.save_template(content)
+    return jsonify({'msg': 'Template Updated'})
+
+# --- Client Script Serving ---
+@bp.route('/get_script/<subject>')
+def get_client_script(subject):
+    # 1. Get Template from DB
+    tpl = template_dao.get_template()
+    if not tpl: tpl = "print('No Template Found')"
+    
+    # 2. Inject Configuration (Dynamic)
+    host_url = request.host_url.rstrip('/')
+    # DB에서 PC Type 조회
+    # (여기선 간략화를 위해 DAO get_all 등에서 필터링하거나 별도 메서드 필요하지만, 생략하고 Param으로 가정)
+    # 실제로는 ProjectDAO에 get_one 구현하여 pc_type 가져와야 함.
+    # 안전하게 Default 처리
+    header = f'SERVER_URL = "{host_url}"\\nSUBJECT = "{subject}"\\nPC_TYPE = "Unknown"\\n'
+    
+    full_script = tpl.replace('# [SERVER_INJECTED_CONFIG]', header)
+    
+    return Response(full_script, mimetype='text/plain')
+
+# --- Client Machine Interaction API ---
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json.get('subject')
+    command_dao.complete_running(subj) # Finish previous
+    row = command_dao.get_next_pending(subj)
+    if row:
+        command_dao.update_status(row['LogID'], 1) # Mark Running
+        return jsonify({'status': 'ok', 'command': row['CommandText']})
+    return jsonify({'status': 'done'})
+"""
+
+# ==============================================================================
+# [D] 템플릿 파일들 (app/templates/*.html)
+# ==============================================================================
+dashboard_html = """
+{% extends "base.html" %}
+{% block content %}
+<h2>Project Dashboard</h2>
+<div class="card">
+    <h3>새 프로젝트 생성</h3>
+    <input type="text" id="new_subj" placeholder="주제 (Subject ID)">
+    <select id="new_pc"><option>WinServer</option><option>Ubuntu_AI</option><option>RPi_Edge</option></select>
+    <button onclick="createProject()">생성</button>
+</div>
+<br>
+<table class="w-100">
+    <thead><tr><th>Type</th><th>Subject</th><th>Local Path</th><th>Action</th></tr></thead>
+    <tbody>
+    {% for p in projects %}
+    <tr>
+        <td>{{ p.PCType }}</td>
+        <td><a href="/project/{{ p.Subject }}" style="font-weight:bold; color:#007bff;">{{ p.Subject }}</a></td>
+        <td>{{ p.LocalPath }}</td>
+        <td>
+            <button onclick="deleteProject('{{ p.Subject }}')" class="btn-danger">삭제</button>
+        </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+<script>
+async function createProject() {
+    await fetch('/api/project', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+            subject: document.getElementById('new_subj').value,
+            pc_type: document.getElementById('new_pc').value
+        })
+    });
+    location.reload();
+}
+async function deleteProject(subj) {
+    if(confirm('프로젝트와 모든 명령이 삭제됩니다.')) {
+        await fetch('/api/project/'+subj, {method:'DELETE'});
+        location.reload();
+    }
+}
+</script>
+{% endblock %}
+"""
+
+detail_html = """
+{% extends "base.html" %}
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center;">
+    <h2>Project: <span style="color:#007bff">{{ subject }}</span></h2>
+    <a href="/" class="btn">뒤로가기</a>
+</div>
+
+<div class="card">
+    <h3>연동 스크립트 (Client Script)</h3>
+    <p>아래 명령어를 복사하여 타겟 PC 터미널에 붙여넣으세요.</p>
+    <div style="background:#333; color:#fff; padding:15px; border-radius:5px; font-family:monospace;">
+        curl -s "{{ request.host_url }}get_script/{{ subject }}" | python3
+    </div>
+</div>
+
+<div class="card">
+    <h3>명령어 관리 (Queue)</h3>
+    <div style="display:flex; gap:10px;">
+        <input type="text" id="cmd_input" placeholder="새로 수행할 명령 입력 (예: python run_process.py)" style="flex:1;">
+        <button onclick="addCmd()">추가</button>
+    </div>
+    <br>
+    <table class="w-100">
+        <thead><tr><th>ID</th><th>Status</th><th>Command</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for c in commands %}
+        <tr class="{{ 'row-done' if c.Status == 2 else 'row-pending' }}">
+            <td>{{ c.LogID }}</td>
+            <td>
+                {% if c.Status == 0 %}<span class="badge badge-warn">대기</span>{% endif %}
+                {% if c.Status == 1 %}<span class="badge badge-info">실행중</span>{% endif %}
+                {% if c.Status == 2 %}<span class="badge badge-success">완료</span>{% endif %}
+            </td>
+            <td>{{ c.CommandText }}</td>
+            <td>
+                {% if c.Status == 0 %}
+                <button onclick="delCmd({{ c.LogID }})" class="btn-danger btn-sm">삭제</button>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<script>
+async function addCmd() {
+    const txt = document.getElementById('cmd_input').value;
+    if(!txt) return;
+    await fetch('/api/command', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({subject: '{{ subject }}', command: txt})
+    });
+    location.reload();
+}
+async function delCmd(id) {
+    await fetch('/api/command/'+id, {method:'DELETE'});
+    location.reload();
+}
+</script>
+{% endblock %}
+"""
+
+settings_html = """
+{% extends "base.html" %}
+{% block content %}
+<h2>클라이언트 스크립트 템플릿 수정</h2>
+<p>모든 프로젝트에 공통으로 적용되는 파이썬 클라이언트 코드의 원본(Base Template)입니다.<br>
+<code># [SERVER_INJECTED_CONFIG]</code> 부분은 서버가 자동으로 채워넣으므로 지우지 마세요.</p>
+
+<textarea id="editor" style="width:100%; height:500px; background:#282c34; color:#abb2bf; font-family:monospace; padding:15px;">{{ script }}</textarea>
+<br><br>
+<button onclick="saveTemplate()" style="width:100%; padding:15px; font-size:1.2em;">템플릿 저장 (Apply to All)</button>
+
+<script>
+async function saveTemplate() {
+    await fetch('/api/template', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({content: document.getElementById('editor').value})
+    });
+    alert('저장되었습니다.');
+}
+</script>
+{% endblock %}
+"""
+
+base_html = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>PM2 Log Console</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Enterprise Cline Bridge</title>
     <style>
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
-        body { background-color: #020617; color: #f8fafc; font-family: 'Pretendard', sans-serif; }
-        .log-area { 
-            background-color: #000000; 
-            border: 1px solid #1e293b; 
-            font-family: 'Fira Code', 'Courier New', monospace; 
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-        .status-online { color: #4ade80; }
-        .status-offline { color: #f87171; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .nav { background: #343a40; padding: 15px; border-radius: 8px; margin-bottom: 20px; display:flex; gap:20px; }
+        .nav a { color: white; text-decoration: none; font-weight: bold; }
+        .card { background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+        input, select { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #c82333; }
+        .w-100 { width: 100%; }
+        .badge { padding: 5px 10px; border-radius: 12px; font-size: 0.8em; color: white; }
+        .badge-warn { background: #ffc107; color: #333; }
+        .badge-info { background: #17a2b8; }
+        .badge-success { background: #28a745; }
+        .row-done { background: #f8f9fa; color: #aaa; }
     </style>
 </head>
-<body class="h-screen flex flex-col p-6">
-    <div class="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
-        <h1 class="text-2xl font-bold tracking-tighter text-sky-400">SERVER DASHBOARD <span class="text-slate-500 font-light">| PM2 Logs</span></h1>
-        <div class="text-sm text-slate-400">Port: <span class="text-orange-400">30000</span></div>
-    </div>
-
-    <div class="grid grid-cols-12 gap-6 flex-1 overflow-hidden">
-        <div class="col-span-3 bg-slate-900/50 rounded-xl p-4 border border-slate-800 overflow-y-auto">
-            <h2 class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-4">Processes</h2>
-            <div id="app-list" class="space-y-2"></div>
+<body>
+    <div class="container">
+        <div class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/settings">Script Settings</a>
         </div>
-
-        <div class="col-span-9 flex flex-col">
-            <div class="flex items-center justify-between mb-2">
-                <h3 id="current-app" class="text-lg font-medium text-sky-300 italic underline decoration-sky-500/30">Select an application...</h3>
-                <div class="flex gap-2">
-                    <button onclick="fetchLogs()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded transition">Refresh</button>
-                    <button onclick="autoRefreshToggle()" id="auto-btn" class="text-xs bg-slate-800 px-3 py-1.5 rounded transition text-slate-400">Auto: OFF</button>
-                </div>
-            </div>
-            <div id="log-window" class="log-area flex-1 p-5 rounded-xl text-sm leading-relaxed overflow-y-auto">Select a process from the left to view real-time logs...</div>
-        </div>
+        {% block content %}{% endblock %}
     </div>
-
-    <script>
-        let selectedApp = "";
-        let autoRefresh = false;
-        let refreshInterval;
-
-        async function loadApps() {
-            try {
-                const res = await fetch('/api/apps');
-                const apps = await res.json();
-                const listDiv = document.getElementById('app-list');
-                listDiv.innerHTML = apps.map(app => `
-                    <div onclick="selectApp('${app.name}')" class="group cursor-pointer p-3 rounded-lg border border-transparent hover:border-slate-700 hover:bg-slate-800/50 transition">
-                        <div class="flex justify-between items-center">
-                            <span class="font-medium text-slate-200 group-hover:text-white underline-offset-4">${app.name}</span>
-                            <span class="text-[10px] ${app.status === 'online' ? 'status-online' : 'status-offline'}">● ${app.status.toUpperCase()}</span>
-                        </div>
-                    </div>
-                `).join('');
-            } catch (e) { console.error("Apps load error", e); }
-        }
-
-        function selectApp(name) {
-            selectedApp = name;
-            document.getElementById('current-app').innerText = "> " + name;
-            fetchLogs();
-        }
-
-        async function fetchLogs() {
-            if (!selectedApp) return;
-            try {
-                const res = await fetch(\`/api/logs/\${selectedApp}\`);
-                const data = await res.json();
-                const logWindow = document.getElementById('log-window');
-                
-                // Colorize common terms
-                let logContent = data.logs
-                    .replace(/ERROR/g, '<span class="text-red-500 font-bold">ERROR</span>')
-                    .replace(/INFO/g, '<span class="text-blue-400">INFO</span>')
-                    .replace(/SUCCESS/g, '<span class="text-green-400">SUCCESS</span>')
-                    .replace(/WARNING/g, '<span class="text-yellow-400">WARNING</span>');
-
-                logWindow.innerHTML = logContent || "No logs found in the file.";
-                logWindow.scrollTop = logWindow.scrollHeight;
-            } catch (e) { console.error("Logs fetch error", e); }
-        }
-
-        function autoRefreshToggle() {
-            autoRefresh = !autoRefresh;
-            const btn = document.getElementById('auto-btn');
-            if (autoRefresh) {
-                btn.innerText = "Auto: ON";
-                btn.classList.add('text-sky-400', 'bg-sky-900/20');
-                refreshInterval = setInterval(fetchLogs, 3000);
-            } else {
-                btn.innerText = "Auto: OFF";
-                btn.classList.remove('text-sky-400', 'bg-sky-900/20');
-                clearInterval(refreshInterval);
-            }
-        }
-
-        setInterval(loadApps, 10000);
-        loadApps();
-    </script>
 </body>
 </html>
 """
 
-# --- Backend Logic ---
+# ==============================================================================
+# [E] 애플리케이션 팩토리 (app/__init__.py)
+# ==============================================================================
+app_init_py = """
+from flask import Flask
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+def create_app():
+    app = Flask(__name__)
+    
+    # Register Blueprints
+    from app.routes import bp
+    app.register_blueprint(bp)
+    
+    return app
+"""
 
-@app.route('/api/apps')
-def get_apps():
-    try:
-        # pm2 jlist 명령어로 JSON 데이터 획득
-        result = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True)
-        data = json.loads(result.stdout)
-        apps = [{"name": app['name'], "status": app['pm2_env']['status']} for app in data]
-        return jsonify(apps)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# ==============================================================================
+# [F] 실행 파일 (run.py)
+# ==============================================================================
+run_py = """
+from app import create_app
+from config.config import Config
 
-@app.route('/api/logs/<app_name>')
-def get_logs(app_name):
-    try:
-        # 1. 해당 앱의 로그 파일 경로 찾기
-        result = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True)
-        data = json.loads(result.stdout)
-        
-        target_app = next((app for app in data if app['name'] == app_name), None)
-        if not target_app:
-            return jsonify({"logs": "Application not found."})
-
-        log_path = target_app['pm2_env'].get('pm_out_log_path')
-        
-        # 2. 로그 파일 읽기 (마지막 100줄)
-        if log_path and os.path.exists(log_path):
-            # tail 명령어를 사용하는 것이 가장 효율적
-            tail_res = subprocess.run(['tail', '-n', '100', log_path], capture_output=True, text=True)
-            return jsonify({"logs": tail_res.stdout})
-        else:
-            return jsonify({"logs": f"Log file not found at: {log_path}"})
-
-    except Exception as e:
-        return jsonify({"logs": f"Error reading logs: {str(e)}"}), 500
+app = create_app()
 
 if __name__ == '__main__':
-    # 외부 접속 허용 및 포트 30000 설정
-    app.run(host='0.0.0.0', port=30000)
+    print(f"==================================================")
+    print(f" Enterprise Cline Bridge Started")
+    print(f" Port: {Config.WEB_PORT}")
+    print(f" Allowed IPs: {Config.ALLOWED_IPS}")
+    print(f"==================================================")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT, debug=True)
+"""
+
+# ==============================================================================
+# [G] 설치 및 생성 로직
+# ==============================================================================
+def create_structure():
+    dirs = ['config', 'app', 'app/templates']
+    for d in dirs:
+        if not os.path.exists(d):
+            os.makedirs(d)
+            print(f"[Create Dir] {d}")
+
+    files = {
+        'config/config.py': config_py,
+        'app/__init__.py': app_init_py,
+        'app/dao.py': dao_py,
+        'app/routes.py': routes_py,
+        'app/templates/base.html': base_html,
+        'app/templates/dashboard.html': dashboard_html,
+        'app/templates/detail.html': detail_html,
+        'app/templates/settings.html': settings_html,
+        'run.py': run_py,
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
+
+    for path, content in files.items():
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content.strip())
+        print(f"[Create File] {path}")
+
+    print("\n[설치 완료] 1. DB쿼리 실행 -> 2. pip install -r requirements.txt -> 3. python run.py")
+
+if __name__ == '__main__':
+    create_structure()
+설치 및 실행 가이드
+DB 쿼리 실행: 맨 위에 있는 SQL 쿼리를 MSSQL에서 실행하여 테이블을 생성/갱신하십시오. (TB_CLINE_TEMPLATES가 핵심입니다.)
+
+구조 생성: 위 파이썬 코드(setup_enterprise.py)를 실행하면 config, app 등 체계적인 폴더 구조가 잡힙니다.
+
+실행: python run.py로 서버를 켭니다.
+
+접근 제어: 이제 10.244.120.24, 10.244.8.3 (그리고 로컬호스트) 외의 IP에서 접근하면 403 Forbidden 에러가 발생합니다.
+
+기능 확인:
+
+대시보드: 프로젝트 목록이 나옵니다.
+
+상세화면(Detail): 프로젝트를 클릭하면 명령어를 하나씩 추가/삭제할 수 있는 큐 관리 화면이 나옵니다. (내일 할 일 미리 등록 가능)
+
+스크립트 설정(Script Settings): 상단 메뉴를 통해 Python Client Scr
