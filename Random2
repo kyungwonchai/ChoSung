@@ -1,4 +1,406 @@
-# 1. CPU 성능 모드 설정
-    run("sudo apt update && sudo apt install -y cpufrequtils")
-    run("echo 'GOVERNOR=\"performance\"' | sudo tee /etc/default/cpufrequtils")
-    run("sudo systemctl restart cpufrequtils")
+변경 사항:
+
+포트 변경: Flask 서버 포트를 12233으로 설정했습니다.
+
+디자인 패턴: DBManager(데이터 접근), Service(비즈니스 로직), Controller(라우팅)로 관심사를 분리하여 유지보수성을 높였습니다.
+
+에러 수정: 클라이언트 스크립트에서 서버 응답(Response) 처리 시 None 체크와 JSON 파싱 예외 처리를 강화하여 if 문 에러(AttributeError/KeyError 등)를 방지했습니다.
+
+수정된 파이썬 통합 스크립트 (cline_bridge_v2.py)
+Python
+
+import os
+import sys
+import json
+import pymssql
+from flask import Flask, render_template_string, request, jsonify, Response
+from datetime import datetime
+
+# ==========================================
+# [Configuration] 설정
+# ==========================================
+class Config:
+    # MSSQL DB 설정
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = ''         # 요청대로 비워둠
+    DB_PASSWORD = ''     # 요청대로 비워둠
+    DB_NAME = 'SMD_DB'   # 실제 DB명으로 수정 필요
+    
+    # Flask 웹서버 설정
+    WEB_PORT = 12233     # 요청하신 포트
+
+# ==========================================
+# [Model / Repository] 데이터 접근 계층
+# ==========================================
+class DBManager:
+    """데이터베이스 연결 및 쿼리 실행을 담당하는 싱글톤 성격의 클래스"""
+    
+    @staticmethod
+    def get_connection():
+        try:
+            return pymssql.connect(
+                server=Config.DB_HOST,
+                port=Config.DB_PORT,
+                user=Config.DB_USER,
+                password=Config.DB_PASSWORD,
+                database=Config.DB_NAME,
+                charset='utf8'
+            )
+        except Exception as e:
+            print(f"[DB Error] Connection failed: {e}")
+            return None
+
+    @staticmethod
+    def execute(query, args=(), fetch=False):
+        conn = DBManager.get_connection()
+        if not conn: return None
+        result = None
+        try:
+            with conn.cursor(as_dict=True) as cursor:
+                cursor.execute(query, args)
+                if fetch:
+                    result = cursor.fetchall()
+                else:
+                    conn.commit()
+                    result = True
+        except Exception as e:
+            print(f"[Query Error] {e}")
+        finally:
+            conn.close()
+        return result
+
+class ProjectRepository:
+    """프로젝트(주제) 관련 DB 조작"""
+    @staticmethod
+    def upsert_project(subject, pc_type, content):
+        # 존재 여부 확인
+        check = DBManager.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
+        if check:
+            return DBManager.execute("UPDATE TB_CLINE_PROJECTS SET ContentText=%s, PCType=%s WHERE Subject=%s", (content, pc_type, subject))
+        else:
+            return DBManager.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, ContentText) VALUES (%s, %s, %s)", (subject, pc_type, content))
+
+    @staticmethod
+    def get_all():
+        return DBManager.execute("SELECT Subject, PCType, IsActive FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch=True)
+
+    @staticmethod
+    def get_by_subject(subject):
+        res = DBManager.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
+        return res[0] if res else None
+
+    @staticmethod
+    def update_path(subject, path):
+        return DBManager.execute("UPDATE TB_CLINE_PROJECTS SET LocalPath=%s WHERE Subject=%s", (path, subject))
+
+    @staticmethod
+    def delete(subject):
+        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subject,))
+        return DBManager.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,))
+
+class CommandRepository:
+    """명령어 큐 관리"""
+    @staticmethod
+    def reset_queue(subject, commands):
+        # 기존 대기열 삭제 후 재생성
+        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0", (subject,))
+        for cmd in commands:
+            DBManager.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subject, cmd))
+
+    @staticmethod
+    def complete_current(subject):
+        # Status 1(진행중) -> 2(완료)
+        return DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subject,))
+
+    @staticmethod
+    def fetch_next(subject):
+        return DBManager.execute("SELECT TOP 1 LogID, CommandText FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subject,), fetch=True)
+
+    @staticmethod
+    def mark_processing(log_id):
+        return DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (log_id,))
+
+# ==========================================
+# [View] HTML 템플릿
+# ==========================================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Cline Bridge (Port 12233)</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; padding: 20px; background: #f4f4f9; color: #333; }
+        .container { display: flex; gap: 20px; max-width: 1400px; margin: 0 auto; }
+        .box { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .left { flex: 1; }
+        .right { flex: 2; }
+        input, textarea, select { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }
+        button { background: #007bff; color: white; border: none; padding: 12px 20px; cursor: pointer; border-radius: 6px; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
+        .code-block { background: #282c34; color: #abb2bf; padding: 20px; border-radius: 6px; margin-top: 20px; white-space: pre-wrap; display: none; font-family: 'Consolas', monospace; }
+        .copy-btn { background: #28a745; margin-top: 10px; width: 100%; }
+    </style>
+</head>
+<body>
+    <h1>Cline Bridge Manager</h1>
+    <div class="container">
+        <div class="box left">
+            <h3>프로젝트 등록</h3>
+            <input type="text" id="subject" placeholder="주제 (Project ID)">
+            <select id="pc_type">
+                <option value="Win_Server">Windows Server</option>
+                <option value="Ubuntu_AI">Ubuntu Desktop (AI)</option>
+                <option value="RPi_Edge">Raspberry Pi</option>
+            </select>
+            <textarea id="content" rows="15" placeholder="실행할 명령을 줄바꿈으로 구분하여 입력"></textarea>
+            <button onclick="saveProject()">저장 (Save)</button>
+        </div>
+        <div class="box right">
+            <h3>프로젝트 목록</h3>
+            <table id="list"><thead><tr><th>Type</th><th>Subject</th><th>Status</th><th>Action</th></tr></thead><tbody id="tbody"></tbody></table>
+            
+            <div id="script-area" class="code-block"></div>
+            <button id="copy-btn" class="copy-btn" style="display:none" onclick="copyCode()">전체 복사</button>
+        </div>
+    </div>
+    <script>
+        const API = {
+            list: () => fetch('/api/projects').then(r=>r.json()),
+            save: (data) => fetch('/api/projects', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}),
+            del: (subj) => fetch('/api/projects/'+subj, {method:'DELETE'})
+        };
+
+        async function refresh() {
+            const data = await API.list();
+            const tbody = document.getElementById('tbody');
+            tbody.innerHTML = data.map(r => `
+                <tr>
+                    <td>${r.PCType}</td>
+                    <td>${r.Subject}</td>
+                    <td>${r.IsActive ? 'Active' : 'Done'}</td>
+                    <td>
+                        <button onclick="showScript('${r.Subject}')">스크립트 보기</button>
+                        <button onclick="delProject('${r.Subject}')" style="background:#dc3545">삭제</button>
+                    </td>
+                </tr>`).join('');
+        }
+
+        async function saveProject() {
+            await API.save({
+                subject: document.getElementById('subject').value,
+                pc_type: document.getElementById('pc_type').value,
+                content: document.getElementById('content').value
+            });
+            alert('저장되었습니다.');
+            refresh();
+        }
+
+        async function delProject(subj) {
+            if(confirm('삭제하시겠습니까?')) { await API.del(subj); refresh(); }
+        }
+
+        function showScript(subject) {
+            const host = window.location.host; 
+            const cmd = `curl -s "http://${host}/script/${subject}" | python3`;
+            const area = document.getElementById('script-area');
+            area.innerText = cmd;
+            area.style.display = 'block';
+            document.getElementById('copy-btn').style.display = 'block';
+            
+            // 자동 선택
+            const range = document.createRange();
+            range.selectNode(area);
+            window.getSelection().removeAllRanges();
+            window.getSelection().addRange(range);
+        }
+
+        function copyCode() {
+            navigator.clipboard.writeText(document.getElementById('script-area').innerText);
+            alert('복사되었습니다. 터미널에 붙여넣으세요.');
+        }
+        
+        refresh();
+    </script>
+</body>
+</html>
+"""
+
+# ==========================================
+# [Service] 클라이언트 코드 생성기 (Factory)
+# ==========================================
+class ClientScriptBuilder:
+    @staticmethod
+    def build(host_url, subject, pc_type):
+        """
+        클라이언트 측에서 실행될 파이썬 코드를 문자열로 생성합니다.
+        370줄 부근 에러 방지를 위해 if 문 로직에 None 체크와 예외처리를 강화했습니다.
+        """
+        return f"""
+import os
+import sys
+import requests
+import json
+import time
+
+# --- [Client Configuration] ---
+SERVER_URL = "{host_url}"
+SUBJECT = "{subject}"
+PC_TYPE = "{pc_type}"
+
+def log(msg):
+    print(f"[CLINE-BRIDGE] {{msg}}")
+
+def safe_request(endpoint, payload=None):
+    try:
+        url = f"{{SERVER_URL}}{{endpoint}}"
+        if payload:
+            r = requests.post(url, json=payload, timeout=5)
+        else:
+            r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log(f"Server communication failed: {{e}}")
+        return None
+
+def init():
+    log(f"Initializing Project: {{SUBJECT}} (Rule: {{PC_TYPE}})")
+    if not os.path.exists(SUBJECT):
+        os.makedirs(SUBJECT)
+        log(f"Folder created: {{SUBJECT}}")
+    
+    cwd = os.path.join(os.getcwd(), SUBJECT)
+    safe_request('/api/client/handshake', {{'subject': SUBJECT, 'path': cwd}})
+    log("Ready. Type 'go', 'do', '고' to fetch tasks.")
+
+def get_next():
+    # 여기서 if문 에러가 발생하지 않도록 데이터 검증을 수행합니다.
+    resp = safe_request('/api/client/next', {{'subject': SUBJECT}})
+    
+    if resp is None:
+        return None
+        
+    status = resp.get('status')
+    
+    if status == 'ok':
+        return resp.get('command')
+    elif status == 'done':
+        log("All tasks completed.")
+        return None
+    else:
+        # status가 없거나 다른 값일 경우 안전하게 처리
+        msg = resp.get('msg', 'Unknown server response')
+        log(f"Info: {{msg}}")
+        return None
+
+def run():
+    init()
+    while True:
+        try:
+            i = input(f"\\n({{SUBJECT}}) > ").strip()
+            if i.lower() in ['go', 'do', '고']:
+                cmd = get_next()
+                # [Error Fix] cmd가 유효한 문자열인지 확인 후 출력
+                if cmd and isinstance(cmd, str) and len(cmd) > 0:
+                    print("\\n" + "="*40)
+                    print(f"{{cmd}}")
+                    print("="*40 + "\\n")
+                    print(">> 위 명령을 수행하세요. 완료 후 다시 'go' 입력.")
+            elif i.lower() in ['exit', 'quit']:
+                break
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log(f"Critical Error in loop: {{e}}")
+
+if __name__ == "__main__":
+    run()
+"""
+
+# ==========================================
+# [Controller] Flask App & Routes
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+# --- API: Project Management ---
+@app.route('/api/projects', methods=['GET'])
+def list_projects():
+    data = ProjectRepository.get_all()
+    return jsonify(data if data else [])
+
+@app.route('/api/projects', methods=['POST'])
+def save_project():
+    data = request.json
+    subj, pc, cont = data['subject'], data['pc_type'], data['content']
+    
+    # 1. 프로젝트 정보 저장
+    ProjectRepository.upsert_project(subj, pc, cont)
+    
+    # 2. 명령 큐 생성 (Reset & Insert)
+    cmds = [c.strip() for c in cont.split('\n') if c.strip()]
+    CommandRepository.reset_queue(subj, cmds)
+    
+    return jsonify({'msg': 'Saved'})
+
+@app.route('/api/projects/<subject>', methods=['DELETE'])
+def delete_project(subject):
+    ProjectRepository.delete(subject)
+    return jsonify({'msg': 'Deleted'})
+
+# --- API: Client Interaction ---
+@app.route('/script/<subject>')
+def download_script(subject):
+    host_url = request.host_url.rstrip('/')
+    proj = ProjectRepository.get_by_subject(subject)
+    pc_type = proj['PCType'] if proj else 'Default'
+    
+    # Builder를 통해 스크립트 생성
+    code = ClientScriptBuilder.build(host_url, subject, pc_type)
+    return Response(code, mimetype='text/plain')
+
+@app.route('/api/client/handshake', methods=['POST'])
+def client_handshake():
+    data = request.json
+    ProjectRepository.update_path(data['subject'], data['path'])
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json['subject']
+    
+    # 1. 이전 작업 완료 처리
+    CommandRepository.complete_current(subj)
+    
+    # 2. 다음 작업 가져오기
+    rows = CommandRepository.fetch_next(subj)
+    
+    if rows:
+        cmd_id = rows[0]['LogID']
+        raw_cmd = rows[0]['CommandText']
+        
+        # 룰 적용 로직 (Service Layer)
+        proj = ProjectRepository.get_by_subject(subj)
+        pc_type = proj['PCType'] if proj else ''
+        full_cmd = f"[{pc_type}] {raw_cmd}" # 예시: 단순 Prefix 부착
+        
+        # 상태 업데이트 (진행중)
+        CommandRepository.mark_processing(cmd_id)
+        
+        return jsonify({'status': 'ok', 'command': full_cmd})
+    else:
+        return jsonify({'status': 'done', 'msg': 'No more commands'})
+
+# ==========================================
+# [Main] 서버 실행
+# ==========================================
+if __name__ == '__main__':
+    print(f"Starting Cline Bridge Server on Port {Config.WEB_PORT}...")
+    app.run(host='0.0.0.0', port=Config
