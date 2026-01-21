@@ -1,451 +1,375 @@
-데이터베이스 스크립트 (MSSQL)
-기존 테이블을 보완하여 스크립트 템플릿 테이블과 명령어 관리를 강화했습니다.
+데이터베이스 스크립트 (최종 수정)
+가상환경(VenvPath) 컬럼을 추가하고, 로더와 워커를 분리하여 관리할 수 있도록 수정했습니다.
 
 SQL
 
--- 1. 프로젝트 마스터 (PC 정보 및 상태)
+-- [1] 프로젝트 (PC별 설정 관리)
+-- VenvPath: 이 프로젝트가 실행될 로컬 PC의 가상환경 파이썬 경로 (예: /home/user/venv/bin/python)
 CREATE TABLE TB_CLINE_PROJECTS (
     ProjectID INT IDENTITY(1,1) PRIMARY KEY,
-    Subject NVARCHAR(200) NOT NULL UNIQUE,
-    PCType NVARCHAR(50), 
+    Subject NVARCHAR(200) NOT NULL UNIQUE, -- 프로젝트 고유 ID
+    PCType NVARCHAR(50),
+    VenvPath NVARCHAR(500), -- [핵심] 웹에서 미리 세팅하는 가상환경 경로
     LocalPath NVARCHAR(500),
     CreatedAt DATETIME DEFAULT GETDATE()
 );
 
--- 2. 명령어 큐 (개별 명령 관리, 상태 관리)
+-- [2] 명령어 큐
 CREATE TABLE TB_CLINE_COMMANDS (
     LogID INT IDENTITY(1,1) PRIMARY KEY,
-    Subject NVARCHAR(200) NOT NULL, -- FK to TB_CLINE_PROJECTS.Subject
+    Subject NVARCHAR(200),
     CommandText NVARCHAR(MAX),
-    Status INT DEFAULT 0, -- 0:대기, 1:진행중, 2:완료
-    ResultLog NVARCHAR(MAX),
+    Status INT DEFAULT 0, -- 0:대기, 1:실행중, 2:완료
     CreatedAt DATETIME DEFAULT GETDATE(),
     CompletedAt DATETIME
 );
-CREATE INDEX IDX_CLINE_CMD_SUBJ ON TB_CLINE_COMMANDS(Subject, Status);
 
--- 3. [NEW] 클라이언트 스크립트 템플릿 관리 (웹에서 수정 가능)
+-- [3] 스크립트 템플릿 (Worker 로직 - 웹에서 수정 가능)
 CREATE TABLE TB_CLINE_TEMPLATES (
     TemplateID INT IDENTITY(1,1) PRIMARY KEY,
-    TemplateName NVARCHAR(50) UNIQUE,
-    ScriptContent NVARCHAR(MAX), -- 파이썬 클라이언트 코드 원본
+    TemplateName NVARCHAR(50) DEFAULT 'Worker',
+    ScriptContent NVARCHAR(MAX),
     LastUpdated DATETIME DEFAULT GETDATE()
 );
 
--- 기본 템플릿 데이터 삽입 (초기값)
-INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Default', 
+-- 기본 Worker 스크립트 (go/do 루프 로직) 삽입
+INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', 
 'import os, sys, requests, time
 
-# [SERVER_INJECTED_CONFIG]
+# [INJECTED_BY_LOADER]
 
-def main():
-    if not os.path.exists(SUBJECT): os.makedirs(SUBJECT)
-    # ... (Web에서 수정 가능한 영역) ...
-    print(f"[{PC_TYPE}] Client Started for {SUBJECT}")
-    # ...
+def log(msg): print(f"[WORKER] {msg}")
+
+def run():
+    log(f"Started in Venv: {sys.executable}")
+    log(f"Project: {SUBJECT} / Server: {SERVER_URL}")
+    
+    # 작업 루프
+    while True:
+        try:
+            user_in = input(f"({SUBJECT}) > ").strip()
+            if user_in.lower() in ["go", "do", "고"]:
+                # 서버에 다음 명령 요청
+                try:
+                    res = requests.post(f"{SERVER_URL}/api/client/next", json={"subject": SUBJECT}, timeout=5)
+                    data = res.json()
+                    if data.get("status") == "ok":
+                        cmd = data.get("command")
+                        print("\n" + "="*40)
+                        print(f" [명령 수신]\\n {cmd}")
+                        print("="*40 + "\n >> 위 내용을 수행하고 다시 go를 입력하세요.\n")
+                    elif data.get("status") == "done":
+                        log("대기중인 작업이 없습니다.")
+                    else:
+                        log("서버 응답 없음.")
+                except Exception as e:
+                    log(f"통신 에러: {e}")
+            elif user_in.lower() in ["exit", "quit"]:
+                break
+        except KeyboardInterrupt:
+            break
+
+if __name__ == "__main__":
+    run()
 ');
-3. 시스템 생성기 (One-Shot Generator)
-이 파이썬 코드를 실행하면 완벽한 구조의 폴더와 파일들이 생성됩니다.
+2. 아키텍처 구현 (생성기 스크립트)
+아래 파이썬 코드를 실행하면 완성된 웹 서버 프로젝트가 생성됩니다.
 
-파일명: setup_enterprise.py
+파일명: setup_architect.py
 
 Python
 
 import os
 
 # ==============================================================================
-# [A] 설정 파일 (config/config.py)
+# [A] 설정 (config/settings.py) - 보안 및 환경설정 분리
 # ==============================================================================
-config_py = """
+config_code = """
 import os
 
 class Config:
-    # 데이터베이스 설정
+    # --- Database ---
     DB_HOST = '10.244.122.122'
     DB_PORT = 166
-    DB_USER = ''
-    DB_PASSWORD = ''
+    DB_USER = ''         # 계정 정보 (보안상 비움)
+    DB_PASSWORD = ''     # 비번 정보 (보안상 비움)
     DB_NAME = 'SMD_DB'
     
-    # 웹 서버 설정
+    # --- Web Server ---
     WEB_PORT = 12233
-    SECRET_KEY = os.urandom(24)
+    SECRET_KEY = os.urandom(32)
     
-    # 보안 설정 (접근 허용 IP)
-    ALLOWED_IPS = ['10.244.120.24', '10.244.8.3', '127.0.0.1'] 
-    # 주의: 127.0.0.1은 로컬 테스트용으로 포함했습니다. 필요 없으면 삭제하십시오.
+    # --- Security (IP Whitelist) ---
+    ALLOWED_IPS = ['10.244.120.24', '10.244.8.3', '127.0.0.1']
 """
 
 # ==============================================================================
-# [B] 데이터 접근 계층 (app/dao.py)
+# [B] 데이터 접근 (app/dao.py) - 쿼리 로직 캡슐화
 # ==============================================================================
-dao_py = """
+dao_code = """
 import pymssql
-from config.config import Config
+from config.settings import Config
 
-class DBManager:
+class DB:
     @staticmethod
-    def get_connection():
+    def _conn():
         return pymssql.connect(
-            server=Config.DB_HOST, port=Config.DB_PORT, 
-            user=Config.DB_USER, password=Config.DB_PASSWORD, 
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
             database=Config.DB_NAME, charset='utf8'
         )
 
     @staticmethod
-    def execute_query(query, args=(), fetch_one=False, fetch_all=False):
-        conn = DBManager.get_connection()
-        result = None
+    def execute(sql, args=(), fetch=None):
+        conn = DB._conn()
+        res = None
         try:
-            with conn.cursor(as_dict=True) as cursor:
-                cursor.execute(query, args)
-                if fetch_one:
-                    result = cursor.fetchone()
-                elif fetch_all:
-                    result = cursor.fetchall()
-                else:
-                    conn.commit()
-                    result = True
-        except Exception as e:
-            print(f"[DB Error] {str(e)}")
-            raise e
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': res = cur.fetchone()
+                elif fetch == 'all': res = cur.fetchall()
+                else: conn.commit()
         finally:
             conn.close()
-        return result
+        return res
 
 class ProjectDAO:
-    def get_all(self):
-        return DBManager.execute_query("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch_all=True)
-    
-    def upsert(self, subject, pc_type):
-        chk = DBManager.execute_query("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch_one=True)
-        if chk:
-            DBManager.execute_query("UPDATE TB_CLINE_PROJECTS SET PCType=%s WHERE Subject=%s", (pc_type, subject))
-        else:
-            DBManager.execute_query("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType) VALUES (%s, %s)", (subject, pc_type))
+    def list_all(self):
+        return DB.execute("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch='all')
 
-    def delete(self, subject):
-        DBManager.execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subject,))
-        DBManager.execute_query("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,))
-        
-    def update_path(self, subject, path):
-        DBManager.execute_query("UPDATE TB_CLINE_PROJECTS SET LocalPath=%s WHERE Subject=%s", (path, subject))
+    def upsert(self, subj, pc, venv):
+        row = DB.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subj,), fetch='one')
+        if row:
+            DB.execute("UPDATE TB_CLINE_PROJECTS SET PCType=%s, VenvPath=%s WHERE Subject=%s", (pc, venv, subj))
+        else:
+            DB.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, VenvPath) VALUES (%s, %s, %s)", (subj, pc, venv))
+
+    def delete(self, subj):
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subj,))
+        DB.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subj,))
+
+    def get_info(self, subj):
+        return DB.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subj,), fetch='one')
 
 class CommandDAO:
-    def get_by_subject(self, subject):
-        return DBManager.execute_query("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (subject,), fetch_all=True)
-
-    def add(self, subject, cmd):
-        DBManager.execute_query("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subject, cmd))
-
-    def update_status(self, log_id, status):
-        sql = "UPDATE TB_CLINE_COMMANDS SET Status=%s" + (", CompletedAt=GETDATE()" if status==2 else "") + " WHERE LogID=%s"
-        DBManager.execute_query(sql, (status, log_id))
-
+    def list_by_subj(self, subj):
+        return DB.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (subj,), fetch='all')
+    
+    def add(self, subj, cmd):
+        DB.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subj, cmd))
+    
     def delete(self, log_id):
-        DBManager.execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (log_id,))
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (log_id,))
 
-    def get_next_pending(self, subject):
-        return DBManager.execute_query("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subject,), fetch_one=True)
-
-    def complete_running(self, subject):
-        DBManager.execute_query("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subject,))
+    def get_next(self, subj):
+        # 이전 진행중인 것 완료 처리
+        DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subj,))
+        # 다음 대기중인 것 가져오기
+        row = DB.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subj,), fetch='one')
+        if row:
+            DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (row['LogID'],))
+        return row
 
 class TemplateDAO:
-    def get_template(self):
-        row = DBManager.execute_query("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch_one=True)
-        # DB에 없으면 기본값 반환
-        if not row:
-            return None
-        return row['ScriptContent']
+    def get_worker(self):
+        row = DB.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+        return row['ScriptContent'] if row else "# No Template"
 
-    def save_template(self, content):
-        # 단일 템플릿 관리라고 가정 (Upsert logic)
-        cnt = DBManager.execute_query("SELECT COUNT(*) as C FROM TB_CLINE_TEMPLATES", fetch_one=True)['C']
-        if cnt > 0:
-            DBManager.execute_query("UPDATE TB_CLINE_TEMPLATES SET ScriptContent=%s, LastUpdated=GETDATE()", (content,))
-        else:
-            DBManager.execute_query("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Default', %s)", (content,))
+    def save_worker(self, content):
+        DB.execute("UPDATE TB_CLINE_TEMPLATES SET ScriptContent=%s", (content,))
+        # 만약 없으면 INSERT 로직 필요하나 편의상 UPDATE 가정
 """
 
 # ==============================================================================
-# [C] 뷰/컨트롤러 계층 (app/routes.py)
+# [C] 로더 생성기 (app/loader_gen.py) - 핵심 로직
 # ==============================================================================
-routes_py = """
-from flask import Blueprint, render_template, request, jsonify, Response, abort
-from app.dao import ProjectDAO, CommandDAO, TemplateDAO
-from config.config import Config
+loader_gen_code = """
+def generate_loader(server_url, subject, venv_path):
+    # 이 스크립트는 'curl | python' 했을 때 최초로 실행되는 놈입니다.
+    # 1. 프로젝트 폴더 생성
+    # 2. Worker 스크립트 다운로드
+    # 3. 지정된 가상환경(venv)으로 Worker 실행
+    
+    if not venv_path or venv_path.strip() == '':
+        venv_python = 'python3' # 기본값
+    else:
+        # 윈도우/리눅스 경로 구분 처리를 위해 간단히 raw string 처리
+        venv_python = venv_path
+    
+    return f'''
+import os
+import sys
+import subprocess
+import requests
 
-bp = Blueprint('main', __name__)
-project_dao = ProjectDAO()
-command_dao = CommandDAO()
-template_dao = TemplateDAO()
-
-# --- Middleware: IP Restriction ---
-@bp.before_request
-def check_ip():
-    # request.remote_addr가 프록시 환경이면 X-Forwarded-For를 써야할 수도 있음
-    client_ip = request.remote_addr
-    if client_ip not in Config.ALLOWED_IPS:
-        abort(403, description=f"Access Denied for IP: {client_ip}")
-
-# --- UI Views ---
-@bp.route('/')
-def dashboard():
-    projects = project_dao.get_all()
-    return render_template('dashboard.html', projects=projects)
-
-@bp.route('/project/<subject>')
-def project_detail(subject):
-    # 해당 프로젝트의 명령어 목록 관리 페이지
-    cmds = command_dao.get_by_subject(subject)
-    return render_template('detail.html', subject=subject, commands=cmds)
-
-@bp.route('/settings')
-def settings():
-    # 클라이언트 스크립트 템플릿 수정 페이지
-    current_script = template_dao.get_template()
-    if not current_script:
-        # Default Fallback
-        current_script = \"\"\"import os, sys, requests, time
-# [SERVER_INJECTED_CONFIG]
+# [Server Config]
+SERVER_URL = "{server_url}"
+SUBJECT = "{subject}"
+VENV_PYTHON = r"{venv_python}"
 
 def main():
-    if not os.path.exists(SUBJECT): os.makedirs(SUBJECT)
-    print(f"[{PC_TYPE}] Project: {SUBJECT} Started.")
-    # Add your logic here...
-\"\"\"
-    return render_template('settings.html', script=current_script)
+    print(f"[LOADER] Setting up {{SUBJECT}}...")
+    
+    # 1. Create Directory
+    if not os.path.exists(SUBJECT):
+        os.makedirs(SUBJECT)
+    
+    # 2. Download Worker Script
+    worker_path = os.path.join(SUBJECT, "worker.py")
+    try:
+        res = requests.get(f"{{SERVER_URL}}/get_worker/{{SUBJECT}}")
+        if res.status_code == 200:
+            with open(worker_path, "w", encoding="utf-8") as f:
+                f.write(res.text)
+            print(f"[LOADER] Downloaded worker.py")
+        else:
+            print("[LOADER] Failed to download worker script.")
+            return
+    except Exception as e:
+        print(f"[LOADER] Error downloading: {{e}}")
+        return
 
-# --- API Endpoints (AJAX) ---
+    # 3. Execute Worker in Venv
+    print(f"[LOADER] Executing worker using: {{VENV_PYTHON}}")
+    print("-" * 50)
+    
+    # 가상환경 파이썬 호출
+    try:
+        # 호출할 때 cwd를 프로젝트 폴더로 할지, 현재 폴더로 할지 결정. 여기선 현재폴더 유지하되 파일경로 전달
+        # 윈도우/리눅스 호환을 위해 subprocess 사용
+        subprocess.call([VENV_PYTHON, worker_path])
+    except FileNotFoundError:
+        print(f"[ERROR] 가상환경 파이썬을 찾을 수 없습니다: {{VENV_PYTHON}}")
+        print("웹 설정에서 'Venv Path'를 확인해주세요.")
+    except Exception as e:
+        print(f"[ERROR] 실행 중 오류 발생: {{e}}")
+
+if __name__ == "__main__":
+    main()
+'''
+"""
+
+# ==============================================================================
+# [D] 라우트 및 컨트롤러 (app/routes.py)
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response, abort
+from config.settings import Config
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+from app.loader_gen import generate_loader
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO()
+c_dao = CommandDAO()
+t_dao = TemplateDAO()
+
+# --- Middleware: IP 차단 ---
+@bp.before_request
+def check_ip():
+    client_ip = request.remote_addr
+    # 로컬 개발 테스트를 위해 127.0.0.1 허용, 실제 운영시 제거 가능
+    if client_ip not in Config.ALLOWED_IPS:
+        abort(403, description=f"Access Denied: {client_ip}")
+
+# --- Pages ---
+@bp.route('/')
+def index():
+    return render_template('index.html', projects=p_dao.list_all())
+
+@bp.route('/project/<subject>')
+def detail(subject):
+    return render_template('detail.html', info=p_dao.get_info(subject), cmds=c_dao.list_by_subj(subject))
+
+@bp.route('/editor')
+def editor():
+    return render_template('editor.html', script=t_dao.get_worker())
+
+# --- API: Management ---
 @bp.route('/api/project', methods=['POST'])
 def save_project():
-    data = request.json
-    project_dao.upsert(data['subject'], data['pc_type'])
-    return jsonify({'msg': 'Project Created'})
+    d = request.json
+    p_dao.upsert(d['subject'], d['pc_type'], d['venv_path'])
+    return jsonify({'msg': 'Saved'})
 
 @bp.route('/api/project/<subject>', methods=['DELETE'])
-def delete_project(subject):
-    project_dao.delete(subject)
+def del_project(subject):
+    p_dao.delete(subject)
     return jsonify({'msg': 'Deleted'})
 
 @bp.route('/api/command', methods=['POST'])
 def add_command():
-    data = request.json
-    command_dao.add(data['subject'], data['command'])
-    return jsonify({'msg': 'Command Added'})
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'msg': 'Added'})
 
-@bp.route('/api/command/<int:log_id>', methods=['DELETE'])
-def delete_command(log_id):
-    command_dao.delete(log_id)
-    return jsonify({'msg': 'Command Deleted'})
+@bp.route('/api/command/<log_id>', methods=['DELETE'])
+def del_command(log_id):
+    c_dao.delete(log_id)
+    return jsonify({'msg': 'Deleted'})
 
 @bp.route('/api/template', methods=['POST'])
 def save_template():
-    content = request.json['content']
-    template_dao.save_template(content)
-    return jsonify({'msg': 'Template Updated'})
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'msg': 'Updated'})
 
-# --- Client Script Serving ---
-@bp.route('/get_script/<subject>')
-def get_client_script(subject):
-    # 1. Get Template from DB
-    tpl = template_dao.get_template()
-    if not tpl: tpl = "print('No Template Found')"
+# --- API: Client Interaction (The Core) ---
+@bp.route('/boot/<subject>')
+def boot_loader(subject):
+    # 1. DB에서 해당 프로젝트의 설정(Venv Path)을 조회
+    info = p_dao.get_info(subject)
+    venv = info['VenvPath'] if info else 'python' # 기본값
     
-    # 2. Inject Configuration (Dynamic)
-    host_url = request.host_url.rstrip('/')
-    # DB에서 PC Type 조회
-    # (여기선 간략화를 위해 DAO get_all 등에서 필터링하거나 별도 메서드 필요하지만, 생략하고 Param으로 가정)
-    # 실제로는 ProjectDAO에 get_one 구현하여 pc_type 가져와야 함.
-    # 안전하게 Default 처리
-    header = f'SERVER_URL = "{host_url}"\\nSUBJECT = "{subject}"\\nPC_TYPE = "Unknown"\\n'
-    
-    full_script = tpl.replace('# [SERVER_INJECTED_CONFIG]', header)
-    
-    return Response(full_script, mimetype='text/plain')
+    # 2. 로더 스크립트 동적 생성
+    server_url = request.host_url.rstrip('/')
+    code = generate_loader(server_url, subject, venv)
+    return Response(code, mimetype='text/plain')
 
-# --- Client Machine Interaction API ---
+@bp.route('/get_worker/<subject>')
+def get_worker_script(subject):
+    # 1. 템플릿 로드
+    raw_code = t_dao.get_worker()
+    
+    # 2. 동적 값 주입 (Injection)
+    server_url = request.host_url.rstrip('/')
+    header = f'SERVER_URL = "{server_url}"\\nSUBJECT = "{subject}"'
+    final_code = raw_code.replace('# [INJECTED_BY_LOADER]', header)
+    
+    return Response(final_code, mimetype='text/plain')
+
 @bp.route('/api/client/next', methods=['POST'])
 def client_next():
     subj = request.json.get('subject')
-    command_dao.complete_running(subj) # Finish previous
-    row = command_dao.get_next_pending(subj)
+    row = c_dao.get_next(subj)
     if row:
-        command_dao.update_status(row['LogID'], 1) # Mark Running
         return jsonify({'status': 'ok', 'command': row['CommandText']})
-    return jsonify({'status': 'done'})
+    else:
+        return jsonify({'status': 'done'})
 """
 
 # ==============================================================================
-# [D] 템플릿 파일들 (app/templates/*.html)
+# [E] HTML 템플릿들
 # ==============================================================================
-dashboard_html = """
-{% extends "base.html" %}
-{% block content %}
-<h2>Project Dashboard</h2>
-<div class="card">
-    <h3>새 프로젝트 생성</h3>
-    <input type="text" id="new_subj" placeholder="주제 (Subject ID)">
-    <select id="new_pc"><option>WinServer</option><option>Ubuntu_AI</option><option>RPi_Edge</option></select>
-    <button onclick="createProject()">생성</button>
-</div>
-<br>
-<table class="w-100">
-    <thead><tr><th>Type</th><th>Subject</th><th>Local Path</th><th>Action</th></tr></thead>
-    <tbody>
-    {% for p in projects %}
-    <tr>
-        <td>{{ p.PCType }}</td>
-        <td><a href="/project/{{ p.Subject }}" style="font-weight:bold; color:#007bff;">{{ p.Subject }}</a></td>
-        <td>{{ p.LocalPath }}</td>
-        <td>
-            <button onclick="deleteProject('{{ p.Subject }}')" class="btn-danger">삭제</button>
-        </td>
-    </tr>
-    {% endfor %}
-    </tbody>
-</table>
-<script>
-async function createProject() {
-    await fetch('/api/project', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({
-            subject: document.getElementById('new_subj').value,
-            pc_type: document.getElementById('new_pc').value
-        })
-    });
-    location.reload();
-}
-async function deleteProject(subj) {
-    if(confirm('프로젝트와 모든 명령이 삭제됩니다.')) {
-        await fetch('/api/project/'+subj, {method:'DELETE'});
-        location.reload();
-    }
-}
-</script>
-{% endblock %}
-"""
-
-detail_html = """
-{% extends "base.html" %}
-{% block content %}
-<div style="display:flex; justify-content:space-between; align-items:center;">
-    <h2>Project: <span style="color:#007bff">{{ subject }}</span></h2>
-    <a href="/" class="btn">뒤로가기</a>
-</div>
-
-<div class="card">
-    <h3>연동 스크립트 (Client Script)</h3>
-    <p>아래 명령어를 복사하여 타겟 PC 터미널에 붙여넣으세요.</p>
-    <div style="background:#333; color:#fff; padding:15px; border-radius:5px; font-family:monospace;">
-        curl -s "{{ request.host_url }}get_script/{{ subject }}" | python3
-    </div>
-</div>
-
-<div class="card">
-    <h3>명령어 관리 (Queue)</h3>
-    <div style="display:flex; gap:10px;">
-        <input type="text" id="cmd_input" placeholder="새로 수행할 명령 입력 (예: python run_process.py)" style="flex:1;">
-        <button onclick="addCmd()">추가</button>
-    </div>
-    <br>
-    <table class="w-100">
-        <thead><tr><th>ID</th><th>Status</th><th>Command</th><th>Action</th></tr></thead>
-        <tbody>
-        {% for c in commands %}
-        <tr class="{{ 'row-done' if c.Status == 2 else 'row-pending' }}">
-            <td>{{ c.LogID }}</td>
-            <td>
-                {% if c.Status == 0 %}<span class="badge badge-warn">대기</span>{% endif %}
-                {% if c.Status == 1 %}<span class="badge badge-info">실행중</span>{% endif %}
-                {% if c.Status == 2 %}<span class="badge badge-success">완료</span>{% endif %}
-            </td>
-            <td>{{ c.CommandText }}</td>
-            <td>
-                {% if c.Status == 0 %}
-                <button onclick="delCmd({{ c.LogID }})" class="btn-danger btn-sm">삭제</button>
-                {% endif %}
-            </td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-
-<script>
-async function addCmd() {
-    const txt = document.getElementById('cmd_input').value;
-    if(!txt) return;
-    await fetch('/api/command', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({subject: '{{ subject }}', command: txt})
-    });
-    location.reload();
-}
-async function delCmd(id) {
-    await fetch('/api/command/'+id, {method:'DELETE'});
-    location.reload();
-}
-</script>
-{% endblock %}
-"""
-
-settings_html = """
-{% extends "base.html" %}
-{% block content %}
-<h2>클라이언트 스크립트 템플릿 수정</h2>
-<p>모든 프로젝트에 공통으로 적용되는 파이썬 클라이언트 코드의 원본(Base Template)입니다.<br>
-<code># [SERVER_INJECTED_CONFIG]</code> 부분은 서버가 자동으로 채워넣으므로 지우지 마세요.</p>
-
-<textarea id="editor" style="width:100%; height:500px; background:#282c34; color:#abb2bf; font-family:monospace; padding:15px;">{{ script }}</textarea>
-<br><br>
-<button onclick="saveTemplate()" style="width:100%; padding:15px; font-size:1.2em;">템플릿 저장 (Apply to All)</button>
-
-<script>
-async function saveTemplate() {
-    await fetch('/api/template', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({content: document.getElementById('editor').value})
-    });
-    alert('저장되었습니다.');
-}
-</script>
-{% endblock %}
-"""
-
-base_html = """
+layout_html = """
 <!DOCTYPE html>
-<html lang="ko">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>Enterprise Cline Bridge</title>
+    <title>Cline Enterprise Bridge</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+        body { font-family: 'Consolas', sans-serif; background: #222; color: #ddd; padding: 20px; }
         .container { max-width: 1200px; margin: 0 auto; }
-        .nav { background: #343a40; padding: 15px; border-radius: 8px; margin-bottom: 20px; display:flex; gap:20px; }
-        .nav a { color: white; text-decoration: none; font-weight: bold; }
-        .card { background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        a { color: #4da6ff; text-decoration: none; }
+        .card { background: #333; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #444; }
+        input, select, textarea { background: #444; border: 1px solid #555; color: white; padding: 8px; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
+        button { background: #0066cc; color: white; border: none; padding: 10px 20px; cursor: pointer; }
+        button:hover { background: #0055aa; }
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
-        input, select { padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
-        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-        button:hover { background: #0056b3; }
-        .btn-danger { background: #dc3545; }
-        .btn-danger:hover { background: #c82333; }
-        .w-100 { width: 100%; }
-        .badge { padding: 5px 10px; border-radius: 12px; font-size: 0.8em; color: white; }
-        .badge-warn { background: #ffc107; color: #333; }
-        .badge-info { background: #17a2b8; }
-        .badge-success { background: #28a745; }
-        .row-done { background: #f8f9fa; color: #aaa; }
+        th, td { border-bottom: 1px solid #555; padding: 10px; text-align: left; }
+        .cmd-box { background: #111; padding: 15px; border-left: 5px solid #0066cc; font-family: monospace; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="nav">
-            <a href="/">Dashboard</a>
-            <a href="/settings">Script Settings</a>
+        <div style="margin-bottom: 20px;">
+            <a href="/">[DASHBOARD]</a> | <a href="/editor">[WORKER SCRIPT EDITOR]</a>
         </div>
         {% block content %}{% endblock %}
     </div>
@@ -453,85 +377,190 @@ base_html = """
 </html>
 """
 
-# ==============================================================================
-# [E] 애플리케이션 팩토리 (app/__init__.py)
-# ==============================================================================
-app_init_py = """
-from flask import Flask
+index_html = """
+{% extends "layout.html" %}
+{% block content %}
+<h2>Project Management</h2>
+<div class="card">
+    <h3>Register New PC/Project</h3>
+    <input id="subj" placeholder="Subject Name (ID)">
+    <input id="pc" placeholder="PC Type (Desc)">
+    <input id="venv" placeholder="Virtual Env Python Path (e.g. C:\\myenv\\Scripts\\python.exe or /home/user/venv/bin/python)">
+    <button onclick="save()">Register</button>
+</div>
+<div class="card">
+    <h3>Registered Projects</h3>
+    <table>
+        <thead><tr><th>Subject</th><th>PC Type</th><th>Venv Path</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for p in projects %}
+        <tr>
+            <td><a href="/project/{{ p.Subject }}">{{ p.Subject }}</a></td>
+            <td>{{ p.PCType }}</td>
+            <td>{{ p.VenvPath }}</td>
+            <td><button onclick="del('{{ p.Subject }}')" style="background:#cc0000">DEL</button></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+<script>
+async function save() {
+    await fetch('/api/project', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+            subject:document.getElementById('subj').value,
+            pc_type:document.getElementById('pc').value,
+            venv_path:document.getElementById('venv').value
+        })
+    });
+    location.reload();
+}
+async function del(s) {
+    if(confirm('Delete?')) { await fetch('/api/project/'+s, {method:'DELETE'}); location.reload(); }
+}
+</script>
+{% endblock %}
+"""
 
-def create_app():
-    app = Flask(__name__)
-    
-    # Register Blueprints
-    from app.routes import bp
-    app.register_blueprint(bp)
-    
-    return app
+detail_html = """
+{% extends "layout.html" %}
+{% block content %}
+<h2>Project: <span style="color:#4da6ff">{{ info.Subject }}</span></h2>
+<div class="card">
+    <h3>Boot Command (One-Shot)</h3>
+    <p>Target PC의 터미널에서 아래 명령을 실행하십시오. (설정된 Venv로 자동 실행됩니다)</p>
+    <div class="cmd-box">
+        curl -s "{{ request.host_url }}boot/{{ info.Subject }}" | python3
+    </div>
+</div>
+
+<div class="card">
+    <h3>Command Queue</h3>
+    <div style="display:flex; gap:10px;">
+        <input id="cmd" placeholder="Command to execute (e.g. pip install pandas)">
+        <button onclick="add()">Queue Command</button>
+    </div>
+    <br>
+    <table>
+        <thead><tr><th>Status</th><th>Command</th><th>Action</th></tr></thead>
+        <tbody>
+        {% for c in cmds %}
+        <tr>
+            <td>
+                {% if c.Status == 0 %}<span style="color:yellow">Pending</span>{% endif %}
+                {% if c.Status == 1 %}<span style="color:cyan">Running</span>{% endif %}
+                {% if c.Status == 2 %}<span style="color:lime">Done</span>{% endif %}
+            </td>
+            <td>{{ c.CommandText }}</td>
+            <td><button onclick="delCmd({{ c.LogID }})">X</button></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+<script>
+async function add() {
+    await fetch('/api/command', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({subject:'{{ info.Subject }}', command:document.getElementById('cmd').value})
+    });
+    location.reload();
+}
+async function delCmd(id) { await fetch('/api/command/'+id, {method:'DELETE'}); location.reload(); }
+</script>
+{% endblock %}
+"""
+
+editor_html = """
+{% extends "layout.html" %}
+{% block content %}
+<h2>Worker Script Editor</h2>
+<p>모든 클라이언트가 다운로드 받아 실행할 공통 로직(worker.py)입니다.</p>
+<textarea id="code" style="height:500px; font-family:monospace;">{{ script }}</textarea>
+<button onclick="save()" style="margin-top:10px; width:100%;">Save Changes</button>
+<script>
+async function save() {
+    await fetch('/api/template', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({content:document.getElementById('code').value})
+    });
+    alert('Saved!');
+}
+</script>
+{% endblock %}
 """
 
 # ==============================================================================
-# [F] 실행 파일 (run.py)
+# [F] 메인 실행부 (run.py & setup)
 # ==============================================================================
-run_py = """
-from app import create_app
-from config.config import Config
+run_code = """
+from flask import Flask
+from config.settings import Config
+from app.routes import bp
 
-app = create_app()
+app = Flask(__name__, template_folder='app/templates')
+app.register_blueprint(bp)
 
 if __name__ == '__main__':
-    print(f"==================================================")
-    print(f" Enterprise Cline Bridge Started")
-    print(f" Port: {Config.WEB_PORT}")
-    print(f" Allowed IPs: {Config.ALLOWED_IPS}")
-    print(f"==================================================")
-    app.run(host='0.0.0.0', port=Config.WEB_PORT, debug=True)
+    print(f"=== [System Started] Port: {Config.WEB_PORT} / Allowed: {Config.ALLOWED_IPS} ===")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT)
 """
 
-# ==============================================================================
-# [G] 설치 및 생성 로직
-# ==============================================================================
-def create_structure():
+def create_files():
     dirs = ['config', 'app', 'app/templates']
     for d in dirs:
-        if not os.path.exists(d):
-            os.makedirs(d)
-            print(f"[Create Dir] {d}")
+        if not os.path.exists(d): os.makedirs(d)
 
     files = {
-        'config/config.py': config_py,
-        'app/__init__.py': app_init_py,
-        'app/dao.py': dao_py,
-        'app/routes.py': routes_py,
-        'app/templates/base.html': base_html,
-        'app/templates/dashboard.html': dashboard_html,
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/loader_gen.py': loader_gen_code,
+        'app/templates/layout.html': layout_html,
+        'app/templates/index.html': index_html,
         'app/templates/detail.html': detail_html,
-        'app/templates/settings.html': settings_html,
-        'run.py': run_py,
+        'app/templates/editor.html': editor_html,
+        'run.py': run_code,
         'requirements.txt': 'flask\npymssql\nrequests'
     }
 
     for path, content in files.items():
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content.strip())
-        print(f"[Create File] {path}")
+        print(f"[OK] Generated: {path}")
 
-    print("\n[설치 완료] 1. DB쿼리 실행 -> 2. pip install -r requirements.txt -> 3. python run.py")
+    print("\\n[Setup Complete] Run 'python run.py' to start the server.")
 
 if __name__ == '__main__':
-    create_structure()
-설치 및 실행 가이드
-DB 쿼리 실행: 맨 위에 있는 SQL 쿼리를 MSSQL에서 실행하여 테이블을 생성/갱신하십시오. (TB_CLINE_TEMPLATES가 핵심입니다.)
+    create_files()
+실행 및 사용법
+DB 업데이트: 맨 위의 SQL 쿼리를 실행해 VenvPath 컬럼과 TB_CLINE_TEMPLATES 테이블을 만듭니다.
 
-구조 생성: 위 파이썬 코드(setup_enterprise.py)를 실행하면 config, app 등 체계적인 폴더 구조가 잡힙니다.
+설치: 위 파이썬 코드(setup_architect.py)를 실행합니다.
 
-실행: python run.py로 서버를 켭니다.
+서버 시작: python run.py
 
-접근 제어: 이제 10.244.120.24, 10.244.8.3 (그리고 로컬호스트) 외의 IP에서 접근하면 403 Forbidden 에러가 발생합니다.
+웹 접속 (10.244.120.24 등 허용된 IP에서만 가능):
 
-기능 확인:
+http://서버IP:12233 접속
 
-대시보드: 프로젝트 목록이 나옵니다.
+Subject: MyWorkPC
 
-상세화면(Detail): 프로젝트를 클릭하면 명령어를 하나씩 추가/삭제할 수 있는 큐 관리 화면이 나옵니다. (내일 할 일 미리 등록 가능)
+Venv Path: /home/kyungwon/my_env/bin/python (리눅스) 또는 C:\Envs\mywork\Scripts\python.exe (윈도우) <- 이 부분이 핵심입니다.
 
-스크립트 설정(Script Settings): 상단 메뉴를 통해 Python Client Scr
+등록 버튼 클릭.
+
+터미널 실행 (클라이언트 PC):
+
+프로젝트 상세 화면에 나오는 curl ... | python3 명령어를 복사해서 타겟 PC 터미널에 붙여넣습니다.
+
+작동 원리:
+
+서버가 loader.py를 줍니다.
+
+loader.py가 실행되면서 worker.py를 다운받습니다.
+
+loader.py가 웹에서 설정한 Venv Path의 파이썬을 이용해 worker.py를 실행시킵니다.
+
+이제 worker.py는 가상환경 안에서 돌면서 go / do 명령을 기다립니다.
