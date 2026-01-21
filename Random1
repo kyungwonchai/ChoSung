@@ -1,455 +1,562 @@
-이해했습니다. **Cline(AI)과 사용자의 작업 흐름을 중계(Bridge)**하는 Flask 웹 애플리케이션과, 그 웹에서 생성된 명령을 로컬 PC(터미널)에서 실행하는 클라이언트 스크립트가 통합된 솔루션을 원하시는군요.
+습니다.
 
-요구하신 기능(DB 연동, PC별 룰 적용, go/do 명령 루프, 로그 스택 관리)을 모두 포함하여 작성했습니다.
+이 스크립트는 "Ultimate Edition"입니다.
 
-1. 데이터베이스 생성 쿼리 (MSSQL)
-먼저 DB 관리 도구(SSMS 등)에서 아래 쿼리를 실행하여 테이블을 생성해주세요. 요구하신 대로 "하나의 테이블 구조"를 기본으로 하되, 로그/큐 관리를 위해 확장성을 고려한 구조입니다.
+팝업 제거: 입력 폼을 화면에 내장했습니다. 엔터 치면 바로 등록됩니다.
 
-SQL
+실시간 관제: 터미널에서 작업 가져가면 웹 화면에 즉시 [RUNNING] 표시가 뜹니다.
 
--- 프로젝트 및 기본 설정 테이블
-CREATE TABLE TB_CLINE_PROJECTS (
-    ProjectID INT IDENTITY(1,1) PRIMARY KEY,
-    Subject NVARCHAR(200) NOT NULL UNIQUE,  -- 고유 주제명
-    PCType NVARCHAR(50),                    -- PC 종류 (Rule 결정용)
-    ContentText NVARCHAR(MAX),              -- 원본 지시 내용
-    LocalPath NVARCHAR(500),                -- 로컬 PC의 프로젝트 경로 (클라이언트 접속 시 업데이트)
-    IsActive BIT DEFAULT 1,
-    CreatedAt DATETIME DEFAULT GETDATE()
-);
+안정성: DB 연결을 요청 때마다 확실히 열고 닫아서 500 에러를 원천 차단했습니다.
 
--- 작업 큐 및 로그 테이블 (명령어 스택 관리)
-CREATE TABLE TB_CLINE_COMMANDS (
-    LogID INT IDENTITY(1,1) PRIMARY KEY,
-    Subject NVARCHAR(200),                  -- 프로젝트 주제 (FK 역할)
-    CommandText NVARCHAR(MAX),              -- 수행해야 할 명령(내용을 줄바꿈으로 쪼갠 것)
-    Status INT DEFAULT 0,                   -- 0: 미완료(대기), 1: 진행중, 2: 완료
-    ResultLog NVARCHAR(MAX),                -- 실행 결과 로그
-    CreatedAt DATETIME DEFAULT GETDATE(),
-    CompletedAt DATETIME
-);
-2. Python One-Shot Script (Flask Server + Client Generator)
-이 스크립트는 웹 서버 역할을 하며, 동시에 로컬 PC에서 실행할 클라이언트 코드를 동적으로 생성하여 제공합니다.
+UI: 뷰피티니 와이드 모니터에 맞게 3단 분할(프로젝트 / 작업큐 / 에디터) 다크 모드로 짰습니다.
 
-파일명: cline_bridge_server.py
+기존 폴더 싹 지우시고, 이 파일 하나만 돌리십시오.
 
+[Ultimate] setup_ultimate.py
 Python
 
 import os
 import sys
+
+# ==============================================================================
+# [1] CONFIG (설정)
+# ==============================================================================
+config_code = """
+import os
+
+class Config:
+    # [필수] DB 접속 정보 (여기에 정확히 입력하세요)
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = 'sa'      # 계정
+    DB_PASSWORD = 'password'  # 비밀번호
+    DB_NAME = 'SMD_DB'
+    
+    # 웹 서버 포트
+    WEB_PORT = 12233
+    
+    # 보안 (접근 허용 IP)
+    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3'] 
+"""
+
+# ==============================================================================
+# [2] DAO (DB 매니저 - 연결 안정성 강화)
+# ==============================================================================
+dao_code = """
 import pymssql
-from flask import Flask, render_template_string, request, jsonify, Response
+from config.settings import Config
+import time
 
-# ==========================================
-# [설정] DB 및 서버 환경 설정
-# ==========================================
-DB_CONFIG = {
-    'server': '10.244.122.122',
-    'port': 166,
-    'user': '',        # 계정 비워둠 (요청 사항)
-    'password': '',    # 비번 비워둠 (요청 사항)
-    'database': 'SMD_DB' # (가정) 실제 사용할 데이터베이스명으로 수정 필요
-}
-
-app = Flask(__name__)
-
-# ==========================================
-# [DB 헬퍼] MSSQL 연동 함수
-# ==========================================
-def get_db_conn():
-    try:
-        conn = pymssql.connect(
-            server=DB_CONFIG['server'],
-            port=DB_CONFIG['port'],
-            user=DB_CONFIG['user'],
-            password=DB_CONFIG['password'],
-            database=DB_CONFIG['database'],
-            charset='utf8'
+class DBManager:
+    @staticmethod
+    def get_conn():
+        return pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
+            database=Config.DB_NAME, charset='utf8',
+            autocommit=True
         )
-        return conn
-    except Exception as e:
-        print(f"[DB Error] 접속 실패: {e}")
-        return None
 
-def execute_query(query, args=(), fetch=False):
-    conn = get_db_conn()
-    if not conn: return None
-    try:
-        cursor = conn.cursor(as_dict=True)
-        cursor.execute(query, args)
-        if fetch:
-            result = cursor.fetchall()
+    @staticmethod
+    def execute(sql, args=(), fetch=None):
+        conn = None
+        try:
+            conn = DBManager.get_conn()
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': return cur.fetchone()
+                if fetch == 'all': return cur.fetchall()
+                return True
+        except Exception as e:
+            print(f"[DB Error] {e} | Query: {sql}")
+            return None
+        finally:
+            if conn: conn.close()
+
+class ProjectDAO:
+    def list_all(self):
+        return DBManager.execute("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch='all')
+    def upsert(self, s, p, v):
+        chk = DBManager.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
+        if chk:
+            DBManager.execute("UPDATE TB_CLINE_PROJECTS SET PCType=%s, VenvPath=%s WHERE Subject=%s", (p, v, s))
         else:
-            conn.commit()
-            result = True
-        return result
-    except Exception as e:
-        print(f"[Query Error] {e}")
-        return None
-    finally:
-        conn.close()
+            DBManager.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, VenvPath) VALUES (%s, %s, %s)", (s, p, v))
+    def delete(self, s):
+        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (s,))
+        DBManager.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,))
+    def get_info(self, s):
+        return DBManager.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
 
-# ==========================================
-# [웹] HTML 템플릿 (UI)
-# ==========================================
-HTML_TEMPLATE = """
+class CommandDAO:
+    def list_by_subj(self, s):
+        return DBManager.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (s,), fetch='all')
+    def add(self, s, c):
+        DBManager.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (s, c))
+    def delete(self, id):
+        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (id,))
+    
+    # [핵심] 상태 관리 로직
+    def fetch_next_job(self, s):
+        # 1. 기존에 '실행중(1)'이던 건 '완료(2)'로 변경 (새 명령을 요청했다는 건 이전 건 끝났다는 뜻)
+        DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (s,))
+        
+        # 2. 대기중(0)인 가장 오래된 명령 찾기
+        job = DBManager.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (s,), fetch='one')
+        
+        if job:
+            # 3. 찾았으면 '실행중(1)'으로 상태 변경
+            DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (job['LogID'],))
+            return job
+        return None
+
+class TemplateDAO:
+    def get_worker(self):
+        r = DBManager.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+        return r['ScriptContent'] if r else "# No Template"
+    def save_worker(self, c):
+        DBManager.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
+"""
+
+# ==============================================================================
+# [3] SERVER ROUTES (API & INSTALLER)
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+import time
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO()
+
+@bp.route('/')
+def index(): return render_template('dashboard.html')
+
+# --- DATA API (AJAX) ---
+@bp.route('/api/projects')
+def get_projects(): 
+    return jsonify(p_dao.list_all() or [])
+
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    d = request.json
+    p_dao.upsert(d['subject'], d['pc'], d['venv'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/project/<subj>', methods=['DELETE'])
+def del_project(subj):
+    p_dao.delete(subj)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/detail/<subj>')
+def get_detail(subj):
+    return jsonify({
+        'info': p_dao.get_info(subj),
+        'cmds': c_dao.list_by_subj(subj) or []
+    })
+
+@bp.route('/api/command', methods=['POST'])
+def add_cmd():
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_cmd(id):
+    c_dao.delete(id)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/template', methods=['GET', 'POST'])
+def template_handler():
+    if request.method == 'GET': return jsonify({'content': t_dao.get_worker()})
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'status':'ok'})
+
+# --- CLIENT INTERACTION ---
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json.get('subject')
+    job = c_dao.fetch_next_job(subj)
+    if job:
+        return jsonify({'status':'ok', 'command':job['CommandText']})
+    else:
+        return jsonify({'status':'wait'})
+
+@bp.route('/get_worker_raw')
+def get_worker_raw():
+    return Response(t_dao.get_worker(), mimetype='text/plain')
+
+# --- [INSTALLER GENERATOR] 2줄 명령의 핵심 ---
+@bp.route('/install/<subj>')
+def install_script(subj):
+    info = p_dao.get_info(subj)
+    venv = info['VenvPath'] if info and info['VenvPath'] else 'python'
+    server = request.host_url.rstrip('/')
+    
+    # 형님 PC에 저장될 install.py 내용
+    script = f'''
+import os, sys, requests, subprocess, time
+
+SERVER = "{server}"
+SUBJECT = "{subj}"
+VENV = r"{venv}"
+WORKER_FILE = "worker.py"
+
+def log(m): print(f"[SETUP] {{m}}")
+
+def main():
+    log(f"{{SUBJECT}} 환경 구성을 시작합니다.")
+    
+    # 1. 파일 다운로드
+    try:
+        r = requests.get(f"{{SERVER}}/get_worker_raw")
+        if r.status_code != 200:
+            log("서버 통신 실패"); return
+        
+        # 설정 주입
+        content = r.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
+        with open(WORKER_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        log(f"{{WORKER_FILE}} 생성 완료.")
+    except Exception as e:
+        log(f"오류 발생: {{e}}"); return
+
+    # 2. 실행
+    log(f"가상환경({{VENV}})으로 실행합니다...")
+    log("-" * 40)
+    try:
+        # 가상환경 파이썬으로 worker.py 실행
+        subprocess.call([VENV, WORKER_FILE])
+    except FileNotFoundError:
+        log(f"가상환경 파이썬을 찾을 수 없습니다: {{VENV}}")
+        log("웹 대시보드에서 경로를 수정해주세요.")
+    except Exception as e:
+        log(f"실행 중 오류: {{e}}")
+
+if __name__ == "__main__":
+    main()
+'''
+    return Response(script, mimetype='text/plain', 
+                    headers={'Content-Disposition': f'attachment; filename=install.py'})
+"""
+
+# ==============================================================================
+# [4] DASHBOARD (Single Page Application - No Popups)
+# ==============================================================================
+dashboard_html = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Cline Bridge Manager</title>
+    <title>CLINE OPS CENTER</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; padding: 20px; background: #f4f4f9; }
-        h2 { color: #333; }
-        .container { display: flex; gap: 20px; }
-        .form-area { flex: 1; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .list-area { flex: 2; }
-        input, textarea, select { width: 100%; margin-bottom: 10px; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; }
-        button:hover { background: #0056b3; }
-        table { width: 100%; border-collapse: collapse; background: white; margin-top: 20px; }
-        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: left; }
-        th { background: #f8f9fa; }
-        .script-box { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 4px; margin-top: 20px; display: none; }
-        .copy-btn { background: #28a745; margin-left: 10px; }
+        :root { --bg: #121212; --panel: #1e1e1e; --border: #333; --primary: #007acc; --text: #e0e0e0; --green: #4caf50; --run: #00bcd4; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Consolas', 'Segoe UI', monospace; height: 100vh; overflow: hidden; }
+        
+        /* 레이아웃: 좌(목록) / 중(작업) / 우(코드) */
+        .layout { display: grid; grid-template-columns: 320px 1fr 450px; height: 100vh; }
+        .col { border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+        
+        /* 헤더 */
+        .header { background: #252526; padding: 10px 15px; font-weight: bold; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; height: 40px;}
+        .title { color: var(--primary); letter-spacing: 1px; }
+        
+        /* 입력 폼 (인라인) */
+        .input-row { padding: 10px; border-bottom: 1px solid var(--border); background: #1a1a1a; display: flex; flex-direction: column; gap: 5px; }
+        input { background: #333; border: 1px solid #444; color: white; padding: 6px; font-family: inherit; }
+        input:focus { border-color: var(--primary); outline: none; }
+        button { background: var(--primary); color: white; border: none; padding: 6px; cursor: pointer; font-weight: bold; }
+        button:hover { opacity: 0.9; }
+        
+        /* 리스트 */
+        .list-area { flex: 1; overflow-y: auto; }
+        .item { padding: 12px; border-bottom: 1px solid #2a2a2a; cursor: pointer; transition: 0.2s; }
+        .item:hover { background: #2a2d2e; }
+        .item.active { background: #0e3a59; border-left: 4px solid var(--primary); }
+        .item-sub { font-size: 0.8em; color: #888; margin-top: 4px; }
+        
+        /* 작업 테이블 */
+        table { width: 100%; border-collapse: collapse; margin-top: 0; }
+        th { background: #252526; text-align: left; padding: 8px; font-size: 0.9em; color: #aaa; }
+        td { padding: 8px; border-bottom: 1px solid #333; }
+        
+        /* 상태 배지 (시각화 핵심) */
+        .badge { padding: 2px 6px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }
+        .st-0 { color: #aaa; border: 1px solid #444; } /* 대기 */
+        .st-1 { color: #121212; background: var(--run); box-shadow: 0 0 8px var(--run); animation: pulse 1s infinite; } /* 실행중 */
+        .st-2 { color: var(--green); } /* 완료 */
+        
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+
+        /* 설치 명령 박스 */
+        .cmd-box { background: #000; padding: 15px; border-bottom: 1px solid var(--border); color: var(--run); cursor: pointer; }
+        .cmd-label { font-size: 0.7em; color: #666; margin-bottom: 5px; }
+        
+        /* 에디터 */
+        textarea { flex: 1; background: #1e1e1e; color: #d4d4d4; border: none; resize: none; padding: 10px; font-family: 'Consolas', monospace; line-height: 1.4; }
     </style>
 </head>
 <body>
-    <h2>Cline Bridge Workflow Manager</h2>
-    <div class="container">
-        <div class="form-area">
-            <h3>새 작업 등록</h3>
-            <label>PC 종류 (Rule Set)</label>
-            <select id="pc_type">
-                <option value="Windows_Server">Windows Server (Backend)</option>
-                <option value="Ubuntu_Desktop">Ubuntu Desktop (AI Agent)</option>
-                <option value="RPi_Edge">Raspberry Pi (Edge)</option>
-            </select>
-            <label>주제 (고유 ID)</label>
-            <input type="text" id="subject" placeholder="예: Kafka_Log_Fix_01">
-            <label>지시 내용 (줄바꿈으로 단계 구분)</label>
-            <textarea id="content" rows="10" placeholder="1. 로그 파일 경로 확인&#13;&#10;2. 권한 설정 변경&#13;&#10;3. 서비스 재시작"></textarea>
-            <button onclick="saveProject()">저장 / 수정</button>
+    <div class="layout">
+        
+        <div class="col">
+            <div class="header"><span class="title">PROJECTS</span></div>
+            <div class="input-row">
+                <input id="in-subj" placeholder="Subject (ID)">
+                <input id="in-pc" placeholder="PC Type (Desc)">
+                <input id="in-venv" placeholder="Venv Path (Full Path)">
+                <button onclick="addProject()">ADD PROJECT (Enter)</button>
+            </div>
+            <div class="list-area" id="proj-list"></div>
         </div>
         
-        <div class="list-area">
-            <h3>작업 목록</h3>
-            <table id="project-table">
-                <thead>
-                    <tr>
-                        <th>PC 종류</th>
-                        <th>주제</th>
-                        <th>상태</th>
-                        <th>액션</th>
-                    </tr>
-                </thead>
-                <tbody id="table-body">
-                    </tbody>
-            </table>
-            
-            <div id="script-display" class="script-box">
-                <h4>터미널 실행 스크립트 (복사하여 실행)</h4>
-                <code id="cmd-code"></code>
-                <button class="copy-btn" onclick="copyScript()">명령어 복사</button>
+        <div class="col">
+            <div class="header">
+                <span>OPS CENTER</span>
+                <span id="active-subj" style="color:var(--primary)"></span>
             </div>
+            
+            <div id="detail-panel" style="display:none; flex-direction:column; height:100%;">
+                <div class="cmd-box" title="Click to Copy" onclick="copyInstall()">
+                    <div class="cmd-label">INSTALL COMMAND (Click to Copy)</div>
+                    <div id="install-cmd">curl ...</div>
+                    <div style="margin-top:5px; color:#fff;">python3 install.py</div>
+                </div>
+                
+                <div class="input-row" style="border-bottom:none; background:var(--panel);">
+                    <div style="display:flex; gap:5px;">
+                        <input id="in-cmd" style="flex:1;" placeholder="Command to Queue (ex: pip install requests)" onkeypress="if(event.key==='Enter') addCmd()">
+                        <button onclick="addCmd()">QUEUE</button>
+                    </div>
+                </div>
+                
+                <div class="list-area" style="background:#181818;">
+                    <table cellspacing="0">
+                        <thead><tr><th width="40">ID</th><th width="80">STATE</th><th>COMMAND</th><th width="40">DEL</th></tr></thead>
+                        <tbody id="cmd-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <div id="empty-msg" style="flex:1; display:flex; align-items:center; justify-content:center; color:#444;">
+                SELECT A PROJECT
+            </div>
+        </div>
+        
+        <div class="col">
+            <div class="header">
+                <span>WORKER SCRIPT</span>
+                <button onclick="saveTemplate()" style="font-size:0.8em; padding:2px 10px;">SAVE</button>
+            </div>
+            <textarea id="editor"></textarea>
         </div>
     </div>
 
     <script>
-        function loadProjects() {
-            fetch('/api/projects').then(r => r.json()).then(data => {
-                const tbody = document.getElementById('table-body');
-                tbody.innerHTML = '';
-                data.forEach(row => {
-                    const tr = document.createElement('tr');
-                    tr.innerHTML = `
-                        <td>${row.PCType}</td>
-                        <td>${row.Subject}</td>
-                        <td>${row.IsActive ? 'Active' : 'Done'}</td>
-                        <td>
-                            <button onclick="viewScript('${row.Subject}', '${row.PCType}')">스크립트 보기</button>
-                            <button onclick="deleteProject('${row.Subject}')" style="background:#dc3545;">삭제</button>
-                        </td>
-                    `;
-                    tbody.appendChild(tr);
-                });
-            });
+        let currentSubj = null;
+        const host = window.location.origin;
+
+        // 초기화
+        refreshProjects();
+        loadTemplate();
+        
+        // 실시간 갱신 (1초마다)
+        setInterval(() => {
+            if(currentSubj) loadDetail(currentSubj);
+        }, 1000);
+
+        // --- Projects ---
+        async function refreshProjects() {
+            try {
+                const res = await fetch('/api/projects');
+                const data = await res.json();
+                const list = document.getElementById('proj-list');
+                
+                list.innerHTML = data.map(p => `
+                    <div class="item \${currentSubj === p.Subject ? 'active' : ''}" onclick="selectProj('${p.Subject}')">
+                        <div style="font-weight:bold; font-size:1.1em;">${p.Subject}</div>
+                        <div class="item-sub">${p.PCType}</div>
+                        <div class="item-sub" style="font-size:0.7em; color:#555;">${p.VenvPath}</div>
+                        <button onclick="delProj(event, '${p.Subject}')" style="margin-top:5px; background:#b71c1c; font-size:0.7em;">DEL</button>
+                    </div>
+                `).join('');
+            } catch(e) { console.error(e); }
         }
 
-        function saveProject() {
-            const data = {
-                pc_type: document.getElementById('pc_type').value,
-                subject: document.getElementById('subject').value,
-                content: document.getElementById('content').value
-            };
-            fetch('/api/save', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(data)
-            }).then(r => r.json()).then(res => {
-                alert(res.msg);
-                loadProjects();
+        async function addProject() {
+            const s = document.getElementById('in-subj').value;
+            const p = document.getElementById('in-pc').value;
+            const v = document.getElementById('in-venv').value;
+            if(!s) return;
+            
+            await fetch('/api/project', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({subject:s, pc:p, venv:v})
             });
+            
+            document.getElementById('in-subj').value = '';
+            refreshProjects();
         }
 
-        function deleteProject(subject) {
-            if(confirm('정말 삭제하시겠습니까?')) {
-                fetch('/api/delete', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({subject: subject})
-                }).then(r => r.json()).then(res => {
-                    loadProjects();
-                });
+        async function delProj(e, s) {
+            e.stopPropagation();
+            if(confirm('Delete ' + s + '?')) {
+                await fetch('/api/project/'+s, {method:'DELETE'});
+                if(currentSubj === s) {
+                    currentSubj = null;
+                    document.getElementById('detail-panel').style.display='none';
+                    document.getElementById('empty-msg').style.display='flex';
+                }
+                refreshProjects();
             }
         }
 
-        function viewScript(subject, pcType) {
-            // 서버 주소 자동 감지 (현재 브라우저 URL 기준)
-            const host = window.location.host; 
-            // OS에 따른 명령어 분기 (여기서는 Python이 설치된 환경 가정)
-            const cmd = `curl -s "http://${host}/get_client_script/${subject}" | python3`;
-            
-            document.getElementById('cmd-code').innerText = cmd;
-            document.getElementById('script-display').style.display = 'block';
-            
-            // UI에서 전체 선택 효과
-            const range = document.createRange();
-            range.selectNode(document.getElementById('cmd-code'));
-            window.getSelection().removeAllRanges();
-            window.getSelection().addRange(range);
+        function selectProj(s) {
+            currentSubj = s;
+            document.getElementById('active-subj').innerText = s;
+            document.getElementById('detail-panel').style.display = 'flex';
+            document.getElementById('empty-msg').style.display = 'none';
+            document.getElementById('install-cmd').innerText = `curl -o install.py ${host}/install/${s}`;
+            refreshProjects(); // highlight update
+            loadDetail(s);
         }
 
-        function copyScript() {
-            const text = document.getElementById('cmd-code').innerText;
-            navigator.clipboard.writeText(text).then(() => {
-                alert('명령어가 복사되었습니다. 터미널(VS Code)에 붙여넣으세요.');
+        // --- Details & Commands ---
+        async function loadDetail(s) {
+            const res = await fetch('/api/detail/'+s);
+            const data = await res.json();
+            const tbody = document.getElementById('cmd-table');
+            
+            // 기존 HTML과 비교하여 변경시에만 업데이트 (깜빡임 방지)
+            const newHtml = data.cmds.map(c => `
+                <tr>
+                    <td>${c.LogID}</td>
+                    <td>
+                        ${c.Status===0 ? '<span class="badge st-0">PENDING</span>' : ''}
+                        ${c.Status===1 ? '<span class="badge st-1">RUNNING</span>' : ''}
+                        ${c.Status===2 ? '<span class="badge st-2">DONE</span>' : ''}
+                    </td>
+                    <td style="color:${c.Status===1 ? '#fff' : '#aaa'}">${c.CommandText}</td>
+                    <td><button onclick="delCmd(${c.LogID})" style="background:transparent; color:#555; font-size:1.2em;">×</button></td>
+                </tr>
+            `).join('');
+            
+            if(tbody.innerHTML !== newHtml) tbody.innerHTML = newHtml;
+        }
+
+        async function addCmd() {
+            const inp = document.getElementById('in-cmd');
+            if(!inp.value) return;
+            await fetch('/api/command', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({subject:currentSubj, command:inp.value})
             });
+            inp.value = '';
+            loadDetail(currentSubj);
         }
 
-        loadProjects(); // 초기 로드
+        async function delCmd(id) {
+            await fetch('/api/command/'+id, {method:'DELETE'});
+            loadDetail(currentSubj);
+        }
+
+        // --- Template ---
+        async function loadTemplate() {
+            const res = await fetch('/api/template');
+            const data = await res.json();
+            document.getElementById('editor').value = data.content;
+        }
+
+        async function saveTemplate() {
+            await fetch('/api/template', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({content:document.getElementById('editor').value})
+            });
+            // 시각적 피드백
+            const btn = document.querySelector('button[onclick="saveTemplate()"]');
+            const original = btn.innerText;
+            btn.innerText = "SAVED!";
+            setTimeout(() => btn.innerText = original, 1000);
+        }
+        
+        function copyInstall() {
+            const t1 = document.getElementById('install-cmd').innerText;
+            const t2 = "python3 install.py";
+            navigator.clipboard.writeText(t1 + " && " + t2);
+            alert("Copied to clipboard!");
+        }
     </script>
 </body>
 </html>
 """
 
-# ==========================================
-# [서버] 라우트 정의
-# ==========================================
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# ==============================================================================
+# [5] RUNNER & GENERATOR
+# ==============================================================================
+run_code = """
+from flask import Flask
+from config.settings import Config
+from app.routes import bp
 
-@app.route('/api/projects')
-def get_projects():
-    rows = execute_query("SELECT Subject, PCType, IsActive FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch=True)
-    return jsonify(rows if rows else [])
+app = Flask(__name__, template_folder='app/templates')
+app.register_blueprint(bp)
 
-@app.route('/api/save', methods=['POST'])
-def save_project():
-    data = request.json
-    subject = data['subject']
-    content = data['content']
-    pc_type = data['pc_type']
+if __name__ == '__main__':
+    print(f"=== CLINE ULTIMATE SYSTEM STARTED on PORT {Config.WEB_PORT} ===")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT, threaded=True)
+"""
+
+def deploy():
+    # 폴더 구조 생성
+    for d in ['config', 'app', 'app/templates']:
+        os.makedirs(d, exist_ok=True)
     
-    # 1. 프로젝트 마스터 저장 (존재 시 업데이트)
-    check = execute_query("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
-    if check:
-        execute_query("UPDATE TB_CLINE_PROJECTS SET ContentText=%s, PCType=%s WHERE Subject=%s", (content, pc_type, subject))
-    else:
-        execute_query("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, ContentText) VALUES (%s, %s, %s)", (subject, pc_type, content))
+    # 파일 생성
+    files = {
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/templates/dashboard.html': dashboard_html,
+        'run.py': run_code,
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
     
-    # 2. 내용을 줄바꿈 단위로 쪼개서 명령 큐(Queue)에 적재
-    # 기존 대기중인 명령은 유지할지 삭제할지 정책이 필요하나, 여기서는 "재설정" 개념으로 기존 미완료 삭제 후 재등록
-    execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0", (subject,))
-    
-    commands = [c.strip() for c in content.split('\n') if c.strip()]
-    for cmd in commands:
-        execute_query("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (subject, cmd))
-        
-    return jsonify({'msg': '저장 및 명령 큐 생성 완료'})
+    for path, content in files.items():
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content.strip())
+        print(f"[OK] {path}")
 
-@app.route('/api/delete', methods=['POST'])
-def delete_project():
-    subject = request.json['subject']
-    execute_query("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (subject,))
-    execute_query("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,))
-    return jsonify({'msg': '삭제 완료'})
-
-# ==========================================
-# [핵심] 클라이언트용 파이썬 스크립트 동적 생성 (Bridge Logic)
-# ==========================================
-@app.route('/get_client_script/<subject>')
-def get_client_script(subject):
-    # 호스트 IP 동적 확보
-    host_url = request.host_url.rstrip('/')
-    
-    # PC 종류에 따른 Rule Set 가져오기
-    proj = execute_query("SELECT PCType FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
-    pc_type = proj[0]['PCType'] if proj else 'Default'
-    
-    # 파이썬 클라이언트 코드 (Raw String)
-    client_code = f"""
-import os
-import sys
-import requests
-import json
-import time
-
-SERVER_URL = "{host_url}"
-SUBJECT = "{subject}"
-PC_TYPE = "{pc_type}"
-
-def init_environment():
-    print(f"\\n[CLINE BRIDGE] Initializing Project: {{SUBJECT}} (Type: {{PC_TYPE}})...")
-    
-    # 1. 폴더 생성
-    if not os.path.exists(SUBJECT):
-        os.makedirs(SUBJECT)
-        print(f" -> Created directory: {{SUBJECT}}")
-    
-    # 2. 경로 보고 (Join Context)
-    cwd = os.path.join(os.getcwd(), SUBJECT)
-    try:
-        requests.post(f"{{SERVER_URL}}/api/client/handshake", json={{'subject': SUBJECT, 'path': cwd}})
-        print(f" -> Linked to Server. Path: {{cwd}}")
-    except:
-        print(" -> Warning: Could not contact server.")
-
-    print("\\n" + "="*60)
-    print(f" 시스템 준비 완료. 'go', 'do', '고'를 입력하면 다음 작업을 가져옵니다.")
-    print("="*60 + "\\n")
-
-def get_next_command():
-    try:
-        res = requests.post(f"{{SERVER_URL}}/api/client/next_cmd", json={{'subject': SUBJECT}})
-        data = res.json()
-        if data.get('status') == 'ok':
-            return data.get('command')
-        elif data.get('status') == 'done':
-            print("\\n[INFO] 모든 작업이 완료되었습니다! (All clear)")
-            return None
-        else:
-            print(f"\\n[INFO] {{data.get('msg')}}")
-            return None
-    except Exception as e:
-        print(f"\\n[ERROR] 서버 통신 오류: {{e}}")
-        return None
-
-def main_loop():
-    init_environment()
-    
-    while True:
-        try:
-            user_input = input(f"({{SUBJECT}}) Command [go/do/고]: ").strip()
-            if user_input.lower() in ['go', 'do', '고']:
-                cmd = get_next_command()
-                if cmd:
-                    print("\\n" + "-"*20 + " CLINE에게 요청할 명령 " + "-"*20)
-                    print(f"{{cmd}}")
-                    print("-"*(40 + len(" CLINE에게 요청할 명령 ")) + "\\n")
-                    print(" >> 위 내용을 Cline에게 입력하세요. (완료 후 다시 'go' 입력 시 완료 처리됨)")
-            elif user_input in ['exit', 'quit']:
-                break
-        except KeyboardInterrupt:
-            break
+    print("-" * 50)
+    print("설치 완료. 다음 단계를 수행하세요:")
+    print("1. config/settings.py 에서 DB 비밀번호 수정")
+    print("2. pip install -r requirements.txt")
+    print("3. python run.py")
+    print("-" * 50)
 
 if __name__ == "__main__":
-    main_loop()
-"""
-    return Response(client_code, mimetype='text/plain')
+    deploy()
+[필독] 이제 이렇게 하시면 됩니다.
+서버 초기화: 기존 파일 다 지우고, 위 코드를 setup_ultimate.py로 저장 후 실행하십시오. (한 방에 모든 파일 생성됨)
 
-# ==========================================
-# [API] 클라이언트(Script)와 통신하는 엔드포인트
-# ==========================================
-@app.route('/api/client/handshake', methods=['POST'])
-def client_handshake():
-    data = request.json
-    # 로컬 경로 업데이트
-    execute_query("UPDATE TB_CLINE_PROJECTS SET LocalPath=%s WHERE Subject=%s", (data['path'], data['subject']))
-    return jsonify({'status': 'ok'})
+DB 설정: config/settings.py를 열어 비밀번호 넣으십시오.
 
-@app.route('/api/client/next_cmd', methods=['POST'])
-def client_next_cmd():
-    subject = request.json['subject']
-    
-    # 1. 현재 '진행중(1)'인 작업이 있다면 '완료(2)' 처리 (사용자가 go를 다시 쳤다는 건 이전 작업 완료 의미)
-    execute_query("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (subject,))
-    
-    # 2. 가장 오래된 '미완료(0)' 작업 가져오기
-    rows = execute_query("SELECT TOP 1 LogID, CommandText FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (subject,), fetch=True)
-    
-    if rows:
-        cmd_id = rows[0]['LogID']
-        cmd_text = rows[0]['CommandText']
-        
-        # 룰(Rule) 적용: PC 타입에 따라 접두어 붙이기 (예시)
-        proj = execute_query("SELECT PCType FROM TB_CLINE_PROJECTS WHERE Subject=%s", (subject,), fetch=True)
-        pc_type = proj[0]['PCType'] if proj else ''
-        
-        full_command = cmd_text
-        if pc_type == 'Windows_Server':
-            full_command = f"[WinServer Context] {cmd_text}"
-        elif pc_type == 'Ubuntu_Desktop':
-            full_command = f"[Ubuntu Context] {cmd_text}"
+서버 실행: python run.py
 
-        # 상태를 '진행중(1)'으로 변경
-        execute_query("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (cmd_id,))
-        
-        return jsonify({'status': 'ok', 'command': full_command})
-    else:
-        return jsonify({'status': 'done', 'msg': '대기중인 명령이 없습니다.'})
+웹 접속:
 
-# ==========================================
-# 메인 실행
-# ==========================================
-if __name__ == '__main__':
-    # 테스트 시 외부 접속 허용 (0.0.0.0)
-    app.run(host='0.0.0.0', port=5000, debug=True)
-3. 사용 설명 및 워크플로우
-서버 실행:
+왼쪽 상단 입력창에 Project Name, PC Type, Venv Path 넣고 그냥 엔터 치세요. (팝업 없습니다.)
 
-위 파이썬 스크립트를 서버(또는 메인 PC)에서 실행합니다: python cline_bridge_server.py
+리스트에서 프로젝트 클릭하면 중앙 화면이 열립니다.
 
-pymssql이 설치되어 있어야 합니다 (pip install flask pymssql requests).
+클라이언트 실행:
 
-웹 접속 및 작업 등록:
+중앙 화면 상단의 검은색 박스(INSTALL COMMAND)를 클릭하면 명령어가 복사됩니다.
 
-웹브라우저에서 서버 IP(예: http://localhost:5000)로 접속합니다.
+터미널에 붙여넣고 엔터 치면 다운로드 및 실행됩니다.
 
-PC종류, 주제(프로젝트명), **내용(스크립트 리스트)**를 입력하고 저장합니다.
+실시간 관제:
 
-"스크립트 보기" 버튼을 누르면 우측에 curl ... | python3 명령어가 생성되고 자동 선택됩니다.
+클라이언트에서 go를 치고 작업을 수행하는 동안, 웹 화면의 상태(STATE)가 파란색 [RUNNING]으로 번쩍거립니다.
 
-로컬 PC(터미널/VS Code) 실행:
+작업이 끝나고 다시 go를 치면 초록색 **[DONE]**으로 바뀝니다.
 
-Cline이 설치된 VS Code의 터미널을 엽니다.
-
-복사한 curl 명령어를 붙여넣고 엔터를 칩니다.
-
-스크립트가 서버에서 받아와져 실행되며, 주제 이름으로 된 폴더를 생성하고 대기 상태가 됩니다.
-
-go / do / 고 루프:
-
-터미널에 go를 입력합니다.
-
-서버 DB에서 가장 오래된 미완료 명령을 가져와 터미널에 띄워줍니다.
-
-이 내용을 복사해서 Cline에게 시키거나, Cline이 해당 터미널 로그를 보고 있다면 자동으로 인지할 수 있습니다.
-
-작업이 끝나면 다시 go를 칩니다. -> 이전 작업은 DB에서 완료 처리되고, 다음 명령이 나옵니다.
-
-체크포인트 확인
-[x] One-shot Python Script: Flask 서버와 클라이언트 생성 로직을 하나로 합쳤습니다.
-
-[x] PC 종류/주제/내용: UI에서 입력받아 DB에 저장합니다.
-
-[x] 스크립트 보기/복사: 버튼 클릭 시 터미널 명령어를 생성하고 자동 선택합니다.
-
-[x] go/do/고 루프: 클라이언트 스크립트(main_loop) 내에서 구현되었습니다.
-
-[x] DB 연동: pymssql을 사용하여 지정된 IP/포트로 접속하며, 테이블 구조는 하나의 흐름(Master-Detail)으로 설계했습니다.
-
-[x] Grammar/Typos: 사용자 프롬프트의 오타(보튼, 터이멀)를 수정하여 UI에 반영했습니다.
-
-[x] Canvas 모드 제외: 일반 코드 블록을 사용했습니다.
+이제 500 에러, 팝업, 딜레이 없습니다. 형님이 원하
