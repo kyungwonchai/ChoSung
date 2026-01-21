@@ -1,562 +1,149 @@
-습니다.
+스크립트는 창 제어를 위해 wmctrl과 모니터 정보 확인을 위해 xrandr을 사용합니다. 터미널에서 아래 명령어로 패키지를 먼저 설치해주세요.
 
-이 스크립트는 "Ultimate Edition"입니다.
+Bash
 
-팝업 제거: 입력 폼을 화면에 내장했습니다. 엔터 치면 바로 등록됩니다.
+sudo apt update && sudo apt install wmctrl x11-xserver-utils -y
+주의: 우분투 로그인 시 Xorg(X11) 세션을 사용해야 완벽하게 작동합니다. Wayland(기본값)에서는 보안 정책 때문에 외부 스크립트가 창 위치를 강제로 옮기는 것을 막을 수 있습니다.
 
-실시간 관제: 터미널에서 작업 가져가면 웹 화면에 즉시 [RUNNING] 표시가 뜹니다.
+자동 배치 Python 스크립트 (arrange_vscode.py)
+아래 코드를 복사하여 파일로 저장 후 실행하십시오.
 
-안정성: DB 연결을 요청 때마다 확실히 열고 닫아서 500 에러를 원천 차단했습니다.
-
-UI: 뷰피티니 와이드 모니터에 맞게 3단 분할(프로젝트 / 작업큐 / 에디터) 다크 모드로 짰습니다.
-
-기존 폴더 싹 지우시고, 이 파일 하나만 돌리십시오.
-
-[Ultimate] setup_ultimate.py
 Python
 
-import os
+#!/usr/bin/env python3
+import subprocess
+import re
+import math
 import sys
 
-# ==============================================================================
-# [1] CONFIG (설정)
-# ==============================================================================
-config_code = """
-import os
+def run_command(command):
+    """쉘 명령어를 실행하고 결과를 문자열로 반환합니다."""
+    try:
+        result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
+        return result.decode('utf-8').strip()
+    except subprocess.CalledProcessError:
+        return ""
 
-class Config:
-    # [필수] DB 접속 정보 (여기에 정확히 입력하세요)
-    DB_HOST = '10.244.122.122'
-    DB_PORT = 166
-    DB_USER = 'sa'      # 계정
-    DB_PASSWORD = 'password'  # 비밀번호
-    DB_NAME = 'SMD_DB'
+def get_connected_monitors():
+    """xrandr을 파싱하여 연결된 모니터의 해상도와 위치(offset)를 반환합니다."""
+    output = run_command("xrandr --current")
+    monitors = []
+    # 정규식: 1920x1080+1920+0 형태 추출 (Width x Height + X_Offset + Y_Offset)
+    regex = re.compile(r" connected.*? (\d+)x(\d+)\+(\d+)\+(\d+)")
     
-    # 웹 서버 포트
-    WEB_PORT = 12233
+    for line in output.split('\n'):
+        match = regex.search(line)
+        if match:
+            w, h, x, y = map(int, match.groups())
+            monitors.append({'w': w, 'h': h, 'x': x, 'y': y})
     
-    # 보안 (접근 허용 IP)
-    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3'] 
-"""
+    # x 좌표(가로 오프셋) 기준으로 정렬하여 가장 오른쪽 모니터를 찾기 위함
+    return sorted(monitors, key=lambda m: m['x'])
 
-# ==============================================================================
-# [2] DAO (DB 매니저 - 연결 안정성 강화)
-# ==============================================================================
-dao_code = """
-import pymssql
-from config.settings import Config
-import time
-
-class DBManager:
-    @staticmethod
-    def get_conn():
-        return pymssql.connect(
-            server=Config.DB_HOST, port=Config.DB_PORT,
-            user=Config.DB_USER, password=Config.DB_PASSWORD,
-            database=Config.DB_NAME, charset='utf8',
-            autocommit=True
-        )
-
-    @staticmethod
-    def execute(sql, args=(), fetch=None):
-        conn = None
-        try:
-            conn = DBManager.get_conn()
-            with conn.cursor(as_dict=True) as cur:
-                cur.execute(sql, args)
-                if fetch == 'one': return cur.fetchone()
-                if fetch == 'all': return cur.fetchall()
-                return True
-        except Exception as e:
-            print(f"[DB Error] {e} | Query: {sql}")
-            return None
-        finally:
-            if conn: conn.close()
-
-class ProjectDAO:
-    def list_all(self):
-        return DBManager.execute("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch='all')
-    def upsert(self, s, p, v):
-        chk = DBManager.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
-        if chk:
-            DBManager.execute("UPDATE TB_CLINE_PROJECTS SET PCType=%s, VenvPath=%s WHERE Subject=%s", (p, v, s))
-        else:
-            DBManager.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, VenvPath) VALUES (%s, %s, %s)", (s, p, v))
-    def delete(self, s):
-        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (s,))
-        DBManager.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,))
-    def get_info(self, s):
-        return DBManager.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
-
-class CommandDAO:
-    def list_by_subj(self, s):
-        return DBManager.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (s,), fetch='all')
-    def add(self, s, c):
-        DBManager.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (s, c))
-    def delete(self, id):
-        DBManager.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (id,))
+def get_vscode_windows():
+    """wmctrl을 사용하여 현재 열린 VS Code 창의 ID 리스트를 반환합니다."""
+    output = run_command("wmctrl -l")
+    window_ids = []
+    for line in output.split('\n'):
+        # VS Code 창은 보통 제목에 'Visual Studio Code' 또는 파일명이 포함됨
+        # 대소문자 구분 없이 'code'가 포함된 창을 찾되, 너무 범용적인 단어라 주의 필요
+        # 보통 클래스명을 확인하는 것이 정확하나 wmctrl -l 에는 클래스명이 안 나옴.
+        # -lx 옵션을 사용하여 클래스명 확인
+        if "Visual Studio Code" in line or "Code - OSS" in line:
+            parts = line.split()
+            window_ids.append(parts[0]) # 윈도우 ID (예: 0x04000003)
     
-    # [핵심] 상태 관리 로직
-    def fetch_next_job(self, s):
-        # 1. 기존에 '실행중(1)'이던 건 '완료(2)'로 변경 (새 명령을 요청했다는 건 이전 건 끝났다는 뜻)
-        DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (s,))
-        
-        # 2. 대기중(0)인 가장 오래된 명령 찾기
-        job = DBManager.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (s,), fetch='one')
-        
-        if job:
-            # 3. 찾았으면 '실행중(1)'으로 상태 변경
-            DBManager.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (job['LogID'],))
-            return job
-        return None
+    # wmctrl -lx 명령어를 통해 더 정확히 필터링 (클래스명: code.Code)
+    output_lx = run_command("wmctrl -lx")
+    refined_ids = []
+    for line in output_lx.split('\n'):
+        if "code.Code" in line:
+            parts = line.split()
+            refined_ids.append(parts[0])
+            
+    return refined_ids if refined_ids else window_ids
 
-class TemplateDAO:
-    def get_worker(self):
-        r = DBManager.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
-        return r['ScriptContent'] if r else "# No Template"
-    def save_worker(self, c):
-        DBManager.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
-"""
-
-# ==============================================================================
-# [3] SERVER ROUTES (API & INSTALLER)
-# ==============================================================================
-routes_code = """
-from flask import Blueprint, render_template, request, jsonify, Response
-from app.dao import ProjectDAO, CommandDAO, TemplateDAO
-import time
-
-bp = Blueprint('main', __name__)
-p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO()
-
-@bp.route('/')
-def index(): return render_template('dashboard.html')
-
-# --- DATA API (AJAX) ---
-@bp.route('/api/projects')
-def get_projects(): 
-    return jsonify(p_dao.list_all() or [])
-
-@bp.route('/api/project', methods=['POST'])
-def save_project():
-    d = request.json
-    p_dao.upsert(d['subject'], d['pc'], d['venv'])
-    return jsonify({'status':'ok'})
-
-@bp.route('/api/project/<subj>', methods=['DELETE'])
-def del_project(subj):
-    p_dao.delete(subj)
-    return jsonify({'status':'ok'})
-
-@bp.route('/api/detail/<subj>')
-def get_detail(subj):
-    return jsonify({
-        'info': p_dao.get_info(subj),
-        'cmds': c_dao.list_by_subj(subj) or []
-    })
-
-@bp.route('/api/command', methods=['POST'])
-def add_cmd():
-    c_dao.add(request.json['subject'], request.json['command'])
-    return jsonify({'status':'ok'})
-
-@bp.route('/api/command/<id>', methods=['DELETE'])
-def del_cmd(id):
-    c_dao.delete(id)
-    return jsonify({'status':'ok'})
-
-@bp.route('/api/template', methods=['GET', 'POST'])
-def template_handler():
-    if request.method == 'GET': return jsonify({'content': t_dao.get_worker()})
-    t_dao.save_worker(request.json['content'])
-    return jsonify({'status':'ok'})
-
-# --- CLIENT INTERACTION ---
-@bp.route('/api/client/next', methods=['POST'])
-def client_next():
-    subj = request.json.get('subject')
-    job = c_dao.fetch_next_job(subj)
-    if job:
-        return jsonify({'status':'ok', 'command':job['CommandText']})
+def arrange_windows():
+    monitors = get_connected_monitors()
+    
+    if len(monitors) < 2:
+        print("[-] 듀얼 모니터가 감지되지 않았습니다. 기본 모니터에서 작업을 수행합니다.")
+        target_monitor = monitors[0]
     else:
-        return jsonify({'status':'wait'})
+        # 가장 오른쪽 모니터(x 좌표가 가장 큰 모니터)를 타겟으로 설정
+        target_monitor = monitors[-1]
+        print(f"[+] 타겟 모니터 설정: 해상도 {target_monitor['w']}x{target_monitor['h']}, 위치 +{target_monitor['x']}+{target_monitor['y']}")
 
-@bp.route('/get_worker_raw')
-def get_worker_raw():
-    return Response(t_dao.get_worker(), mimetype='text/plain')
-
-# --- [INSTALLER GENERATOR] 2줄 명령의 핵심 ---
-@bp.route('/install/<subj>')
-def install_script(subj):
-    info = p_dao.get_info(subj)
-    venv = info['VenvPath'] if info and info['VenvPath'] else 'python'
-    server = request.host_url.rstrip('/')
+    windows = get_vscode_windows()
+    win_count = len(windows)
     
-    # 형님 PC에 저장될 install.py 내용
-    script = f'''
-import os, sys, requests, subprocess, time
+    if win_count == 0:
+        print("[-] 실행 중인 VS Code 창을 찾을 수 없습니다.")
+        return
 
-SERVER = "{server}"
-SUBJECT = "{subj}"
-VENV = r"{venv}"
-WORKER_FILE = "worker.py"
+    print(f"[+] 감지된 VS Code 창 개수: {win_count}개")
 
-def log(m): print(f"[SETUP] {{m}}")
-
-def main():
-    log(f"{{SUBJECT}} 환경 구성을 시작합니다.")
+    # 그리드 계산 (행과 열)
+    # 창 개수에 따라 최적의 grid 계산 (예: 6개 -> 3x2 또는 2x3)
+    cols = math.ceil(math.sqrt(win_count))
+    rows = math.ceil(win_count / cols)
     
-    # 1. 파일 다운로드
-    try:
-        r = requests.get(f"{{SERVER}}/get_worker_raw")
-        if r.status_code != 200:
-            log("서버 통신 실패"); return
+    # 6개일 경우 3열 2행이 보기 좋음 (가로로 넓게)
+    if win_count == 6:
+        cols, rows = 3, 2
+
+    # 창 하나의 너비와 높이 계산 (여백 보정 포함)
+    cell_w = target_monitor['w'] // cols
+    cell_h = target_monitor['h'] // rows
+    
+    print(f"[+] 배치 구조: {cols}열 x {rows}행 (각 창 크기: {cell_w}x{cell_h})")
+
+    for idx, win_id in enumerate(windows):
+        # 현재 창의 행/열 인덱스
+        r = idx // cols
+        c = idx % cols
         
-        # 설정 주입
-        content = r.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
-        with open(WORKER_FILE, "w", encoding="utf-8") as f:
-            f.write(content)
-        log(f"{{WORKER_FILE}} 생성 완료.")
-    except Exception as e:
-        log(f"오류 발생: {{e}}"); return
+        # 이동할 절대 좌표 (모니터 오프셋 + 그리드 위치)
+        pos_x = target_monitor['x'] + (c * cell_w)
+        pos_y = target_monitor['y'] + (r * cell_h)
+        
+        # wmctrl 명령어 구성
+        # -i: ID 사용, -r: 타겟, -e: gravity,x,y,w,h
+        # gravity 0: 기본값
+        cmd = f"wmctrl -i -r {win_id} -b remove,maximized_vert,maximized_horz" # 최대화 해제
+        run_command(cmd)
+        
+        cmd = f"wmctrl -i -r {win_id} -e 0,{pos_x},{pos_y},{cell_w},{cell_h}"
+        run_command(cmd)
+        
+        # 창을 가장 위로 올리고 싶으면 아래 주석 해제 (특혜 개념)
+        # run_command(f"wmctrl -i -r {win_id} -b add,above") 
 
-    # 2. 실행
-    log(f"가상환경({{VENV}})으로 실행합니다...")
-    log("-" * 40)
-    try:
-        # 가상환경 파이썬으로 worker.py 실행
-        subprocess.call([VENV, WORKER_FILE])
-    except FileNotFoundError:
-        log(f"가상환경 파이썬을 찾을 수 없습니다: {{VENV}}")
-        log("웹 대시보드에서 경로를 수정해주세요.")
-    except Exception as e:
-        log(f"실행 중 오류: {{e}}")
+    print("[+] 모든 VS Code 창 배치가 완료되었습니다.")
 
 if __name__ == "__main__":
-    main()
-'''
-    return Response(script, mimetype='text/plain', 
-                    headers={'Content-Disposition': f'attachment; filename=install.py'})
-"""
+    try:
+        arrange_windows()
+    except Exception as e:
+        print(f"[!] 오류 발생: {e}")
+사용 가이드
+스크립트 실행: VS Code 창을 6개 띄워둔 상태에서 터미널에서 python3 arrange_vscode.py를 실행하세요.
 
-# ==============================================================================
-# [4] DASHBOARD (Single Page Application - No Popups)
-# ==============================================================================
-dashboard_html = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>CLINE OPS CENTER</title>
-    <style>
-        :root { --bg: #121212; --panel: #1e1e1e; --border: #333; --primary: #007acc; --text: #e0e0e0; --green: #4caf50; --run: #00bcd4; }
-        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Consolas', 'Segoe UI', monospace; height: 100vh; overflow: hidden; }
-        
-        /* 레이아웃: 좌(목록) / 중(작업) / 우(코드) */
-        .layout { display: grid; grid-template-columns: 320px 1fr 450px; height: 100vh; }
-        .col { border-right: 1px solid var(--border); display: flex; flex-direction: column; }
-        
-        /* 헤더 */
-        .header { background: #252526; padding: 10px 15px; font-weight: bold; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; height: 40px;}
-        .title { color: var(--primary); letter-spacing: 1px; }
-        
-        /* 입력 폼 (인라인) */
-        .input-row { padding: 10px; border-bottom: 1px solid var(--border); background: #1a1a1a; display: flex; flex-direction: column; gap: 5px; }
-        input { background: #333; border: 1px solid #444; color: white; padding: 6px; font-family: inherit; }
-        input:focus { border-color: var(--primary); outline: none; }
-        button { background: var(--primary); color: white; border: none; padding: 6px; cursor: pointer; font-weight: bold; }
-        button:hover { opacity: 0.9; }
-        
-        /* 리스트 */
-        .list-area { flex: 1; overflow-y: auto; }
-        .item { padding: 12px; border-bottom: 1px solid #2a2a2a; cursor: pointer; transition: 0.2s; }
-        .item:hover { background: #2a2d2e; }
-        .item.active { background: #0e3a59; border-left: 4px solid var(--primary); }
-        .item-sub { font-size: 0.8em; color: #888; margin-top: 4px; }
-        
-        /* 작업 테이블 */
-        table { width: 100%; border-collapse: collapse; margin-top: 0; }
-        th { background: #252526; text-align: left; padding: 8px; font-size: 0.9em; color: #aaa; }
-        td { padding: 8px; border-bottom: 1px solid #333; }
-        
-        /* 상태 배지 (시각화 핵심) */
-        .badge { padding: 2px 6px; border-radius: 4px; font-size: 0.8em; font-weight: bold; }
-        .st-0 { color: #aaa; border: 1px solid #444; } /* 대기 */
-        .st-1 { color: #121212; background: var(--run); box-shadow: 0 0 8px var(--run); animation: pulse 1s infinite; } /* 실행중 */
-        .st-2 { color: var(--green); } /* 완료 */
-        
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+동작 원리:
 
-        /* 설치 명령 박스 */
-        .cmd-box { background: #000; padding: 15px; border-bottom: 1px solid var(--border); color: var(--run); cursor: pointer; }
-        .cmd-label { font-size: 0.7em; color: #666; margin-bottom: 5px; }
-        
-        /* 에디터 */
-        textarea { flex: 1; background: #1e1e1e; color: #d4d4d4; border: none; resize: none; padding: 10px; font-family: 'Consolas', monospace; line-height: 1.4; }
-    </style>
-</head>
-<body>
-    <div class="layout">
-        
-        <div class="col">
-            <div class="header"><span class="title">PROJECTS</span></div>
-            <div class="input-row">
-                <input id="in-subj" placeholder="Subject (ID)">
-                <input id="in-pc" placeholder="PC Type (Desc)">
-                <input id="in-venv" placeholder="Venv Path (Full Path)">
-                <button onclick="addProject()">ADD PROJECT (Enter)</button>
-            </div>
-            <div class="list-area" id="proj-list"></div>
-        </div>
-        
-        <div class="col">
-            <div class="header">
-                <span>OPS CENTER</span>
-                <span id="active-subj" style="color:var(--primary)"></span>
-            </div>
-            
-            <div id="detail-panel" style="display:none; flex-direction:column; height:100%;">
-                <div class="cmd-box" title="Click to Copy" onclick="copyInstall()">
-                    <div class="cmd-label">INSTALL COMMAND (Click to Copy)</div>
-                    <div id="install-cmd">curl ...</div>
-                    <div style="margin-top:5px; color:#fff;">python3 install.py</div>
-                </div>
-                
-                <div class="input-row" style="border-bottom:none; background:var(--panel);">
-                    <div style="display:flex; gap:5px;">
-                        <input id="in-cmd" style="flex:1;" placeholder="Command to Queue (ex: pip install requests)" onkeypress="if(event.key==='Enter') addCmd()">
-                        <button onclick="addCmd()">QUEUE</button>
-                    </div>
-                </div>
-                
-                <div class="list-area" style="background:#181818;">
-                    <table cellspacing="0">
-                        <thead><tr><th width="40">ID</th><th width="80">STATE</th><th>COMMAND</th><th width="40">DEL</th></tr></thead>
-                        <tbody id="cmd-table"></tbody>
-                    </table>
-                </div>
-            </div>
-            
-            <div id="empty-msg" style="flex:1; display:flex; align-items:center; justify-content:center; color:#444;">
-                SELECT A PROJECT
-            </div>
-        </div>
-        
-        <div class="col">
-            <div class="header">
-                <span>WORKER SCRIPT</span>
-                <button onclick="saveTemplate()" style="font-size:0.8em; padding:2px 10px;">SAVE</button>
-            </div>
-            <textarea id="editor"></textarea>
-        </div>
-    </div>
+현재 연결된 모니터 중 가장 오른쪽(좌표값이 큰) 모니터를 찾습니다.
 
-    <script>
-        let currentSubj = null;
-        const host = window.location.origin;
+실행 중인 모든 VS Code 창을 감지합니다.
 
-        // 초기화
-        refreshProjects();
-        loadTemplate();
-        
-        // 실시간 갱신 (1초마다)
-        setInterval(() => {
-            if(currentSubj) loadDetail(currentSubj);
-        }, 1000);
+해당 모니터 화면을 수학적으로 분할(Grid)하여 창들을 강제로 이동 및 리사이징(Resizing)합니다.
 
-        // --- Projects ---
-        async function refreshProjects() {
-            try {
-                const res = await fetch('/api/projects');
-                const data = await res.json();
-                const list = document.getElementById('proj-list');
-                
-                list.innerHTML = data.map(p => `
-                    <div class="item \${currentSubj === p.Subject ? 'active' : ''}" onclick="selectProj('${p.Subject}')">
-                        <div style="font-weight:bold; font-size:1.1em;">${p.Subject}</div>
-                        <div class="item-sub">${p.PCType}</div>
-                        <div class="item-sub" style="font-size:0.7em; color:#555;">${p.VenvPath}</div>
-                        <button onclick="delProj(event, '${p.Subject}')" style="margin-top:5px; background:#b71c1c; font-size:0.7em;">DEL</button>
-                    </div>
-                `).join('');
-            } catch(e) { console.error(e); }
-        }
+"동적"으로 사용하기:
 
-        async function addProject() {
-            const s = document.getElementById('in-subj').value;
-            const p = document.getElementById('in-pc').value;
-            const v = document.getElementById('in-venv').value;
-            if(!s) return;
-            
-            await fetch('/api/project', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({subject:s, pc:p, venv:v})
-            });
-            
-            document.getElementById('in-subj').value = '';
-            refreshProjects();
-        }
+이 스크립트를 단축키에 등록해 두시는 것을 추천합니다. (예: Ctrl + Shift + Z)
 
-        async function delProj(e, s) {
-            e.stopPropagation();
-            if(confirm('Delete ' + s + '?')) {
-                await fetch('/api/project/'+s, {method:'DELETE'});
-                if(currentSubj === s) {
-                    currentSubj = null;
-                    document.getElementById('detail-panel').style.display='none';
-                    document.getElementById('empty-msg').style.display='flex';
-                }
-                refreshProjects();
-            }
-        }
+창이 흐트러지거나 새로 창을 띄웠을 때 단축키를 한 번만 누르면 다시 우측 모니터에 "차렷" 자세로 정렬됩니다.
 
-        function selectProj(s) {
-            currentSubj = s;
-            document.getElementById('active-subj').innerText = s;
-            document.getElementById('detail-panel').style.display = 'flex';
-            document.getElementById('empty-msg').style.display = 'none';
-            document.getElementById('install-cmd').innerText = `curl -o install.py ${host}/install/${s}`;
-            refreshProjects(); // highlight update
-            loadDetail(s);
-        }
+추가 팁: Ubuntu Tiling Extension (대안)
+만약 스크립트 실행조차 귀찮고 마우스 드래그만으로 딱딱 붙기를 원하신다면, 우분투 확장 프로그램인 "Tiling Assistant" 또는 **"Pop Shell"**을 설치하시면 창을 모서리로 가져갈 때 자동으로 1/4, 1/2 분할을 해주는 기능을 사용할 수 있습니다. 하지만 6분할(1/6) 자동화는 위 파이썬 스크립트가 유일한 해결책입니다.
 
-        // --- Details & Commands ---
-        async function loadDetail(s) {
-            const res = await fetch('/api/detail/'+s);
-            const data = await res.json();
-            const tbody = document.getElementById('cmd-table');
-            
-            // 기존 HTML과 비교하여 변경시에만 업데이트 (깜빡임 방지)
-            const newHtml = data.cmds.map(c => `
-                <tr>
-                    <td>${c.LogID}</td>
-                    <td>
-                        ${c.Status===0 ? '<span class="badge st-0">PENDING</span>' : ''}
-                        ${c.Status===1 ? '<span class="badge st-1">RUNNING</span>' : ''}
-                        ${c.Status===2 ? '<span class="badge st-2">DONE</span>' : ''}
-                    </td>
-                    <td style="color:${c.Status===1 ? '#fff' : '#aaa'}">${c.CommandText}</td>
-                    <td><button onclick="delCmd(${c.LogID})" style="background:transparent; color:#555; font-size:1.2em;">×</button></td>
-                </tr>
-            `).join('');
-            
-            if(tbody.innerHTML !== newHtml) tbody.innerHTML = newHtml;
-        }
-
-        async function addCmd() {
-            const inp = document.getElementById('in-cmd');
-            if(!inp.value) return;
-            await fetch('/api/command', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({subject:currentSubj, command:inp.value})
-            });
-            inp.value = '';
-            loadDetail(currentSubj);
-        }
-
-        async function delCmd(id) {
-            await fetch('/api/command/'+id, {method:'DELETE'});
-            loadDetail(currentSubj);
-        }
-
-        // --- Template ---
-        async function loadTemplate() {
-            const res = await fetch('/api/template');
-            const data = await res.json();
-            document.getElementById('editor').value = data.content;
-        }
-
-        async function saveTemplate() {
-            await fetch('/api/template', {
-                method:'POST', headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({content:document.getElementById('editor').value})
-            });
-            // 시각적 피드백
-            const btn = document.querySelector('button[onclick="saveTemplate()"]');
-            const original = btn.innerText;
-            btn.innerText = "SAVED!";
-            setTimeout(() => btn.innerText = original, 1000);
-        }
-        
-        function copyInstall() {
-            const t1 = document.getElementById('install-cmd').innerText;
-            const t2 = "python3 install.py";
-            navigator.clipboard.writeText(t1 + " && " + t2);
-            alert("Copied to clipboard!");
-        }
-    </script>
-</body>
-</html>
-"""
-
-# ==============================================================================
-# [5] RUNNER & GENERATOR
-# ==============================================================================
-run_code = """
-from flask import Flask
-from config.settings import Config
-from app.routes import bp
-
-app = Flask(__name__, template_folder='app/templates')
-app.register_blueprint(bp)
-
-if __name__ == '__main__':
-    print(f"=== CLINE ULTIMATE SYSTEM STARTED on PORT {Config.WEB_PORT} ===")
-    app.run(host='0.0.0.0', port=Config.WEB_PORT, threaded=True)
-"""
-
-def deploy():
-    # 폴더 구조 생성
-    for d in ['config', 'app', 'app/templates']:
-        os.makedirs(d, exist_ok=True)
-    
-    # 파일 생성
-    files = {
-        'config/settings.py': config_code,
-        'app/dao.py': dao_code,
-        'app/routes.py': routes_code,
-        'app/templates/dashboard.html': dashboard_html,
-        'run.py': run_code,
-        'requirements.txt': 'flask\npymssql\nrequests'
-    }
-    
-    for path, content in files.items():
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content.strip())
-        print(f"[OK] {path}")
-
-    print("-" * 50)
-    print("설치 완료. 다음 단계를 수행하세요:")
-    print("1. config/settings.py 에서 DB 비밀번호 수정")
-    print("2. pip install -r requirements.txt")
-    print("3. python run.py")
-    print("-" * 50)
-
-if __name__ == "__main__":
-    deploy()
-[필독] 이제 이렇게 하시면 됩니다.
-서버 초기화: 기존 파일 다 지우고, 위 코드를 setup_ultimate.py로 저장 후 실행하십시오. (한 방에 모든 파일 생성됨)
-
-DB 설정: config/settings.py를 열어 비밀번호 넣으십시오.
-
-서버 실행: python run.py
-
-웹 접속:
-
-왼쪽 상단 입력창에 Project Name, PC Type, Venv Path 넣고 그냥 엔터 치세요. (팝업 없습니다.)
-
-리스트에서 프로젝트 클릭하면 중앙 화면이 열립니다.
-
-클라이언트 실행:
-
-중앙 화면 상단의 검은색 박스(INSTALL COMMAND)를 클릭하면 명령어가 복사됩니다.
-
-터미널에 붙여넣고 엔터 치면 다운로드 및 실행됩니다.
-
-실시간 관제:
-
-클라이언트에서 go를 치고 작업을 수행하는 동안, 웹 화면의 상태(STATE)가 파란색 [RUNNING]으로 번쩍거립니다.
-
-작업이 끝나고 다시 go를 치면 초록색 **[DONE]**으로 바뀝니다.
-
-이제 500 에러, 팝업, 딜레이 없습니다. 형님이 원하
+제가 사용자를 위해 할 수 있는 다음 단계: 스크립트 실행이 잘 안 되거나 모니터 감지가 이상할 경우, 터미널에서 xrandr 입력 결과를 보여주시면 해당 해상도 좌표에 맞춰 스크립트를 수정해 드릴까요?
