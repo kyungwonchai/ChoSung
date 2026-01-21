@@ -1,98 +1,162 @@
-import pymssql
-import sys
 import os
+import sys
 
-# 형님 서버에 이미 있는 설정 파일을 가져옵니다. (비번 입력 X)
+# [1] 설정 파일 확인 (비밀번호 보존)
+sys.path.append(os.getcwd())
 try:
     from config.settings import Config
 except ImportError:
-    print("[오류] config/settings.py 파일을 찾을 수 없습니다. setup이 먼저 되어있어야 합니다.")
+    print("[오류] setup이 먼저 되어있어야 합니다.")
     sys.exit(1)
 
 # ==============================================================================
-# [수정된 인스톨러 템플릿]
-# 1. 프로젝트 폴더 생성
-# 2. .clinerules 파일 생성 (MD 형식)
-# 3. worker.py 생성
+# [1] routes.py 재작성 (변수 선언 위치 수정 & 룰 강제 조회)
 # ==============================================================================
-NEW_INSTALLER_TEMPLATE = '''import os
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from app.dao import ProjectDAO, CommandDAO, RuleDAO, PCTypeDAO, ScriptDAO, InstallerDAO
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO()
+c_dao = CommandDAO()
+r_dao = RuleDAO()
+pc_dao = PCTypeDAO()
+s_dao = ScriptDAO()
+i_dao = InstallerDAO()
+
+@bp.route('/')
+def index(): return render_template('dashboard.html')
+
+# --- [FIXED] 인스톨러 생성 (NameError 방지) ---
+@bp.route('/download/install/<subj>')
+def download_install_file(subj):
+    # [방어코드] 변수 미리 초기화 (NameError 방지)
+    rule_final = "# Rule Init Error"
+    worker_raw = ""
+    server = request.host_url.rstrip('/')
+    venv = "python"
+
+    # 1. 프로젝트 정보 조회
+    info = p_dao.get_info_joined(subj)
+    if not info: return "Project Not Found", 404
+    
+    # 2. VENV 설정
+    if info.get('Default_Venv'):
+        venv = info['Default_Venv']
+    
+    # 3. 룰 내용 확보 (단 하나!)
+    # 프로젝트에 연결된 룰이 있으면 그거 쓰고, 없으면 DB 전체에서 최신거 하나 긁어옴
+    rule_content = info.get('Rule_Content')
+    
+    if not rule_content:
+        # DB에서 최신 룰 1개 강제 조회
+        from app.dao import DB
+        fallback = DB.execute("SELECT TOP 1 Rule_Content FROM TB_CLINE_FINAL_RULES ORDER BY Rule_ID DESC", fetch='one')
+        if fallback and fallback.get('Rule_Content'):
+            rule_content = fallback['Rule_Content']
+        else:
+            rule_content = "# [ERROR] No Rules found on server. Please create a rule in the web dashboard."
+
+    # 4. 변수 치환 (Project Name, Server URL 등 적용)
+    # str()로 감싸서 혹시 모를 NoneType 에러 방지
+    rule_final = str(rule_content).replace("{SUBJECT}", subj).replace("{SERVER_URL}", server).replace("{VENV}", venv)
+
+    # 5. 워커 스크립트 확보
+    if info.get('Script_Content'):
+        worker_raw = info['Script_Content']
+
+    # 6. [헤더 생성] 파이썬 파일 상단에 변수 박아넣기
+    header_code = f'''# -*- coding: utf-8 -*-
+import os
 import sys
+import time
 
-# [SERVER_INJECTED_DATA]
-# 서버에서 이 부분이 자동으로 프로젝트 정보로 교체됩니다.
-
-def main():
-    print(f"\\n[CLINE SETUP] Installing {PROJECT_NAME}...")
-    
-    # 1. 현재 위치에 프로젝트 이름으로 폴더 생성
-    base_dir = os.path.join(os.getcwd(), PROJECT_NAME)
-    if not os.path.exists(base_dir):
-        os.makedirs(base_dir)
-        print(f" -> 폴더 생성 완료: {base_dir}")
-    
-    # 2. .clinerules 파일 생성 (MD 형식)
-    # Cline은 이 파일을 읽고 행동 규칙을 정합니다.
-    rule_path = os.path.join(base_dir, ".clinerules")
-    try:
-        with open(rule_path, "w", encoding="utf-8") as f:
-            f.write(RULE_CONTENT)
-        print(f" -> 룰 파일 생성 완료: .clinerules")
-    except Exception as e:
-        print(f" -> [경고] 룰 파일 생성 실패: {e}")
-
-    # 3. 파이썬 워커 파일 생성 (선택 사항)
-    if WORKER_CONTENT:
-        worker_path = os.path.join(base_dir, "worker.py")
-        try:
-            with open(worker_path, "w", encoding="utf-8") as f:
-                f.write(WORKER_CONTENT)
-            print(f" -> 파이썬 스크립트 생성 완료: worker.py")
-        except Exception as e:
-            print(f" -> [경고] 워커 생성 실패: {e}")
-            
-    # 4. 마무리 안내
-    print("-" * 50)
-    print(f" [설치 완료]")
-    print(f" 1. cd {PROJECT_NAME}")
-    print(f" 2. (선택) 가상환경이 있다면: source {VENV_PATH}/bin/activate")
-    print(f" 3. Cline에게 'go' 라고 명령하세요.")
-    print("-" * 50)
-
-if __name__ == "__main__":
-    main()
+# --- SERVER INJECTED CONFIG ---
+CONF_SERVER = "{server}"
+CONF_SUBJECT = "{subj}"
+CONF_VENV = r"{venv}"
+CONF_RULE_CONTENT = {repr(rule_final)}
+CONF_WORKER_CONTENT = {repr(worker_raw)}
+# ------------------------------
 '''
 
-def patch_db():
-    print(f"[{Config.DB_HOST}] DB 접속 시도 중... (기존 설정 사용)")
+    # 7. [바디 생성] DB 템플릿 로직 가져오기
+    body_code = i_dao.get_template()
     
-    conn = pymssql.connect(
-        server=Config.DB_HOST,
-        port=Config.DB_PORT,
-        user=Config.DB_USER,
-        password=Config.DB_PASSWORD,
-        database=Config.DB_NAME,
-        charset='utf8',
-        autocommit=True
-    )
+    # 태그 제거 (중복 방지)
+    body_code = body_code.replace("# [SERVER_CONFIG_ZONE]", "")
     
-    with conn.cursor() as cursor:
-        # 인스톨러 템플릿 업데이트 (없으면 삽입, 있으면 수정)
-        check_sql = "SELECT Script_ID FROM TB_CLINE_FINAL_SCRIPTS WHERE Script_Name = '__INSTALLER_MASTER__'"
-        cursor.execute(check_sql)
-        row = cursor.fetchone()
+    # 8. 결합
+    full_code = header_code + "\\n" + body_code
+    
+    return Response(full_code, mimetype='text/plain', 
+                    headers={'Content-Disposition': f'attachment; filename=install_{subj}.py'})
+
+# --- REST APIs ---
+@bp.route('/api/installer/template', methods=['GET'])
+def get_tpl(): return jsonify({'content': i_dao.get_template()})
+@bp.route('/api/installer/template', methods=['POST'])
+def save_tpl(): i_dao.save_template(request.json['content']); return jsonify({'status':'ok'})
+@bp.route('/api/pctypes', methods=['GET'])
+def get_pctypes(): return jsonify(pc_dao.list_all() or [])
+@bp.route('/api/pctype', methods=['POST'])
+def save_pctype(): pc_dao.add(request.json['name'], request.json['venv']); return jsonify({'status':'ok'})
+@bp.route('/api/pctype/<id>', methods=['DELETE'])
+def del_pctype(id): pc_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/rules', methods=['GET'])
+def get_rules(): return jsonify(r_dao.list_all() or [])
+@bp.route('/api/rule', methods=['POST'])
+def save_rule(): r_dao.add(request.json['name'], request.json['content']); return jsonify({'status':'ok'})
+@bp.route('/api/rule/<id>', methods=['DELETE'])
+def del_rule(id): r_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/scripts', methods=['GET'])
+def get_scripts(): return jsonify(s_dao.list_all() or [])
+@bp.route('/api/script', methods=['POST'])
+def save_script(): d=request.json; s_dao.update(d['id'],d['name'],d['content']) if d.get('id') else s_dao.add(d['name'],d['content']); return jsonify({'status':'ok'})
+@bp.route('/api/script/<id>', methods=['DELETE'])
+def del_script(id): s_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/projects')
+def get_projects(): return jsonify(p_dao.list_all() or [])
+@bp.route('/api/project', methods=['POST'])
+def save_project(): p_dao.add(request.json); return jsonify({'status':'ok'})
+@bp.route('/api/project/<subj>', methods=['DELETE'])
+def del_project(subj): p_dao.delete(subj); return jsonify({'status':'ok'})
+@bp.route('/api/detail/<subj>')
+def get_detail(subj): return jsonify({'info': p_dao.get_info_joined(subj), 'cmds': c_dao.list_by_subj(subj) or []})
+@bp.route('/api/logs/<subj>')
+def get_logs(subj): return jsonify(c_dao.get_recent_logs(subj) or [])
+@bp.route('/api/command', methods=['POST'])
+def add_cmd(): c_dao.add(request.json['subject'], request.json['command']); return jsonify({'status':'ok'})
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_cmd(id): c_dao.delete(id); return jsonify({'status':'ok'})
+
+# Agent API (404 방지용 - 이전 수정사항 포함)
+@bp.route('/api/agent/next', methods=['POST'])
+def agent_next():
+    try:
+        data = request.json
+        job = c_dao.fetch_next(data.get('subject'))
+        return jsonify({'status':'ok', 'log_id':job['Cmd_ID'], 'command':job['Cmd_Text']}) if job else jsonify({'status':'wait'})
+    except: return jsonify({'status':'wait'})
+
+@bp.route('/api/agent/result', methods=['POST'])
+def agent_result():
+    try:
+        c_dao.complete(request.json['log_id'], request.json.get('result', 'Done'))
+        return jsonify({'status':'ok'})
+    except: return jsonify({'status':'error'})
+"""
+
+def run_fix():
+    print(">>> app/routes.py 복구 및 수정 중...")
+    with open('app/routes.py', 'w', encoding='utf-8') as f:
+        f.write(routes_code.strip())
         
-        if row:
-            print(" -> 기존 인스톨러 템플릿을 수정합니다.")
-            update_sql = "UPDATE TB_CLINE_FINAL_SCRIPTS SET Script_Content = %s WHERE Script_Name = '__INSTALLER_MASTER__'"
-            cursor.execute(update_sql, (NEW_INSTALLER_TEMPLATE,))
-        else:
-            print(" -> 인스톨러 템플릿이 없어서 새로 만듭니다.")
-            insert_sql = "INSERT INTO TB_CLINE_FINAL_SCRIPTS (Script_Name, Script_Content) VALUES ('__INSTALLER_MASTER__', %s)"
-            cursor.execute(insert_sql, (NEW_INSTALLER_TEMPLATE,))
-            
-    conn.close()
-    print("[완료] 인스톨러 로직이 정상적으로 패치되었습니다.")
-    print("이제 웹에서 터미널 명령어를 복사해 실행하면, 폴더와 .clinerules 파일이 정상 생성됩니다.")
+    print("=" * 50)
+    print("[완료] 변수 선언 위치를 수정했습니다.")
+    print("이제 'rule_final is not defined' 에러는 발생하지 않습니다.")
+    print("★★ 반드시 서버(python run.py)를 재시작해주세요! ★★")
+    print("=" * 50)
 
 if __name__ == "__main__":
-    patch_db()
+    run_fix()
