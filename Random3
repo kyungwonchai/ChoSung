@@ -1,148 +1,575 @@
-1. 로그 회전(Log Rotation) 명령 가이드
-AI에게 로그 관련 코드를 짜달라고 할 때, 아래와 같이 명확하게 제약 조건을 설명하면 정확한 코드를 얻을 수 있습니다.
+단계: DB 재설계 (MSSQL 쿼리)
+기존 테이블 싹 날리고, 룰(Rule) 테이블을 독립시켰습니다.
 
-설명 예시: "파이썬 logging 라이브러리의 TimedRotatingFileHandler를 사용하여 로그 시스템을 만들어줘. 로그는 매일 자정(midnight)에 한 번 회전하고, 보관 주기(backupCount)는 1일로 설정해서 딱 하루치 데이터만 남기고 이전 로그는 삭제되게 해줘. 로그 파일 경로는 ./logs/app_name.log 형식이면 좋겠어."
+SQL
 
-2. PM2를 이용한 관리 및 로그 제어
-PM2 자체 기능을 사용하여 로그 용량과 보관 기간을 관리하는 것이 가장 깔끔합니다.
+-- 1. 기존 테이블 정리
+IF OBJECT_ID('TB_CLINE_COMMANDS', 'U') IS NOT NULL DROP TABLE TB_CLINE_COMMANDS;
+IF OBJECT_ID('TB_CLINE_PROJECTS', 'U') IS NOT NULL DROP TABLE TB_CLINE_PROJECTS;
+IF OBJECT_ID('TB_CLINE_RULES', 'U') IS NOT NULL DROP TABLE TB_CLINE_RULES;
 
-① PM2 로그 로테이트 설치 터미널에서 아래 명령어를 입력하면 PM2가 알아서 로그를 쪼개고 오래된 것을 지워줍니다.
+-- 2. [NEW] 전역 룰 마스터 (여기서만 수정하면 다 반영됨)
+CREATE TABLE TB_CLINE_RULES (
+    RuleID INT IDENTITY(1,1) PRIMARY KEY,
+    RuleName NVARCHAR(100) NOT NULL, -- 예: "기본 파이썬 코딩 룰", "보안 강화 룰"
+    RuleContent NVARCHAR(MAX),       -- 실제 프롬프트/규칙 내용
+    CreatedAt DATETIME DEFAULT GETDATE()
+);
 
-Bash
+-- 기본 룰 하나 삽입
+INSERT INTO TB_CLINE_RULES (RuleName, RuleContent) VALUES 
+('Default Python Rule', '1. 모든 코드는 UTF-8 인코딩 사용\n2. 에러 처리는 try-except 필수\n3. 변수명은 스네이크 케이스');
 
-pm2 install pm2-logrotate
-② 하루치만 보관하도록 설정
+-- 3. 프로젝트 마스터 (RuleID로 참조)
+CREATE TABLE TB_CLINE_PROJECTS (
+    ProjectID INT IDENTITY(1,1) PRIMARY KEY,
+    Subject NVARCHAR(200) NOT NULL UNIQUE,
+    Description NVARCHAR(500),
+    PCType NVARCHAR(50),
+    VenvPath NVARCHAR(500),
+    RuleID INT, -- [핵심] 텍스트가 아니라 ID만 저장 (FK 개념)
+    CreatedAt DATETIME DEFAULT GETDATE()
+);
 
-Bash
-
-# 최대 보관 파일 수를 1개로 제한 (당일 로그 + 전날 로그 1개)
-pm2 set pm2-logrotate:retain 1
-# 파일 하나당 용량 제한 (예: 10MB)
-pm2 set pm2-logrotate:max_size 10M
-③ 앱 등록 예시
-
-Bash
-
-pm2 start script.py --name "my-app-01" --log ./logs/my-app-01.log
-3. 실시간 로그 뷰어 Flask 앱 (Port: 30000)
-PM2에 등록된 앱 리스트를 불러오고, 해당 앱의 로그를 실시간으로 확인할 수 있는 '다크 모드' 테마의 Flask 앱입니다.
+-- 4. 명령 큐
+CREATE TABLE TB_CLINE_COMMANDS (
+    LogID INT IDENTITY(1,1) PRIMARY KEY,
+    Subject NVARCHAR(200),
+    CommandText NVARCHAR(MAX),
+    Status INT DEFAULT 0, -- 0:대기, 1:실행, 2:완료
+    ResultLog NVARCHAR(MAX),
+    CreatedAt DATETIME DEFAULT GETDATE(),
+    CompletedAt DATETIME
+);
+2단계: 아키텍트급 통합 스크립트 (cline_architect.py)
+이 코드는 "룰 관리자" 기능을 포함한 웹 서버를 생성합니다. UI에서 룰을 먼저 등록하고, 프로젝트 생성 시 드롭다운으로 선택하게 만들었습니다.
 
 Python
 
 import os
-import subprocess
-import json
-from flask import Flask, render_template_string, jsonify
 
-app = Flask(__name__)
+# ==============================================================================
+# [1] CONFIG
+# ==============================================================================
+config_code = """
+import os
 
-# CSS 및 HTML 템플릿 (개까리한 다크 테마)
-HTML_TEMPLATE = """
+class Config:
+    # MSSQL 접속 정보 [수정필요]
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = 'sa'
+    DB_PASSWORD = 'password'
+    DB_NAME = 'SMD_DB'
+    
+    WEB_PORT = 12233
+    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3'] 
+"""
+
+# ==============================================================================
+# [2] DAO (Join Logic 추가)
+# ==============================================================================
+dao_code = """
+import pymssql
+from config.settings import Config
+
+class DB:
+    @staticmethod
+    def execute(sql, args=(), fetch=None):
+        conn = pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
+            database=Config.DB_NAME, charset='utf8', autocommit=True
+        )
+        try:
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': return cur.fetchone()
+                if fetch == 'all': return cur.fetchall()
+                return True
+        except Exception as e:
+            print(f"[DB Error] {e}\\nQuery: {sql}")
+            return None
+        finally: conn.close()
+
+class RuleDAO:
+    def list_all(self):
+        return DB.execute("SELECT * FROM TB_CLINE_RULES ORDER BY RuleID ASC", fetch='all')
+    def add(self, name, content):
+        DB.execute("INSERT INTO TB_CLINE_RULES (RuleName, RuleContent) VALUES (%s, %s)", (name, content))
+    def update(self, rid, name, content):
+        DB.execute("UPDATE TB_CLINE_RULES SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (name, content, rid))
+    def delete(self, rid):
+        # 룰 삭제 시 해당 룰을 쓰던 프로젝트는 NULL 처리 하거나 기본값 처리 필요 (여기선 단순 삭제)
+        DB.execute("DELETE FROM TB_CLINE_RULES WHERE RuleID=%s", (rid,))
+
+class ProjectDAO:
+    def list_all(self):
+        # 프로젝트 목록 가져올 때 룰 이름도 같이 가져옴 (JOIN)
+        sql = '''
+            SELECT P.*, R.RuleName 
+            FROM TB_CLINE_PROJECTS P
+            LEFT JOIN TB_CLINE_RULES R ON P.RuleID = R.RuleID
+            ORDER BY P.CreatedAt DESC
+        '''
+        return DB.execute(sql, fetch='all')
+
+    def upsert(self, d):
+        chk = DB.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (d['subject'],), fetch='one')
+        if chk:
+            sql = "UPDATE TB_CLINE_PROJECTS SET Description=%s, PCType=%s, VenvPath=%s, RuleID=%s WHERE Subject=%s"
+            args = (d['desc'], d['pc'], d['venv'], d['rule_id'], d['subject'])
+        else:
+            sql = "INSERT INTO TB_CLINE_PROJECTS (Subject, Description, PCType, VenvPath, RuleID) VALUES (%s, %s, %s, %s, %s)"
+            args = (d['subject'], d['desc'], d['pc'], d['venv'], d['rule_id'])
+        DB.execute(sql, args)
+
+    def delete(self, s):
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (s,))
+        DB.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,))
+
+    def get_info_with_rule(self, s):
+        # 인스톨러 생성 시 실제 룰 내용을 가져오기 위해 JOIN 사용
+        sql = '''
+            SELECT P.*, R.RuleContent 
+            FROM TB_CLINE_PROJECTS P
+            LEFT JOIN TB_CLINE_RULES R ON P.RuleID = R.RuleID
+            WHERE P.Subject = %s
+        '''
+        return DB.execute(sql, (s,), fetch='one')
+
+class CommandDAO:
+    def list_by_subj(self, s): return DB.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (s,), fetch='all')
+    def add(self, s, c): DB.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (s, c))
+    def delete(self, id): DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (id,))
+    def fetch_next(self, s):
+        DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (s,))
+        job = DB.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (s,), fetch='one')
+        if job: DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (job['LogID'],))
+        return job
+
+class TemplateDAO:
+    def get_worker(self):
+        r = DB.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+        return r['ScriptContent'] if r else "# No Template"
+    def save_worker(self, c):
+        DB.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
+"""
+
+# ==============================================================================
+# [3] ROUTES (룰 관리 API 추가)
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO, RuleDAO
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO(); r_dao = RuleDAO()
+
+@bp.route('/')
+def index(): return render_template('dashboard.html')
+
+# --- RULES API (전역 룰 관리) ---
+@bp.route('/api/rules', methods=['GET'])
+def get_rules(): return jsonify(r_dao.list_all() or [])
+
+@bp.route('/api/rule', methods=['POST'])
+def save_rule():
+    d = request.json
+    if d.get('id'): r_dao.update(d['id'], d['name'], d['content'])
+    else: r_dao.add(d['name'], d['content'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/rule/<id>', methods=['DELETE'])
+def del_rule(id):
+    r_dao.delete(id)
+    return jsonify({'status':'ok'})
+
+# --- PROJECT API ---
+@bp.route('/api/projects')
+def get_projects(): return jsonify(p_dao.list_all() or [])
+
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    p_dao.upsert(request.json)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/project/<subj>', methods=['DELETE'])
+def del_project(subj):
+    p_dao.delete(subj)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/detail/<subj>')
+def get_detail(subj):
+    # 상세 조회 시 룰 내용도 포함됨
+    info = p_dao.get_info_with_rule(subj)
+    return jsonify({'info': info, 'cmds': c_dao.list_by_subj(subj) or []})
+
+# --- COMMAND API ---
+@bp.route('/api/command', methods=['POST'])
+def add_cmd():
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_cmd(id):
+    c_dao.delete(id)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    job = c_dao.fetch_next(request.json.get('subject'))
+    return jsonify({'status':'ok', 'command':job['CommandText']}) if job else jsonify({'status':'wait'})
+
+@bp.route('/api/template', methods=['GET', 'POST'])
+def tpl_handle():
+    if request.method=='GET': return jsonify({'content':t_dao.get_worker()})
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/get_worker_raw')
+def get_worker_raw(): return Response(t_dao.get_worker(), mimetype='text/plain')
+
+# --- [DYNAMIC INSTALLER] DB에서 룰을 조회하여 주입 ---
+@bp.route('/setup/<subj>')
+def setup_script(subj):
+    info = p_dao.get_info_with_rule(subj)
+    if not info: return "Project Not Found", 404
+    
+    server = request.host_url.rstrip('/')
+    venv = info['VenvPath'] if info['VenvPath'] else 'python'
+    
+    # [핵심] DB에서 가져온 RuleContent를 동적으로 주입
+    # 만약 RuleID가 없거나 삭제되었으면 기본 메시지
+    rule_content = info['RuleContent'] if info['RuleContent'] else "지정된 룰이 없습니다."
+    
+    # Python 문자열 내에서 이스케이프 문제 방지를 위해 repr 사용 고려 가능하나
+    # 여기선 raw string 처리 (단, triple quote 충돌 주의)
+    rule_content_safe = rule_content.replace('"', '\\"').replace("'''", "")
+
+    # [INSTALLER CODE]
+    installer = f'''
+import os, sys, requests, subprocess
+
+SERVER = "{server}"
+SUBJECT = "{subj}"
+VENV = r"{venv}"
+WORKER_FILE = "worker.py"
+RULE_FILE = "GLOBAL_RULES.txt"
+
+def main():
+    print(f"[SETUP] {{SUBJECT}} 환경 구성 중...")
+    base = os.path.join(os.getcwd(), SUBJECT)
+    if not os.path.exists(base): os.makedirs(base)
+    
+    # 1. 전역 룰 파일 생성 (매 실행마다 최신내용 갱신)
+    rule_content = r"""{rule_content_safe}"""
+    with open(os.path.join(base, RULE_FILE), "w", encoding="utf-8") as f:
+        f.write(rule_content)
+    print("[OK] 전역 룰 파일 갱신됨")
+
+    # 2. 워커 스크립트 다운로드
+    try:
+        r = requests.get(f"{{SERVER}}/get_worker_raw")
+        content = r.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
+        with open(os.path.join(base, WORKER_FILE), "w", encoding="utf-8") as f:
+            f.write(content)
+        print("[OK] 워커 스크립트 갱신됨")
+    except Exception as e:
+        print(f"[ERR] 다운로드 실패: {{e}}"); return
+
+    # 3. 실행
+    print(f"[RUN] 가상환경({{VENV}}) 진입...")
+    print("-" * 40)
+    try:
+        subprocess.call([VENV, WORKER_FILE], cwd=base)
+    except Exception as e:
+        print(f"[ERR] 실행 오류: {{e}}")
+
+if __name__ == "__main__":
+    main()
+'''
+    return Response(installer, mimetype='text/plain')
+"""
+
+# ==============================================================================
+# [4] UI (DASHBOARD) - 룰 관리 탭 추가
+# ==============================================================================
+dashboard_html = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PM2 Log Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>CLINE OPS v2</title>
     <style>
-        body { background-color: #0f172a; color: #e2e8f0; }
-        .log-container { background-color: #020617; border: 1px solid #1e293b; height: 600px; overflow-y: auto; font-family: 'Courier New', Courier, monospace; }
-        .app-card:hover { background-color: #1e293b; cursor: pointer; transition: 0.3s; }
-        .active-app { border-left: 4px solid #38bdf8; background-color: #1e293b; }
+        :root { --bg: #1e1e1e; --panel: #252526; --border: #333; --blue: #007acc; --text: #ccc; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; display: flex; }
+        
+        /* Layout */
+        .sidebar { width: 300px; background: #111; border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+        .main { flex: 1; display: flex; flex-direction: column; }
+        
+        /* Tabs */
+        .tabs { display: flex; background: #2d2d2d; border-bottom: 1px solid var(--border); }
+        .tab { padding: 10px 20px; cursor: pointer; font-weight: bold; border-right: 1px solid var(--border); }
+        .tab.active { background: var(--blue); color: white; }
+        .tab-content { display: none; height: 100%; flex-direction: column; }
+        .tab-content.active { display: flex; }
+
+        /* Components */
+        input, select, textarea { background: #3c3c3c; border: 1px solid #555; color: white; padding: 8px; width: 100%; box-sizing: border-box; margin-bottom: 5px; }
+        button { background: var(--blue); color: white; border: none; padding: 8px; cursor: pointer; }
+        .list-item { padding: 12px; border-bottom: 1px solid #333; cursor: pointer; }
+        .list-item:hover { background: #333; }
+        .list-item.active { background: #0e3a59; border-left: 3px solid var(--blue); }
+        
+        /* Helper */
+        .row { display: flex; gap: 10px; padding: 10px; border-bottom: 1px solid #333; }
+        .code-box { font-family: monospace; background: black; padding: 10px; color: #4fc1ff; cursor: pointer; }
     </style>
 </head>
-<body class="p-8">
-    <div class="max-w-6xl mx-auto">
-        <header class="mb-8 border-b border-slate-700 pb-4">
-            <h1 class="text-3xl font-bold text-sky-400">PM2 LOG MONITOR</h1>
-            <p class="text-slate-400">실시간 프로세스 로그 대시보드 (Port 30000)</p>
-        </header>
-
-        <div class="grid grid-cols-12 gap-6">
-            <div class="col-span-4 bg-slate-900 rounded-lg p-4 border border-slate-800">
-                <h2 class="text-xl font-semibold mb-4 text-slate-200">Registered Apps</h2>
-                <div id="app-list" class="space-y-2">
-                    </div>
+<body>
+    <div class="sidebar">
+        <div class="tabs">
+            <div class="tab active" onclick="swTab('projects')">PROJECTS</div>
+            <div class="tab" onclick="swTab('rules')">RULES</div>
+        </div>
+        
+        <div id="tab-projects" class="tab-content active" style="overflow-y:auto;">
+            <div style="padding:10px; background:#252526;">
+                <button onclick="openProjModal()" style="width:100%">+ NEW PROJECT</button>
             </div>
+            <div id="proj-list"></div>
+        </div>
 
-            <div class="col-span-8">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 id="current-app-name" class="text-xl font-semibold text-sky-300">앱을 선택하세요</h2>
-                    <button onclick="fetchLogs()" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-1 rounded text-sm transition">새로고침</button>
-                </div>
-                <div id="log-window" class="log-container p-4 rounded-lg text-sm leading-relaxed">
-                    로그를 보려면 왼쪽 리스트에서 앱을 클릭하세요...
-                </div>
+        <div id="tab-rules" class="tab-content" style="overflow-y:auto;">
+            <div style="padding:10px; background:#252526;">
+                <button onclick="openRuleModal()" style="width:100%">+ NEW RULE</button>
             </div>
+            <div id="rule-list"></div>
+        </div>
+    </div>
+
+    <div class="main">
+        <div id="workspace" style="display:none; flex-direction:column; height:100%;">
+            <div style="padding:15px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center;">
+                <h2 id="ws-title" style="margin:0;"></h2>
+                <span id="ws-rule-name" style="color:orange; font-size:0.9em; border:1px solid orange; padding:2px 5px; border-radius:4px;"></span>
+            </div>
+            
+            <div class="code-box" onclick="copySetup()" title="Click to Copy">
+                <div style="color:#888; font-size:0.8em; margin-bottom:5px;">SETUP COMMAND</div>
+                <span id="ws-cmd"></span>
+            </div>
+            
+            <div class="row">
+                <input id="new-cmd" placeholder="Command..." onkeypress="if(event.key==='Enter') addCmd()">
+                <button onclick="addCmd()" style="width:100px;">QUEUE</button>
+            </div>
+            
+            <div style="flex:1; overflow-y:auto; padding:15px;">
+                <table style="width:100%; border-collapse:collapse;">
+                    <thead><tr style="text-align:left; color:#888;"><th>ID</th><th>STATE</th><th>COMMAND</th><th></th></tr></thead>
+                    <tbody id="cmd-tbl"></tbody>
+                </table>
+            </div>
+        </div>
+        <div id="empty-msg" style="margin:auto; color:#555;">SELECT A PROJECT</div>
+    </div>
+
+    <div id="modal-proj" style="display:none; position:fixed; top:20%; left:30%; width:400px; background:#252526; padding:20px; border:1px solid #555; box-shadow:0 0 20px black;">
+        <h3>New Project</h3>
+        <input id="mp-subj" placeholder="Subject ID">
+        <input id="mp-desc" placeholder="Description">
+        <input id="mp-pc" placeholder="PC Type">
+        <input id="mp-venv" placeholder="Venv Path">
+        <select id="mp-rule"></select> <div style="margin-top:10px; display:flex; gap:10px;">
+            <button onclick="saveProj()">SAVE</button>
+            <button onclick="closeModal('modal-proj')" style="background:#555;">CANCEL</button>
+        </div>
+    </div>
+
+    <div id="modal-rule" style="display:none; position:fixed; top:20%; left:30%; width:400px; background:#252526; padding:20px; border:1px solid #555; box-shadow:0 0 20px black;">
+        <h3>Manage Rule</h3>
+        <input type="hidden" id="mr-id">
+        <input id="mr-name" placeholder="Rule Name">
+        <textarea id="mr-content" rows="10" placeholder="Rule Content"></textarea>
+        <div style="margin-top:10px; display:flex; gap:10px;">
+            <button onclick="saveRule()">SAVE</button>
+            <button onclick="closeModal('modal-rule')" style="background:#555;">CANCEL</button>
         </div>
     </div>
 
     <script>
-        let selectedApp = "";
+        const host = window.location.origin;
+        let curSubj = null;
+        let rulesCache = [];
 
-        async function loadApps() {
-            const res = await fetch('/api/apps');
-            const apps = await res.json();
-            const listDiv = document.getElementById('app-list');
-            listDiv.innerHTML = apps.map(app => `
-                <div onclick="selectApp('${app.name}')" class="app-card p-3 rounded border border-slate-800 flex justify-between items-center">
-                    <span>${app.name}</span>
-                    <span class="text-xs ${app.status === 'online' ? 'text-green-400' : 'text-red-400'}">● ${app.status}</span>
+        init();
+        function init() {
+            loadRules(); // Load rules first for dropdown
+            loadProjects();
+            setInterval(() => { if(curSubj) loadDetail(curSubj); }, 2000);
+        }
+
+        function swTab(t) {
+            document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('tab-'+t).classList.add('active');
+        }
+
+        // --- RULES ---
+        async function loadRules() {
+            const res = await fetch('/api/rules');
+            rulesCache = await res.json();
+            
+            // Draw List
+            document.getElementById('rule-list').innerHTML = rulesCache.map(r => `
+                <div class="list-item" onclick="editRule(${r.RuleID}, '${r.RuleName}')">
+                    <div style="font-weight:bold;">${r.RuleName}</div>
+                    <div style="font-size:0.8em; color:#888;">${r.RuleContent.substring(0,30)}...</div>
+                </div>
+            `).join('');
+
+            // Draw Dropdown
+            document.getElementById('mp-rule').innerHTML = rulesCache.map(r => 
+                `<option value="${r.RuleID}">${r.RuleName}</option>`
+            ).join('');
+        }
+
+        function openRuleModal() {
+            document.getElementById('mr-id').value = '';
+            document.getElementById('mr-name').value = '';
+            document.getElementById('mr-content').value = '';
+            document.getElementById('modal-rule').style.display = 'block';
+        }
+
+        function editRule(id, name) {
+            const r = rulesCache.find(x => x.RuleID == id);
+            document.getElementById('mr-id').value = id;
+            document.getElementById('mr-name').value = name;
+            document.getElementById('mr-content').value = r.RuleContent;
+            document.getElementById('modal-rule').style.display = 'block';
+        }
+
+        async function saveRule() {
+            const body = {
+                id: document.getElementById('mr-id').value,
+                name: document.getElementById('mr-name').value,
+                content: document.getElementById('mr-content').value
+            };
+            await fetch('/api/rule', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+            closeModal('modal-rule');
+            loadRules();
+        }
+
+        // --- PROJECTS ---
+        async function loadProjects() {
+            const res = await fetch('/api/projects');
+            const data = await res.json();
+            document.getElementById('proj-list').innerHTML = data.map(p => `
+                <div class="list-item \${curSubj===p.Subject?'active':''}" onclick="sel('${p.Subject}')">
+                    <div style="font-weight:bold;">${p.Subject}</div>
+                    <div style="font-size:0.8em;">${p.PCType} | Rule: ${p.RuleName || 'None'}</div>
                 </div>
             `).join('');
         }
 
-        async function selectApp(name) {
-            selectedApp = name;
-            document.getElementById('current-app-name').innerText = name + " Logs";
-            fetchLogs();
+        function openProjModal() { document.getElementById('modal-proj').style.display = 'block'; }
+        
+        async function saveProj() {
+            const body = {
+                subject: document.getElementById('mp-subj').value,
+                desc: document.getElementById('mp-desc').value,
+                pc: document.getElementById('mp-pc').value,
+                venv: document.getElementById('mp-venv').value,
+                rule_id: document.getElementById('mp-rule').value // Rule ID 전송
+            };
+            await fetch('/api/project', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+            closeModal('modal-proj');
+            loadProjects();
         }
 
-        async function fetchLogs() {
-            if (!selectedApp) return;
-            const logWindow = document.getElementById('log-window');
-            const res = await fetch(`/api/logs/${selectedApp}`);
+        function sel(s) {
+            curSubj = s;
+            document.getElementById('workspace').style.display = 'flex';
+            document.getElementById('empty-msg').style.display = 'none';
+            document.getElementById('ws-title').innerText = s;
+            document.getElementById('ws-cmd').innerText = `curl -s ${host}/setup/${s} | python3`;
+            loadProjects(); // highlight
+            loadDetail(s);
+        }
+
+        async function loadDetail(s) {
+            const res = await fetch('/api/detail/'+s);
             const data = await res.json();
-            logWindow.innerHTML = data.logs.replace(/\\n/g, '<br>');
-            logWindow.scrollTop = logWindow.scrollHeight;
+            
+            // 룰 이름 표시
+            document.getElementById('ws-rule-name').innerText = "RULE: " + (data.info.RuleName || 'None');
+            
+            document.getElementById('cmd-tbl').innerHTML = data.cmds.map(c => `
+                <tr style="border-bottom:1px solid #333;">
+                    <td>${c.LogID}</td>
+                    <td style="color:${c.Status===1?'#4fc1ff':(c.Status===2?'#4caf50':'#aaa')}">
+                        ${c.Status===0?'WAIT':(c.Status===1?'RUNNING':'DONE')}
+                    </td>
+                    <td>${c.CommandText}</td>
+                    <td><button onclick="delCmd(${c.LogID})" style="background:none; border:none; color:#555;">X</button></td>
+                </tr>
+            `).join('');
         }
 
-        setInterval(loadApps, 5000);
-        loadApps();
+        async function addCmd() {
+            const v = document.getElementById('new-cmd').value;
+            if(!v) return;
+            await fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subject:curSubj, command:v})});
+            document.getElementById('new-cmd').value = '';
+            loadDetail(curSubj);
+        }
+        async function delCmd(id) { await fetch('/api/command/'+id, {method:'DELETE'}); loadDetail(curSubj); }
+
+        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+        function copySetup() { navigator.clipboard.writeText(document.getElementById('ws-cmd').innerText); alert('Copied'); }
     </script>
 </body>
 </html>
 """
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# ==============================================================================
+# [5] GENERATE
+# ==============================================================================
+def deploy():
+    for d in ['config', 'app', 'app/templates']: os.makedirs(d, exist_ok=True)
+    files = {
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/templates/dashboard.html': dashboard_html,
+        'run.py': """from flask import Flask\nfrom config.settings import Config\nfrom app.routes import bp\napp = Flask(__name__, template_folder='app/templates')\napp.register_blueprint(bp)\nif __name__=='__main__': app.run(host='0.0.0.0', port=Config.WEB_PORT)""",
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
+    for p, c in files.items():
+        with open(p, 'w', encoding='utf-8') as f: f.write(c.strip())
+    print("[설치 완료] 1. MSSQL 쿼리 실행(테이블 생성) -> 2. run.py 실행")
 
-@app.route('/api/apps')
-def get_apps():
-    # PM2 리스트 가져오기
-    result = subprocess.run(['pm2', 'jlist'], capture_output=True, text=True)
-    apps_data = json.loads(result.stdout)
-    apps = [{"name": app['name'], "status": app['pm2_env']['status']} for app in apps_data]
-    return jsonify(apps)
+if __name__ == "__main__":
+    deploy()
+최종 사용법 (이젠 정말 완벽합니다)
+DB 초기화: 맨 위 SQL 쿼리 실행 (테이블 구조 변경됨).
 
-@app.route('/api/logs/<app_name>')
-def get_logs(app_name):
-    # PM2 로그 경로 찾기
-    result = subprocess.run(['pm2', 'describe', app_name], capture_output=True, text=True)
-    # 실제 환경에서는 pm2 jlist의 log 경로를 사용하는 것이 더 정확함
-    # 여기서는 간단히 tail 명령어로 마지막 100줄만 가져옴
-    log_proc = subprocess.run(['pm2', 'logs', app_name, '--raw', '--lines', '100', '--err', '--out'], 
-                              capture_output=True, text=True, timeout=2)
-    return jsonify({"logs": log_proc.stdout if log_proc.stdout else "No logs found."})
+설치: 위 파이썬 코드 실행 → setup_architect.py (파일 생성).
 
-if __name__ == '__main__':
-    # 30000번 포트로 실행
-    app.run(host='0.0.0.0', port=30000)
-실행 가이드
-위 Flask 코드를 viewer.py로 저장합니다.
+실행: python run.py.
 
-pip install flask 명령어로 플라스크를 설치합니다.
+웹 대시보드 (좌측 탭 메뉴):
 
-python viewer.py를 실행하거나, 이 뷰어 자체도 pm2 start viewer.py --name "Log-Viewer"로 등록해 버리세요.
+RULES 탭: 여기서 "기본 파이썬 룰", "보안 룰" 등을 만듭니다. (한 번만 입력하면 됨)
+
+PROJECTS 탭: 프로젝트 생성 시 방금 만든 룰을 콤보박스에서 선택만 하세요.
+
+로컬 PC:
+
+프로젝트 선택 후 나오는 curl 명령을 실행하면, 선택된 룰의 내용이 자동으로 로컬에 GLOBAL_RULES.txt로 생성됩니다.
+
+나중에 룰 내용을 웹에서 수정하고, 로컬에서 다시 curl 한번 때리
