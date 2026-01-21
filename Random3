@@ -1,57 +1,486 @@
-단계: DB 컬럼 무제한으로 확장 (SQL 실행)
-이 쿼리를 SSMS에서 실행해서, 결과 담을 그릇을 **2GB(최대)**까지 늘려주십시오. 없으면 만들고, 작으면 늘립니다.
+import os
+import sys
+import pymssql
 
-SQL
+sys.path.append(os.getcwd())
+try:
+    from config.settings import Config
+except ImportError:
+    print("[오류] 설정 파일 없음.")
+    sys.exit(1)
 
--- 테이블이 TB_CLINE_FINAL_COMMANDS 라고 가정
-USE SMD_DB; -- 형님 DB명 확인
+# ==============================================================================
+# [1] routes.py 수정 (현재 폴더 설치 모드 지원)
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from app.dao import ProjectDAO, CommandDAO, RuleDAO, PCTypeDAO, ScriptDAO, InstallerDAO, StatsDAO
 
--- 1. 혹시 컬럼이 없으면 추가
-IF NOT EXISTS (
-  SELECT * FROM sys.columns 
-  WHERE object_id = OBJECT_ID('TB_CLINE_FINAL_COMMANDS') AND name = 'Cmd_Result'
-)
-BEGIN
-    ALTER TABLE TB_CLINE_FINAL_COMMANDS ADD Cmd_Result NVARCHAR(MAX);
-    PRINT 'Cmd_Result 컬럼 추가 완료';
-END
+bp = Blueprint('main', __name__)
+p_dao=ProjectDAO(); c_dao=CommandDAO(); r_dao=RuleDAO(); pc_dao=PCTypeDAO(); s_dao=ScriptDAO(); i_dao=InstallerDAO(); st_dao=StatsDAO()
 
--- 2. 컬럼이 있다면 용량을 MAX로 변경 (이게 중요합니다)
-ALTER TABLE TB_CLINE_FINAL_COMMANDS ALTER COLUMN Cmd_Result NVARCHAR(MAX);
-PRINT 'Cmd_Result 컬럼 용량 무제한(MAX)으로 변경 완료';
-2단계: 룰(Rule) 수정 (파일 저장 후 전송)
-웹 대시보드 [RULES] 탭에 가서 기존 룰을 이 내용으로 덮어쓰십시오. 형님 말씀대로 **"실행 결과를 last_result.log에 저장하고, 그걸 읽어서 보내라"**고 명시했습니다.
+@bp.route('/')
+def index(): return render_template('dashboard.html')
 
-Markdown
+# --- [CORE] INSTALLER GENERATOR (모드 지원) ---
+@bp.route('/download/install/<subj>')
+def download_install_file(subj):
+    # ?mode=current 파라미터가 있으면 현재 폴더에 설치
+    mode = request.args.get('mode', 'new') 
+    is_inject = (mode == 'current')
 
-# [Role]
-You are the dedicated executor for "{SUBJECT}".
-Server: {SERVER_URL}
+    info = p_dao.get_info_joined(subj)
+    if not info: return "Project Not Found", 404
+    
+    server = request.host_url.rstrip('/')
+    venv = info['Default_Venv'] or 'python'
+    
+    # 룰 내용 확보
+    rule_raw = info['Rule_Content']
+    if not rule_raw:
+        from app.dao import DB
+        fallback = DB.execute("SELECT TOP 1 Rule_Content FROM TB_CLINE_FINAL_RULES ORDER BY Rule_ID DESC", fetch='one')
+        rule_raw = fallback['Rule_Content'] if fallback else "# No Rule"
 
-# [Command Loop]
-When triggered by **"go"**, **"do"**, **"고"**:
+    # 변수 치환
+    rule_final = rule_raw.replace("{SUBJECT}", subj).replace("{SERVER_URL}", server).replace("{VENV}", venv)
+    worker_raw = info['Script_Content'] or ""
 
-1.  **FETCH**: POST `{SERVER_URL}/api/agent/next` with `{"subject": "{SUBJECT}"}`.
-2.  **CHECK**:
-    - If `{"status": "wait"}`, print "Waiting..." and STOP.
-    - If `{"status": "ok", "log_id": 123, "command": "..."}`, proceed.
-3.  **EXECUTE & LOG**:
-    - Execute the command.
-    - **IMPORTANT**: Save the output (stdout/stderr) to a file named `last_result.log`.
-    - Example: `python script.py > last_result.log 2>&1`
-4.  **READ LOG**:
-    - Read the content of `last_result.log`.
-5.  **REPORT**:
-    - POST `{SERVER_URL}/api/agent/result`
-    - Body: `{"subject": "{SUBJECT}", "log_id": [ID], "result": "[CONTENT_OF_LOG_FILE]"}`
-    - If the log is too long, send the last 2000 characters.
+    # [헤더에 모드 정보 주입]
+    header_vars = f'''# -*- coding: utf-8 -*-
+import os
+import sys
+import time
 
-# [Environment]
-- Venv: {VENV} (Use this for python commands)
-- Helper Script: {SCRIPT_NAME}
-요약
-SQL 실행: 결과 컬럼을 NVARCHAR(MAX)로 빵빵하게 늘립니다.
+# [SERVER CONFIG]
+CONF_SERVER = "{server}"
+CONF_SUBJECT = "{subj}"
+CONF_VENV = r"{venv}"
+CONF_RULE_CONTENT = {repr(rule_final)}
+CONF_WORKER_CONTENT = {repr(worker_raw)}
+CONF_IS_INJECT = {is_inject} 
+# True면 현재폴더, False면 새폴더 생성
+'''
 
-룰 수정: "결과를 파일에 담았다가 보내라"고 지침을 바꿉니다.
+    # DB 템플릿 가져오기
+    body_code = i_dao.get_template().replace("# [SERVER_CONFIG_ZONE]", "")
+    
+    return Response(header_vars + "\\n" + body_code, mimetype='text/plain', 
+                    headers={'Content-Disposition': f'attachment; filename=install_{subj}.py'})
 
-이제 에러 없이 긴 로그도 DB에 척척 쌓이고, 웹 화면 아래쪽 로그 창에 실시간으로 뜰 겁니다.
+# --- [EXISTING APIS] ---
+@bp.route('/api/stats/<subj>')
+def get_stats(subj): return jsonify(st_dao.get_summary(subj))
+@bp.route('/api/history/<subj>')
+def get_history(subj): return jsonify(c_dao.list_history(subj) or [])
+@bp.route('/api/result/<id>')
+def get_full_result(id):
+    row = c_dao.get_full_result(id)
+    return jsonify({'result': row['Cmd_Result'] if row else 'No Data'})
+@bp.route('/api/detail/<subj>')
+def get_detail(subj): return jsonify({'info': p_dao.get_info_joined(subj), 'active_cmds': c_dao.list_active(subj) or []})
+@bp.route('/api/project/toggle/<subj>', methods=['POST'])
+def toggle_proj(subj): p_dao.toggle_active(subj); return jsonify({'status':'ok'})
+@bp.route('/api/project/move/<subj>/<direction>', methods=['POST'])
+def move_proj(subj, d): p_dao.move_project(subj, d); return jsonify({'status':'ok'})
+
+@bp.route('/api/installer/template', methods=['GET'])
+def get_tpl(): return jsonify({'content': i_dao.get_template()})
+@bp.route('/api/installer/template', methods=['POST'])
+def save_tpl(): i_dao.save_template(request.json['content']); return jsonify({'status':'ok'})
+@bp.route('/api/pctypes', methods=['GET'])
+def get_pctypes(): return jsonify(pc_dao.list_all() or [])
+@bp.route('/api/pctype', methods=['POST'])
+def save_pctype(): pc_dao.add(request.json['name'], request.json['venv']); return jsonify({'status':'ok'})
+@bp.route('/api/pctype/<id>', methods=['DELETE'])
+def del_pctype(id): pc_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/rules', methods=['GET'])
+def get_rules(): return jsonify(r_dao.list_all() or [])
+@bp.route('/api/rule', methods=['POST'])
+def save_rule(): r_dao.add(request.json['name'], request.json['content']); return jsonify({'status':'ok'})
+@bp.route('/api/rule/<id>', methods=['DELETE'])
+def del_rule(id): r_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/scripts', methods=['GET'])
+def get_scripts(): return jsonify(s_dao.list_all() or [])
+@bp.route('/api/script', methods=['POST'])
+def save_script(): d=request.json; s_dao.update(d['id'],d['name'],d['content']) if d.get('id') else s_dao.add(d['name'],d['content']); return jsonify({'status':'ok'})
+@bp.route('/api/script/<id>', methods=['DELETE'])
+def del_script(id): s_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/projects')
+def get_projects(): return jsonify(p_dao.list_all() or [])
+@bp.route('/api/project', methods=['POST'])
+def save_project(): p_dao.add(request.json); return jsonify({'status':'ok'})
+@bp.route('/api/project/<subj>', methods=['DELETE'])
+def del_project(subj): p_dao.delete(subj); return jsonify({'status':'ok'})
+@bp.route('/api/command', methods=['POST'])
+def add_cmd(): c_dao.add(request.json['subject'], request.json['command']); return jsonify({'status':'ok'})
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_cmd(id): c_dao.delete(id); return jsonify({'status':'ok'})
+@bp.route('/api/agent/next', methods=['POST'])
+def agent_next():
+    try:
+        job = c_dao.fetch_next(request.json.get('subject'))
+        return jsonify({'status':'ok', 'log_id':job['Cmd_ID'], 'command':job['Cmd_Text']}) if job else jsonify({'status':'wait'})
+    except: return jsonify({'status':'wait'})
+@bp.route('/api/agent/result', methods=['POST'])
+def agent_result():
+    try:
+        c_dao.complete(request.json['log_id'], request.json.get('result', 'Done'))
+        return jsonify({'status':'ok'})
+    except: return jsonify({'status':'error'})
+"""
+
+# ==============================================================================
+# [2] DB 템플릿 수정 (모드에 따라 폴더 생성 여부 결정)
+# ==============================================================================
+SMART_TEMPLATE = """
+def main():
+    # [안전장치]
+    try: subject = CONF_SUBJECT
+    except: print("[ERR] Config not injected"); return
+
+    print(f"\\n[SETUP] Target: {subject}")
+    
+    # [MODE CHECK]
+    # CONF_IS_INJECT가 True면 현재 폴더(.), False면 새 폴더(ProjectName) 사용
+    is_inject = False
+    if 'CONF_IS_INJECT' in globals():
+        is_inject = CONF_IS_INJECT
+    
+    if is_inject:
+        base_dir = os.getcwd()
+        print(f" [MODE] Injecting into CURRENT FOLDER: {base_dir}")
+    else:
+        base_dir = os.path.join(os.getcwd(), subject)
+        if not os.path.exists(base_dir):
+            os.makedirs(base_dir)
+            print(f" [MODE] Creating NEW FOLDER: {base_dir}")
+        else:
+            print(f" [MODE] Using EXISTING FOLDER: {base_dir}")
+
+    # 2. .clinerules Folder
+    rules_dir = os.path.join(base_dir, ".clinerules")
+    if not os.path.exists(rules_dir):
+        os.makedirs(rules_dir)
+    
+    # 3. Rule File
+    target_file = os.path.join(rules_dir, "absoluterule.md")
+    try:
+        content = CONF_RULE_CONTENT if 'CONF_RULE_CONTENT' in globals() else ""
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f" [OK] Rule Updated: .clinerules/absoluterule.md")
+    except Exception as e:
+        print(f" [ERR] Rule write failed: {e}")
+
+    # 4. Worker Script
+    if 'CONF_WORKER_CONTENT' in globals() and CONF_WORKER_CONTENT:
+        worker_path = os.path.join(base_dir, "worker.py")
+        try:
+            with open(worker_path, "w", encoding="utf-8") as f:
+                f.write(CONF_WORKER_CONTENT)
+            print(f" [OK] Script Updated: worker.py")
+        except Exception as e:
+            print(f" [ERR] Worker write failed: {e}")
+
+    print("-" * 50)
+    print(" [DONE] Setup finished.")
+
+if __name__ == "__main__":
+    main()
+"""
+
+# ==============================================================================
+# [3] Dashboard UI 수정 (클릭 범위 확장 & 커맨드 선택창)
+# ==============================================================================
+dashboard_html = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>ULTIMATE OPS CENTER</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        /* (Style은 기존과 동일하되 item-row cursor pointer 추가) */
+        :root { --bg: #0d1117; --sidebar: #161b22; --panel: #21262d; --border: #30363d; --accent: #58a6ff; --text: #c9d1d9; --text-dim: #8b949e; --cmd-bg: #000; --cmd-text: #4fc1ff; }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; height: 100vh; display: flex; overflow: hidden; }
+        .sidebar { width: 300px; background: var(--sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; z-index: 2;}
+        .main { flex: 1; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
+        .tabs { display: flex; background: var(--panel); border-bottom: 1px solid var(--border); }
+        .tab { flex: 1; padding: 12px 0; text-align: center; cursor: pointer; font-size: 0.75em; font-weight: 700; color: var(--text-dim); border-bottom: 2px solid transparent; transition: 0.2s; }
+        .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); background: rgba(88, 166, 255, 0.05); }
+        .tab-content { display: none; height: 100%; flex-direction: column; overflow: hidden; }
+        .tab-content.active { display: flex; }
+        .list-area { flex: 1; overflow-y: auto; padding: 0; }
+        
+        /* ITEM ROW (CLICK FIX) */
+        .item-row { display: flex; border-bottom: 1px solid var(--border); align-items: stretch; transition: 0.1s; background: var(--bg); cursor: pointer; }
+        .item-row:hover { background: rgba(255,255,255,0.02); }
+        .item-row.inactive { opacity: 0.5; }
+        .item-row.active-sel { background: rgba(88, 166, 255, 0.08); border-left: 3px solid var(--accent); }
+        
+        .item-check { width: 30px; display: flex; align-items: center; justify-content: center; border-right: 1px solid #222; }
+        .item-content { flex: 1; padding: 12px 10px; overflow: hidden; }
+        .item-head { font-weight: 700; font-size: 0.9em; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .item-sub { font-size: 0.7em; color: var(--text-dim); margin-top: 3px; }
+        .item-ctrl { width: 25px; display: flex; flex-direction: column; border-left: 1px solid #222; }
+        .btn-move { flex: 1; border: none; background: none; color: #555; cursor: pointer; font-size: 0.7em; display: flex; align-items: center; justify-content: center; }
+        .btn-move:hover { background: #333; color: #fff; }
+        .btn-del-list { width: 25px; border: none; background: #da3633; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; font-weight: bold; }
+        .btn-del-list:hover { background: #b02a28; }
+
+        /* Other styles... */
+        .workspace { display: none; height: 100%; grid-template-rows: 60px 1fr 1fr; padding: 0; overflow: hidden; }
+        .ws-header { grid-row: 1; border-bottom: 1px solid var(--border); background: var(--panel); display: flex; align-items: center; padding: 0 20px; justify-content: space-between; }
+        .ws-title { font-size: 1.2em; font-weight: 800; letter-spacing: -0.5px; }
+        .ws-badges { display: flex; gap: 10px; }
+        .badge { background: #333; padding: 4px 8px; border-radius: 4px; font-size: 0.75em; font-weight: 700; color: #fff; }
+        .ws-grid { grid-row: 2; display: grid; grid-template-columns: 400px 1fr; border-bottom: 1px solid var(--border); overflow: hidden; }
+        .panel-queue { border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--bg); }
+        .panel-head { padding: 10px 15px; background: rgba(255,255,255,0.02); font-size: 0.8em; font-weight: 700; color: var(--text-dim); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;}
+        .cmd-input-area { padding: 15px; border-bottom: 1px solid var(--border); background: var(--panel); }
+        .queue-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .panel-analytics { display: flex; flex-direction: column; background: #0b0e13; padding: 20px; }
+        .chart-container { flex: 1; position: relative; max-height: 250px; }
+        .stats-row { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card { flex: 1; background: var(--panel); border: 1px solid var(--border); padding: 15px; border-radius: 6px; }
+        .stat-val { font-size: 1.8em; font-weight: 800; color: var(--text); }
+        .stat-label { font-size: 0.75em; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+        .ws-history { grid-row: 3; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
+        .history-table-wrap { flex: 1; overflow: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+        th { text-align: left; padding: 10px 15px; background: var(--panel); position: sticky; top: 0; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 0.75em; }
+        td { padding: 8px 15px; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: middle; }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+        .status-pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.7em; font-weight: 700; }
+        .st-wait { background: #333; color: #aaa; }
+        .st-run { background: rgba(31, 111, 235, 0.2); color: #58a6ff; border: 1px solid rgba(31, 111, 235, 0.4); }
+        .st-done { background: rgba(35, 134, 54, 0.2); color: #3fb950; border: 1px solid rgba(35, 134, 54, 0.4); }
+        input, select, textarea { background: #0d1117; border: 1px solid var(--border); color: var(--text); padding: 8px; border-radius: 4px; width: 100%; font-family: 'JetBrains Mono'; font-size: 0.9em; outline: none; }
+        button { background: var(--accent); color: #0d1117; border: none; padding: 8px 15px; border-radius: 4px; font-weight: 700; cursor: pointer; font-size: 0.8em; transition: 0.2s; }
+        .btn-icon { background: none; color: var(--text-dim); padding: 4px; cursor: pointer; border: none; }
+        .btn-icon:hover { color: #da3633; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 999; justify-content: center; align-items: center; }
+        .modal-box { background: var(--panel); border: 1px solid var(--border); width: 80%; height: 80%; padding: 0; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+        .modal-head { padding: 15px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-weight: 700; }
+        .modal-body { flex: 1; padding: 0; overflow: hidden; display: flex; }
+        .code-view { flex: 1; background: #000; color: #e6edf3; padding: 20px; font-family: 'JetBrains Mono'; overflow: auto; white-space: pre-wrap; font-size: 0.9em; line-height: 1.5; border: none; resize: none; }
+        .bottom-bar { padding: 15px; border-top: 1px solid var(--border); background: var(--panel); }
+        
+        .btn-del-mini { position: absolute; right: 10px; top: 10px; background: #da3633; color: white; border-radius: 4px; padding: 2px 6px; font-size: 0.7em; display: none; }
+        .item:hover .btn-del-mini { display: block; }
+        .item { padding: 15px; border-bottom: 1px solid var(--border); cursor: pointer; position: relative;}
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="tabs">
+            <div class="tab active" onclick="tab('proj')">PROJ</div>
+            <div class="tab" onclick="tab('types')">PC</div>
+            <div class="tab" onclick="tab('scripts')">PY</div>
+            <div class="tab" onclick="tab('rules')">RULE</div>
+            <div class="tab" onclick="tab('install')" style="color:#ff9800;">INST</div>
+        </div>
+        
+        <div id="t-proj" class="tab-content active">
+            <div style="padding:10px;font-size:0.8em;color:var(--accent);text-align:center;border-bottom:1px solid var(--border);" id="proj-counter">LOADING...</div>
+            <div class="list-area" id="l-proj"></div>
+            <div class="bottom-bar"><button onclick="openProjModal()">+ NEW PROJECT</button></div>
+        </div>
+        
+        <div id="t-types" class="tab-content"><div class="list-area" id="l-types"></div><div class="bottom-bar"><button onclick="openTypeModal()">+ PC TYPE</button></div></div>
+        <div id="t-scripts" class="tab-content"><div class="list-area" id="l-scripts"></div><div class="bottom-bar"><button onclick="openScriptModal()">+ SCRIPT</button></div></div>
+        <div id="t-rules" class="tab-content"><div class="list-area" id="l-rules"></div><div class="bottom-bar"><button onclick="openRuleModal()">+ RULE</button></div></div>
+        <div id="t-install" class="tab-content"><div style="padding:15px;color:#aaa;font-size:0.8em;">Installer Template</div><div style="flex:1;padding:10px;"><textarea id="txt-install" class="code-view" style="height:100%;"></textarea></div><div class="bottom-bar"><button onclick="saveInstallerTpl()">SAVE</button></div></div>
+    </div>
+
+    <div class="main">
+        <div id="empty" style="margin:auto;color:var(--text-dim);text-align:center;"><h2>SELECT A PROJECT</h2><p>To view analytics and manage commands.</p></div>
+        <div id="workspace" class="workspace">
+            <div class="ws-header">
+                <div class="ws-title" id="ws-title">PROJECT NAME</div>
+                <div class="ws-badges">
+                    <div class="badge" id="bdg-venv">Python</div>
+                    <button onclick="showInstallCmd()" style="background:#238636;color:#fff;">INSTALL CMD</button>
+                </div>
+            </div>
+            <div class="ws-grid">
+                <div class="panel-queue">
+                    <div class="panel-head">ACTIVE QUEUE <span id="q-count" style="color:var(--accent)">0</span></div>
+                    <div class="queue-list" id="q-list"></div>
+                    <div class="cmd-input-area">
+                        <input id="new-cmd" placeholder="Command..." onkeypress="if(event.key==='Enter') addCmd()">
+                        <button onclick="addCmd()" style="margin-top:10px;width:100%;">ADD TO QUEUE</button>
+                    </div>
+                </div>
+                <div class="panel-analytics">
+                    <div class="stats-row">
+                        <div class="stat-card"><div class="stat-val" id="st-week">0</div><div class="stat-label">This Week</div></div>
+                        <div class="stat-card"><div class="stat-val" id="st-month">0</div><div class="stat-label">This Month</div></div>
+                        <div class="stat-card"><div class="stat-val" id="st-total">0</div><div class="stat-label">Total Calls</div></div>
+                    </div>
+                    <div class="panel-head" style="background:none;padding:0;margin-bottom:10px;">ACTIVITY TIMELINE</div>
+                    <div class="chart-container"><canvas id="chart-canvas"></canvas></div>
+                </div>
+            </div>
+            <div class="ws-history">
+                <div class="panel-head">JOB HISTORY</div>
+                <div class="history-table-wrap">
+                    <table cellspacing="0">
+                        <thead><tr><th width="50">ID</th><th width="80">STATUS</th><th>COMMAND</th><th width="200">RESULT</th><th width="150">FINISHED</th><th width="80">VIEW</th></tr></thead>
+                        <tbody id="hist-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="m-proj" class="modal"><div class="modal-box" style="width:400px;height:auto;"><div class="modal-head">NEW PROJECT<button class="btn-icon" onclick="closeModal('m-proj')">×</button></div><div style="padding:20px;"><input id="ip-subj" placeholder="Subject ID"><input id="ip-memo" placeholder="Memo" style="margin-top:10px;"><label style="display:block;margin-top:10px;">Type</label><select id="ip-type"></select><label style="display:block;margin-top:10px;">Rule</label><select id="ip-rule"></select><label style="display:block;margin-top:10px;">Script</label><select id="ip-script"></select><button onclick="saveProj()" style="margin-top:20px;">CREATE</button></div></div></div>
+    <div id="m-result" class="modal"><div class="modal-box"><div class="modal-head">EXECUTION RESULT<button class="btn-icon" onclick="closeModal('m-result')">×</button></div><div class="modal-body"><textarea id="res-text" class="code-view" readonly></textarea></div></div></div>
+    
+    <div id="m-inst-cmd" class="modal"><div class="modal-box" style="width:700px;height:auto;"><div class="modal-head">INSTALLATION COMMANDS<button class="btn-icon" onclick="closeModal('m-inst-cmd')">×</button></div>
+        <div style="padding:20px;">
+            <div style="margin-bottom:15px;">
+                <label style="font-weight:bold; color:var(--accent);">OPTION 1: NEW FOLDER (Clean Install)</label>
+                <div style="font-size:0.8em; color:#888; margin-bottom:5px;">Creates a new folder named '<span id="inst-name-1"></span>' and installs there.</div>
+                <textarea id="txt-curl-new" class="code-view" style="height:60px; margin-bottom:5px;"></textarea>
+                <button onclick="copyCurl('txt-curl-new')">COPY</button>
+            </div>
+            <div style="border-top:1px solid #333; margin:15px 0;"></div>
+            <div>
+                <label style="font-weight:bold; color:var(--success);">OPTION 2: CURRENT FOLDER (Inject)</label>
+                <div style="font-size:0.8em; color:#888; margin-bottom:5px;">Installs .clinerules and scripts directly into the <b>current directory</b>.</div>
+                <textarea id="txt-curl-cur" class="code-view" style="height:60px; margin-bottom:5px;"></textarea>
+                <button onclick="copyCurl('txt-curl-cur')">COPY</button>
+            </div>
+        </div>
+    </div></div>
+
+    <div id="m-type" class="modal"><div class="modal-box" style="width:400px;height:auto;"><div style="padding:20px;"><input type="hidden" id="it-id"><input id="it-name" placeholder="Name"><input id="it-venv" placeholder="Venv" style="margin-top:5px;"><button onclick="saveType()" style="margin-top:10px;">SAVE</button><button onclick="closeModal('m-type')" style="margin-top:5px;background:#444;">CANCEL</button></div></div></div>
+    <div id="m-rule" class="modal"><div class="modal-box"><div style="padding:20px;display:flex;flex-direction:column;height:100%;"><input type="hidden" id="ir-id"><input id="ir-name" placeholder="Name"><textarea id="ir-content" class="code-view" style="flex:1;margin-top:10px;"></textarea><button onclick="saveRule()" style="margin-top:10px;">SAVE</button><button onclick="closeModal('m-rule')" style="margin-top:5px;background:#444;">CANCEL</button></div></div></div>
+    <div id="m-script" class="modal"><div class="modal-box"><div style="padding:20px;display:flex;flex-direction:column;height:100%;"><input type="hidden" id="is-id"><input id="is-name" placeholder="Name"><textarea id="is-content" class="code-view" style="flex:1;margin-top:10px;"></textarea><button onclick="saveScript()" style="margin-top:10px;">SAVE</button><button onclick="closeModal('m-script')" style="margin-top:5px;background:#444;">CANCEL</button></div></div></div>
+
+    <script>
+        const host = window.location.origin; let curSubj=null; let myChart=null;
+        init(); function init(){ refreshAll(); loadInstallerTpl(); setInterval(()=>{if(curSubj) refreshDashboard(curSubj);}, 3000); }
+
+        // [CLICK FIX] sel(s) is called on the main row. stopPropagation on buttons.
+        async function loadProjs() {
+            const d = await(await fetch('/api/projects')).json();
+            const activeCount = d.filter(p => p.Is_Active).length;
+            document.getElementById('proj-counter').innerText = `ACTIVE: ${activeCount} / TOTAL: ${d.length}`;
+            
+            document.getElementById('l-proj').innerHTML = d.map(p => `
+                <div class="item-row ${p.Is_Active?'':'inactive'} ${curSubj===p.Proj_Subject?'active-sel':''}" onclick="sel('${p.Proj_Subject}')">
+                    <div class="item-check" onclick="event.stopPropagation(); toggleProj('${p.Proj_Subject}')">
+                        <div style="width:12px; height:12px; border-radius:50%; background:${p.Is_Active?'#238636':'#333'}; border:1px solid #555;"></div>
+                    </div>
+                    <div class="item-content">
+                        <div class="item-head">${p.Proj_Subject}</div>
+                        <div class="item-sub">${p.Type_Name}</div>
+                    </div>
+                    <div class="item-ctrl">
+                        <button class="btn-move" onclick="event.stopPropagation(); moveProj('${p.Proj_Subject}', 'up')">▲</button>
+                        <button class="btn-move" onclick="event.stopPropagation(); moveProj('${p.Proj_Subject}', 'down')">▼</button>
+                    </div>
+                    <button class="btn-del-list" onclick="event.stopPropagation(); delProj('${p.Proj_Subject}')">×</button>
+                </div>
+            `).join('');
+        }
+
+        // Generic Loaders (Clickable anywhere)
+        async function loadScripts(){try{scripts=await(await fetch('/api/scripts')).json();document.getElementById('l-scripts').innerHTML=scripts.map(s=>`<div class="item" onclick="openScriptModal(${s.Script_ID})"><div class="item-head">${s.Script_Name}</div><div class="btn-del-mini" onclick="event.stopPropagation(); delScript(${s.Script_ID})">Del</div></div>`).join('');document.getElementById('ip-script').innerHTML=scripts.map(s=>`<option value="${s.Script_ID}">${s.Script_Name}</option>`).join('');}catch{}}
+        async function loadTypes(){try{types=await(await fetch('/api/pctypes')).json();document.getElementById('l-types').innerHTML=types.map(t=>`<div class="item" onclick="openTypeModal(${t.Type_ID})"><div class="item-head">${t.Type_Name}</div><div class="btn-del-mini" onclick="event.stopPropagation(); delType(${t.Type_ID})">Del</div></div>`).join('');document.getElementById('ip-type').innerHTML=types.map(t=>`<option value="${t.Type_ID}">${t.Type_Name}</option>`).join('');}catch{}}
+        async function loadRules(){try{rules=await(await fetch('/api/rules')).json();document.getElementById('l-rules').innerHTML=rules.map(r=>`<div class="item" onclick="openRuleModal(${r.Rule_ID})"><div class="item-head">${r.Rule_Name}</div><div class="btn-del-mini" onclick="event.stopPropagation(); delRule(${r.Rule_ID})">Del</div></div>`).join('');document.getElementById('ip-rule').innerHTML=rules.map(r=>`<option value="${r.Rule_ID}">${r.Rule_Name}</option>`).join('');}catch{}}
+
+        // Actions
+        async function toggleProj(s) { await fetch('/api/project/toggle/'+s, {method:'POST'}); loadProjs(); }
+        async function moveProj(s, d) { await fetch(`/api/project/move/${s}/${d}`, {method:'POST'}); loadProjs(); }
+        function sel(s) { curSubj=s; document.getElementById('empty').style.display='none'; document.getElementById('workspace').style.display='grid'; document.getElementById('ws-title').innerText=s; refreshDashboard(s); refreshStats(s); }
+        function refreshAll() { loadTypes(); loadRules(); loadScripts(); loadProjs(); }
+
+        // Dashboard Refresh
+        async function refreshDashboard(s) {
+            const d = await(await fetch('/api/detail/'+s)).json();
+            document.getElementById('bdg-venv').innerText = d.info.Default_Venv || 'python';
+            document.getElementById('q-count').innerText = d.active_cmds.length;
+            document.getElementById('q-list').innerHTML = d.active_cmds.map(c => `<div class="item" style="border:none; border-bottom:1px solid #333;"><span class="status-pill ${c.Cmd_Status===1?'st-run':'st-wait'}">${c.Cmd_Status===1?'RUN':'WAIT'}</span> <span style="font-family:'JetBrains Mono'; font-size:0.85em; margin-left:8px;">${c.Cmd_Text}</span> <button class="btn-icon" style="float:right;" onclick="delCmd(${c.Cmd_ID})">×</button></div>`).join('');
+            const hist = await(await fetch('/api/history/'+s)).json();
+            document.getElementById('hist-body').innerHTML = hist.map(h => `<tr><td>${h.Cmd_ID}</td><td><span class="status-pill st-done">DONE</span></td><td style="font-family:'JetBrains Mono'">${h.Cmd_Text}</td><td style="color:#888;">${h.Short_Res}...</td><td>${h.DoneDate.replace('T',' ').substring(5,16)}</td><td><button onclick="viewResult(${h.Cmd_ID})" style="padding:2px 8px; font-size:0.7em;">VIEW</button></td></tr>`).join('');
+        }
+        async function refreshStats(s) {
+            const st = await(await fetch('/api/stats/'+s)).json();
+            document.getElementById('st-week').innerText = st.week; document.getElementById('st-month').innerText = st.month; document.getElementById('st-total').innerText = st.total;
+            const ctx = document.getElementById('chart-canvas').getContext('2d');
+            if(myChart) myChart.destroy();
+            myChart = new Chart(ctx, { type: 'bar', data: { labels: st.daily.map(d=>d.D), datasets: [{ label: 'Executions', data: st.daily.map(d=>d.C), backgroundColor: '#58a6ff', borderRadius:4 }] }, options: { responsive:true, maintainAspectRatio:false, scales:{ y:{beginAtZero:true, grid:{color:'#30363d'}}, x:{grid:{display:false}} }, plugins:{legend:{display:false}} } });
+        }
+
+        // Install Modal (Dual Commands)
+        function showInstallCmd() { 
+            const url1 = `${host}/download/install/${curSubj}`;
+            const url2 = `${host}/download/install/${curSubj}?mode=current`;
+            
+            document.getElementById('inst-name-1').innerText = curSubj;
+            document.getElementById('txt-curl-new').value = `curl -s "${url1}" -o install_${curSubj}.py && python install_${curSubj}.py`;
+            document.getElementById('txt-curl-cur').value = `curl -s "${url2}" -o install_${curSubj}.py && python install_${curSubj}.py`;
+            
+            document.getElementById('m-inst-cmd').style.display='flex'; 
+        }
+        function copyCurl(id) { navigator.clipboard.writeText(document.getElementById(id).value); alert('Copied!'); }
+
+        // Core Functions
+        async function saveProj(){await fetch('/api/project',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:document.getElementById('ip-subj').value,memo:document.getElementById('ip-memo').value,type_id:document.getElementById('ip-type').value,rule_id:document.getElementById('ip-rule').value,script_id:document.getElementById('ip-script').value})});closeModal('m-proj');loadProjs();}
+        async function viewResult(id) { const r = await(await fetch('/api/result/'+id)).json(); document.getElementById('res-text').value = r.result; document.getElementById('m-result').style.display = 'flex'; }
+        async function addCmd() { const v=document.getElementById('new-cmd').value; if(!v)return; await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subject:curSubj,command:v})}); document.getElementById('new-cmd').value=''; refreshDashboard(curSubj); }
+        async function delCmd(id){ if(confirm('Remove from queue?')){ await fetch('/api/command/'+id, {method:'DELETE'}); refreshDashboard(curSubj); }}
+        
+        async function delProj(s){ if(confirm(`Delete Project ${s}?`)){ await fetch('/api/project/'+s,{method:'DELETE'}); loadProjs(); } }
+        async function delScript(id){ if(confirm('Delete Script?')){ await fetch('/api/script/'+id,{method:'DELETE'}); loadScripts(); } }
+        async function delType(id){ if(confirm('Delete Type?')){ await fetch('/api/pctype/'+id,{method:'DELETE'}); loadTypes(); } }
+        async function delRule(id){ if(confirm('Delete Rule?')){ await fetch('/api/rule/'+id,{method:'DELETE'}); loadRules(); } }
+
+        function tab(t){ document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active')); document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active')); document.querySelector(`.tab[onclick="tab('${t}')"]`).classList.add('active'); document.getElementById('t-'+t).classList.add('active'); }
+        function closeModal(id){ document.getElementById(id).style.display='none'; }
+        
+        async function loadInstallerTpl(){try{const d=await(await fetch('/api/installer/template')).json();document.getElementById('txt-install').value=d.content;}catch{}}
+        async function saveInstallerTpl(){await fetch('/api/installer/template',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:document.getElementById('txt-install').value})});alert('Saved');}
+        
+        function openProjModal(){document.getElementById('ip-subj').value='';document.getElementById('ip-memo').value='';closeModal('m-proj');document.getElementById('m-proj').style.display='flex';}
+        function openScriptModal(id){document.getElementById('is-id').value='';document.getElementById('is-name').value='';document.getElementById('is-content').value='';if(id){const s=scripts.find(x=>x.Script_ID==id);if(s){document.getElementById('is-id').value=s.Script_ID;document.getElementById('is-name').value=s.Script_Name;document.getElementById('is-content').value=s.Script_Content;}}document.getElementById('m-script').style.display='flex';}
+        function openTypeModal(id){document.getElementById('it-id').value='';document.getElementById('it-name').value='';document.getElementById('it-venv').value='';if(id){const t=types.find(x=>x.Type_ID==id);if(t){document.getElementById('it-id').value=t.Type_ID;document.getElementById('it-name').value=t.Type_Name;document.getElementById('it-venv').value=t.Default_Venv;}}document.getElementById('m-type').style.display='flex';}
+        function openRuleModal(id){document.getElementById('ir-id').value='';document.getElementById('ir-name').value='';document.getElementById('ir-content').value='';if(id){const r=rules.find(x=>x.Rule_ID==id);if(r){document.getElementById('ir-id').value=r.Rule_ID;document.getElementById('ir-name').value=r.Rule_Name;document.getElementById('ir-content').value=r.Rule_Content;}}document.getElementById('m-rule').style.display='flex';}
+        
+        async function saveType(){await fetch('/api/pctype',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:document.getElementById('it-id').value,name:document.getElementById('it-name').value,venv:document.getElementById('it-venv').value})});closeModal('m-type');loadTypes();}
+        async function saveRule(){await fetch('/api/rule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:document.getElementById('ir-id').value,name:document.getElementById('ir-name').value,content:document.getElementById('ir-content').value})});closeModal('m-rule');loadRules();}
+        async function saveScript(){await fetch('/api/script',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:document.getElementById('is-id').value,name:document.getElementById('is-name').value,content:document.getElementById('is-content').value})});closeModal('m-script');loadScripts();}
+    </script>
+</body>
+</html>
+"""
+
+# ==============================================================================
+# [4] 실행
+# ==============================================================================
+def apply_fix():
+    print(">>> 1. Updating routes.py (Install Mode Support)...")
+    with open('app/routes.py', 'w', encoding='utf-8') as f: f.write(routes_code.strip())
+    
+    print(">>> 2. Updating DB Template (Folder Logic)...")
+    conn = pymssql.connect(server=Config.DB_HOST, port=Config.DB_PORT, user=Config.DB_USER, password=Config.DB_PASSWORD, database=Config.DB_NAME, charset='utf8', autocommit=True)
+    with conn.cursor() as cursor:
+        cursor.execute("UPDATE TB_CLINE_FINAL_SCRIPTS SET Script_Content=%s WHERE Script_Name='__INSTALLER_MASTER__'", (SMART_TEMPLATE,))
+        if cursor.rowcount==0: cursor.execute("INSERT INTO TB_CLINE_FINAL_SCRIPTS (Script_Name, Script_Content) VALUES ('__INSTALLER_MASTER__', %s)", (SMART_TEMPLATE,))
+    conn.close()
+
+    print(">>> 3. Updating Dashboard UI (Click Fix & Dual Install)...")
+    with open('app/templates/dashboard.html', 'w', encoding='utf-8') as f: f.write(dashboard_html.strip())
+
+    print("="*50)
+    print(" [완료] 서버 재시작 필수!")
+    print("="*50)
+
+if __name__ == "__main__":
+    apply_fix()
