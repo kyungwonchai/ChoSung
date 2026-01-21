@@ -1,1 +1,406 @@
+라, 실제 파일(install.py)이 내 컴퓨터에 생기고, 그걸 실행하면 나머지 파일들이 촥 깔리는 구조입니다.
 
+형님이 원하신 대로 딱 2줄로 정리했습니다.
+
+curl ... -o install.py: 서버에서 세팅된 설치 파일을 내 폴더로 가져온다. (파일 생성됨)
+
+python3 install.py: 이걸 실행하면, 지정된 가상환경을 타고 들어가서 필요한 폴더 만들고 워커(worker.py) 다운받고 실행한다.
+
+[최종 수정판] setup_complete.py
+이 스크립트를 서버에서 돌리시면 모든 게 해결됩니다.
+
+Python
+
+import os
+
+# ==============================================================================
+# [1] 설정 (Config)
+# ==============================================================================
+config_code = """
+import os
+
+class Config:
+    # --- DB 설정 ---
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = ''     # [필수] 계정 입력
+    DB_PASSWORD = '' # [필수] 비번 입력
+    DB_NAME = 'SMD_DB'
+    
+    # --- 서버 설정 ---
+    WEB_PORT = 12233
+    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3'] 
+"""
+
+# ==============================================================================
+# [2] DAO (데이터 접근)
+# ==============================================================================
+dao_code = """
+import pymssql
+from config.settings import Config
+
+class DB:
+    @staticmethod
+    def execute(sql, args=(), fetch=None):
+        conn = pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
+            database=Config.DB_NAME, charset='utf8'
+        )
+        res = None
+        try:
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': res = cur.fetchone()
+                elif fetch == 'all': res = cur.fetchall()
+                else: conn.commit()
+        except Exception as e: print(f"[DB Error] {e}")
+        finally: conn.close()
+        return res
+
+class ProjectDAO:
+    def list_all(self): return DB.execute("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch='all')
+    def upsert(self, s, p, v):
+        row = DB.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
+        if row: DB.execute("UPDATE TB_CLINE_PROJECTS SET PCType=%s, VenvPath=%s WHERE Subject=%s", (p, v, s))
+        else: DB.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, VenvPath) VALUES (%s, %s, %s)", (s, p, v))
+    def delete(self, s):
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (s,))
+        DB.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,))
+    def get_info(self, s): return DB.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
+
+class CommandDAO:
+    def list_by_subj(self, s): return DB.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (s,), fetch='all')
+    def add(self, s, c): DB.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (s, c))
+    def delete(self, id): DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (id,))
+    def get_next(self, s):
+        DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (s,))
+        row = DB.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (s,), fetch='one')
+        if row: DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (row['LogID'],))
+        return row
+
+class TemplateDAO:
+    def get_worker(self):
+        row = DB.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+        return row['ScriptContent'] if row else "# No Template"
+    def save_worker(self, c):
+        DB.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
+"""
+
+# ==============================================================================
+# [3] Routes (여기가 형님이 원하신 파일 생성 로직 핵심입니다)
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from config.settings import Config
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO()
+
+@bp.route('/')
+def dashboard(): return render_template('dashboard.html')
+
+# --- API ---
+@bp.route('/api/projects')
+def get_projects(): return jsonify(p_dao.list_all())
+
+@bp.route('/api/project_detail/<subject>')
+def get_detail(subject): return jsonify({'info': p_dao.get_info(subject), 'cmds': c_dao.list_by_subj(subject)})
+
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    d = request.json
+    p_dao.upsert(d['subject'], d['pc_type'], d['venv_path'])
+    return jsonify({'msg':'Saved'})
+
+@bp.route('/api/project/<subject>', methods=['DELETE'])
+def del_project(subject): p_dao.delete(subject); return jsonify({'msg':'Deleted'})
+
+@bp.route('/api/command', methods=['POST'])
+def add_command(): c_dao.add(request.json['subject'], request.json['command']); return jsonify({'msg':'Added'})
+
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_command(id): c_dao.delete(id); return jsonify({'msg':'Deleted'})
+
+@bp.route('/api/template', methods=['GET'])
+def get_tpl(): return jsonify({'content': t_dao.get_worker()})
+
+@bp.route('/api/template', methods=['POST'])
+def save_tpl(): t_dao.save_worker(request.json['content']); return jsonify({'msg':'Saved'})
+
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json.get('subject')
+    row = c_dao.get_next(subj)
+    return jsonify({'status':'ok', 'command':row['CommandText']}) if row else jsonify({'status':'done'})
+
+@bp.route('/get_worker_file')
+def get_worker_file():
+    return Response(t_dao.get_worker(), mimetype='text/plain')
+
+# --- [핵심] 인스톨러 다운로드 (2줄 명령 중 첫번째 줄) ---
+@bp.route('/download_installer/<subject>')
+def download_installer(subject):
+    info = p_dao.get_info(subject)
+    venv = info['VenvPath'] if info and info['VenvPath'] else 'python'
+    server = request.host_url.rstrip('/')
+    
+    # 이 내용이 'install.py'라는 파일로 형님 PC에 저장됩니다.
+    installer_code = f'''
+import os, sys, requests, subprocess
+
+# [서버에서 주입된 설정]
+SERVER = "{server}"
+SUBJECT = "{subject}"
+VENV_PYTHON = r"{venv}"
+WORKER_FILE = "worker.py"
+
+def main():
+    print(f"\\n[INSTALLER] '{{SUBJECT}}' 환경 구성을 시작합니다...")
+    
+    # 1. 워커 파일 다운로드 (파일 생성)
+    print(f"[1/3] 워커 스크립트 다운로드 중...")
+    try:
+        res = requests.get(f"{{SERVER}}/get_worker_file")
+        if res.status_code == 200:
+            # 주입된 변수를 워커에도 전달하기 위해 내용 수정
+            content = res.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
+            
+            with open(WORKER_FILE, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f" -> '{{WORKER_FILE}}' 생성 완료.")
+        else:
+            print(f"[ERROR] 다운로드 실패. 서버 응답: {{res.status_code}}"); return
+    except Exception as e:
+        print(f"[ERROR] 통신 오류: {{e}}"); return
+
+    # 2. 가상환경으로 실행
+    print(f"[2/3] 가상환경(VENV) 확인: {{VENV_PYTHON}}")
+    print(f"[3/3] 워커 실행 중... (종료하려면 Ctrl+C)")
+    print("="*50)
+    
+    try:
+        # 현재 폴더에 있는 worker.py를 지정된 가상환경 파이썬으로 실행
+        subprocess.call([VENV_PYTHON, WORKER_FILE])
+    except FileNotFoundError:
+        print(f"[FATAL] 가상환경 파이썬을 찾을 수 없습니다: {{VENV_PYTHON}}")
+        print(" -> 웹 대시보드에서 경로가 정확한지 확인해주세요.")
+    except Exception as e:
+        print(f"[ERROR] 실행 실패: {{e}}")
+
+if __name__ == "__main__":
+    main()
+'''
+    # 파일 형태로 다운로드 되도록 헤더 설정
+    return Response(installer_code, mimetype='text/plain', 
+                    headers={'Content-Disposition': f'attachment; filename=install_{subject}.py'})
+"""
+
+# ==============================================================================
+# [4] Dashboard HTML (2줄 명령 표시)
+# ==============================================================================
+dashboard_html = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>CLINE MANAGER</title>
+    <style>
+        body { background: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; height: 100vh; }
+        .sidebar { width: 300px; background: #252526; border-right: 1px solid #333; display: flex; flex-direction: column; }
+        .main { flex: 1; display: flex; flex-direction: column; }
+        .header { height: 50px; background: #333; display: flex; align-items: center; padding: 0 20px; font-weight: bold; }
+        .content { flex: 1; padding: 20px; overflow-y: auto; }
+        
+        .item { padding: 15px; border-bottom: 1px solid #333; cursor: pointer; }
+        .item:hover { background: #2a2d2e; }
+        .item.active { background: #007acc; color: white; }
+        .item-sub { font-size: 0.8em; color: #aaa; margin-top: 5px; }
+        
+        .box { background: #111; padding: 15px; border: 1px solid #444; margin-bottom: 20px; border-radius: 4px; }
+        .cmd-line { font-family: monospace; color: #4fc1ff; margin-bottom: 10px; cursor: pointer; }
+        .cmd-line:hover { text-decoration: underline; }
+        .cmd-desc { font-size: 0.8em; color: #888; margin-bottom: 2px; }
+        
+        input { background: #3c3c3c; border: 1px solid #555; color: white; padding: 8px; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
+        button { background: #007acc; color: white; border: none; padding: 8px 15px; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #444; }
+        
+        .status-0 { color: #dcdcaa; } .status-1 { color: #4fc1ff; font-weight: bold; } .status-2 { color: #6a9955; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="header">PROJECTS <button onclick="addProj()" style="margin-left:auto; font-size:0.8em;">+ NEW</button></div>
+        <div id="list" style="flex:1; overflow-y:auto;"></div>
+    </div>
+    
+    <div class="main">
+        <div class="header">DASHBOARD <span id="title-subj" style="margin-left:10px; color:#4fc1ff;"></span></div>
+        <div id="detail" class="content" style="display:none;">
+            
+            <div class="box">
+                <div class="cmd-desc">Step 1. 설치 파일 다운로드 (클릭해서 복사)</div>
+                <div class="cmd-line" onclick="copy(this)" id="cmd1"></div>
+                
+                <div class="cmd-desc">Step 2. 실행 (클릭해서 복사)</div>
+                <div class="cmd-line" onclick="copy(this)" id="cmd2"></div>
+            </div>
+
+            <div style="display:flex; gap:10px;">
+                <input id="new-cmd" placeholder="명령어 입력 (예: echo hello)" onkeypress="if(event.key==='Enter') addCmd()">
+                <button onclick="addCmd()">Add Queue</button>
+            </div>
+            
+            <table>
+                <thead><tr><th width="50">ID</th><th width="80">Status</th><th>Command</th><th width="50">Del</th></tr></thead>
+                <tbody id="tbl-body"></tbody>
+            </table>
+            
+            <div style="margin-top:20px; border-top:1px solid #444; padding-top:20px;">
+                 <h4 style="margin:0 0 10px 0;">Worker Script Editor</h4>
+                 <textarea id="editor" style="width:100%; height:200px; background:#1e1e1e; color:#ccc; border:1px solid #444; font-family:monospace;"></textarea>
+                 <button onclick="saveTpl()" style="width:100%; margin-top:5px; background:#333;">Save Script</button>
+            </div>
+        </div>
+        <div id="empty" class="content" style="display:flex; justify-content:center; align-items:center; color:#555;">
+            프로젝트를 선택하세요.
+        </div>
+    </div>
+
+    <script>
+        let curSubj = null;
+        const host = window.location.origin;
+
+        loadList();
+        loadTpl();
+        setInterval(() => { if(curSubj) loadDetail(curSubj); }, 2000);
+
+        async function loadList() {
+            const res = await fetch('/api/projects');
+            const data = await res.json();
+            document.getElementById('list').innerHTML = data.map(p => `
+                <div class="item \${curSubj===p.Subject?'active':''}" onclick="sel('${p.Subject}')">
+                    <div>${p.Subject}</div>
+                    <div class="item-sub">${p.PCType}</div>
+                </div>
+            `).join('');
+        }
+
+        function sel(s) {
+            curSubj = s;
+            document.getElementById('title-subj').innerText = s;
+            document.getElementById('detail').style.display = 'block';
+            document.getElementById('empty').style.display = 'none';
+            
+            // 2줄 명령 생성
+            document.getElementById('cmd1').innerText = `curl -o install.py ${host}/download_installer/${s}`;
+            document.getElementById('cmd2').innerText = `python3 install.py`; // 또는 python install.py
+
+            loadList();
+            loadDetail(s);
+        }
+
+        async function loadDetail(s) {
+            const res = await fetch('/api/project_detail/'+s);
+            const data = await res.json();
+            document.getElementById('tbl-body').innerHTML = data.cmds.map(c => `
+                <tr>
+                    <td>${c.LogID}</td>
+                    <td class="status-${c.Status}">${c.Status===0?'WAIT':(c.Status===1?'RUN':'DONE')}</td>
+                    <td>${c.CommandText}</td>
+                    <td><button onclick="delCmd(${c.LogID})" style="background:#ce3838;">X</button></td>
+                </tr>
+            `).join('');
+        }
+
+        async function addCmd() {
+            const v = document.getElementById('new-cmd').value;
+            if(!v) return;
+            await fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subject:curSubj, command:v})});
+            document.getElementById('new-cmd').value = '';
+            loadDetail(curSubj);
+        }
+        async function delCmd(id) { await fetch('/api/command/'+id, {method:'DELETE'}); loadDetail(curSubj); }
+        
+        async function addProj() {
+            const s = prompt("Subject:"); if(!s) return;
+            const p = prompt("PC Type:");
+            const v = prompt("Venv Path (ex: /usr/bin/python3):");
+            await fetch('/api/project', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subject:s, pc_type:p, venv_path:v})});
+            loadList();
+        }
+
+        async function loadTpl() {
+            const r = await fetch('/api/template');
+            const d = await r.json();
+            document.getElementById('editor').value = d.content;
+        }
+        async function saveTpl() {
+            await fetch('/api/template', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content:document.getElementById('editor').value})});
+            alert('Saved');
+        }
+        
+        function copy(el) {
+            navigator.clipboard.writeText(el.innerText);
+            alert('복사되었습니다: ' + el.innerText);
+        }
+    </script>
+</body>
+</html>
+"""
+
+# ==============================================================================
+# [5] Run
+# ==============================================================================
+run_code = """
+from flask import Flask
+from config.settings import Config
+from app.routes import bp
+
+app = Flask(__name__, template_folder='app/templates')
+app.register_blueprint(bp)
+
+if __name__ == '__main__':
+    print(f"Server running on port {Config.WEB_PORT}")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT)
+"""
+
+def create_system():
+    dirs = ['config', 'app', 'app/templates']
+    for d in dirs:
+        if not os.path.exists(d): os.makedirs(d)
+
+    files = {
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/templates/dashboard.html': dashboard_html,
+        'run.py': run_code,
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
+
+    for path, content in files.items():
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content.strip())
+        print(f"[생성됨] {path}")
+
+    print("\\n[설치 완료] 1. config/settings.py 비밀번호 수정")
+    print("           2. python run.py 실행")
+
+if __name__ == '__main__':
+    create_system()
+형님, 이렇게 하시면 됩니다.
+이 코드를 실행해서 서버를 켭니다.
+
+웹 페이지에 들어가 프로젝트를 선택하면 명령어 2줄이 뜹니다.
+
+형님의 VS Code 터미널에서:
+
+첫 번째 줄 (curl ...) 붙여넣고 엔터 -> install.py 파일이 다운로드되어 생성됩니다.
+
+두 번째 줄 (python3 install.py) 붙여넣고 엔터 -> 이게 실행되면서 가상환경 세팅하고 worker.py 파일도 만들고 실행까지 쭉 이어집니다.
+
+이제 파일이 생성 안 된다는 문제는 없을 겁니다.
