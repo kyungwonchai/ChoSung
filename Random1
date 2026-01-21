@@ -1,149 +1,438 @@
-스크립트는 창 제어를 위해 wmctrl과 모니터 정보 확인을 위해 xrandr을 사용합니다. 터미널에서 아래 명령어로 패키지를 먼저 설치해주세요.
+import os
 
-Bash
+# ==============================================================================
+# [1] CONFIG
+# ==============================================================================
+config_code = """
+import os
 
-sudo apt update && sudo apt install wmctrl x11-xserver-utils -y
-주의: 우분투 로그인 시 Xorg(X11) 세션을 사용해야 완벽하게 작동합니다. Wayland(기본값)에서는 보안 정책 때문에 외부 스크립트가 창 위치를 강제로 옮기는 것을 막을 수 있습니다.
+class Config:
+    # [DB 접속 정보 수정 필수]
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = 'sa'
+    DB_PASSWORD = 'password'
+    DB_NAME = 'SMD_DB'
+    
+    WEB_PORT = 12233
+    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3']
+"""
 
-자동 배치 Python 스크립트 (arrange_vscode.py)
-아래 코드를 복사하여 파일로 저장 후 실행하십시오.
+# ==============================================================================
+# [2] DAO (DB 로직 - 변경 없음)
+# ==============================================================================
+dao_code = """
+import pymssql
+from config.settings import Config
 
-Python
+class DB:
+    @staticmethod
+    def execute(sql, args=(), fetch=None):
+        conn = pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
+            database=Config.DB_NAME, charset='utf8', autocommit=True
+        )
+        try:
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': return cur.fetchone()
+                if fetch == 'all': return cur.fetchall()
+                return True
+        except Exception as e:
+            print(f"[DB Error] {e}\\nQuery: {sql}")
+            return None
+        finally: conn.close()
 
-#!/usr/bin/env python3
-import subprocess
-import re
-import math
-import sys
+class RuleDAO:
+    def list_all(self):
+        return DB.execute("SELECT * FROM TB_CLINE_OPT_RULES ORDER BY Rule_ID ASC", fetch='all')
+    def add(self, name, content):
+        DB.execute("INSERT INTO TB_CLINE_OPT_RULES (Rule_Name, Rule_Content) VALUES (%s, %s)", (name, content))
+    def update(self, rid, name, content):
+        DB.execute("UPDATE TB_CLINE_OPT_RULES SET Rule_Name=%s, Rule_Content=%s WHERE Rule_ID=%s", (name, content, rid))
+    def delete(self, rid):
+        DB.execute("DELETE FROM TB_CLINE_OPT_RULES WHERE Rule_ID=%s", (rid,))
 
-def run_command(command):
-    """쉘 명령어를 실행하고 결과를 문자열로 반환합니다."""
+class ProjectDAO:
+    def list_all(self):
+        sql = '''
+            SELECT P.*, R.Rule_Name 
+            FROM TB_CLINE_OPT_PROJECTS P
+            LEFT JOIN TB_CLINE_OPT_RULES R ON P.Rule_Ref_ID = R.Rule_ID
+            ORDER BY P.Proj_RegDate DESC
+        '''
+        return DB.execute(sql, fetch='all')
+
+    def upsert(self, d):
+        chk = DB.execute("SELECT Proj_Subject FROM TB_CLINE_OPT_PROJECTS WHERE Proj_Subject=%s", (d['subject'],), fetch='one')
+        if chk:
+            sql = "UPDATE TB_CLINE_OPT_PROJECTS SET Proj_Memo=%s, Proj_PC_Type=%s, Proj_Venv_Path=%s, Rule_Ref_ID=%s WHERE Proj_Subject=%s"
+            args = (d['memo'], d['pc'], d['venv'], d['rule_id'], d['subject'])
+        else:
+            sql = "INSERT INTO TB_CLINE_OPT_PROJECTS (Proj_Subject, Proj_Memo, Proj_PC_Type, Proj_Venv_Path, Rule_Ref_ID) VALUES (%s, %s, %s, %s, %s)"
+            args = (d['subject'], d['memo'], d['pc'], d['venv'], d['rule_id'])
+        DB.execute(sql, args)
+
+    def delete(self, s):
+        DB.execute("DELETE FROM TB_CLINE_OPT_COMMANDS WHERE Proj_Subject_Ref=%s", (s,))
+        DB.execute("DELETE FROM TB_CLINE_OPT_PROJECTS WHERE Proj_Subject=%s", (s,))
+
+    def get_info_with_rule(self, s):
+        sql = '''
+            SELECT P.*, R.Rule_Content 
+            FROM TB_CLINE_OPT_PROJECTS P
+            LEFT JOIN TB_CLINE_OPT_RULES R ON P.Rule_Ref_ID = R.Rule_ID
+            WHERE P.Proj_Subject = %s
+        '''
+        return DB.execute(sql, (s,), fetch='one')
+
+class CommandDAO:
+    def list_by_subj(self, s):
+        return DB.execute("SELECT * FROM TB_CLINE_OPT_COMMANDS WHERE Proj_Subject_Ref=%s ORDER BY Cmd_ID ASC", (s,), fetch='all')
+    def add(self, s, c):
+        DB.execute("INSERT INTO TB_CLINE_OPT_COMMANDS (Proj_Subject_Ref, Cmd_Text, Cmd_Status) VALUES (%s, %s, 0)", (s, c))
+    def delete(self, id):
+        DB.execute("DELETE FROM TB_CLINE_OPT_COMMANDS WHERE Cmd_ID=%s", (id,))
+    def fetch_next(self, s):
+        DB.execute("UPDATE TB_CLINE_OPT_COMMANDS SET Cmd_Status=2, Cmd_DoneDate=GETDATE() WHERE Proj_Subject_Ref=%s AND Cmd_Status=1", (s,))
+        job = DB.execute("SELECT TOP 1 * FROM TB_CLINE_OPT_COMMANDS WHERE Proj_Subject_Ref=%s AND Cmd_Status=0 ORDER BY Cmd_ID ASC", (s,), fetch='one')
+        if job:
+            DB.execute("UPDATE TB_CLINE_OPT_COMMANDS SET Cmd_Status=1 WHERE Cmd_ID=%s", (job['Cmd_ID'],))
+        return job
+
+class TemplateDAO:
+    def get_worker(self):
+        try:
+            r = DB.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+            return r['ScriptContent'] if r else "# No Template"
+        except: return "# Template Table Not Found"
+    def save_worker(self, c):
+        try: DB.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
+        except: pass
+"""
+
+# ==============================================================================
+# [3] ROUTES (에러 수정된 버전)
+# ==============================================================================
+# 여기가 문제였습니다. f-string 안에서 repr()을 써서 따옴표 충돌을 막았습니다.
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO, RuleDAO
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO(); r_dao = RuleDAO()
+
+@bp.route('/')
+def index(): return render_template('dashboard.html')
+
+# --- RULES ---
+@bp.route('/api/rules', methods=['GET'])
+def get_rules(): return jsonify(r_dao.list_all() or [])
+
+@bp.route('/api/rule', methods=['POST'])
+def save_rule():
+    d = request.json
+    if d.get('id'): r_dao.update(d['id'], d['name'], d['content'])
+    else: r_dao.add(d['name'], d['content'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/rule/<id>', methods=['DELETE'])
+def del_rule(id):
+    r_dao.delete(id)
+    return jsonify({'status':'ok'})
+
+# --- PROJECTS ---
+@bp.route('/api/projects')
+def get_projects(): return jsonify(p_dao.list_all() or [])
+
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    p_dao.upsert(request.json)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/project/<subj>', methods=['DELETE'])
+def del_project(subj):
+    p_dao.delete(subj)
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/detail/<subj>')
+def get_detail(subj):
+    return jsonify({'info': p_dao.get_info_with_rule(subj), 'cmds': c_dao.list_by_subj(subj) or []})
+
+# --- COMMANDS ---
+@bp.route('/api/command', methods=['POST'])
+def add_cmd():
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'status':'ok'})
+
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_cmd(id):
+    c_dao.delete(id)
+    return jsonify({'status':'ok'})
+
+# --- CLIENT ---
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    job = c_dao.fetch_next(request.json.get('subject'))
+    return jsonify({'status':'ok', 'command':job['Cmd_Text']}) if job else jsonify({'status':'wait'})
+
+@bp.route('/get_worker_raw')
+def get_worker_raw(): return Response(t_dao.get_worker(), mimetype='text/plain')
+
+@bp.route('/api/template', methods=['GET', 'POST'])
+def tpl():
+    if request.method=='GET': return jsonify({'content':t_dao.get_worker()})
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'status':'ok'})
+
+# --- INSTALLER (FIXED) ---
+@bp.route('/setup/<subj>')
+def setup_script(subj):
+    info = p_dao.get_info_with_rule(subj)
+    if not info: return "Project Not Found", 404
+    
+    server = request.host_url.rstrip('/')
+    venv = info['Proj_Venv_Path'] if info['Proj_Venv_Path'] else 'python'
+    rule_content = info['Rule_Content'] if info['Rule_Content'] else "No Rules."
+    
+    # [수정됨] 따옴표 충돌을 막기 위해 repr() 함수를 사용해 파이썬 문자열 리터럴로 변환
+    rule_repr = repr(rule_content)
+
+    installer = f'''
+import os, sys, requests, subprocess
+
+SERVER = "{server}"
+SUBJECT = "{subj}"
+VENV = r"{venv}"
+WORKER_FILE = "worker.py"
+RULE_FILE = "GLOBAL_RULES.txt"
+
+def main():
+    print(f"[SETUP] {{SUBJECT}} Setting up...")
+    base = os.path.join(os.getcwd(), SUBJECT)
+    if not os.path.exists(base): os.makedirs(base)
+    
+    # 1. 룰 파일 생성 (안전한 방식)
+    # repr()로 처리된 문자열을 그대로 할당
+    rule_txt = {rule_repr}
+    
+    with open(os.path.join(base, RULE_FILE), "w", encoding="utf-8") as f:
+        f.write(rule_txt)
+    print(f"[OK] Rule file updated.")
+
+    # 2. 워커 다운로드
     try:
-        result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
-        return result.decode('utf-8').strip()
-    except subprocess.CalledProcessError:
-        return ""
+        r = requests.get(f"{{SERVER}}/get_worker_raw")
+        content = r.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
+        with open(os.path.join(base, WORKER_FILE), "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"[OK] Worker script updated.")
+    except Exception as e:
+        print(f"[ERR] Download failed: {{e}}"); return
 
-def get_connected_monitors():
-    """xrandr을 파싱하여 연결된 모니터의 해상도와 위치(offset)를 반환합니다."""
-    output = run_command("xrandr --current")
-    monitors = []
-    # 정규식: 1920x1080+1920+0 형태 추출 (Width x Height + X_Offset + Y_Offset)
-    regex = re.compile(r" connected.*? (\d+)x(\d+)\+(\d+)\+(\d+)")
-    
-    for line in output.split('\n'):
-        match = regex.search(line)
-        if match:
-            w, h, x, y = map(int, match.groups())
-            monitors.append({'w': w, 'h': h, 'x': x, 'y': y})
-    
-    # x 좌표(가로 오프셋) 기준으로 정렬하여 가장 오른쪽 모니터를 찾기 위함
-    return sorted(monitors, key=lambda m: m['x'])
-
-def get_vscode_windows():
-    """wmctrl을 사용하여 현재 열린 VS Code 창의 ID 리스트를 반환합니다."""
-    output = run_command("wmctrl -l")
-    window_ids = []
-    for line in output.split('\n'):
-        # VS Code 창은 보통 제목에 'Visual Studio Code' 또는 파일명이 포함됨
-        # 대소문자 구분 없이 'code'가 포함된 창을 찾되, 너무 범용적인 단어라 주의 필요
-        # 보통 클래스명을 확인하는 것이 정확하나 wmctrl -l 에는 클래스명이 안 나옴.
-        # -lx 옵션을 사용하여 클래스명 확인
-        if "Visual Studio Code" in line or "Code - OSS" in line:
-            parts = line.split()
-            window_ids.append(parts[0]) # 윈도우 ID (예: 0x04000003)
-    
-    # wmctrl -lx 명령어를 통해 더 정확히 필터링 (클래스명: code.Code)
-    output_lx = run_command("wmctrl -lx")
-    refined_ids = []
-    for line in output_lx.split('\n'):
-        if "code.Code" in line:
-            parts = line.split()
-            refined_ids.append(parts[0])
-            
-    return refined_ids if refined_ids else window_ids
-
-def arrange_windows():
-    monitors = get_connected_monitors()
-    
-    if len(monitors) < 2:
-        print("[-] 듀얼 모니터가 감지되지 않았습니다. 기본 모니터에서 작업을 수행합니다.")
-        target_monitor = monitors[0]
-    else:
-        # 가장 오른쪽 모니터(x 좌표가 가장 큰 모니터)를 타겟으로 설정
-        target_monitor = monitors[-1]
-        print(f"[+] 타겟 모니터 설정: 해상도 {target_monitor['w']}x{target_monitor['h']}, 위치 +{target_monitor['x']}+{target_monitor['y']}")
-
-    windows = get_vscode_windows()
-    win_count = len(windows)
-    
-    if win_count == 0:
-        print("[-] 실행 중인 VS Code 창을 찾을 수 없습니다.")
-        return
-
-    print(f"[+] 감지된 VS Code 창 개수: {win_count}개")
-
-    # 그리드 계산 (행과 열)
-    # 창 개수에 따라 최적의 grid 계산 (예: 6개 -> 3x2 또는 2x3)
-    cols = math.ceil(math.sqrt(win_count))
-    rows = math.ceil(win_count / cols)
-    
-    # 6개일 경우 3열 2행이 보기 좋음 (가로로 넓게)
-    if win_count == 6:
-        cols, rows = 3, 2
-
-    # 창 하나의 너비와 높이 계산 (여백 보정 포함)
-    cell_w = target_monitor['w'] // cols
-    cell_h = target_monitor['h'] // rows
-    
-    print(f"[+] 배치 구조: {cols}열 x {rows}행 (각 창 크기: {cell_w}x{cell_h})")
-
-    for idx, win_id in enumerate(windows):
-        # 현재 창의 행/열 인덱스
-        r = idx // cols
-        c = idx % cols
-        
-        # 이동할 절대 좌표 (모니터 오프셋 + 그리드 위치)
-        pos_x = target_monitor['x'] + (c * cell_w)
-        pos_y = target_monitor['y'] + (r * cell_h)
-        
-        # wmctrl 명령어 구성
-        # -i: ID 사용, -r: 타겟, -e: gravity,x,y,w,h
-        # gravity 0: 기본값
-        cmd = f"wmctrl -i -r {win_id} -b remove,maximized_vert,maximized_horz" # 최대화 해제
-        run_command(cmd)
-        
-        cmd = f"wmctrl -i -r {win_id} -e 0,{pos_x},{pos_y},{cell_w},{cell_h}"
-        run_command(cmd)
-        
-        # 창을 가장 위로 올리고 싶으면 아래 주석 해제 (특혜 개념)
-        # run_command(f"wmctrl -i -r {win_id} -b add,above") 
-
-    print("[+] 모든 VS Code 창 배치가 완료되었습니다.")
+    # 3. 실행
+    print(f"[RUN] Executing via {{VENV}}...")
+    print("-" * 40)
+    try:
+        subprocess.call([VENV, WORKER_FILE], cwd=base)
+    except Exception as e:
+        print(f"[ERR] Execution failed: {{e}}")
 
 if __name__ == "__main__":
-    try:
-        arrange_windows()
-    except Exception as e:
-        print(f"[!] 오류 발생: {e}")
-사용 가이드
-스크립트 실행: VS Code 창을 6개 띄워둔 상태에서 터미널에서 python3 arrange_vscode.py를 실행하세요.
+    main()
+'''
+    return Response(installer, mimetype='text/plain')
+"""
 
-동작 원리:
+# ==============================================================================
+# [4] UI (변경 없음)
+# ==============================================================================
+dashboard_html = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>CLINE SYSTEM</title>
+    <style>
+        :root { --bg: #1e1e1e; --panel: #252526; --border: #333; --accent: #007acc; --text: #ccc; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; display: flex; }
+        .sidebar { width: 320px; background: #111; border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+        .main { flex: 1; display: flex; flex-direction: column; }
+        .tabs { display: flex; background: #2d2d2d; border-bottom: 1px solid var(--border); }
+        .tab { padding: 12px 20px; cursor: pointer; font-weight: bold; flex: 1; text-align: center; border-right: 1px solid var(--border); }
+        .tab.active { background: var(--accent); color: white; }
+        .tab-content { display: none; height: 100%; flex-direction: column; }
+        .tab-content.active { display: flex; }
+        .list-item { padding: 15px; border-bottom: 1px solid #333; cursor: pointer; }
+        .list-item:hover { background: #333; }
+        .list-item.active { background: #0e3a59; border-left: 4px solid var(--accent); }
+        input, select, textarea { background: #3c3c3c; border: 1px solid #555; color: white; padding: 10px; width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+        button { background: var(--accent); color: white; border: none; padding: 10px; cursor: pointer; font-weight: bold; }
+        .cmd-box { background: black; padding: 15px; color: #4fc1ff; cursor: pointer; font-family: monospace; border: 1px solid #444; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="tabs">
+            <div class="tab active" onclick="swTab('proj')">PROJECTS</div>
+            <div class="tab" onclick="swTab('rule')">RULES</div>
+        </div>
+        <div id="tc-proj" class="tab-content active" style="overflow-y:auto;">
+            <div style="padding:15px; background:var(--panel);">
+                <button onclick="openModal('m-proj')" style="width:100%">+ ADD PROJECT</button>
+            </div>
+            <div id="list-proj"></div>
+        </div>
+        <div id="tc-rule" class="tab-content" style="overflow-y:auto;">
+            <div style="padding:15px; background:var(--panel);">
+                <button onclick="openModal('m-rule')" style="width:100%">+ ADD RULE</button>
+            </div>
+            <div id="list-rule"></div>
+        </div>
+    </div>
+    <div class="main">
+        <div id="workspace" style="display:none; flex-direction:column; height:100%;">
+            <div style="padding:20px; border-bottom:1px solid #333; background:var(--panel); display:flex; justify-content:space-between; align-items:center;">
+                <h2 id="ws-title" style="margin:0;"></h2>
+                <div id="ws-rule" style="color:orange; border:1px solid orange; padding:4px 8px; border-radius:4px; font-size:0.9em;"></div>
+            </div>
+            <div style="padding:20px;">
+                <div class="cmd-box" onclick="copySetup()">
+                    <div style="color:#888; font-size:0.8em; margin-bottom:5px;">SETUP COMMAND (Click to Copy)</div>
+                    <span id="ws-cmd"></span>
+                </div>
+            </div>
+            <div style="flex:1; display:flex; flex-direction:column; padding:0 20px 20px 20px;">
+                <div style="display:flex; gap:10px; margin-bottom:10px;">
+                    <input id="new-cmd" placeholder="Command to execute..." onkeypress="if(event.key==='Enter') addCmd()">
+                    <button onclick="addCmd()" style="width:100px;">QUEUE</button>
+                </div>
+                <div style="flex:1; overflow-y:auto; border:1px solid #333; background:#181818;">
+                    <table style="width:100%; border-collapse:collapse;">
+                        <thead><tr style="text-align:left; background:#222; color:#888;"><th style="padding:10px;">ID</th><th>STATUS</th><th>COMMAND</th><th></th></tr></thead>
+                        <tbody id="tbl-cmd"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div id="empty-msg" style="margin:auto; color:#666;">SELECT A PROJECT</div>
+    </div>
+    <div id="m-proj" style="display:none; position:fixed; top:15%; left:35%; width:400px; background:#252526; padding:20px; border:1px solid #555; box-shadow:0 0 30px black;">
+        <h3>NEW PROJECT</h3>
+        <input id="ip-subj" placeholder="Subject ID">
+        <input id="ip-memo" placeholder="Memo">
+        <input id="ip-pc" placeholder="PC Type">
+        <input id="ip-venv" placeholder="Venv Path">
+        <select id="ip-rule"></select>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+            <button onclick="saveProj()">SAVE</button>
+            <button onclick="closeModal('m-proj')" style="background:#555;">CANCEL</button>
+        </div>
+    </div>
+    <div id="m-rule" style="display:none; position:fixed; top:15%; left:35%; width:400px; background:#252526; padding:20px; border:1px solid #555; box-shadow:0 0 30px black;">
+        <h3>RULE MANAGEMENT</h3>
+        <input type="hidden" id="ir-id">
+        <input id="ir-name" placeholder="Rule Name">
+        <textarea id="ir-content" rows="10" placeholder="Rule Content"></textarea>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+            <button onclick="saveRule()">SAVE</button>
+            <button onclick="closeModal('m-rule')" style="background:#555;">CANCEL</button>
+        </div>
+    </div>
+    <script>
+        const host = window.location.origin;
+        let curSubj = null; let rules = [];
+        init();
+        function init() { loadRules(); loadProjs(); setInterval(() => { if(curSubj) loadDetail(curSubj); }, 2000); }
+        function swTab(t) {
+            document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
+            if(t==='proj') { document.querySelector('.tab:nth-child(1)').classList.add('active'); document.getElementById('tc-proj').classList.add('active'); }
+            else { document.querySelector('.tab:nth-child(2)').classList.add('active'); document.getElementById('tc-rule').classList.add('active'); }
+        }
+        async function loadRules() {
+            rules = await (await fetch('/api/rules')).json();
+            document.getElementById('list-rule').innerHTML = rules.map(r => `
+                <div class="list-item" onclick="editRule(${r.Rule_ID}, '${r.Rule_Name}')">
+                    <div style="font-weight:bold;">${r.Rule_Name}</div>
+                    <div style="font-size:0.8em; color:#888;">${r.Rule_Content.substring(0,30)}...</div>
+                    <button onclick="event.stopPropagation(); delRule(${r.Rule_ID})" style="font-size:0.7em; background:#b71c1c; margin-top:5px;">DEL</button>
+                </div>
+            `).join('');
+            document.getElementById('ip-rule').innerHTML = rules.map(r => `<option value="${r.Rule_ID}">${r.Rule_Name}</option>`).join('');
+        }
+        async function loadProjs() {
+            const data = await (await fetch('/api/projects')).json();
+            document.getElementById('list-proj').innerHTML = data.map(p => `
+                <div class="list-item \${curSubj===p.Proj_Subject?'active':''}" onclick="sel('${p.Proj_Subject}')">
+                    <div style="font-weight:bold;">${p.Proj_Subject}</div>
+                    <div style="font-size:0.8em;">${p.Proj_PC_Type} | ${p.Proj_Memo || ''}</div>
+                </div>
+            `).join('');
+        }
+        async function saveProj() {
+            await fetch('/api/project', { method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ subject: document.getElementById('ip-subj').value, memo: document.getElementById('ip-memo').value,
+                    pc: document.getElementById('ip-pc').value, venv: document.getElementById('ip-venv').value, rule_id: document.getElementById('ip-rule').value }) });
+            closeModal('m-proj'); loadProjs();
+        }
+        async function saveRule() {
+            await fetch('/api/rule', { method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ id: document.getElementById('ir-id').value, name: document.getElementById('ir-name').value, content: document.getElementById('ir-content').value }) });
+            closeModal('m-rule'); loadRules();
+        }
+        function sel(s) {
+            curSubj = s; document.getElementById('workspace').style.display = 'flex'; document.getElementById('empty-msg').style.display = 'none';
+            document.getElementById('ws-title').innerText = s; document.getElementById('ws-cmd').innerText = `curl -s ${host}/setup/${s} | python3`;
+            loadProjs(); loadDetail(s);
+        }
+        async function loadDetail(s) {
+            const d = await (await fetch('/api/detail/'+s)).json();
+            document.getElementById('ws-rule').innerText = "RULE: " + (d.info.Rule_Name || 'None');
+            document.getElementById('tbl-cmd').innerHTML = d.cmds.map(c => `
+                <tr style="border-bottom:1px solid #333;">
+                    <td style="padding:10px;">${c.Cmd_ID}</td>
+                    <td style="color:${c.Cmd_Status===1?'#4fc1ff':(c.Cmd_Status===2?'#4caf50':'#aaa')}">${c.Cmd_Status===0?'WAIT':(c.Cmd_Status===1?'RUNNING':'DONE')}</td>
+                    <td>${c.Cmd_Text}</td>
+                    <td><button onclick="delCmd(${c.Cmd_ID})" style="background:none; color:#555;">X</button></td>
+                </tr>`).join('');
+        }
+        async function addCmd() {
+            const v = document.getElementById('new-cmd').value; if(!v) return;
+            await fetch('/api/command', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subject:curSubj, command:v})});
+            document.getElementById('new-cmd').value = ''; loadDetail(curSubj);
+        }
+        async function delCmd(id) { await fetch('/api/command/'+id, {method:'DELETE'}); loadDetail(curSubj); }
+        async function delRule(id) { if(confirm('Delete?')) { await fetch('/api/rule/'+id, {method:'DELETE'}); loadRules(); } }
+        function openModal(id) { document.getElementById(id).style.display = 'block'; }
+        function editRule(id, name) {
+            const r = rules.find(x=>x.Rule_ID==id); document.getElementById('ir-id').value = id; document.getElementById('ir-name').value = name;
+            document.getElementById('ir-content').value = r.Rule_Content; openModal('m-rule');
+        }
+        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+        function copySetup() { navigator.clipboard.writeText(document.getElementById('ws-cmd').innerText); alert('Copied'); }
+    </script>
+</body>
+</html>
+"""
 
-현재 연결된 모니터 중 가장 오른쪽(좌표값이 큰) 모니터를 찾습니다.
+# ==============================================================================
+# [5] GENERATE
+# ==============================================================================
+def deploy():
+    for d in ['config', 'app', 'app/templates']: os.makedirs(d, exist_ok=True)
+    files = {
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/templates/dashboard.html': dashboard_html,
+        'run.py': "from flask import Flask\nfrom config.settings import Config\nfrom app.routes import bp\napp=Flask(__name__, template_folder='app/templates')\napp.register_blueprint(bp)\nif __name__=='__main__': app.run(host='0.0.0.0', port=Config.WEB_PORT)",
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
+    for p, c in files.items():
+        with open(p, 'w', encoding='utf-8') as f: f.write(c.strip())
+    print("[설치 완료] 1. setup_fixed.py 실행 -> 2. run.py 실행")
 
-실행 중인 모든 VS Code 창을 감지합니다.
-
-해당 모니터 화면을 수학적으로 분할(Grid)하여 창들을 강제로 이동 및 리사이징(Resizing)합니다.
-
-"동적"으로 사용하기:
-
-이 스크립트를 단축키에 등록해 두시는 것을 추천합니다. (예: Ctrl + Shift + Z)
-
-창이 흐트러지거나 새로 창을 띄웠을 때 단축키를 한 번만 누르면 다시 우측 모니터에 "차렷" 자세로 정렬됩니다.
-
-추가 팁: Ubuntu Tiling Extension (대안)
-만약 스크립트 실행조차 귀찮고 마우스 드래그만으로 딱딱 붙기를 원하신다면, 우분투 확장 프로그램인 "Tiling Assistant" 또는 **"Pop Shell"**을 설치하시면 창을 모서리로 가져갈 때 자동으로 1/4, 1/2 분할을 해주는 기능을 사용할 수 있습니다. 하지만 6분할(1/6) 자동화는 위 파이썬 스크립트가 유일한 해결책입니다.
-
-제가 사용자를 위해 할 수 있는 다음 단계: 스크립트 실행이 잘 안 되거나 모니터 감지가 이상할 경우, 터미널에서 xrandr 입력 결과를 보여주시면 해당 해상도 좌표에 맞춰 스크립트를 수정해 드릴까요?
+if __name__ == "__main__":
+    deploy()
