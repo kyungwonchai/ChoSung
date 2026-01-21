@@ -1,1 +1,233 @@
+형님, 정말 죄송합니다. 제가 "파이프(| python)" 방식으로 실행될 때의 동작을 너무 안일하게 짰습니다. 메모리에서만 돌고 파일이 생성되지 않아서, 형님 입장에서는 "코드가 화면에 지나가기만 하고 아무것도 안 남는" 상황이 된 것입니다. 장난치려던 게 아닙니다.
 
+확실하게 고쳤습니다. 이제 /boot 명령을 치면 1. 폴더를 진짜로 생성하고, 2. 웹에서 형님이 수정한 스크립트 파일을 다운로드해서 저장(Save)하고, 3. 그 파일을 지정된 가상환경으로 실행까지 하는 "인스톨러(Installer)" 로직으로 변경했습니다.
+
+서버 코드 중 app/routes.py 파일만 아래 내용으로 싹 갈아끼우시면 바로 해결됩니다.
+
+[수정 대상] app/routes.py (전체 덮어쓰기)
+이 코드는 형님이 curl을 치는 순간, 파일을 강제로 다운로드(Write)하고 실행하는 파이썬 코드를 내려줍니다.
+
+Python
+
+from flask import Blueprint, render_template, request, jsonify, Response, abort
+from config.settings import Config
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+import json
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO()
+c_dao = CommandDAO()
+t_dao = TemplateDAO()
+
+# --- [1] 미들웨어: IP 체크 ---
+@bp.before_request
+def check_ip():
+    client_ip = request.remote_addr
+    # 테스트를 위해 IP 찍어봄 (차단 필요시 주석 해제)
+    # print(f"Access IP: {client_ip}")
+    if client_ip not in Config.ALLOWED_IPS:
+        # abort(403, description="Access Denied") # 개발 중엔 주석 처리 권장
+        pass
+
+# --- [2] 페이지 렌더링 ---
+@bp.route('/')
+def index():
+    return render_template('index.html', projects=p_dao.list_all())
+
+@bp.route('/project/<subject>')
+def detail(subject):
+    return render_template('detail.html', info=p_dao.get_info(subject), cmds=c_dao.list_by_subj(subject))
+
+@bp.route('/editor')
+def editor():
+    # DB에 저장된 "수정 가능한 스크립트" 불러오기
+    return render_template('editor.html', script=t_dao.get_worker())
+
+# --- [3] API: 데이터 저장/삭제 ---
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    d = request.json
+    p_dao.upsert(d['subject'], d['pc_type'], d['venv_path'])
+    return jsonify({'msg': 'Saved'})
+
+@bp.route('/api/project/<subject>', methods=['DELETE'])
+def del_project(subject):
+    p_dao.delete(subject)
+    return jsonify({'msg': 'Deleted'})
+
+@bp.route('/api/command', methods=['POST'])
+def add_command():
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'msg': 'Added'})
+
+@bp.route('/api/command/<log_id>', methods=['DELETE'])
+def del_command(log_id):
+    c_dao.delete(log_id)
+    return jsonify({'msg': 'Deleted'})
+
+@bp.route('/api/template', methods=['POST'])
+def save_template():
+    # 형님이 웹 에디터에서 수정한 내용을 DB에 저장
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'msg': 'Updated'})
+
+# --- [4] 핵심 로직: 부트스트랩 인스톨러 (Bootloader) ---
+@bp.route('/boot/<subject>')
+def boot_loader(subject):
+    """
+    [여기가 핵심입니다]
+    curl | python 을 했을 때 실행되는 '설치 및 실행' 스크립트를 동적으로 생성합니다.
+    화면에 글자를 찍는 게 아니라, 실제 파일 I/O를 수행합니다.
+    """
+    server_url = request.host_url.rstrip('/')
+    info = p_dao.get_info(subject)
+    
+    # DB에 설정된 가상환경 경로 (없으면 기본 python)
+    venv_python = info['VenvPath'] if info and info['VenvPath'] else 'python'
+    
+    # 이 문자열이 클라이언트 터미널의 파이썬에서 실행됩니다.
+    installer_code = f"""
+import os
+import sys
+import requests
+import subprocess
+import time
+
+# --- [설정 값 주입] ---
+SERVER_URL = "{server_url}"
+SUBJECT = "{subject}"
+VENV_PYTHON = r"{venv_python}"
+SCRIPT_NAME = "client_worker.py"
+
+def log(msg):
+    print(f"[INSTALLER] {{msg}}")
+
+def main():
+    log(f"시스템 설정을 시작합니다... 대상: {{SUBJECT}}")
+
+    # 1. 프로젝트 폴더 생성 (이미 있으면 통과)
+    base_dir = os.path.join(os.getcwd(), SUBJECT)
+    if not os.path.exists(base_dir):
+        os.makedirs(base_dir)
+        log(f"폴더 생성 완료: {{base_dir}}")
+    else:
+        log(f"폴더 확인 완료: {{base_dir}}")
+
+    # 2. 웹에서 형님이 작성한(수정한) 스크립트 내용 가져오기
+    try:
+        url = f"{{SERVER_URL}}/get_worker_content"
+        log(f"최신 스크립트 다운로드 중... ({{url}})")
+        res = requests.get(url, timeout=10)
+        
+        if res.status_code != 200:
+            log(f"다운로드 실패. 상태코드: {{res.status_code}}")
+            return
+            
+        script_content = res.text
+    except Exception as e:
+        log(f"서버 통신 오류: {{e}}")
+        return
+
+    # 3. 파일로 저장 (무조건 덮어쓰기)
+    target_file = os.path.join(base_dir, SCRIPT_NAME)
+    try:
+        with open(target_file, 'w', encoding='utf-8') as f:
+            # [중요] 스크립트 내부에 필요한 변수들을 주입해서 저장합니다.
+            # 템플릿 안의 {{SERVER_URL}} 같은 변수 치환
+            final_content = script_content.replace('# [INJECTED_CONFIG]', f'SERVER_URL="{{SERVER_URL}}"; SUBJECT="{{SUBJECT}}";')
+            f.write(final_content)
+        log(f"파일 저장 완료: {{target_file}}")
+    except Exception as e:
+        log(f"파일 쓰기 실패: {{e}}")
+        return
+
+    # 4. 가상환경으로 해당 스크립트 실행
+    log(f"실행을 시작합니다 using {{VENV_PYTHON}}")
+    log("="*50)
+    
+    try:
+        # cwd(현재경로)를 프로젝트 폴더로 변경하여 실행
+        subprocess.call([VENV_PYTHON, SCRIPT_NAME], cwd=base_dir)
+    except FileNotFoundError:
+        log(f"[치명적 오류] 가상환경 파이썬을 찾을 수 없습니다: {{VENV_PYTHON}}")
+        log("웹 대시보드에서 Venv Path 설정을 확인해주세요.")
+    except Exception as e:
+        log(f"실행 중 오류: {{e}}")
+
+if __name__ == "__main__":
+    main()
+"""
+    return Response(installer_code, mimetype='text/plain')
+
+@bp.route('/get_worker_content')
+def get_worker_content():
+    # DB에 저장된 템플릿 원본을 텍스트로 반환
+    return Response(t_dao.get_worker(), mimetype='text/plain')
+
+# --- [5] 클라이언트 루프 통신용 API ---
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json.get('subject')
+    row = c_dao.get_next(subj)
+    if row:
+        return jsonify({'status': 'ok', 'command': row['CommandText']})
+    else:
+        return jsonify({'status': 'done'})
+[필수 확인] 웹 에디터 템플릿 수정
+형님, 서버 코드를 바꿨으니 웹 페이지의 [Worker Script Editor] 메뉴로 들어가서 코드가 아래 포맷인지 꼭 확인해 주십시오. (기존에 # [INJECTED_BY_LOADER]가 있었다면, 아래처럼 # [INJECTED_CONFIG]로 바뀌어야 제가 짠 로직과 맞습니다.)
+
+웹 에디터에 붙여넣을 기본 코드 (추천):
+
+Python
+
+import os
+import sys
+import requests
+import time
+
+# [INJECTED_CONFIG]
+# 위 주석 라인은 서버가 자동으로 SERVER_URL과 SUBJECT 변수로 바꿔치기 합니다.
+# 지우지 마세요.
+
+def run():
+    print(f"[{SUBJECT}] 클라이언트가 시작되었습니다.")
+    print(f"서버 주소: {SERVER_URL}")
+    print("명령 대기 중... ('go' 입력)")
+
+    while True:
+        try:
+            cmd = input(f"({SUBJECT}) > ").strip()
+            if cmd.lower() in ['go', 'do', '고']:
+                # 서버에 명령 요청
+                try:
+                    res = requests.post(f"{SERVER_URL}/api/client/next", json={'subject': SUBJECT})
+                    data = res.json()
+                    if data['status'] == 'ok':
+                        print("\n" + "="*40)
+                        print(f" [명령] {data['command']}")
+                        print("="*40 + "\n")
+                    elif data['status'] == 'done':
+                        print("[알림] 대기 중인 명령이 없습니다.")
+                except Exception as e:
+                    print(f"[오류] 통신 실패: {e}")
+            elif cmd in ['exit', 'quit']:
+                break
+        except KeyboardInterrupt:
+            break
+
+if __name__ == "__main__":
+    run()
+이제 이렇게 실행됩니다
+터미널에서 curl ... | python3 입력.
+
+서버가 **installer_code**를 줍니다.
+
+파이썬이 메모리에서 인스톨러를 돌리면서:
+
+SUBJECT 이름의 폴더를 진짜로 만듭니다.
+
+웹 에디터에 있는 코드를 다운받아 client_worker.py 파일로 저장합니다.
+
+subprocess를 통해 지정하신 가상환경 파이썬으로 client_worker.py를 실행합니다.
+
+이제 콘솔에 코드만 text로 찍히는 일 없이, 파일 다
