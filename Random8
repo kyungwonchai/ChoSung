@@ -1,1 +1,468 @@
+ne-Shot] 시스템 생성 스크립트 (setup_final.py)
+이 파일을 서버에서 실행(python setup_final.py)하면 모든 준비가 끝납니다.
 
+Python
+
+import os
+
+# ==============================================================================
+# [1] 설정 (Config)
+# ==============================================================================
+config_code = """
+import os
+
+class Config:
+    # --- DB 설정 (형님 환경) ---
+    DB_HOST = '10.244.122.122'
+    DB_PORT = 166
+    DB_USER = ''     # 계정 입력 필요
+    DB_PASSWORD = '' # 비번 입력 필요
+    DB_NAME = 'SMD_DB'
+    
+    # --- 서버 설정 ---
+    WEB_PORT = 12233
+    SECRET_KEY = os.urandom(32)
+    # 접근 허용 IP (테스트용으로 0.0.0.0 열어둠, 필요시 수정)
+    ALLOWED_IPS = ['127.0.0.1', '10.244.120.24', '10.244.8.3'] 
+"""
+
+# ==============================================================================
+# [2] 데이터 접근 (DAO) - 기존 유지
+# ==============================================================================
+dao_code = """
+import pymssql
+from config.settings import Config
+
+class DB:
+    @staticmethod
+    def execute(sql, args=(), fetch=None):
+        conn = pymssql.connect(
+            server=Config.DB_HOST, port=Config.DB_PORT,
+            user=Config.DB_USER, password=Config.DB_PASSWORD,
+            database=Config.DB_NAME, charset='utf8'
+        )
+        res = None
+        try:
+            with conn.cursor(as_dict=True) as cur:
+                cur.execute(sql, args)
+                if fetch == 'one': res = cur.fetchone()
+                elif fetch == 'all': res = cur.fetchall()
+                else: conn.commit()
+        except Exception as e:
+            print(f"[DB Error] {e}")
+        finally:
+            conn.close()
+        return res
+
+class ProjectDAO:
+    def list_all(self):
+        return DB.execute("SELECT * FROM TB_CLINE_PROJECTS ORDER BY CreatedAt DESC", fetch='all')
+    def upsert(self, s, p, v):
+        row = DB.execute("SELECT Subject FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
+        if row: DB.execute("UPDATE TB_CLINE_PROJECTS SET PCType=%s, VenvPath=%s WHERE Subject=%s", (p, v, s))
+        else: DB.execute("INSERT INTO TB_CLINE_PROJECTS (Subject, PCType, VenvPath) VALUES (%s, %s, %s)", (s, p, v))
+    def delete(self, s):
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE Subject=%s", (s,))
+        DB.execute("DELETE FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,))
+    def get_info(self, s):
+        return DB.execute("SELECT * FROM TB_CLINE_PROJECTS WHERE Subject=%s", (s,), fetch='one')
+
+class CommandDAO:
+    def list_by_subj(self, s):
+        return DB.execute("SELECT * FROM TB_CLINE_COMMANDS WHERE Subject=%s ORDER BY LogID ASC", (s,), fetch='all')
+    def add(self, s, c):
+        DB.execute("INSERT INTO TB_CLINE_COMMANDS (Subject, CommandText, Status) VALUES (%s, %s, 0)", (s, c))
+    def delete(self, id):
+        DB.execute("DELETE FROM TB_CLINE_COMMANDS WHERE LogID=%s", (id,))
+    def get_next(self, s):
+        DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=2, CompletedAt=GETDATE() WHERE Subject=%s AND Status=1", (s,))
+        row = DB.execute("SELECT TOP 1 * FROM TB_CLINE_COMMANDS WHERE Subject=%s AND Status=0 ORDER BY LogID ASC", (s,), fetch='one')
+        if row: DB.execute("UPDATE TB_CLINE_COMMANDS SET Status=1 WHERE LogID=%s", (row['LogID'],))
+        return row
+
+class TemplateDAO:
+    def get_worker(self):
+        row = DB.execute("SELECT TOP 1 ScriptContent FROM TB_CLINE_TEMPLATES ORDER BY TemplateID DESC", fetch='one')
+        return row['ScriptContent'] if row else "# No Template"
+    def save_worker(self, c):
+        DB.execute("INSERT INTO TB_CLINE_TEMPLATES (TemplateName, ScriptContent) VALUES ('Worker', %s)", (c,))
+"""
+
+# ==============================================================================
+# [3] 서버 로직 (Routes) - 인스톨러 강화
+# ==============================================================================
+routes_code = """
+from flask import Blueprint, render_template, request, jsonify, Response
+from config.settings import Config
+from app.dao import ProjectDAO, CommandDAO, TemplateDAO
+
+bp = Blueprint('main', __name__)
+p_dao = ProjectDAO(); c_dao = CommandDAO(); t_dao = TemplateDAO()
+
+@bp.route('/')
+def dashboard():
+    return render_template('dashboard.html')
+
+# --- API: 대시보드용 데이터 통신 ---
+@bp.route('/api/projects')
+def get_projects():
+    return jsonify(p_dao.list_all())
+
+@bp.route('/api/project_detail/<subject>')
+def get_detail(subject):
+    return jsonify({
+        'info': p_dao.get_info(subject),
+        'cmds': c_dao.list_by_subj(subject)
+    })
+
+@bp.route('/api/project', methods=['POST'])
+def save_project():
+    d = request.json
+    p_dao.upsert(d['subject'], d['pc_type'], d['venv_path'])
+    return jsonify({'msg':'Saved'})
+
+@bp.route('/api/project/<subject>', methods=['DELETE'])
+def del_project(subject):
+    p_dao.delete(subject)
+    return jsonify({'msg':'Deleted'})
+
+@bp.route('/api/command', methods=['POST'])
+def add_command():
+    c_dao.add(request.json['subject'], request.json['command'])
+    return jsonify({'msg':'Added'})
+
+@bp.route('/api/command/<id>', methods=['DELETE'])
+def del_command(id):
+    c_dao.delete(id)
+    return jsonify({'msg':'Deleted'})
+
+# --- 에디터 관련 ---
+@bp.route('/api/template', methods=['GET'])
+def get_template_api():
+    return jsonify({'content': t_dao.get_worker()})
+
+@bp.route('/api/template', methods=['POST'])
+def save_template_api():
+    t_dao.save_worker(request.json['content'])
+    return jsonify({'msg':'Saved'})
+
+# --- [핵심] 부트스트랩 인스톨러 ---
+@bp.route('/boot/<subject>')
+def boot(subject):
+    # 이 코드가 curl | python3 했을 때 최초 실행되는 코드입니다.
+    info = p_dao.get_info(subject)
+    venv = info['VenvPath'] if info and info['VenvPath'] else 'python'
+    server = request.host_url.rstrip('/')
+    
+    code = f'''
+import os, sys, requests, subprocess, time
+SERVER="{server}"; SUBJECT="{subject}"; VENV=r"{venv}"; FILE="client_worker.py"
+
+def run():
+    print(f"[BOOT] {{SUBJECT}} 환경 구성 중...")
+    base = os.path.join(os.getcwd(), SUBJECT)
+    if not os.path.exists(base): os.makedirs(base)
+    
+    # 워커 스크립트 다운로드
+    try:
+        r = requests.get(f"{{SERVER}}/get_worker_raw")
+        if r.status_code==200:
+            with open(os.path.join(base, FILE), "w", encoding="utf-8") as f:
+                # 설정 주입
+                final = r.text.replace("# [INJECTED_CONFIG]", f"SERVER_URL='{{SERVER}}'; SUBJECT='{{SUBJECT}}'")
+                f.write(final)
+            print("[BOOT] 스크립트 다운로드 완료.")
+        else:
+            print("[BOOT] 다운로드 실패."); return
+    except Exception as e: print(f"[BOOT] 오류: {{e}}"); return
+    
+    # 실행
+    print(f"[BOOT] {{VENV}} 로 실행 시작...")
+    try:
+        subprocess.call([VENV, FILE], cwd=base)
+    except Exception as e:
+        print(f"[ERROR] 가상환경 실행 실패: {{e}}\\n경로를 확인하세요: {{VENV}}")
+
+if __name__=="__main__": run()
+'''
+    return Response(code, mimetype='text/plain')
+
+@bp.route('/get_worker_raw')
+def get_worker_raw():
+    return Response(t_dao.get_worker(), mimetype='text/plain')
+
+@bp.route('/api/client/next', methods=['POST'])
+def client_next():
+    subj = request.json.get('subject')
+    row = c_dao.get_next(subj)
+    return jsonify({'status':'ok', 'command':row['CommandText']}) if row else jsonify({'status':'done'})
+"""
+
+# ==============================================================================
+# [4] UI: 뷰피티니 와이드 모니터용 통합 대시보드 (dashboard.html)
+# ==============================================================================
+dashboard_html = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Cline Enterprise Dashboard</title>
+    <style>
+        :root { --bg: #1e1e1e; --panel: #252526; --border: #333; --accent: #007acc; --text: #d4d4d4; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
+        
+        /* 3단 레이아웃 (Grid) */
+        .grid-container {
+            display: grid;
+            grid-template-columns: 300px 1fr 400px; /* 좌:목록, 중:작업, 우:에디터 */
+            grid-template-rows: 60px 1fr;
+            height: 100vh;
+        }
+        
+        /* 헤더 */
+        .header { grid-column: 1 / -1; background: #333; padding: 0 20px; display: flex; align-items: center; border-bottom: 1px solid var(--border); }
+        .header h2 { margin: 0; color: white; }
+        
+        /* 패널 공통 */
+        .panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+        .panel-header { padding: 10px; background: #2d2d2d; font-weight: bold; border-bottom: 1px solid var(--border); display:flex; justify-content:space-between; }
+        .panel-body { padding: 10px; overflow-y: auto; flex: 1; }
+        
+        /* 좌측: 프로젝트 목록 */
+        .project-item { padding: 12px; border-bottom: 1px solid var(--border); cursor: pointer; transition: 0.2s; }
+        .project-item:hover { background: #3e3e42; }
+        .project-item.active { background: var(--accent); color: white; }
+        .project-meta { font-size: 0.8em; color: #aaa; margin-top: 4px; }
+        
+        /* 중앙: 작업 관리 */
+        .cmd-input-area { display: flex; gap: 10px; margin-bottom: 20px; }
+        input { background: #3c3c3c; border: 1px solid var(--border); color: white; padding: 8px; flex: 1; }
+        button { background: var(--accent); color: white; border: none; padding: 8px 15px; cursor: pointer; }
+        button.del { background: #ce3838; }
+        
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
+        .status-0 { color: #dcdcaa; } /* 대기 */
+        .status-1 { color: #4fc1ff; font-weight: bold; } /* 실행중 */
+        .status-2 { color: #6a9955; } /* 완료 */
+        
+        .one-shot-box { background: #111; padding: 15px; border-radius: 4px; border: 1px solid #444; margin-bottom: 20px; font-family: monospace; color: #4fc1ff; cursor: pointer; }
+        
+        /* 우측: 에디터 */
+        textarea { width: 100%; height: 100%; background: #1e1e1e; color: #d4d4d4; border: none; resize: none; font-family: monospace; padding: 10px; box-sizing: border-box; }
+    </style>
+</head>
+<body>
+    <div class="grid-container">
+        <div class="header">
+            <h2>CLINE BRIDGE MANAGER</h2>
+            <div style="margin-left: auto; font-size: 0.9em; color: #888;">ViewFinity S6 Optimized</div>
+        </div>
+        
+        <div class="panel">
+            <div class="panel-header">
+                PROJECTS
+                <button onclick="openAddModal()" style="font-size:0.8em;">+ NEW</button>
+            </div>
+            <div class="panel-body" id="project-list">
+                </div>
+        </div>
+        
+        <div class="panel">
+            <div class="panel-header">COMMAND QUEUE <span id="current-subj" style="margin-left:10px; color:var(--accent)"></span></div>
+            <div class="panel-body" id="main-area" style="display:none;">
+                
+                <div class="one-shot-box" onclick="copyCmd()" title="클릭시 복사">
+                    curl -s "<span id="server-url"></span>/boot/<span id="cmd-subj"></span>" | python3
+                </div>
+                
+                <div class="cmd-input-area">
+                    <input id="new-cmd" placeholder="명령어 입력 (예: pip install pandas)" onkeypress="if(event.key==='Enter') addCmd()">
+                    <button onclick="addCmd()">Add Queue</button>
+                </div>
+                
+                <table>
+                    <thead><tr><th width="50">ID</th><th width="80">Status</th><th>Command</th><th width="50">Del</th></tr></thead>
+                    <tbody id="cmd-list"></tbody>
+                </table>
+            </div>
+            <div class="panel-body" id="empty-msg" style="display:flex; justify-content:center; align-items:center; color:#555;">
+                좌측에서 프로젝트를 선택하세요.
+            </div>
+        </div>
+        
+        <div class="panel">
+            <div class="panel-header">
+                WORKER SCRIPT
+                <button onclick="saveTemplate()" style="background:#2d2d2d; border:1px solid #555;">SAVE</button>
+            </div>
+            <textarea id="editor"></textarea>
+        </div>
+    </div>
+
+    <script>
+        let selectedSubj = null;
+        const host = window.location.origin;
+        document.getElementById('server-url').innerText = host;
+
+        // --- 초기 로드 ---
+        loadProjects();
+        loadTemplate();
+        setInterval(() => { if(selectedSubj) loadDetail(selectedSubj, false); }, 2000); // 2초마다 자동 갱신
+
+        async function loadProjects() {
+            const res = await fetch('/api/projects');
+            const data = await res.json();
+            const list = document.getElementById('project-list');
+            list.innerHTML = data.map(p => `
+                <div class="project-item \${selectedSubj===p.Subject?'active':''}" onclick="selectProject('${p.Subject}')">
+                    <div style="font-weight:bold;">${p.Subject}</div>
+                    <div class="project-meta">${p.PCType} | ${p.VenvPath.substring(0,20)}...</div>
+                    <button onclick="delProject(event, '${p.Subject}')" style="font-size:0.7em; background:none; color:#ce3838; padding:0; margin-top:5px;">DELETE</button>
+                </div>
+            `).join('');
+        }
+
+        function selectProject(subj) {
+            selectedSubj = subj;
+            document.getElementById('current-subj').innerText = subj;
+            document.getElementById('cmd-subj').innerText = subj;
+            document.getElementById('main-area').style.display = 'block';
+            document.getElementById('empty-msg').style.display = 'none';
+            loadProjects(); // 하이라이트 갱신
+            loadDetail(subj, true);
+        }
+
+        async function loadDetail(subj, showLoading) {
+            const res = await fetch('/api/project_detail/' + subj);
+            const data = await res.json();
+            const tbody = document.getElementById('cmd-list');
+            
+            const html = data.cmds.map(c => `
+                <tr>
+                    <td>${c.LogID}</td>
+                    <td class="status-${c.Status}">
+                        ${c.Status===0 ? 'WAIT' : (c.Status===1 ? 'RUNNING' : 'DONE')}
+                    </td>
+                    <td>${c.CommandText}</td>
+                    <td><button class="del" onclick="delCmd(${c.LogID})">X</button></td>
+                </tr>
+            `).join('');
+            
+            if(tbody.innerHTML !== html) tbody.innerHTML = html; // 변경시에만 DOM 업데이트
+        }
+
+        async function addCmd() {
+            const input = document.getElementById('new-cmd');
+            if(!input.value) return;
+            await fetch('/api/command', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({subject:selectedSubj, command:input.value})
+            });
+            input.value = '';
+            loadDetail(selectedSubj);
+        }
+
+        async function delCmd(id) { await fetch('/api/command/'+id, {method:'DELETE'}); loadDetail(selectedSubj); }
+
+        async function openAddModal() {
+            const subj = prompt("프로젝트명 (ID):");
+            if(!subj) return;
+            const pc = prompt("PC 종류:", "Ubuntu");
+            const venv = prompt("가상환경 Python 경로:", "/usr/bin/python3");
+            await fetch('/api/project', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({subject:subj, pc_type:pc, venv_path:venv})
+            });
+            loadProjects();
+        }
+        
+        async function delProject(e, subj) {
+            e.stopPropagation();
+            if(confirm('삭제하시겠습니까?')) {
+                await fetch('/api/project/'+subj, {method:'DELETE'});
+                selectedSubj = null;
+                document.getElementById('main-area').style.display='none';
+                document.getElementById('empty-msg').style.display='flex';
+                loadProjects();
+            }
+        }
+
+        async function loadTemplate() {
+            const res = await fetch('/api/template');
+            const data = await res.json();
+            document.getElementById('editor').value = data.content;
+        }
+        
+        async function saveTemplate() {
+            await fetch('/api/template', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({content:document.getElementById('editor').value})
+            });
+            alert('스크립트 저장 완료');
+        }
+
+        function copyCmd() {
+            const txt = document.querySelector('.one-shot-box').innerText;
+            navigator.clipboard.writeText(txt);
+            alert('명령어가 복사되었습니다.');
+        }
+    </script>
+</body>
+</html>
+"""
+
+# ==============================================================================
+# [5] 실행 파일 (run.py)
+# ==============================================================================
+run_code = """
+from flask import Flask
+from config.settings import Config
+from app.routes import bp
+
+app = Flask(__name__, template_folder='app/templates')
+app.register_blueprint(bp)
+
+if __name__ == '__main__':
+    print(f"=== [CLINE BRIDGE] Port: {Config.WEB_PORT} ===")
+    app.run(host='0.0.0.0', port=Config.WEB_PORT)
+"""
+
+# ==============================================================================
+# [6] 생성 로직
+# ==============================================================================
+def create_system():
+    dirs = ['config', 'app', 'app/templates']
+    for d in dirs:
+        if not os.path.exists(d): os.makedirs(d)
+
+    files = {
+        'config/settings.py': config_code,
+        'app/dao.py': dao_code,
+        'app/routes.py': routes_code,
+        'app/templates/dashboard.html': dashboard_html,
+        'run.py': run_code,
+        'requirements.txt': 'flask\npymssql\nrequests'
+    }
+
+    for path, content in files.items():
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content.strip())
+        print(f"[OK] {path} 생성됨")
+
+    print("\\n[완료] 1. pip install -r requirements.txt")
+    print("       2. config/settings.py 에서 DB 비밀번호 수정")
+    print("       3. python run.py")
+
+if __name__ == "__main__":
+    create_system()
+형님이 하셔야 할 일
+이 코드를 setup_final.py로 저장하고 실행하십시오.
+
+config/settings.py 파일을 열어 DB 비밀번호만 딱 채워 넣으십시오.
+
+python run.py 실행.
+
+브라우저에서 접속.
+
+왼쪽 상단 + NEW 클릭 -> 프로젝트명, PC종류, 가상환경 경로 입력.
