@@ -1,328 +1,158 @@
-전 준비 (MSSQL 테이블 생성)
-먼저 MSSQL 2014 데이터베이스에 아래 쿼리를 실행하여 테이블을 생성해 주세요.
-
-SQL
-
-CREATE TABLE FolderIndex (
-    IPAddress NVARCHAR(50),
-    Account NVARCHAR(50),
-    DisplayName NVARCHAR(255), -- 접두어_폴더명
-    FullPath NVARCHAR(500),
-    LastUpdated DATETIME DEFAULT GETDATE(),
-    PRIMARY KEY (IPAddress, FullPath)
-);
-2. 프로젝트 생성 스크립트 (Generate_Project.py)
-아래 코드를 복사하여 generate_project.py로 저장 후 한 번만 실행하세요. 그러면 필요한 모든 프로그램이 작성됩니다.
-
-Python
-
 import os
-
-# --- 설정: 파일 내용 정의 ---
-
-# 1. Scanner Script (모든 우분투 PC에 배포용)
-scanner_code = r"""import os
-import socket
-import pymssql
-import datetime
 import sys
-
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'  # MSSQL 서버 IP
-DB_USER = 'sa'            # DB 아이디
-DB_PASSWORD = 'password'  # DB 비밀번호
-DB_NAME = 'MyDatabase'    # DB 이름
-
-# 스캔할 대상 상위 경로 목록
-TARGET_PATHS = [
-    '/home/username/projects',
-    '/var/www/html'
-]
-
-# 설정한 접두어
-PREFIX = "MYPRJ_" 
-# =================================================
-
-def get_ip_address():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
-
-def scan_and_update():
-    current_ip = get_ip_address()
-    current_user = os.getenv('USER')
-    
-    conn = None
-    try:
-        conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-        cursor = conn.cursor()
-        
-        print(f"[{datetime.datetime.now()}] Start Scanning...")
-
-        for base_path in TARGET_PATHS:
-            if not os.path.exists(base_path):
-                continue
-                
-            # 바로 아래 하위 폴더만 검색
-            try:
-                subfolders = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
-            except PermissionError:
-                print(f"Permission denied: {base_path}")
-                continue
-
-            for folder in subfolders:
-                full_path = os.path.join(base_path, folder)
-                display_name = f"{PREFIX}{folder}" # 접두어_폴더명
-                
-                # MERGE 쿼리 (MSSQL 2008+ 지원)
-                sql = \"\"\"
-                MERGE FolderIndex AS target
-                USING (SELECT %s as IP, %s as Path) AS source
-                ON (target.IPAddress = source.IP AND target.FullPath = source.Path)
-                WHEN MATCHED THEN
-                    UPDATE SET DisplayName = %s, Account = %s, LastUpdated = GETDATE()
-                WHEN NOT MATCHED THEN
-                    INSERT (IPAddress, Account, DisplayName, FullPath, LastUpdated)
-                    VALUES (%s, %s, %s, %s, GETDATE());
-                \"\"\"
-                
-                cursor.execute(sql, (
-                    current_ip, full_path,           # Source
-                    display_name, current_user,      # Update
-                    current_ip, current_user, display_name, full_path # Insert
-                ))
-        
-        conn.commit()
-        print("Update Completed.")
-
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        if conn: conn.close()
-
-if __name__ == "__main__":
-    scan_and_update()
-"""
-
-# 2. Web Viewer App (메인 PC용 - VS Code 실행 기능 포함)
-app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
+import ctypes
 import subprocess
-import os
+import shutil
 
-app = Flask(__name__)
+def is_admin():
+    """관리자 권한 확인"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'
-DB_USER = 'sa'
-DB_PASSWORD = 'password'
-DB_NAME = 'MyDatabase'
-# =================================================
-
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
-
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    ip = data.get('ip')
-    user = data.get('account')
-    path = data.get('path')
-
-    # VS Code Remote SSH 명령어 구성
-    # 형식: code --remote ssh-remote+user@ip /path
-    remote_arg = f"ssh-remote+{user}@{ip}"
-    cmd = ['code', '--remote', remote_arg, path]
+def run_command(cmd):
+    """명령어 실행 함수 (인코딩 에러 방지 버전)"""
+    # text=True를 빼고 바이트로 받아서 직접 디코딩합니다.
+    result = subprocess.run(cmd, shell=True, capture_output=True)
+    
+    # 우선 CP949(한국어 윈도우 기본)로 시도하고, 안되면 UTF-8, 그래도 안되면 무시
+    try:
+        stdout = result.stdout.decode('cp949')
+    except UnicodeDecodeError:
+        stdout = result.stdout.decode('utf-8', errors='ignore')
 
     try:
-        # 서브프로세스로 VS Code 실행 (Non-blocking)
-        subprocess.Popen(cmd)
-        return jsonify({'status': 'success', 'message': f'Opening {path} on {ip}'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        stderr = result.stderr.decode('cp949')
+    except UnicodeDecodeError:
+        stderr = result.stderr.decode('utf-8', errors='ignore')
 
-if __name__ == '__main__':
-    # 로컬에서만 접근 (보안)
-    app.run(host='0.0.0.0', port=5000, debug=True)
-"""
+    return result.returncode == 0, stdout, stderr
 
-# 3. HTML Template (검색 기능 포함)
-html_code = r"""<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>Ubuntu Folder Indexer</title>
-    <style>
-        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f4; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        input[type="text"] { width: 100%; padding: 10px; margin-bottom: 20px; box-sizing: border-box; font-size: 16px; border: 1px solid #ddd; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #333; color: white; cursor: pointer; }
-        tr:hover { background-color: #f1f1f1; }
-        .btn-open { background-color: #007acc; color: white; border: none; padding: 8px 12px; cursor: pointer; border-radius: 4px; }
-        .btn-open:hover { background-color: #005f9e; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>📂 Network Folder Indexer</h2>
-        <input type="text" id="searchInput" placeholder="검색 (IP, 계정, 폴더명, 접두어 등)..." onkeyup="filterTable()">
+def read_file_safe(filepath):
+    """파일 읽기 (인코딩 자동 감지)"""
+    encodings = ['utf-8', 'cp949', 'mbcs']
+    for enc in encodings:
+        try:
+            with open(filepath, 'r', encoding=enc) as f:
+                return f.readlines()
+        except UnicodeDecodeError:
+            continue
+    # 다 실패하면 에러 무시하고 읽기
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        return f.readlines()
+
+def main():
+    print("=== Windows SSH Key Setup (Encoding Safe Ver) ===")
+
+    # 1. 관리자 권한 체크
+    if not is_admin():
+        print("[!] 관리자 권한이 필요합니다. 스크립트를 관리자 권한으로 다시 실행해주세요.")
+        input("엔터 키를 누르면 종료합니다...")
+        sys.exit(1)
+
+    # 2. 사용자 입력 (공개키)
+    print("\n[Step 1] 우분투에서 복사한 공개키(ssh-rsa ...)를 아래에 붙여넣고 엔터를 치세요:")
+    try:
+        # 입력받을 때도 인코딩 이슈가 있을 수 있어 sys.stdin 사용
+        public_key = sys.stdin.readline().strip()
+    except:
+        public_key = input(">> ").strip()
+    
+    if not public_key:
+        print("[!] 키가 입력되지 않았습니다.")
+        return
+
+    # 3. 경로 설정
+    user_profile = os.environ['USERPROFILE']
+    ssh_dir = os.path.join(user_profile, '.ssh')
+    auth_keys_file = os.path.join(ssh_dir, 'authorized_keys')
+
+    # 4. .ssh 디렉토리 생성
+    if not os.path.exists(ssh_dir):
+        os.makedirs(ssh_dir)
+
+    # 키 추가
+    key_exists = False
+    if os.path.exists(auth_keys_file):
+        lines = read_file_safe(auth_keys_file)
+        content = "".join(lines)
+        if public_key in content:
+            key_exists = True
+    
+    if not key_exists:
+        # 쓸 때는 utf-8로 강제
+        with open(auth_keys_file, 'a', encoding='utf-8') as f:
+            f.write(public_key + "\n")
+        print("[*] authorized_keys 파일에 키 저장 완료.")
+    else:
+        print("[*] 이미 등록된 키입니다.")
+
+    # 5. 권한(ACL) 설정
+    print("[*] 파일 권한(ACL) 재설정 중...")
+    current_user = os.environ['USERNAME']
+    
+    # icacls 명령어 실행
+    cmd = f'icacls "{auth_keys_file}" /inheritance:r /grant:r "{current_user}:F" /grant:r SYSTEM:F /grant:r Administrators:F'
+    success, out, err = run_command(cmd)
+    
+    if success:
+        print("    -> 권한 설정 성공.")
+    else:
+        print(f"[!] 권한 설정 경고(무시 가능할 수 있음): {err}")
+
+    # 6. sshd_config 수정
+    print("[*] sshd_config 설정 변경 중...")
+    config_path = r"C:\ProgramData\ssh\sshd_config"
+    
+    if os.path.exists(config_path):
+        shutil.copy(config_path, config_path + ".bak") # 백업
         
-        <table id="folderTable">
-            <thead>
-                <tr>
-                    <th>IP Address</th>
-                    <th>Account</th>
-                    <th>Folder Name (Prefix_)</th>
-                    <th>Full Path</th>
-                    <th>Last Updated</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for folder in folders %}
-                <tr>
-                    <td>{{ folder.IPAddress }}</td>
-                    <td>{{ folder.Account }}</td>
-                    <td>{{ folder.DisplayName }}</td>
-                    <td>{{ folder.FullPath }}</td>
-                    <td>{{ folder.LastUpdated }}</td>
-                    <td>
-                        <button class="btn-open" onclick="openVsCode('{{ folder.IPAddress }}', '{{ folder.Account }}', '{{ folder.FullPath }}')">
-                            Open VS Code
-                        </button>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </div>
+        lines = read_file_safe(config_path)
+        new_lines = []
+        comment_mode = False
+        
+        for line in lines:
+            stripped = line.strip()
+            # 설정 변경 로직
+            if stripped.lower().startswith("passwordauthentication"):
+                new_lines.append("PasswordAuthentication no\n")
+            elif stripped.lower().startswith("pubkeyauthentication"):
+                new_lines.append("PubkeyAuthentication yes\n")
+            elif stripped.lower().startswith("match group administrators"):
+                comment_mode = True
+                new_lines.append(f"# {line}")
+            else:
+                if comment_mode:
+                    if stripped.lower().startswith("authorizedkeysfile"):
+                        new_lines.append(f"# {line}")
+                        comment_mode = False
+                    elif line.startswith(" ") or line.startswith("\t"):
+                         new_lines.append(f"# {line}")
+                    else:
+                         new_lines.append(line)
+                         comment_mode = False
+                else:
+                    new_lines.append(line)
 
-    <script>
-        function filterTable() {
-            var input, filter, table, tr, td, i, txtValue;
-            input = document.getElementById("searchInput");
-            filter = input.value.toUpperCase();
-            table = document.getElementById("folderTable");
-            tr = table.getElementsByTagName("tr");
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            print("    -> 설정 파일 수정 완료.")
+        except Exception as e:
+            print(f"[!] 파일 쓰기 실패: {e}")
 
-            for (i = 1; i < tr.length; i++) {
-                var display = false;
-                // 모든 컬럼 검색
-                for(var j=0; j<5; j++) {
-                    td = tr[i].getElementsByTagName("td")[j];
-                    if (td) {
-                        txtValue = td.textContent || td.innerText;
-                        if (txtValue.toUpperCase().indexOf(filter) > -1) {
-                            display = true;
-                            break;
-                        }
-                    }
-                }
-                tr[i].style.display = display ? "" : "none";
-            }
-        }
+        # 서비스 재시작
+        print("[*] sshd 서비스 재시작 중...")
+        run_command("Stop-Service sshd")
+        run_command("Start-Service sshd")
+        print("    -> 서비스 재시작 완료.")
 
-        function openVsCode(ip, account, path) {
-            fetch('/open_vscode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ip: ip, account: account, path: path })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if(data.status === 'success') {
-                    console.log(data.message);
-                } else {
-                    alert('Error: ' + data.message);
-                }
-            })
-            .catch(error => console.error('Error:', error));
-        }
-    </script>
-</body>
-</html>
-"""
+    else:
+        print(f"[!] {config_path} 파일을 찾을 수 없습니다.")
 
-# 4. Requirements.txt
-req_code = """flask
-pymssql
-"""
-
-# --- 파일 생성 로직 ---
-
-def create_project():
-    base_dir = "NetworkFolderIndexer"
-    templates_dir = os.path.join(base_dir, "templates")
-
-    if not os.path.exists(templates_dir):
-        os.makedirs(templates_dir)
-
-    # Write scanner.py
-    with open(os.path.join(base_dir, "scanner.py"), "w", encoding="utf-8") as f:
-        f.write(scanner_code)
-
-    # Write app.py
-    with open(os.path.join(base_dir, "app.py"), "w", encoding="utf-8") as f:
-        f.write(app_code)
-
-    # Write templates/index.html
-    with open(os.path.join(templates_dir, "index.html"), "w", encoding="utf-8") as f:
-        f.write(html_code)
-
-    # Write requirements.txt
-    with open(os.path.join(base_dir, "requirements.txt"), "w", encoding="utf-8") as f:
-        f.write(req_code)
-
-    print(f"✅ 프로젝트 생성 완료: ./{base_dir}")
-    print(f"👉 1. {base_dir}/scanner.py 및 app.py 내부의 DB 정보를 수정하세요.")
-    print(f"👉 2. {base_dir}/scanner.py 내부의 TARGET_PATHS(스캔 경로) 및 PREFIX(접두어)를 수정하세요.")
+    print("\n=== 설정 완료 ===")
+    input("엔터 키를 누르면 종료합니다...")
 
 if __name__ == "__main__":
-    create_project()
-3. 사용 방법
-A. 각 우분투 PC에서 (데이터 수집)
-생성된 scanner.py를 각 우분투 PC로 복사합니다.
-
-파일 내 DB_HOST, TARGET_PATHS, PREFIX 변수를 수정합니다.
-
-백그라운드 일회성 실행 (터미널): 아래 명령어를 입력하면 터미널을 닫아도 백그라운드에서 실행되어 DB 업데이트 후 종료됩니다.
-
-Bash
-
-nohup python3 scanner.py > scanner.log 2>&1 &
-B. 메인 우분투 PC에서 (웹 뷰어 실행)
-app.py가 있는 폴더에서 라이브러리를 설치합니다.
-
-Bash
-
-pip install -r requirements.txt
-웹 서버를 실행합니다.
-
-Bash
-
-python3 app.py
-브라우저에서 http://localhost:5000으로 접속합니다.
-
-테이블에서 원하는 행을 검색하고 "Open VS Code" 버튼을 누르면, 현재 PC의 VS Code가 실행되며 해당 원격 경로를 엽니다.
-
-요약
-Scanner: 지정된 경로 바로 아래 폴더를 접두어_폴더명으로 가공하여 IP, 계정, 시간과 함께 DB에 저장 (Duplicate Key 방지 로직 포함).
-
-Web App: 5개 컬럼(IP, 계정, 변환된 이름, 전체경로, 시간)을 보여주고 실시간 검색(필터링) 제공. 클릭 시 code --remote 명령어로 즉시 연결.
+    main()
