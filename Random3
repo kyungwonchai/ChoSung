@@ -1,64 +1,153 @@
-우분투(리눅스) 환경에서 엣지(Edge) 브라우저는 자체적인 프록시 설정 메뉴가 없습니다. 대신 우분투 시스템의 네트워크 설정을 따라가거나, 실행할 때 명령어 옵션으로 지정해줘야 합니다.
+import os
+import sys
+import ctypes
+import subprocess
+import shutil
 
-원하시는 프록시 설정과 설정 스크립트(PAC 파일) 적용 방법은 크게 두 가지가 있습니다.
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
-방법 1: 우분투 시스템 설정에서 적용 (가장 일반적인 방법)
-엣지를 포함한 시스템 전체(혹은 이를 따르는 앱들)에 프록시를 적용하는 방법입니다.
+def run_command(cmd):
+    """명령어 실행 함수"""
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return result.returncode == 0, result.stdout, result.stderr
 
-설정 진입:
+def main():
+    print("=== Windows SSH Key Setup & Security Hardening ===")
 
-바탕화면 우측 상단(배터리/소리 아이콘) 클릭 -> 설정(Settings) 선택
+    # 1. 관리자 권한 체크
+    if not is_admin():
+        print("[!] 관리자 권한이 필요합니다. 스크립트를 관리자 권한으로 다시 실행해주세요.")
+        input("엔터 키를 누르면 종료합니다...")
+        sys.exit(1)
 
-왼쪽 메뉴에서 네트워크(Network) 선택
+    # 2. 사용자 입력 (공개키)
+    print("\n[Step 1] 우분투에서 복사한 공개키(ssh-rsa ...)를 아래에 붙여넣고 엔터를 치세요:")
+    public_key = input(">> ").strip()
+    
+    if not public_key.startswith("ssh-") and not public_key.startswith("ecdsa-"):
+        print("[!] 유효한 공개키 형식이 아닌 것 같습니다. 그래도 진행합니다.")
 
-네트워크 프록시(Network Proxy) 설정:
+    # 3. 경로 설정
+    user_profile = os.environ['USERPROFILE']
+    ssh_dir = os.path.join(user_profile, '.ssh')
+    auth_keys_file = os.path.join(ssh_dir, 'authorized_keys')
 
-중간쯤에 네트워크 프록시 옆의 톱니바퀴⚙️ 아이콘을 클릭합니다.
+    # 4. .ssh 디렉토리 및 파일 생성
+    if not os.path.exists(ssh_dir):
+        os.makedirs(ssh_dir)
+        print(f"[*] .ssh 디렉토리 생성됨: {ssh_dir}")
 
-설정 스크립트(PAC) 사용 시:
+    # 키 추가 (이어쓰기 모드)
+    # 기존 키가 있는지 확인하여 중복 방지
+    key_exists = False
+    if os.path.exists(auth_keys_file):
+        with open(auth_keys_file, 'r', encoding='utf-8') as f:
+            if public_key in f.read():
+                key_exists = True
+    
+    if not key_exists:
+        with open(auth_keys_file, 'a', encoding='utf-8') as f:
+            f.write(public_key + "\n")
+        print("[*] authorized_keys 파일에 키 저장 완료.")
+    else:
+        print("[*] 이미 등록된 키입니다.")
 
-**자동(Automatic)**을 선택합니다.
+    # 5. 권한(ACL) 설정 (가장 중요)
+    # Windows OpenSSH는 권한이 SYSTEM, Administrator, 본인 외에 다른 사용자가 있으면 키를 거부함
+    print("[*] 파일 권한(ACL) 재설정 중...")
+    
+    # 상속 제거 및 명시적 권한 부여 로직
+    # icacls 명령어 사용
+    current_user = os.environ['USERNAME']
+    
+    cmds = [
+        # 상속 제거 및 복사
+        f'icacls "{auth_keys_file}" /inheritance:r /grant:r "{current_user}:F" /grant:r SYSTEM:F /grant:r Administrators:F'
+    ]
+    
+    for cmd in cmds:
+        success, out, err = run_command(cmd)
+        if not success:
+            print(f"[!] 권한 설정 실패: {err}")
+        else:
+            print(f"    -> 권한 설정 성공: {cmd.split()[2]}...")
 
-설정 URL(Configuration URL) 칸에 가지고 계신 PAC 주소(예: http://example.com/proxy.pac)를 입력합니다.
+    # 6. sshd_config 수정 (비밀번호 끄기 & 관리자 키 경로 이슈 해결)
+    print("[*] sshd_config 설정 변경 중 (PasswordAuth -> No)...")
+    config_path = r"C:\ProgramData\ssh\sshd_config"
+    
+    if os.path.exists(config_path):
+        # 백업 생성
+        shutil.copy(config_path, config_path + ".bak")
+        
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        new_lines = []
+        comment_mode = False
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # 비밀번호 인증 끄기
+            if stripped.lower().startswith("passwordauthentication"):
+                new_lines.append("PasswordAuthentication no\n")
+                continue
+            
+            # 공개키 인증 켜기
+            if stripped.lower().startswith("pubkeyauthentication"):
+                new_lines.append("PubkeyAuthentication yes\n")
+                continue
+                
+            # [중요] Administrators 그룹 설정 주석 처리
+            # 윈도우 기본 설정은 관리자 그룹일 경우 user/.ssh/authorized_keys를 무시하고
+            # ProgramData 내의 별도 파일을 보게 되어있음. 이를 막아야 로그인한 계정의 키를 씀.
+            if stripped.lower().startswith("match group administrators"):
+                comment_mode = True
+                new_lines.append(f"# {line}") # 주석 처리
+                continue
+            
+            if comment_mode:
+                # Match 블록 끝날때까지 주석 (보통 AuthorizedKeysFile 구문이 나옴)
+                if stripped.lower().startswith("authorizedkeysfile"):
+                    new_lines.append(f"# {line}")
+                    comment_mode = False # 여기서 끝냄
+                else:
+                     # Match 블록 내부의 다른 설정일 수 있으므로 상황 봐서 처리
+                     # 보통 바로 다음줄이 AuthorizedKeysFile이므로 위 로직으로 커버됨.
+                     # 안전을 위해 들여쓰기가 있거나 Match 블록 내로 보이면 주석
+                     if line.startswith(" ") or line.startswith("\t"):
+                         new_lines.append(f"# {line}")
+                     else:
+                         new_lines.append(line)
+                         comment_mode = False
+            else:
+                new_lines.append(line)
 
-수동 프록시 사용 시:
+        # 파일 쓰기
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            print("    -> 설정 파일 수정 완료.")
+        except Exception as e:
+            print(f"[!] 설정 파일 쓰기 실패: {e}")
 
-**수동(Manual)**을 선택하고 각 프로토콜(HTTP, HTTPS 등)에 IP와 포트를 입력합니다.
+        # 서비스 재시작
+        print("[*] sshd 서비스 재시작 중...")
+        run_command("Stop-Service sshd")
+        run_command("Start-Service sshd")
+        print("    -> 서비스 재시작 완료.")
 
-👉 이렇게 설정하면 엣지를 그냥 실행해도 자동으로 이 설정을 물고 들어갑니다.
+    else:
+        print(f"[!] {config_path} 파일을 찾을 수 없습니다. OpenSSH Server가 설치되어 있나요?")
 
-방법 2: 엣지 실행 명령어에 직접 지정 (확실한 방법)
-시스템 설정이 잘 안 먹히거나, 엣지만 단독으로 다른 프록시를 태우고 싶을 때는 터미널에서 명령어로 실행하거나 실행 아이콘(바로가기)을 수정해야 합니다.
+    print("\n=== 모든 설정 완료 ===")
+    print("[INFO] 이제 우분투에서 비밀번호 없이 접속 가능합니다.")
+    input("엔터 키를 누르면 종료합니다...")
 
-터미널에서 테스트: 아래 명령어를 터미널에 입력해서 엣지가 프록시를 타고 열리는지 확인해보세요.
-
-설정 스크립트(PAC) 사용 시:
-
-Bash
-
-microsoft-edge-stable --proxy-pac-url="http://주소/파일.pac"
-수동 프록시 서버 지정 시:
-
-Bash
-
-microsoft-edge-stable --proxy-server="ip주소:포트"
-매번 입력하기 귀찮다면 (바로가기 수정): 이전에 아이콘 문제로 보셨던 .desktop 파일을 수정해서 영구적으로 적용할 수 있습니다.
-
-터미널에서 엣지 바로가기 파일을 엽니다.
-
-Bash
-
-sudo nano /usr/share/applications/microsoft-edge.desktop
-Exec= 으로 시작하는 줄을 찾습니다. (보통 Exec=/usr/bin/microsoft-edge-stable %U 처럼 되어 있음)
-
-그 뒤에 프록시 옵션을 추가합니다.
-
-Plaintext
-
-Exec=/usr/bin/microsoft-edge-stable --proxy-pac-url="http://주소/파일.pac" %U
-저장(Ctrl+O, 엔터)하고 종료(Ctrl+X)합니다.
-
-요약
-어디서 하나요?: 우분투 설정 -> 네트워크 -> 네트워크 프록시
-
-스크립트(PAC)는 어디에?: 프록시 설정 창에서 자동(Automatic) 선택 후 URL 입력
+if __name__ == "__main__":
+    main()
