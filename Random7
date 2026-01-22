@@ -1,48 +1,141 @@
-아니라 "권한이 너무 널널해서" SSH가 보안상 튕겨내는 경우입니다.
+아래 기능들이 추가됩니다.
 
-리눅스 SSH는 ~/.ssh 폴더나 키 파일이 남들도 볼 수 있게 열려있으면(예: 777) 키를 아예 무시해버립니다.
+로컬/원격 자동 구분: 내 IP와 DB의 IP가 같으면 SSH 없이 바로 폴더를 엽니다.
 
-접속하려는 우분투(서버) 쪽에서 순서대로 딱 3가지만 확인하세요.
+--no-sandbox 추가: 요청하신 옵션을 기본 적용합니다.
 
-1. (가장 유력) 폴더 및 파일 권한 '쪼이기'
-이게 제일 흔한 원인입니다. 터미널 열고 복붙하세요.
+실행 신뢰성 향상 (--new-window):
 
-Bash
+실행이 안 되던 이유 추측: 보통 기존에 열려 있는 VS Code 창이 명령을 "먹어버리거나(Silent)", 백그라운드 스크립트가 화면(DISPLAY)을 찾지 못해서 그렇습니다.
 
-# 1. 홈 디렉토리 권한 (그룹/타인 쓰기 권한 제거)
-chmod go-w ~/
+해결: --new-window 옵션을 넣어 강제로 새 창을 띄우게 하고, 환경변수 DISPLAY=:0을 명시하여 모니터에 창을 띄우도록 강제했습니다.
 
-# 2. .ssh 폴더는 나만 들어갈 수 있게 (700)
-chmod 700 ~/.ssh
+update_app.py
+아래 코드를 복사해서 generate_project.py가 있던 위치와 같은 곳에서 실행하세요.
 
-# 3. 키 파일은 나만 읽을 수 있게 (600)
-chmod 600 ~/.ssh/authorized_keys
+Python
 
-# 4. 소유자가 혹시 root로 되어있는지 확인하고 내껄로 변경
-chown -R $(whoami):$(whoami) ~/.ssh
-2. sshd_config 설정 확인
-권한 문제가 아니라면 설정 파일에서 키 인증이 꺼져있을 수 있습니다.
+import os
 
-파일 열기: sudo nano /etc/ssh/sshd_config
+# app.py의 내용을 새로 작성합니다.
+new_app_code = r"""from flask import Flask, render_template, request, jsonify
+import pymssql
+import subprocess
+import os
+import socket
 
-아래 항목들이 주석(#) 해제되어 있고 yes인지 확인하세요.
+app = Flask(__name__)
 
-Plaintext
+# ================= CONFIGURATION =================
+DB_HOST = '192.168.0.10'
+DB_USER = 'sa'
+DB_PASSWORD = 'password'
+DB_NAME = 'MyDatabase'
+# =================================================
 
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2
-수정했다면 재시작: sudo systemctl restart ssh
+def get_db_connection():
+    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
 
-3. (실수 체크) 키 값 복사할 때 엔터키 조심
-authorized_keys 파일 열어서(nano ~/.ssh/authorized_keys), 키가 한 줄로 잘 들어가 있는지 보세요.
+def get_local_ip():
+    """현재 PC의 IP 주소를 확인합니다."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # 외부망에 연결 시도 (실제 패킷 전송 X)하여 IP 확인
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
 
-ssh-rsa AAAAB3... 부터 끝까지가 끊김 없이 한 줄이어야 합니다.
+@app.route('/')
+def index():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return render_template('index.html', folders=rows)
 
-복사/붙여넣기 하다가 중간에 줄바꿈이 들어갔다면 에러 납니다.
+@app.route('/open_vscode', methods=['POST'])
+def open_vscode():
+    data = request.json
+    target_ip = data.get('ip')
+    user = data.get('account')
+    path = data.get('path')
 
-그래도 안 되면? (로그 까보기) 우분투(접속 당하는 쪽)에서 이 명령어를 켜두고 외부에서 접속 시도해보세요. 왜 튕기는지 정확한 이유(예: Authentication refused: bad ownership)가 뜹니다.
+    local_ip = get_local_ip()
+    
+    # 1. 기본 명령어 및 옵션 설정
+    # --no-sandbox: 샌드박스 비활성화 (권한 문제 완화)
+    # --new-window: 기존 창에 묻히지 않고 강제로 새 창을 띄움 (실행 확인 용이)
+    # 만약 기존 창을 재사용하고 싶다면 --reuse-window 로 변경하면 되지만, 
+    # 확실한 실행을 위해 --new-window를 추천합니다.
+    cmd = ['code', '--no-sandbox', '--new-window']
 
-Bash
+    # 2. 로컬 vs 원격 판단 로직
+    # 대상 IP가 로컬 IP와 같거나 localhost인 경우 SSH를 타지 않음
+    if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
+        print(f"Adding Local Path: {path}")
+        cmd.append(path)
+        mode_msg = "Local Direct"
+    else:
+        # 원격지인 경우 SSH Remote 사용
+        remote_arg = f"ssh-remote+{user}@{target_ip}"
+        print(f"Adding Remote Path: {remote_arg} {path}")
+        cmd.extend(['--remote', remote_arg, path])
 
-sudo tail -f /var/log/auth.log
-Next Step: 로그 확인했는데 User root not allowed 같은 게 뜨나요, 아니면 로그에도 별 반응이 없나요? 상황 알려주시면 바로 다음 수 알려드릴
+    try:
+        # 3. 환경변수 설정 (실행이 안 되는 문제 해결의 핵심)
+        # 웹 서버(파이썬)가 백그라운드나 터미널에서 실행될 때,
+        # GUI를 어디에 띄울지 몰라 실패하는 경우가 많음.
+        # DISPLAY=:0 을 강제하여 현재 모니터에 띄우도록 함.
+        my_env = os.environ.copy()
+        if 'DISPLAY' not in my_env:
+            my_env['DISPLAY'] = ':0'
+
+        # 서브프로세스로 VS Code 실행
+        subprocess.Popen(cmd, env=my_env)
+        
+        return jsonify({
+            'status': 'success', 
+            'message': f'[{mode_msg}] Opening {path} on {target_ip}'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+if __name__ == '__main__':
+    # 로컬 네트워크의 다른 PC에서도 접속 가능하도록 0.0.0.0 설정
+    app.run(host='0.0.0.0', port=5000, debug=True)
+"""
+
+def update_app():
+    target_path = os.path.join("NetworkFolderIndexer", "app.py")
+    
+    if not os.path.exists("NetworkFolderIndexer"):
+        print("❌ 오류: 'NetworkFolderIndexer' 폴더를 찾을 수 없습니다. generate_project.py를 먼저 실행했는지 확인하세요.")
+        return
+
+    with open(target_path, "w", encoding="utf-8") as f:
+        f.write(new_app_code)
+        
+    print(f"✅ 업데이트 완료: {target_path}")
+    print("👉 이제 'python3 app.py'를 다시 실행하면 적용됩니다.")
+
+if __name__ == "__main__":
+    update_app()
+추가 설명 및 옵션 가이드
+1. 실행이 잘 안 되던 이유와 해결책 웹 서버(파이썬)가 실행될 때, 리눅스는 이 프로그램이 화면(GUI)을 가지고 있는지 모르는 경우가 많습니다.
+
+해결: 코드 내에 my_env['DISPLAY'] = ':0' 부분을 추가했습니다. 이건 "지금 보고 있는 0번 모니터에 창을 띄워라"라는 강제 명령입니다.
+
+2. VS Code 창 관리 옵션 (취향에 따라 변경 가능) 코드 중간의 cmd = ['code', ...] 부분에서 옵션을 바꿀 수 있습니다.
+
+--new-window: (현재 적용됨) 무조건 새 창을 띄웁니다. 실행 여부가 가장 확실하게 보입니다.
+
+--reuse-window: 이미 열린 VS Code 창이 있다면 그 창의 내용을 바꿉니다. 창이 너무 많이 뜨는 게 싫다면 이 옵션으로 바꿔보세요.
+
+--goto: 파일이 이미 열려있다면 그 탭으로 이동합니다(파일 단위 열기 시 유용).
+
+3. 로컬 실행 로직 이제 버튼을 누르면 내부적으로 IP를 비교하여 127.0.0.1이거나 현재 PC IP와 같으면 ssh-remote+... 명령어를 빼고, 단순히 code /경로 형식으로 실행하여 속도가 훨
