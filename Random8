@@ -1,38 +1,35 @@
-래 코드는 해당 버그를 수정한 완전한 업데이트 스크립트입니다. 이것만 다시 한 번 실행해 주시면 즉시 해결됩니다.
-
-fix_app.py
-(이 스크립트를 실행하면 NetworkFolderIndexer/app.py가 정상적인 코드로 덮어씌워집니다.)
-
-Python
-
-import os
-
-# app.py의 내용을 수정하여 다시 작성합니다.
-# 수정사항: else 블록(원격 접속)에서 mode_msg 변수 정의 추가
-
-new_app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
-import subprocess
 import os
 import socket
-
-app = Flask(__name__)
+import pymssql
+import datetime
+import time
+import glob
 
 # ================= CONFIGURATION =================
+# DB 접속 정보 (기존과 동일하게 맞추세요)
 DB_HOST = '192.168.0.10'
 DB_USER = 'sa'
 DB_PASSWORD = 'password'
 DB_NAME = 'MyDatabase'
+
+# 윈도우 스캔 대상 경로 (r'' 문자열 사용 권장)
+TARGET_PATHS = [
+    r'C:\Users\User\Source\Repos',
+    r'D:\Projects',
+    r'C:\Work'
+]
+
+# 접두어 설정 (윈도우용 구분을 위해 설정)
+PREFIX = "WIN_PRJ_" 
+
+# 반복 주기 (초 단위, 10분 = 600초)
+INTERVAL_SECONDS = 600
 # =================================================
 
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-
-def get_local_ip():
-    """현재 PC의 IP 주소를 확인합니다."""
+def get_ip_address():
+    """현재 PC의 IP를 가져옵니다."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # 외부망에 연결 시도 (실제 패킷 전송 X)하여 IP 확인
         s.connect(('10.255.255.255', 1))
         IP = s.getsockname()[0]
     except Exception:
@@ -41,72 +38,86 @@ def get_local_ip():
         s.close()
     return IP
 
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
-
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    target_ip = data.get('ip')
-    user = data.get('account')
-    path = data.get('path')
-
-    local_ip = get_local_ip()
+def has_build_artifacts(folder_path):
+    """
+    해당 폴더 하위에 실제 빌드된 흔적(.dll, .exe)이 있는지 확인합니다.
+    주로 bin 또는 obj 폴더 내부를 확인합니다.
+    """
+    # 체크할 확장자 목록
+    build_extensions = {'.dll', '.exe'}
     
-    # 기본 명령어: 샌드박스 해제, 새 창 강제
-    cmd = ['code', '--no-sandbox', '--new-window']
-    mode_msg = "" # 변수 초기화
+    # 너무 깊게 들어가지 않도록 제한하거나, 특정 폴더만 볼 수도 있지만
+    # 여기서는 하위 모든 폴더 중 bin/obj가 포함된 경로의 파일을 찾습니다.
+    for root, dirs, files in os.walk(folder_path):
+        # 경로에 bin 또는 obj가 포함되어 있는지 확인 (소문자로 변환하여 비교)
+        lower_root = root.lower()
+        if 'bin' in lower_root or 'obj' in lower_root:
+            for file in files:
+                _, ext = os.path.splitext(file)
+                if ext.lower() in build_extensions:
+                    return True # 빌드 흔적 발견 즉시 True 반환
+    return False
 
-    # 로컬 vs 원격 판단
-    if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
-        print(f"Adding Local Path: {path}")
-        cmd.append(path)
-        mode_msg = "Local Direct"
-    else:
-        # 원격지인 경우 SSH Remote 사용
-        remote_arg = f"ssh-remote+{user}@{target_ip}"
-        print(f"Adding Remote Path: {remote_arg} {path}")
-        cmd.extend(['--remote', remote_arg, path])
-        mode_msg = "Remote SSH" # <--- [수정됨] 이 부분이 빠져서 에러가 났었습니다.
-
+def scan_and_update():
+    current_ip = get_ip_address()
+    current_user = os.getenv('USERNAME') # Windows는 USERNAME 환경변수 사용
+    
+    conn = None
     try:
-        # 환경변수 설정 (DISPLAY=:0 강제)
-        my_env = os.environ.copy()
-        if 'DISPLAY' not in my_env:
-            my_env['DISPLAY'] = ':0'
+        print(f"[{datetime.datetime.now()}] 🔍 스캔 시작 ({current_ip})...")
+        conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cursor = conn.cursor()
 
-        # 서브프로세스로 VS Code 실행
-        subprocess.Popen(cmd, env=my_env)
+        valid_folders = []
+
+        for base_path in TARGET_PATHS:
+            if not os.path.exists(base_path):
+                print(f"  ⚠️ 경로 없음: {base_path}")
+                continue
+
+            # os.walk로 하위 폴더 탐색
+            for root, dirs, files in os.walk(base_path):
+                # 1. .sln 파일이 있는지 확인
+                has_sln = any(f.endswith('.sln') for f in files)
+                
+                if has_sln:
+                    # 2. 빌드 흔적(dll, exe)이 하위에 있는지 검증
+                    if has_build_artifacts(root):
+                        folder_name = os.path.basename(root)
+                        display_name = f"{PREFIX}{folder_name}"
+                        
+                        # DB에 넣을 준비
+                        valid_folders.append((display_name, root))
+                        print(f"  ✅ 발견: {display_name} -> {root}")
+                        
+                        # DB Update (MERGE)
+                        sql = """
+                        MERGE FolderIndex AS target
+                        USING (SELECT %s as IP, %s as Path) AS source
+                        ON (target.IPAddress = source.IP AND target.FullPath = source.Path)
+                        WHEN MATCHED THEN
+                            UPDATE SET DisplayName = %s, Account = %s, LastUpdated = GETDATE()
+                        WHEN NOT MATCHED THEN
+                            INSERT (IPAddress, Account, DisplayName, FullPath, LastUpdated)
+                            VALUES (%s, %s, %s, %s, GETDATE());
+                        """
+                        cursor.execute(sql, (
+                            current_ip, root,           # Source
+                            display_name, current_user, # Update
+                            current_ip, current_user, display_name, root # Insert
+                        ))
         
-        return jsonify({
-            'status': 'success', 
-            'message': f'[{mode_msg}] Opening {path} on {target_ip}'
-        })
+        conn.commit()
+        print(f"[{datetime.datetime.now()}] ✨ 업데이트 완료. (발견된 프로젝트: {len(valid_folders)}개)")
+        print(f"⏳ {INTERVAL_SECONDS/60}분 대기 중...")
+
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
-"""
-
-def fix_app():
-    target_path = os.path.join("NetworkFolderIndexer", "app.py")
-    
-    if not os.path.exists("NetworkFolderIndexer"):
-        print("❌ 오류: 'NetworkFolderIndexer' 폴더가 없습니다.")
-        return
-
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(new_app_code)
-        
-    print(f"✅ 버그 수정 완료: {target_path}")
-    print("👉 다시 'python3 app.py'를 실행해 보세요.")
+        print(f"❌ 오류 발생: {e}")
+    finally:
+        if conn: conn.close()
 
 if __name__ == "__main__":
-    fix_app()
+    print("🚀 윈도우 프로젝트 스캐너 가동 (Ctrl+C로 종료)")
+    while True:
+        scan_and_update()
+        time.sleep(INTERVAL_SECONDS)
