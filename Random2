@@ -1,131 +1,166 @@
-import os
+경원님, "캐스팅이 안 된다", "압축이 안 된다", "안 열린다"라는 증상은 단순한 성능 문제가 아니라 **데이터 타입의 호환성 문제(Legacy LOB)**이거나, 최악의 경우 **데이터 페이지 손상(Corruption)**일 가능성이 높습니다.
 
-# app.py 코드를 새로 작성 (Null Byte 제거 + 포트 1633 + 폴더명 runcline 반영)
-new_app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
-import subprocess
-import os
-import socket
-import platform
+특히 MSSQL 2014에서 TEXT, NTEXT, IMAGE 같은 **구형 데이터 타입(LOB)**을 사용 중이라면 데이터 압축이 불가능하며, 형 변환(Casting) 제약이 심합니다.
 
-app = Flask(__name__)
+아래 쿼리들을 순서대로 실행하여 ① 용량이 큰 테이블을 찾고, ② 압축/캐스팅을 방해하는 원인을 분석해 드립니다.
 
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'
-DB_USER = 'sa'
-DB_PASSWORD = 'password'
-DB_NAME = 'MyDatabase'
-# =================================================
+1. 테이블 용량 및 상태 종합 분석 쿼리 (가장 중요)
+이 쿼리는 DB 내 모든 테이블의 크기(Row 수, MB) 뿐만 아니라, 압축 여부, LOB 데이터(압축 방해 요소) 포함 여부, 메모리 최적화 테이블 여부를 한 번에 보여줍니다.
 
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+SQL
 
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
+SELECT
+    t.name AS [테이블명],
+    s.name AS [스키마],
+    p.rows AS [행_개수],
+    CAST(ROUND(((SUM(a.total_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS [전체크기_MB],
+    CAST(ROUND(((SUM(a.used_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS [사용중크기_MB],
+    -- 상태 분석 정보
+    p.data_compression_desc AS [현재_압축상태],
+    t.is_memory_optimized AS [인메모리_테이블여부], -- 1이면 일반적인 쿼리 제약 많음
+    -- 압축/캐스팅 방해 요소 확인 (TEXT, NTEXT, IMAGE 컬럼 존재 여부)
+    (SELECT COUNT(*) 
+     FROM sys.columns c 
+     JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+     WHERE c.object_id = t.object_id 
+       AND ty.name IN ('text', 'ntext', 'image')) AS [구형_LOB컬럼_수]
+FROM sys.tables t
+INNER JOIN sys.indexes i ON t.object_id = i.object_id
+INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+LEFT JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE t.name NOT LIKE 'dt%' -- 시스템 다이어그램 제외
+  AND t.is_ms_shipped = 0
+  AND i.object_id > 255
+GROUP BY t.name, s.name, p.rows, p.data_compression_desc, t.is_memory_optimized, t.object_id
+ORDER BY [전체크기_MB] DESC;
+[결과 해석 및 조치]
 
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    # DB에서 가져올 때부터 Null Byte가 있을 수 있으므로 주의해야 하지만,
-    # 보통은 subprocess 실행 직전에 지우는 게 확실합니다.
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
+구형_LOB컬럼_수 > 0: text, ntext, image 타입이 포함된 테이블입니다. 이 타입들은 MSSQL 2014에서 행 압축(ROW/PAGE Compression)이 불가능하며, varchar(max) 등으로 변환하지 않으면 캐스팅 에러가 자주 발생합니다.
 
-def clean_str(s):
-    """문자열에 포함된 Null Byte(\x00)와 앞뒤 공백을 제거합니다."""
-    if s:
-        return s.replace('\x00', '').strip()
-    return ""
+인메모리_테이블여부 = 1: 메모리 최적화 테이블은 ALTER TABLE이나 특정 쿼리 사용에 큰 제약이 있습니다.
 
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    
-    # [핵심 수정] Null Byte (\x00) 제거 로직 추가
-    target_ip = clean_str(data.get('ip'))
-    user = clean_str(data.get('account'))
-    path = clean_str(data.get('path'))
+안 열리는 경우: 특정 테이블만 조회가 안 된다면 데이터 손상일 수 있습니다. 아래 3번 항목을 참조하세요.
 
-    local_ip = get_local_ip()
-    mode_msg = ""
-    cmd = []
-    
-    # 윈도우 경로 판단 (역슬래시나 콜론 포함 시)
-    is_windows_path = ('\\' in path) or (':' in path)
+2. 압축 및 형 변환을 방해하는 "나쁜 컬럼" 찾기
+어떤 컬럼 때문에 작업이 막히는지 구체적으로 찍어주는 쿼리입니다.
 
-    if is_windows_path:
-        # 윈도우: 단순 실행
-        cmd = ['code', '--new-window', path]
-        mode_msg = "Windows Local (Direct)"
-        
-        try:
-            subprocess.Popen(cmd, shell=True)
-            return jsonify({'status': 'success', 'message': f'[{mode_msg}] Opening {path}'})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+SQL
 
-    else:
-        # 리눅스 (우분투) 로직
-        cmd = ['code', '--no-sandbox', '--new-window']
-        
-        if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
-            cmd.append(path)
-            mode_msg = "Linux Local"
-        else:
-            remote_arg = f"ssh-remote+{user}@{target_ip}"
-            cmd.extend(['--remote', remote_arg, path])
-            mode_msg = "Linux SSH"
+SELECT 
+    t.name AS [테이블명],
+    c.name AS [컬럼명],
+    ty.name AS [데이터타입],
+    c.max_length AS [길이],
+    '이 데이터 타입은 압축 및 일부 형변환을 지원하지 않습니다.' AS [경고]
+FROM sys.columns c
+JOIN sys.tables t ON c.object_id = t.object_id
+JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+WHERE ty.name IN ('text', 'ntext', 'image', 'timestamp') -- 문제의 타입들
+ORDER BY t.name;
+[해결책]
 
-        try:
-            # 리눅스는 DISPLAY 환경변수 필수
-            my_env = os.environ.copy()
-            if 'DISPLAY' not in my_env:
-                my_env['DISPLAY'] = ':0'
+ntext -> nvarchar(max)
 
-            subprocess.Popen(cmd, env=my_env)
-            return jsonify({'status': 'success', 'message': f'[{mode_msg}] Opening on {target_ip}'})
-        except Exception as e:
-            # 에러 메시지에서도 null byte가 있으면 500 에러가 날 수 있으니 처리
-            return jsonify({'status': 'error', 'message': str(e).replace('\x00', '')}), 500
+text -> varchar(max)
 
-if __name__ == '__main__':
-    # 요청하신 포트 1633으로 변경
-    print("🚀 Server starting on port 1633...")
-    app.run(host='0.0.0.0', port=1633, debug=True)
+image -> varbinary(max)
+
+위와 같이 타입을 변경(ALTER COLUMN)해야 압축과 자유로운 형 변환이 가능해집니다.
+
+3. "테이블이 안 열린다" -> 손상 확인 (DBCC)
+만약 SELECT * FROM 테이블 시 멈추거나 에러가 난다면 데이터 페이지가 깨졌을 확률이 높습니다. 이 쿼리로 해당 테이블의 건강 상태를 체크하세요.
+
+SQL
+
+-- 테이블명을 넣어서 실행 (결과에 붉은 에러가 뜨면 손상된 것임)
+DBCC CHECKTABLE ('문제가_되는_테이블명');
+
+-- 혹은 DB 전체 검사 (시간 오래 걸림, 시스템 부하 큼)
+-- DBCC CHECKDB ('데이터베이스명') WITH NO_INFOMSGS;
+4. (자동화) 테이블 분석 리포트 생성 Python 스크립트
+위의 1번 분석 쿼리를 실행하여 CSV로 저장해 주는 Python 스크립트입니다.
+
+준비: pip install pyodbc
+
+설정: DB_CONFIG에 접속 정보 입력
+
+Python
+
+import pyodbc
+import csv
+
+# ---------------------------------------------------------
+# [설정] MSSQL 접속 정보
+# ---------------------------------------------------------
+DB_CONFIG = {
+    'server': 'localhost\\SQLEXPRESS', 
+    'database': 'TargetDB',     # 분석할 데이터베이스 이름
+    'username': 'sa',
+    'password': 'your_password'
+}
+OUTPUT_FILE = 'table_status_report.csv'
+
+# ---------------------------------------------------------
+# [SQL] 테이블 용량 및 문제 원인 분석
+# ---------------------------------------------------------
+SQL_QUERY = """
+SELECT
+    t.name AS Table_Name,
+    p.rows AS Row_Count,
+    CAST(ROUND(((SUM(a.total_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS Total_Size_MB,
+    p.data_compression_desc AS Compression_State,
+    t.is_memory_optimized AS Is_Memory_Optimized,
+    (SELECT COUNT(*) 
+     FROM sys.columns c 
+     JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+     WHERE c.object_id = t.object_id 
+       AND ty.name IN ('text', 'ntext', 'image')) AS Deprecated_LOB_Count
+FROM sys.tables t
+INNER JOIN sys.indexes i ON t.object_id = i.object_id
+INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE t.name NOT LIKE 'dt%' AND t.is_ms_shipped = 0 AND i.object_id > 255
+GROUP BY t.name, p.rows, p.data_compression_desc, t.is_memory_optimized, t.object_id
+ORDER BY Total_Size_MB DESC;
 """
 
-def update_runcline_app():
-    # 폴더명 수정: runcline
-    base_dir = "runcline"
-    target_path = os.path.join(base_dir, "app.py")
-    
-    # 폴더가 없으면 생성 (혹시 모르니)
-    if not os.path.exists(base_dir):
-        try:
-            os.makedirs(base_dir)
-            print(f"📁 '{base_dir}' 폴더가 없어서 새로 생성했습니다.")
-        except OSError:
-            print(f"❌ 오류: '{base_dir}' 폴더를 생성할 수 없습니다.")
-            return
+def main():
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={DB_CONFIG['server']};"
+        f"DATABASE={DB_CONFIG['database']};"
+        f"UID={DB_CONFIG['username']};"
+        f"PWD={DB_CONFIG['password']}"
+    )
 
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(new_app_code)
-        
-    print(f"✅ 수정 완료: {target_path}")
-    print("👉 Null Byte 제거 로직이 적용되었습니다.")
-    print("👉 포트가 1633으로 설정되었습니다.")
-    print(f"👉 실행 명령: python3 {base_dir}/app.py")
+    print(f"[*] '{DB_CONFIG['database']}' 데이터베이스 분석 시작...")
+
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(SQL_QUERY)
+            rows = cursor.fetchall()
+            
+            if not rows:
+                print("[!] 테이블 정보를 가져올 수 없습니다.")
+                return
+
+            with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                columns = [column[0] for column in cursor.description]
+                writer.writerow(columns)
+                writer.writerows(rows)
+                
+            print(f"[+] 분석 완료! '{OUTPUT_FILE}' 파일을 확인하세요.")
+            print("    - Deprecated_LOB_Count가 0보다 크면 압축/캐스팅 불가 원인입니다.")
+
+    except Exception as e:
+        print(f"\n[Error] 오류 발생: {e}")
 
 if __name__ == "__main__":
-    update_runcline_app()
+    main()
+요약: 경원님이 확인해야 할 것
+결과 CSV의 Deprecated_LOB_Count 확인: 이 값이 1 이상이면 ntext 같은 구형 타입을 쓰고 있다는 뜻입니다. -> 압축 불가, 캐스팅 오류의 주범.
+
+DBCC CHECKTABLE: 만약 테이블 조회(SELECT) 자체가 안 되면 데이터 깨짐입니다. 이때는 백업 복구 외엔 방법이 없을 수 있
