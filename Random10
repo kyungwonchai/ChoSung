@@ -1,15 +1,333 @@
-SELECT TOP 20
-    ISNULL(DB_NAME(t.dbid), 'Ad-hoc/System') AS [데이터베이스명],
-    SUBSTRING(t.text, (qs.statement_start_offset/2)+1,
-        ((CASE qs.statement_end_offset
-          WHEN -1 THEN DATALENGTH(t.text)
-          ELSE qs.statement_end_offset
-          END - qs.statement_start_offset)/2) + 1) AS [실행된_쿼리문],
-    qs.execution_count AS [총_실행횟수],
-    (qs.total_worker_time / 1000) AS [총_CPU사용시간_ms],
-    (qs.total_worker_time / qs.execution_count / 1000) AS [평균_CPU사용시간_ms],
-    qs.total_logical_reads AS [논리적_읽기수_메모리부하],
-    qs.last_execution_time AS [마지막_실행시간]
-FROM sys.dm_exec_query_stats qs
-CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
-ORDER BY qs.total_worker_time DESC; -- CPU 사용 시간 기준 정렬
+import os
+import pymssql
+
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print("❌ 오류: 폴더가 없습니다.")
+    exit()
+
+# ====================================================
+# 1. API Routes 업데이트 (룰에 맞는 전용 엔드포인트 추가)
+# ====================================================
+# 룰의 요구사항:
+# - POST /api/agent/next -> {"status": "ok", "command": ...} 반환
+# - POST /api/agent/result -> DB에 결과 저장
+# ====================================================
+
+api_routes_code = r"""from flask import Blueprint, request, jsonify
+from app.database import get_db_connection
+from app.services.ssh_service import send_rule_via_ssh
+import subprocess
+import os
+import datetime
+
+api_bp = Blueprint('api', __name__)
+
+# [설정] 브릿지 API 주소
+BRIDGE_API_URL = "http://192.168.0.10:9111"
+
+# --- [NEW] Agent Protocol Routes (룰 호환용) ---
+
+@api_bp.route('/agent/next', methods=['POST'])
+def agent_next_task():
+    """
+    룰: STEP 1: FETCH
+    에이전트가 { "subject": "{SUBJECT}" } 를 보내면
+    Pending 상태인 작업을 하나 꺼내서 할당함.
+    """
+    data = request.json
+    project_name = data.get('subject')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    # 1. 해당 프로젝트의 Pending 작업 중 가장 오래된 것 1개 조회
+    cursor.execute(\"\"\"
+        SELECT TOP 1 TaskID, TaskContent 
+        FROM TaskQueue 
+        WHERE ProjectName=%s AND Status='Pending'
+        ORDER BY TaskID ASC
+    \"\"\", (project_name,))
+    
+    task = cursor.fetchone()
+    
+    if task:
+        # 2. 상태를 Processing으로 변경 (중복 할당 방지)
+        cursor.execute("UPDATE TaskQueue SET Status='Processing', StartedAt=GETDATE() WHERE TaskID=%s", (task['TaskID'],))
+        conn.commit()
+        conn.close()
+        
+        # 룰 포맷에 맞춰 반환
+        return jsonify({
+            "status": "ok",
+            "log_id": task['TaskID'],
+            "command": task['TaskContent']
+        })
+    else:
+        conn.close()
+        return jsonify({"status": "wait"})
+
+@api_bp.route('/agent/result', methods=['POST'])
+def agent_submit_result():
+    """
+    룰: STEP 3: SUBMIT REPORT
+    에이전트가 { "subject": "...", "log_id": ..., "result": "..." } 를 보냄
+    """
+    data = request.json
+    task_id = data.get('log_id')
+    result_content = data.get('result')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 작업 완료 처리 및 결과 저장
+    cursor.execute(\"\"\"
+        UPDATE TaskQueue 
+        SET Status='Done', CompletedAt=GETDATE(), ResultContent=%s 
+        WHERE TaskID=%s
+    \"\"\", (result_content, task_id))
+    
+    # 프로젝트 통계 갱신 (마지막 활동 시간)
+    project_name = data.get('subject')
+    if project_name:
+        cursor.execute("UPDATE FolderIndex SET LastTaskDate=GETDATE() WHERE DisplayName=%s", (project_name,))
+
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "received"})
+
+# --- 기존 Routes 유지 ---
+
+@api_bp.route('/open_vscode', methods=['POST'])
+def open_vscode():
+    data = request.json
+    target_ip = data.get('ip')
+    user = data.get('account')
+    path = data.get('path')
+    cmd = ['code', '--no-sandbox', '--new-window']
+    remote_arg = f"ssh-remote+{user}@{target_ip}"
+    cmd.extend(['--remote', remote_arg, path])
+    try:
+        env = os.environ.copy()
+        if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+        subprocess.Popen(cmd, env=env)
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/stats/dashboard', methods=['GET'])
+def get_dashboard_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT ISNULL(GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM FolderIndex GROUP BY ISNULL(GroupName, 'No Group')")
+    group_counts = cursor.fetchall()
+    cursor.execute("SELECT ISNULL(f.GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM TaskQueue q JOIN FolderIndex f ON q.ProjectName = f.DisplayName WHERE q.Status IN ('Pending', 'Processing') GROUP BY ISNULL(f.GroupName, 'No Group')")
+    active_counts = cursor.fetchall()
+    conn.close()
+    return jsonify({'groups': group_counts, 'active': active_counts})
+
+@api_bp.route('/rules', methods=['GET', 'POST'])
+def handle_rules():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT * FROM ProjectRules ORDER BY RuleID DESC")
+        rules = cursor.fetchall()
+        conn.close()
+        return jsonify(rules)
+    if request.method == 'POST':
+        data = request.json
+        cursor.execute("INSERT INTO ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (data['name'], data['content']))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/rules/deploy', methods=['POST'])
+def deploy_rule():
+    data = request.json
+    project_name = data.get('project_name')
+    rule_id = data.get('rule_id')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    cursor.execute("SELECT RuleContent FROM ProjectRules WHERE RuleID=%s", (rule_id,))
+    rule_row = cursor.fetchone()
+    
+    cursor.execute("SELECT IPAddress, Account, FullPath FROM FolderIndex WHERE DisplayName=%s", (project_name,))
+    target = cursor.fetchone()
+    
+    if not rule_row or not target:
+        conn.close()
+        return jsonify({'status': 'error', 'message': 'Not found'}), 404
+        
+    # [Templating] 룰 변수 치환 (사용자 요청사항 반영)
+    # {SUBJECT} -> project_name
+    # {SERVER_URL} -> BRIDGE_API_URL
+    # {VENV} -> 'python' (기본값)
+    
+    final_content = rule_row['RuleContent']
+    final_content = final_content.replace('{SUBJECT}', project_name)
+    final_content = final_content.replace('{SERVER_URL}', BRIDGE_API_URL)
+    final_content = final_content.replace('{VENV}', 'python') # 가상환경은 기본 python으로 매핑
+    
+    # 윈도우/리눅스 경로 호환 처리
+    final_content = final_content.replace('{TARGET_PATH}', target['FullPath'].replace('\\', '/'))
+
+    success, msg = send_rule_via_ssh(target['IPAddress'], target['Account'], final_content, target['FullPath'])
+    
+    if success:
+        cursor.execute("UPDATE FolderIndex SET LastRuleContent=%s WHERE DisplayName=%s", (final_content, project_name))
+        conn.commit()
+        
+    conn.close()
+    return jsonify({'status': 'success' if success else 'error', 'message': msg})
+
+@api_bp.route('/memos/<project_name>', methods=['GET', 'POST'])
+def handle_memo(project_name):
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT MemoContent FROM ProjectMemos WHERE ProjectName=%s", (project_name,))
+        row = cursor.fetchone()
+        conn.close()
+        return jsonify({'content': row['MemoContent'] if row else ''})
+    if request.method == 'POST':
+        content = request.json.get('content')
+        sql = "MERGE ProjectMemos AS target USING (SELECT %s as PName) AS source ON (target.ProjectName = source.PName) WHEN MATCHED THEN UPDATE SET MemoContent = %s, UpdatedAt = GETDATE() WHEN NOT MATCHED THEN INSERT (ProjectName, MemoContent) VALUES (%s, %s);"
+        cursor.execute(sql, (project_name, content, project_name, content))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/queue', methods=['GET', 'POST'])
+def handle_queue():
+    # 기존 API도 호환성 위해 유지
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        p_name = request.args.get('project')
+        cursor.execute("SELECT * FROM TaskQueue WHERE ProjectName=%s AND Status IN ('Pending', 'Processing') ORDER BY TaskID", (p_name,))
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify(rows)
+    if request.method == 'POST':
+        data = request.json
+        p_name = data.get('project')
+        content = data.get('content')
+        cursor.execute("INSERT INTO TaskQueue (ProjectName, TaskContent) VALUES (%s, %s)", (p_name, content))
+        cursor.execute("UPDATE FolderIndex SET TaskCount = TaskCount + 1, LastTaskDate = GETDATE() WHERE DisplayName=%s", (p_name,))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+"""
+
+with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
+    f.write(api_routes_code)
+print("1️⃣ API Routes 업데이트 완료 (/agent/next, /agent/result 추가)")
+
+
+# ====================================================
+# 2. DB 업데이트 (ResultContent 컬럼 추가)
+# ====================================================
+print("2️⃣ DB 스키마 업데이트 및 룰 등록 중...")
+
+# 사용자님이 주신 전설의 룰 원문
+legendary_rule = """# [SYSTEM PERSONA: INTELLIGENT WORKER & REPORTER]
+You are an autonomous worker for project "{SUBJECT}".
+Your goal is not just to "run" commands, but to **PERFORM TASKS** and **GENERATE A DETAILED REPORT**.
+
+# [CONFIGURATION]
+- Server: {SERVER_URL}
+- Project Name: {SUBJECT}
+- Virtual Env: {VENV}
+- **Report File**: `task_report.md` (You must CREATE this file every turn)
+
+# [MANDATORY WORKFLOW]
+When triggered by **"go"**, **"do"**, or **"고"**:
+
+## STEP 1: FETCH
+1. POST `{SERVER_URL}/api/agent/next` with `{"subject": "{SUBJECT}"}`.
+2. If `{"status": "wait"}`, print "Waiting..." and STOP.
+3. If `{"status": "ok", "log_id": <ID>, "command": "<INSTRUCTION>"}`:
+   - **<INSTRUCTION>** is your task. It can be a shell command OR a natural language request (e.g., "Create a Flask app").
+
+## STEP 2: PERFORM & DOCUMENT (CRITICAL)
+You must decide how to handle the `<INSTRUCTION>`:
+
+### CASE A: It is a System Command (e.g., `python worker.py`, `ls -al`)
+1. Execute the command.
+2. **CAPTURE** stdout and stderr.
+3. **WRITE** the output into `task_report.md`. (Overwrite `>`).
+
+### CASE B: It is a Request (e.g., "Make a Hello World Flask app")
+1. **PERFORM** the task (Create files, edit code, etc.).
+2. **WRITE A REPORT** into `task_report.md`.
+   - The report MUST include:
+     - What files were created/modified.
+     - A summary of the action taken.
+     - **Result Verification**: (e.g., "Created app.py. Content snippet: ...").
+   - **DO NOT** just write "Done". Write the EVIDENCE.
+
+## STEP 3: SUBMIT REPORT
+1. Read the content of `task_report.md` (Ensure UTF-8).
+2. If the file is empty or missing, write "[Error: No report generated]" and read it.
+3. Send POST to `{SERVER_URL}/api/agent/result`.
+   - Payload:
+     ```json
+     {
+       "subject": "{SUBJECT}",
+       "log_id": <ID>,
+       "result": "<CONTENT_OF_TASK_REPORT_MD>"
+     }
+     ```
+
+# [RULES OF ENGAGEMENT]
+1. **NO LAZINESS**: If the user asks for code, the result sent to the server MUST contain the code or a confirmation of file creation, NOT just the user's prompt.
+2. **NO ECHO**: Do NOT echo the user's command back as the result.
+3. **FILE BASED**: Always write to `task_report.md` first, then read it to send the API request.
+"""
+
+DB_HOST = '192.168.0.10'
+DB_USER = 'sa'
+DB_PASSWORD = 'password'
+DB_NAME = 'MyDatabase'
+
+try:
+    conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+    cursor = conn.cursor()
+    
+    # 1. TaskQueue 테이블에 결과 저장용 컬럼 추가 (없으면)
+    try:
+        cursor.execute("ALTER TABLE TaskQueue ADD ResultContent NVARCHAR(MAX) NULL")
+        conn.commit()
+        print("   - TaskQueue 테이블에 'ResultContent' 컬럼 추가됨.")
+    except:
+        print("   - 'ResultContent' 컬럼은 이미 존재합니다.")
+
+    # 2. 전설의 룰 업데이트
+    rule_name = "Auto-Agent Protocol (Go/Do)"
+    
+    cursor.execute("SELECT Count(*) FROM ProjectRules WHERE RuleName = %s", (rule_name,))
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", 
+                       (rule_name, legendary_rule))
+    else:
+        cursor.execute("UPDATE ProjectRules SET RuleContent = %s WHERE RuleName = %s", 
+                       (legendary_rule, rule_name))
+    
+    conn.commit()
+    conn.close()
+    print("✅ DB 작업 완료: 룰이 최신 버전으로 업데이트되었습니다.")
+
+except Exception as e:
+    print(f"⚠️ DB 연결 실패: {e}")
+    # 쿼리 출력
+    safe_rule = legendary_rule.replace("'", "''")
+    print("\n[수동 SQL 실행 필요]")
+    print(f"UPDATE ProjectRules SET RuleContent = N'{safe_rule}' WHERE RuleName = 'Auto-Agent Protocol (Go/Do)';")
+
+print("\n🚀 시스템 복구 완료.")
+print("👉 이제 에이전트는 '/api/agent/next'로 일을 받고, 'task_report.md'를 작성한 뒤, '/api/agent/result'로 결과를 보고합니다.")
+print("👉 'python3 runcline/run_bridge.py'를 다시 실행하세요!")
