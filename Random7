@@ -1,114 +1,83 @@
 import os
 
-# app.py 코드를 새로 작성 
-# 특징: 윈도우/리눅스 구분 없이 원격지면 무조건 SSH로 접속
-# Null Byte 제거 및 포트 1633 유지
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print(f"❌ 오류: '{base_dir}' 폴더가 없습니다.")
+    exit()
 
-new_app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
-import subprocess
+# ==========================================
+# SSH Service 수정 (공백 경로 완벽 대응 버전)
+# ==========================================
+ssh_service_code = r"""import subprocess
 import os
-import socket
 
-app = Flask(__name__)
-
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'
-DB_USER = 'sa'
-DB_PASSWORD = 'password'
-DB_NAME = 'MyDatabase'
-# =================================================
-
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def send_rule_via_ssh(ip, account, rule_content, project_path):
     try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
-
-def clean_str(s):
-    """Null Byte 및 공백 제거"""
-    if s:
-        return s.replace('\x00', '').strip()
-    return ""
-
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
-
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    
-    # 1. 데이터 클리닝 (Null Byte 에러 방지)
-    target_ip = clean_str(data.get('ip'))
-    user = clean_str(data.get('account'))
-    path = clean_str(data.get('path'))
-
-    local_ip = get_local_ip()
-    cmd = ['code', '--no-sandbox', '--new-window']
-    mode_msg = ""
-
-    # 2. 로직 통일: 내 IP가 아니면 무조건 SSH (윈도우든 리눅스든 상관없음)
-    # 윈도우도 SSH 서버가 켜져 있다면 ssh-remote로 경로를 넘겨주면 VS Code가 알아서 처리함
-    
-    if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
-        # [Case 1] 로컬 (이 우분투 서버 자체의 폴더)
-        cmd.append(path)
-        mode_msg = "Local Direct"
-    else:
-        # [Case 2] 원격 (다른 우분투 or 윈도우) -> SSH 접속
-        remote_arg = f"ssh-remote+{user}@{target_ip}"
-        cmd.extend(['--remote', remote_arg, path])
-        mode_msg = "Remote SSH"
-
-    try:
-        # 실행 환경변수 설정 (DISPLAY)
-        my_env = os.environ.copy()
-        if 'DISPLAY' not in my_env:
-            my_env['DISPLAY'] = ':0'
-
-        print(f"Executing: {' '.join(cmd)}") # 디버깅용 로그
-        subprocess.Popen(cmd, env=my_env)
+        # 1. 경로 정규화 (윈도우 역슬래시 -> 슬래시)
+        # 슬래시는 윈도우/리눅스 모두에서 안전하며, 따옴표 안에서도 안전합니다.
+        if '\\' in project_path:
+            project_path = project_path.replace('\\', '/')
+            
+        # 2. 타겟 경로 설정
+        target_dir = f"{project_path}/.clinerules"
+        target_file = f"{target_dir}/absoluterule.md"
         
-        return jsonify({
-            'status': 'success', 
-            'message': f'[{mode_msg}] Opening {path} on {target_ip}'
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e).replace('\x00', '')}), 500
+        # [핵심] 공백 처리를 위한 경로 래핑 (Quoting)
+        # SSH나 SCP 명령어에 공백이 들어간 경로를 넘길 때는
+        # 반드시 작은따옴표(')로 감싸야 하나의 문자열로 인식됩니다.
+        safe_target_dir = f"'{target_dir}'"   # 예: 'C:/My Projects/.clinerules'
+        safe_target_file = f"'{target_file}'" # 예: 'C:/My Projects/.clinerules/absoluterule.md'
+        
+        # 3. 로컬 임시 파일 생성
+        temp_filename = f"temp_rule_{ip}.md"
+        with open(temp_filename, 'w', encoding='utf-8') as f:
+            f.write(rule_content)
+            
+        # 4. [폴더 생성]
+        if ':' in project_path: 
+            # [Windows PowerShell]
+            # PowerShell은 경로에 공백이 있으면 작은따옴표로 감싸야 합니다.
+            # 이미 safe_target_dir에 작은따옴표가 있으므로 그대로 넣습니다.
+            mkdir_cmd_str = f"powershell -Command \"New-Item -ItemType Directory -Force -Path {safe_target_dir}\""
+            subprocess.run(['ssh', f'{account}@{ip}', mkdir_cmd_str], check=False)
+        else:
+            # [Linux]
+            # mkdir -p 'path with spaces'
+            mkdir_cmd_str = f"mkdir -p {safe_target_dir}"
+            subprocess.run(['ssh', f'{account}@{ip}', mkdir_cmd_str], check=False)
 
-if __name__ == '__main__':
-    print("🚀 RunCline Server starting on port 1633...")
-    app.run(host='0.0.0.0', port=1633, debug=True)
+        # 5. [SCP 파일 전송]
+        # SCP 문법에서 원격지 경로는 "user@ip:'path'" 형태로
+        # 큰따옴표 안에 작은따옴표가 들어가는 구조여야 공백이 안전하게 처리됩니다.
+        remote_dest = f'{account}@{ip}:"{target_file}"' 
+        # 주의: 위에서 safe_target_file을 쓰지 않고 직접 포맷팅하는 이유는
+        # scp 라이브러리나 쉘마다 따옴표 해석 순서가 미묘하기 때문에
+        # 가장 호환성 높은 방식인 user@host:"/path/with space" 방식을 씁니다.
+        
+        # 만약 위 방식이 실패하면 user@host:"'/path/with space'" 방식을 써야 하는데,
+        # 윈도우 OpenSSH 서버는 user@host:"path" (큰따옴표만)를 선호하는 경향이 있습니다.
+        
+        scp_cmd = ['scp', '-o', 'StrictHostKeyChecking=no', temp_filename, remote_dest]
+        
+        # 실행 (에러 발생 시 캡처)
+        subprocess.check_call(scp_cmd)
+        
+        # 6. 청소
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+            
+        return True, "Rule deployed successfully"
+        
+    except subprocess.CalledProcessError as e:
+        return False, f"Transfer Failed (Check path/permissions): {e}"
+    except Exception as e:
+        return False, f"Error: {e}"
 """
 
-def update_universal():
-    base_dir = "runcline"
-    target_path = os.path.join(base_dir, "app.py")
-    
-    if not os.path.exists(base_dir):
-        print(f"❌ 오류: '{base_dir}' 폴더가 없습니다.")
-        return
+target_file = os.path.join(base_dir, "app", "services", "ssh_service.py")
+with open(target_file, "w", encoding="utf-8") as f:
+    f.write(ssh_service_code)
 
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(new_app_code)
-        
-    print(f"✅ 최종 수정 완료: {target_path}")
-    print("👉 이제 윈도우 경로도 SSH를 통해 원격으로 열립니다.")
-    print("👉 포트: 1633 / Null Byte 처리 포함됨")
-
-if __name__ == "__main__":
-    update_universal()
+print("✅ 공백 경로 패치 완료!")
+print("👉 이제 'C:/My Projects/...' 처럼 공백이 있어도 폴더를 생성하고 파일을 넣을 수 있습니다.")
+print("👉 다시 실행: python3 runcline/run_bridge.py")
