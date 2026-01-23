@@ -1,222 +1,574 @@
 import os
-import pymssql
-
-# ==========================================
-# 1. API Route 수정 (동적 변수 치환 로직 추가)
-# ==========================================
-# 핵심: 사용자가 선택한 룰 텍스트 안에 {{PROJECT_NAME}} 같은게 있으면
-#       실제 그 행의 프로젝트 이름으로 바꿔치기해서 전송함.
-# ==========================================
 
 base_dir = "runcline"
 if not os.path.exists(base_dir):
-    print("❌ 오류: 폴더가 없습니다.")
+    print("❌ 오류: 'runcline' 폴더가 없습니다.")
     exit()
 
-api_routes_code = r"""from flask import Blueprint, request, jsonify
-from app.database import get_db_connection
-from app.services.ssh_service import send_rule_via_ssh
-import subprocess
-import os
-
-api_bp = Blueprint('api', __name__)
-
-# --- Configuration for Agent ---
-# 에이전트가 접속할 이 서버(브릿지)의 주소
-BRIDGE_API_URL = "http://192.168.0.10:9111" # [중요] 실제 우분투 서버 IP로 수정 필요
-
-@api_bp.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    target_ip = data.get('ip')
-    user = data.get('account')
-    path = data.get('path')
-    cmd = ['code', '--no-sandbox', '--new-window']
-    remote_arg = f"ssh-remote+{user}@{target_ip}"
-    cmd.extend(['--remote', remote_arg, path])
-    try:
-        env = os.environ.copy()
-        if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
-        subprocess.Popen(cmd, env=env)
-        return jsonify({'status': 'success'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@api_bp.route('/stats/dashboard', methods=['GET'])
-def get_dashboard_stats():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT ISNULL(GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM FolderIndex GROUP BY ISNULL(GroupName, 'No Group')")
-    group_counts = cursor.fetchall()
-    cursor.execute("SELECT ISNULL(f.GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM TaskQueue q JOIN FolderIndex f ON q.ProjectName = f.DisplayName WHERE q.Status IN ('Pending', 'Processing') GROUP BY ISNULL(f.GroupName, 'No Group')")
-    active_counts = cursor.fetchall()
-    conn.close()
-    return jsonify({'groups': group_counts, 'active': active_counts})
-
-@api_bp.route('/rules', methods=['GET', 'POST'])
-def handle_rules():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT * FROM ProjectRules ORDER BY RuleID DESC")
-        rules = cursor.fetchall()
-        conn.close()
-        return jsonify(rules)
-    if request.method == 'POST':
-        data = request.json
-        cursor.execute("INSERT INTO ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (data['name'], data['content']))
-        conn.commit()
-        conn.close()
-        return jsonify({'status': 'success'})
-
-@api_bp.route('/rules/deploy', methods=['POST'])
-def deploy_rule():
-    data = request.json
-    project_name = data.get('project_name')
-    rule_id = data.get('rule_id')
-    
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    
-    # 1. 룰 원본 가져오기
-    cursor.execute("SELECT RuleContent FROM ProjectRules WHERE RuleID=%s", (rule_id,))
-    rule_row = cursor.fetchone()
-    
-    # 2. 타겟 프로젝트 정보 가져오기
-    cursor.execute("SELECT IPAddress, Account, FullPath FROM FolderIndex WHERE DisplayName=%s", (project_name,))
-    target = cursor.fetchone()
-    
-    if not rule_row or not target:
-        conn.close()
-        return jsonify({'status': 'error', 'message': 'Not found'}), 404
-        
-    # [핵심 로직 복원] 동적 변수 치환 (Templating)
-    # 룰 내용 속에 있는 {{변수}}를 실제 값으로 바꿉니다.
-    final_content = rule_row['RuleContent']
-    final_content = final_content.replace('{{PROJECT_NAME}}', project_name)
-    final_content = final_content.replace('{{API_URL}}', BRIDGE_API_URL)
-    final_content = final_content.replace('{{TARGET_IP}}', target['IPAddress'])
-    final_content = final_content.replace('{{TARGET_PATH}}', target['FullPath'])
-    
-    # 3. 전송 (수정된 내용으로)
-    success, msg = send_rule_via_ssh(target['IPAddress'], target['Account'], final_content, target['FullPath'])
-    
-    if success:
-        cursor.execute("UPDATE FolderIndex SET LastRuleContent=%s WHERE DisplayName=%s", (final_content, project_name))
-        conn.commit()
-        
-    conn.close()
-    return jsonify({'status': 'success' if success else 'error', 'message': msg})
-
-@api_bp.route('/memos/<project_name>', methods=['GET', 'POST'])
-def handle_memo(project_name):
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT MemoContent FROM ProjectMemos WHERE ProjectName=%s", (project_name,))
-        row = cursor.fetchone()
-        conn.close()
-        return jsonify({'content': row['MemoContent'] if row else ''})
-    if request.method == 'POST':
-        content = request.json.get('content')
-        sql = "MERGE ProjectMemos AS target USING (SELECT %s as PName) AS source ON (target.ProjectName = source.PName) WHEN MATCHED THEN UPDATE SET MemoContent = %s, UpdatedAt = GETDATE() WHEN NOT MATCHED THEN INSERT (ProjectName, MemoContent) VALUES (%s, %s);"
-        cursor.execute(sql, (project_name, content, project_name, content))
-        conn.commit()
-        conn.close()
-        return jsonify({'status': 'success'})
-
-@api_bp.route('/queue', methods=['GET', 'POST'])
-def handle_queue():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        p_name = request.args.get('project')
-        cursor.execute("SELECT * FROM TaskQueue WHERE ProjectName=%s AND Status IN ('Pending', 'Processing') ORDER BY TaskID", (p_name,))
-        rows = cursor.fetchall()
-        conn.close()
-        return jsonify(rows)
-    if request.method == 'POST':
-        data = request.json
-        p_name = data.get('project')
-        content = data.get('content')
-        cursor.execute("INSERT INTO TaskQueue (ProjectName, TaskContent) VALUES (%s, %s)", (p_name, content))
-        cursor.execute("UPDATE FolderIndex SET TaskCount = TaskCount + 1, LastTaskDate = GETDATE() WHERE DisplayName=%s", (p_name,))
-        conn.commit()
-        conn.close()
-        return jsonify({'status': 'success'})
-"""
-
-with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
-    f.write(api_routes_code)
+print("🚀 AI Bridge v11: Deep Space & Timeless UI Update...")
 
 # ==========================================
-# 2. DB에 'Auto-Agent Rule' 자동 등록
+# 1. Index HTML (메인 대시보드 리마스터)
 # ==========================================
-# 이것이 말씀하신 "Go/Do"를 치면 API를 호출하는 핵심 룰입니다.
-# 사용자가 이 룰을 선택해서 배포하면, 해당 프로젝트에 맞는 API 주소와 프로젝트명이 박힙니다.
+index_html = r"""<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>UNREAL BRIDGE</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        /* [Theme] Deep Space Void */
+        :root {
+            --bg-body: #050508; /* 아주 깊은 어둠 */
+            --bg-panel: rgba(20, 20, 35, 0.6); /* 반투명 패널 */
+            --bg-panel-hover: rgba(30, 30, 50, 0.7);
+            --border-color: rgba(100, 100, 255, 0.1);
+            --accent-primary: #5c6bc0; /* 부드러운 인디고 */
+            --accent-secondary: #7e57c2; /* 딥 퍼플 */
+            --text-main: #e0e0e0;
+            --text-muted: #9fa8da;
+            --gradient-sidebar: linear-gradient(180deg, #0f0c29, #302b63, #24243e);
+        }
 
-agent_rule_content = """# AI Agent Operation Rules (Auto-Generated)
+        body { 
+            background: linear-gradient(135deg, #050508 0%, #0a0a1a 100%);
+            color: var(--text-main); 
+            font-family: 'Inter', 'Segoe UI', sans-serif;
+            min-height: 100vh;
+        }
 
-## 1. Role & Identity
-You are an AI developer agent assigned to the project: **{{PROJECT_NAME}}**.
-Your primary control server is located at: **{{API_URL}}**
+        /* Navbar: 은은한 보라빛 경계 */
+        .navbar {
+            background-color: rgba(10, 10, 20, 0.8) !important;
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border-color);
+        }
+        .navbar-brand { letter-spacing: 2px; text-shadow: 0 0 15px rgba(92, 107, 192, 0.5); }
 
-## 2. Magic Commands (Action Triggers)
-When the user types specific keywords, you must execute the corresponding protocols immediately.
+        /* Search Bar: 고급스러운 그라디언트 보더 */
+        .search-container { position: relative; width: 100%; max-width: 600px; }
+        .gganji-search { 
+            width: 100%; 
+            background: rgba(255, 255, 255, 0.05); 
+            border: 1px solid var(--border-color); 
+            border-radius: 12px; 
+            padding: 12px 20px 12px 50px; 
+            color: #fff; 
+            transition: all 0.3s ease;
+        }
+        .gganji-search:focus { 
+            background: rgba(255, 255, 255, 0.1); 
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 20px rgba(92, 107, 192, 0.3);
+            outline: none;
+        }
+        .search-icon { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); color: var(--text-muted); }
 
-### Command: "Go" or "Do"
-**Action:** Fetch and Execute Task
-1.  **GET Task:** Send a GET request to `{{API_URL}}/api/queue?project={{PROJECT_NAME}}`
-2.  **Check:**
-    * If the list is empty, reply: "No pending tasks in queue."
-    * If tasks exist, take the first task (TaskID) and change its status to 'Processing' (if API supports).
-3.  **Execute:** Perform the instruction described in the `TaskContent`.
-4.  **Report:** After completion, summarize the result and reply to the user.
-
-## 3. Communication Protocol
-* Always check the queue url: `{{API_URL}}/api/queue?project={{PROJECT_NAME}}`
-* When reporting errors, include the full error trace.
-* Do not hallucinate tasks; only execute what is in the JSON response.
-
-## 4. Environment
-* Project Path: `{{TARGET_PATH}}`
-* OS: Windows/Linux (Auto-detect)
-"""
-
-def insert_default_rule():
-    # DB 접속 정보 (기존과 동일)
-    DB_HOST = '192.168.0.10'
-    DB_USER = 'sa'
-    DB_PASSWORD = 'password'
-    DB_NAME = 'MyDatabase'
-    
-    conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-    cursor = conn.cursor()
-    
-    # 이미 있는지 확인
-    cursor.execute("SELECT Count(*) FROM ProjectRules WHERE RuleName = 'Auto-Agent Protocol (Go/Do)'")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", 
-                       ('Auto-Agent Protocol (Go/Do)', agent_rule_content))
-        conn.commit()
-        print("✅ DB: 'Auto-Agent Protocol (Go/Do)' 룰이 생성되었습니다.")
-    else:
-        # 내용 업데이트
-        cursor.execute("UPDATE ProjectRules SET RuleContent = %s WHERE RuleName = 'Auto-Agent Protocol (Go/Do)'", 
-                       (agent_rule_content,))
-        conn.commit()
-        print("✅ DB: 'Auto-Agent Protocol (Go/Do)' 룰이 최신 내용으로 업데이트되었습니다.")
+        /* Sidebar & Panels: Glassmorphism */
+        .sticky-sidebar { position: sticky; top: 20px; height: calc(100vh - 40px); overflow-y: auto; padding-right: 5px; }
         
-    conn.close()
+        .stats-box { 
+            background: var(--bg-panel);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border-color);
+            padding: 20px; 
+            border-radius: 16px; 
+            margin-bottom: 16px; 
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            transition: transform 0.2s;
+        }
+        .stats-box:hover { transform: translateY(-2px); border-color: var(--accent-primary); }
+        
+        .queue-box {
+            background: linear-gradient(135deg, rgba(40, 40, 60, 0.6), rgba(20, 20, 30, 0.6));
+            border-left: 4px solid var(--accent-primary);
+            cursor: pointer;
+        }
 
-if __name__ == "__main__":
-    try:
-        insert_default_rule()
-    except Exception as e:
-        print(f"⚠️ DB 연결 실패 (룰 등록 스킵): {e}")
-        print("👉 api_routes.py는 정상적으로 패치되었습니다.")
+        .stats-num { font-size: 2rem; font-weight: 700; color: #fff; text-shadow: 0 2px 10px rgba(0,0,0,0.5); }
+        .stats-label { font-size: 0.75rem; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; margin-top: 5px; }
 
-print("✅ 시스템 복구 완료!")
-print("1. 룰 전송 시 {{PROJECT_NAME}}, {{API_URL}} 등이 실제 값으로 자동 치환됩니다.")
-print("2. 'Go' 또는 'Do' 입력 시 작동하는 표준 프로토콜 룰이 DB에 저장되었습니다.")
-print("👉 이제 웹에서 'Auto-Agent Protocol' 룰을 선택해서 전송해보세요!")
+        /* Bookmarks */
+        .bookmark-btn { 
+            display: block; width: 100%; text-align: left; margin-bottom: 10px; 
+            background: rgba(255, 255, 255, 0.03); 
+            border: 1px solid var(--border-color); 
+            color: var(--text-muted); 
+            padding: 14px 18px; 
+            border-radius: 12px; 
+            transition: all 0.2s; text-decoration: none; 
+            font-weight: 500;
+        }
+        .bookmark-btn:hover { 
+            background: rgba(92, 107, 192, 0.1); 
+            color: #fff; 
+            border-color: var(--accent-primary); 
+            padding-left: 24px; /* Slide Effect */
+        }
+        .bookmark-icon { color: var(--accent-secondary); margin-right: 12px; }
+
+        /* Table Design */
+        .table-dark { 
+            --bs-table-bg: transparent; 
+            --bs-table-color: var(--text-main);
+        }
+        #projectTable {
+            background: var(--bg-panel);
+            backdrop-filter: blur(5px);
+            border-radius: 16px;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
+        }
+        #projectTable thead {
+            background: rgba(0, 0, 0, 0.3);
+            border-bottom: 1px solid var(--border-color);
+        }
+        #projectTable tbody tr {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            transition: background 0.2s;
+        }
+        #projectTable tbody tr:hover { background: var(--bg-panel-hover); }
+        
+        /* Status Indicators (Deep & Rich) */
+        .bg-active-job { 
+            background: linear-gradient(90deg, rgba(20, 61, 38, 0.4) 0%, rgba(20, 20, 35, 0) 100%) !important; 
+            border-left: 3px solid #2e7d32; 
+        }
+        .bg-memo-exists { 
+            background: linear-gradient(90deg, rgba(20, 50, 80, 0.4) 0%, rgba(20, 20, 35, 0) 100%) !important; 
+            border-left: 3px solid var(--accent-primary); 
+        }
+
+        /* Text Styles */
+        .project-path { font-family: 'Consolas', monospace; font-size: 0.8rem; color: #7e57c2 !important; opacity: 0.9; margin-top: 4px; }
+        .count-badge { 
+            background: rgba(255, 255, 255, 0.05); 
+            border: 1px solid var(--border-color); 
+            color: #fff; 
+            font-weight: 700; 
+            padding: 6px 12px; 
+            border-radius: 8px; 
+            min-width: 40px; 
+            display: inline-block;
+        }
+        .rule-badge { font-size: 0.75rem; color: #5c6bc0; margin-top: 4px; display: block; font-weight: 500; }
+
+        /* Buttons */
+        .btn-primary { background-color: var(--accent-primary); border: none; }
+        .btn-primary:hover { background-color: #3949ab; }
+        .btn-outline-secondary { border-color: var(--border-color); color: var(--text-muted); }
+        .btn-outline-secondary:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+        /* Modal */
+        .modal-content { 
+            background: #121218; 
+            border: 1px solid var(--border-color); 
+            box-shadow: 0 0 50px rgba(0,0,0,0.5); 
+        }
+        .modal-header, .modal-footer { border-color: var(--border-color); }
+        
+        .history-item { border-left: 2px solid #333; padding-left: 20px; margin-bottom: 30px; position: relative; }
+        .history-item::before { content: ''; position: absolute; left: -7px; top: 0; width: 12px; height: 12px; border-radius: 50%; background: #333; }
+        .history-item.done { border-color: #2e7d32; }
+        .history-item.done::before { background: #2e7d32; box-shadow: 0 0 10px rgba(46, 125, 50, 0.5); }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark py-4 sticky-top">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand fw-bold fs-3 text-white" href="#">
+                <i class="bi bi-hexagon-fill text-primary me-2"></i>UNREAL
+            </a>
+            
+            <div class="search-container mx-auto">
+                <i class="bi bi-search search-icon"></i>
+                <input type="text" id="globalSearch" class="gganji-search" placeholder="Search projects..." onkeyup="filterTable()">
+            </div>
+            
+            <div class="d-flex align-items-center gap-3">
+                <div class="text-end me-3">
+                    <div class="text-muted small" style="font-size: 0.7rem;">TOTAL CALLS</div>
+                    <div class="fw-bold fs-5 text-white" id="totalCallsDisplay">{{ total_calls }}</div>
+                </div>
+                <a href="/settings" class="btn btn-outline-secondary rounded-pill px-4">
+                    <i class="bi bi-gear-fill me-1"></i> Settings
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-2 px-4">
+        <div class="row g-4">
+            <div class="col-md-2">
+                <div class="sticky-sidebar">
+                    <div class="stats-box queue-box p-3 mb-4" onclick="openAllQueueModal()">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span class="stats-label text-warning"><i class="bi bi-lightning-fill me-1"></i> Queue</span>
+                            <i class="bi bi-chevron-right text-muted small"></i>
+                        </div>
+                        <div id="activeStats" class="fs-4 fw-bold text-white">0</div>
+                    </div>
+
+                    <div class="row g-2 mb-4">
+                        <div class="col-12">
+                            <div class="stats-box p-3">
+                                <div class="stats-num text-success" id="dayCount">0</div>
+                                <div class="stats-label">Today</div>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <div class="stats-box p-2">
+                                <div class="fs-4 fw-bold text-white" id="weekCount">0</div>
+                                <div class="stats-label" style="font-size:0.65rem">7 Days</div>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <div class="stats-box p-2">
+                                <div class="fs-4 fw-bold text-white" id="monthCount">0</div>
+                                <div class="stats-label" style="font-size:0.65rem">30 Days</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <h6 class="text-muted text-uppercase small fw-bold mb-3 ps-1">Quick Access</h6>
+                        <div id="sidebarBookmarks">
+                            </div>
+                    </div>
+                    
+                    <div class="text-muted small mt-5 ps-1">
+                        <h6 class="text-uppercase mb-3">Groups</h6>
+                        <div id="groupStats">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-10">
+                <table class="table table-dark table-hover align-middle" id="projectTable">
+                    <thead>
+                        <tr class="text-uppercase text-muted small" style="font-size: 0.75rem; letter-spacing: 1px;">
+                            <th style="width: 100px; padding-left: 20px;">Group</th>
+                            <th style="min-width: 420px;">Actions</th>
+                            <th class="text-center" style="width: 100px;">Count</th>
+                            <th>Project Detail</th>
+                            <th>Last Active</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for p in projects %}
+                        <tr class="{{ 'bg-active-job' if p.IsQueued else ('bg-memo-exists' if p.HasMemo else '') }}">
+                            <td style="padding-left: 20px;">
+                                <span class="badge rounded-pill" style="background: rgba(255,255,255,0.1); color: #ccc; font-weight: 400;">{{ p.GroupName }}</span>
+                            </td>
+                            <td>
+                                <div class="d-flex gap-2 align-items-center">
+                                    <button class="btn btn-primary btn-sm rounded-pill px-3" onclick="openVsCode('{{ p.IPAddress }}', '{{ p.Account }}', '{{ p.FullPath }}')" title="Open Code">
+                                        <i class="bi bi-code-slash"></i>
+                                    </button>
+                                    <button class="btn btn-outline-secondary btn-sm rounded-pill px-3 text-white" style="border-color: #2e7d32; background: rgba(46,125,50,0.1);" onclick="openTaskModal('{{ p.DisplayName }}', '{{ p.FullPath }}', `{{ p.CommonInstruction or '' }}`)" title="New Task">
+                                        <i class="bi bi-plus-lg text-success"></i> Task
+                                    </button>
+                                    
+                                    <div class="text-center" style="width: 110px;">
+                                        <button class="btn {{ 'btn-sm w-100 rounded-pill' }}" 
+                                                style="{{ 'background: rgba(92,107,192,0.2); border: 1px solid #5c6bc0; color: #fff;' if p.LastRuleName else 'border: 1px solid #444; color: #888;' }}" 
+                                                onclick="openRuleModal('{{ p.DisplayName }}', '{{ p.FullPath }}')">
+                                            <i class="bi bi-send me-1"></i> Rule
+                                        </button>
+                                        {% if p.LastRuleName %}
+                                        <span class="rule-badge text-truncate">{{ p.LastRuleName }}</span>
+                                        {% endif %}
+                                    </div>
+
+                                    <button class="btn btn-outline-secondary btn-sm rounded-circle" onclick="openMemoModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" style="width:34px;height:34px; border-color: #444;"><i class="bi bi-sticky"></i></button>
+                                    <button class="btn btn-outline-secondary btn-sm rounded-circle" onclick="openHistoryModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" style="width:34px;height:34px; border-color: #444;"><i class="bi bi-clock-history"></i></button>
+                                </div>
+                            </td>
+                            <td class="text-center">
+                                <span class="count-badge">{{ p.TaskCount }}</span>
+                            </td>
+                            <td>
+                                <div class="fw-bold text-white" style="font-size: 1.05rem;">{{ p.DisplayName }}</div>
+                                <div class="project-path">{{ p.FullPath }}</div>
+                            </td>
+                            <td class="small text-muted">{{ p.LastTaskDate }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="allQueueModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title text-warning"><i class="bi bi-lightning-fill"></i> Active Queues</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><ul class="list-group bg-dark" id="allQueueList"></ul></div></div></div></div>
+    <div class="modal fade" id="historyModal" tabindex="-1"><div class="modal-dialog modal-xl modal-dialog-scrollable" style="max-width: 96%;"><div class="modal-content"><div class="modal-header bg-dark"><h5 class="modal-title text-white"><i class="bi bi-clock-history text-info"></i> History: <span id="histProjectName" class="text-muted ms-2"></span></h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body bg-black"><div id="historyTimeline" class="p-4 container-fluid"></div></div></div></div></div>
+    <div class="modal fade" id="taskModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">New Task</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3 p-3 rounded" style="background: rgba(255,255,255,0.05);"><h6 class="text-muted small">Active Queue</h6><ul class="list-group bg-transparent" id="currentQueueList"></ul></div><div class="form-group mb-3"><label class="text-info small fw-bold">Common Instruction</label><textarea class="form-control bg-dark text-info border-secondary" id="commonInstruction" rows="2"></textarea></div><div class="form-group"><label class="text-white">Command</label><textarea class="form-control bg-dark text-white border-secondary" id="taskContent" rows="4" placeholder="Enter instructions..."></textarea></div></div><div class="modal-footer"><button class="btn btn-success px-4" onclick="submitTask()">Add to Queue</button></div></div></div></div>
+    <div class="modal fade" id="ruleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Deploy Rule</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p class="text-muted">Target: <span id="ruleProjectName" class="text-white fw-bold"></span></p><select class="form-select bg-dark text-white border-secondary mb-3" id="ruleSelect"></select></div><div class="modal-footer"><button class="btn btn-primary w-100" onclick="deployRule()">Deploy Rule via SSH</button></div></div></div></div>
+    <div class="modal fade" id="memoModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Private Memo</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><textarea class="form-control bg-dark text-white border-secondary" id="memoContent" rows="12" style="font-family: monospace;"></textarea></div><div class="modal-footer"><button class="btn btn-primary" onclick="saveMemo()">Save Memo</button></div></div></div></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        marked.setOptions({ breaks: true, gfm: true });
+        let currentProject = '', currentPath = '';
+        const taskModal = new bootstrap.Modal(document.getElementById('taskModal')), ruleModal = new bootstrap.Modal(document.getElementById('ruleModal')), memoModal = new bootstrap.Modal(document.getElementById('memoModal')), historyModal = new bootstrap.Modal(document.getElementById('historyModal')), allQueueModal = new bootstrap.Modal(document.getElementById('allQueueModal'));
+
+        document.addEventListener('DOMContentLoaded', () => { updateDashboardStats(); loadSidebarBookmarks(); setInterval(updateDashboardStats, 5000); });
+
+        function filterTable() {
+            const input = document.getElementById('globalSearch').value.toUpperCase();
+            const tr = document.getElementById('projectTable').getElementsByTagName('tr');
+            for (let i = 1; i < tr.length; i++) {
+                tr[i].style.display = (tr[i].textContent || tr[i].innerText).toUpperCase().indexOf(input) > -1 ? "" : "none";
+            }
+        }
+
+        function updateDashboardStats() {
+            fetch('/api/stats/dashboard').then(r => r.json()).then(data => {
+                document.getElementById('groupStats').innerHTML = data.groups.map(g => `<div class="d-flex justify-content-between mb-2"><span class="text-muted small">${g.GroupName}</span> <span class="badge bg-secondary rounded-pill">${g.Cnt}</span></div>`).join('');
+                document.getElementById('activeStats').innerText = data.active.length || 0;
+                document.getElementById('dayCount').innerText = data.counts.day;
+                document.getElementById('weekCount').innerText = data.counts.week;
+                document.getElementById('monthCount').innerText = data.counts.month;
+            });
+        }
+
+        function loadSidebarBookmarks() {
+            fetch('/api/bookmarks').then(r => r.json()).then(data => {
+                document.getElementById('sidebarBookmarks').innerHTML = data.map(b => `
+                    <a href="${b.URL}" target="_blank" class="bookmark-btn">
+                        <i class="bi bi-star-fill bookmark-icon"></i> ${b.Title}
+                    </a>
+                `).join('');
+            });
+        }
+
+        function openAllQueueModal() {
+            fetch('/api/queue').then(r => r.json()).then(tasks => {
+                const l = document.getElementById('allQueueList');
+                l.innerHTML = tasks.length ? tasks.map(t => `<li class="list-group-item bg-dark text-white border-secondary mb-2 rounded p-3"><div class="d-flex justify-content-between mb-2"><span class="badge bg-warning text-dark">${t.Status}</span><small class="text-info">${t.ProjectName}</small></div><div class="font-monospace small text-muted">${t.TaskContent}</div></li>`).join('') : '<li class="list-group-item bg-dark text-secondary text-center">No active tasks.</li>';
+                allQueueModal.show();
+            });
+        }
+
+        function openHistoryModal(n, p) {
+            document.getElementById('histProjectName').innerText = n;
+            const d = document.getElementById('historyTimeline');
+            d.innerHTML = '<div class="text-center p-5 text-muted">Loading history...</div>';
+            fetch('/api/history', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: p}) }).then(r => r.json()).then(rows => {
+                if (rows.length === 0) { d.innerHTML = '<div class="text-center p-5 text-muted">No history found.</div>'; return; }
+                d.innerHTML = rows.map(r => `
+                    <div class="history-item ${r.Status === 'Done' ? 'done' : 'processing'}">
+                        <div class="d-flex justify-content-between mb-2">
+                            <div><span class="badge ${r.Status === 'Done' ? 'bg-success' : 'bg-secondary'}">${r.Status}</span> <span class="text-muted ms-2 small">#${r.TaskID}</span></div>
+                            <div class="text-muted small font-monospace">${r.CompletedAt || r.CreatedAt}</div>
+                        </div>
+                        <div class="card bg-dark border-secondary mb-3">
+                            <div class="card-header border-secondary py-1 text-muted small fw-bold" style="background:rgba(255,255,255,0.05)">REQUEST</div>
+                            <div class="card-body py-3 text-light" style="white-space: pre-wrap;">${r.TaskContent}</div>
+                        </div>
+                        ${r.ResultContent ? `<div class="card bg-dark border-success">
+                            <div class="card-header border-success py-1 text-success small fw-bold" style="background:rgba(46,125,50,0.1)">RESULT</div>
+                            <div class="card-body py-3 markdown-body text-light">${marked.parse(r.ResultContent)}</div>
+                        </div>` : ''}
+                    </div>`).join('');
+            });
+            historyModal.show();
+        }
+
+        // Standard Actions (Task, VSCode, etc)
+        function openTaskModal(n, p, c) { currentProject = n; currentPath = p; document.getElementById('modalProjectName').innerText = n; document.getElementById('taskContent').value = ''; document.getElementById('commonInstruction').value = c; loadQueue(p); taskModal.show(); }
+        function loadQueue(p) { fetch(`/api/queue?path=${encodeURIComponent(p)}`).then(r => r.json()).then(tasks => { document.getElementById('currentQueueList').innerHTML = tasks.length ? tasks.map(t => `<li class="list-group-item bg-transparent text-white border-secondary d-flex justify-content-between align-items-center"><div><span class="badge bg-warning text-dark me-2">${t.Status}</span><span class="small">${t.TaskContent.substring(0, 40)}...</span></div><button class="btn btn-sm btn-outline-danger border-0" onclick="deleteTask(${t.TaskID})"><i class="bi bi-trash"></i></button></li>`).join('') : '<li class="list-group-item bg-transparent text-muted text-center small">Empty queue</li>'; }); }
+        function submitTask() { const c = document.getElementById('taskContent').value, ci = document.getElementById('commonInstruction').value; if (!c) return; fetch('/api/queue', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project: currentProject, path: currentPath, content: c, common_instruction: ci}) }).then(() => { document.getElementById('taskContent').value = ''; loadQueue(currentPath); updateDashboardStats(); location.reload(); }); }
+        function deleteTask(id) { if (confirm('Delete?')) fetch(`/api/queue?id=${id}`, { method: 'DELETE' }).then(() => loadQueue(currentPath)); }
+        function openVsCode(ip, acc, path) { fetch('/api/open_vscode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip, account: acc, path}) }); }
+        function openRuleModal(n, p) { currentProject = n; currentPath = p; document.getElementById('ruleProjectName').innerText = n; fetch('/api/rules').then(r => r.json()).then(rules => { document.getElementById('ruleSelect').innerHTML = rules.map(r => `<option value="${r.RuleID}">${r.RuleName}</option>`).join(''); ruleModal.show(); }); }
+        function deployRule() { const id = document.getElementById('ruleSelect').value; fetch('/api/rules/deploy', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project_name: currentProject, project_path: currentPath, rule_id: id}) }).then(r => r.json()).then(res => { alert(res.message); ruleModal.hide(); location.reload(); }); }
+        function openMemoModal(n, p) { currentProject = n; currentPath = p; fetch('/api/memos/get', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path: p}) }).then(r => r.json()).then(d => { document.getElementById('memoContent').value = d.content; memoModal.show(); }); }
+        function saveMemo() { const c = document.getElementById('memoContent').value; fetch('/api/memos', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project: currentProject, path: currentPath, content: c}) }).then(() => { memoModal.hide(); location.reload(); }); }
+    </script>
+</body>
+</html>
+"""
+with open(os.path.join(base_dir, "app", "templates", "index.html"), "w", encoding="utf-8") as f:
+    f.write(index_html)
+
+
+# ==========================================
+# 3. Settings HTML (Deep Space UI 적용)
+# ==========================================
+print("3️⃣ Settings HTML 업데이트 (Deep Theme)...")
+settings_html = r"""<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        body { 
+            background: linear-gradient(135deg, #050508 0%, #0a0a1a 100%);
+            color: #e0e0e0; height: 100vh; overflow: hidden; font-family: 'Segoe UI', sans-serif;
+        }
+        .full-height { height: calc(100vh - 80px); }
+        
+        .list-group-item { 
+            border: none; border-bottom: 1px solid rgba(255,255,255,0.05); 
+            background: rgba(20, 20, 35, 0.4); 
+            color: #aaa; cursor: pointer; transition: 0.2s; 
+        }
+        .list-group-item:hover, .list-group-item.active { 
+            background: rgba(40, 40, 60, 0.6); 
+            color: #fff; 
+            border-left: 4px solid #5c6bc0; 
+        }
+        
+        .form-control { 
+            background-color: rgba(0,0,0,0.3); 
+            border: 1px solid rgba(255,255,255,0.1); 
+            color: #fff; font-family: 'Consolas', monospace; 
+        }
+        .form-control:focus { 
+            background-color: rgba(0,0,0,0.5); 
+            border-color: #5c6bc0; 
+            color: #fff; box-shadow: none; 
+        }
+        
+        .card { 
+            background: rgba(20, 20, 35, 0.6); 
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(100,100,255,0.1);
+        }
+        .card-header { border-bottom: 1px solid rgba(255,255,255,0.05); background: rgba(0,0,0,0.2); }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #050508; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body class="p-3">
+    <div class="d-flex justify-content-between align-items-center mb-3 px-2">
+        <h3 class="fw-bold m-0 text-white"><i class="bi bi-gear-fill text-primary me-2"></i>Settings</h3>
+        <a href="/" class="btn btn-outline-secondary rounded-pill px-4"><i class="bi bi-arrow-left me-1"></i> Dashboard</a>
+    </div>
+
+    <div class="row g-3 h-100 pb-5">
+        <div class="col-md-3 h-100 d-flex flex-column">
+            <div class="card flex-grow-1 mb-3" style="min-height: 0;">
+                <div class="card-header d-flex justify-content-between align-items-center py-3">
+                    <span class="fw-bold text-white">Rules</span>
+                    <button class="btn btn-sm btn-primary rounded-pill px-3" onclick="createNewRule()"><i class="bi bi-plus-lg"></i> New</button>
+                </div>
+                <div class="card-body p-0 overflow-auto">
+                    <ul class="list-group list-group-flush" id="ruleList"></ul>
+                </div>
+            </div>
+
+            <div class="card" style="height: 35%;">
+                <div class="card-header fw-bold text-warning py-2">Favorites</div>
+                <div class="card-body p-2 d-flex flex-column">
+                    <div class="input-group mb-2">
+                        <input type="text" id="bmTitle" class="form-control form-control-sm" placeholder="Title">
+                        <input type="text" id="bmUrl" class="form-control form-control-sm" placeholder="URL">
+                        <button class="btn btn-warning btn-sm" onclick="addBookmark()">Add</button>
+                    </div>
+                    <div class="overflow-auto flex-grow-1" id="bookmarkList"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-9 h-100">
+            <div class="card h-100">
+                <div class="card-header d-flex justify-content-between align-items-center py-3">
+                    <span id="editorTitle" class="fw-bold text-white fs-5"><i class="bi bi-pencil-square text-muted me-2"></i>Select a rule</span>
+                    <div>
+                        <button class="btn btn-success px-4 rounded-pill" onclick="saveRule()"><i class="bi bi-save me-1"></i> Save</button>
+                        <button class="btn btn-outline-danger ms-2 rounded-pill" onclick="deleteRule()" id="btnDelete" style="display:none;"><i class="bi bi-trash"></i></button>
+                    </div>
+                </div>
+                <div class="card-body d-flex flex-column p-3 full-height">
+                    <input type="hidden" id="editRuleId">
+                    <div class="mb-3">
+                        <input type="text" id="ruleName" class="form-control fs-5 fw-bold text-info bg-transparent border-0 ps-0" placeholder="Rule Name">
+                        <hr class="border-secondary my-2">
+                    </div>
+                    <div class="flex-grow-1">
+                        <textarea id="ruleContent" class="form-control h-100 border-0 bg-transparent text-light" style="resize: none; font-size: 0.95rem; line-height: 1.6;" placeholder="Write your rule content here (Markdown supported)..."></textarea>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let rulesData = [];
+        document.addEventListener('DOMContentLoaded', () => { loadRules(); loadBookmarks(); });
+
+        function loadRules() {
+            fetch('/api/rules').then(r => r.json()).then(data => {
+                rulesData = data;
+                document.getElementById('ruleList').innerHTML = data.map((r, i) => `
+                    <li class="list-group-item" onclick="loadRule(${i}, this)">
+                        <div class="fw-bold text-white">${r.RuleName}</div>
+                        <div class="small text-muted text-truncate">${r.RuleContent.substring(0, 30)}...</div>
+                    </li>`).join('');
+            });
+        }
+        function createNewRule() {
+            document.querySelectorAll('.list-group-item').forEach(el => el.classList.remove('active'));
+            document.getElementById('editorTitle').innerText = 'Create New Rule';
+            document.getElementById('editRuleId').value = '';
+            document.getElementById('ruleName').value = '';
+            document.getElementById('ruleContent').value = '';
+            document.getElementById('btnDelete').style.display = 'none';
+            document.getElementById('ruleName').focus();
+        }
+        function loadRule(index, el) {
+            document.querySelectorAll('.list-group-item').forEach(el => el.classList.remove('active'));
+            el.classList.add('active');
+            const r = rulesData[index];
+            document.getElementById('editorTitle').innerText = 'Editing Rule';
+            document.getElementById('editRuleId').value = r.RuleID;
+            document.getElementById('ruleName').value = r.RuleName;
+            document.getElementById('ruleContent').value = r.RuleContent;
+            document.getElementById('btnDelete').style.display = 'inline-block';
+        }
+        function saveRule() {
+            const id = document.getElementById('editRuleId').value, name = document.getElementById('ruleName').value, content = document.getElementById('ruleContent').value;
+            if(!name) return alert('Rule Name is required');
+            const url = id ? `/api/rules/${id}` : '/api/rules', method = id ? 'PUT' : 'POST';
+            fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, content}) }).then(() => { loadRules(); alert('Saved!'); });
+        }
+        function deleteRule() {
+            const id = document.getElementById('editRuleId').value;
+            if(id && confirm('Delete this rule?')) fetch(`/api/rules/${id}`, {method:'DELETE'}).then(() => { createNewRule(); loadRules(); });
+        }
+        function loadBookmarks() {
+            fetch('/api/bookmarks').then(r => r.json()).then(data => {
+                document.getElementById('bookmarkList').innerHTML = data.map(b => `
+                    <div class="d-flex justify-content-between align-items-center mb-2 p-2 rounded" style="background:rgba(255,255,255,0.05)">
+                        <a href="${b.URL}" target="_blank" class="text-info text-decoration-none text-truncate" style="max-width: 80%;">${b.Title}</a>
+                        <button class="btn btn-sm text-danger border-0 p-0" onclick="deleteBookmark(${b.BookmarkID})"><i class="bi bi-x-lg"></i></button>
+                    </div>`).join('');
+            });
+        }
+        function addBookmark() {
+            const t = document.getElementById('bmTitle').value, u = document.getElementById('bmUrl').value;
+            if(!t || !u) return;
+            fetch('/api/bookmarks', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title:t, url:u}) }).then(() => { document.getElementById('bmTitle').value=''; document.getElementById('bmUrl').value=''; loadBookmarks(); });
+        }
+        function deleteBookmark(id) { if(confirm('Delete?')) fetch(`/api/bookmarks?id=${id}`, {method:'DELETE'}).then(()=>loadBookmarks()); }
+    </script>
+</body>
+</html>
+"""
+with open(os.path.join(base_dir, "app", "templates", "settings.html"), "w", encoding="utf-8") as f:
+    f.write(settings_html)
+
+print("\n✅ v11 업데이트 완료!")
+print("👉 Theme: Deep Space Void (Blue & Very Dark Purple)")
+print("👉 UI: Timeless Modern Design applied.")
+print("👉 'python3 runcline/run_bridge.py' 실행하세요.")
