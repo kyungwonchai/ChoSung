@@ -1,113 +1,81 @@
 import os
 
-# app.py 코드를 새로 작성 
-# 핵심 수정: 윈도우 경로의 백슬래시(\)를 슬래시(/)로 치환하여 전달
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print(f"❌ 오류: '{base_dir}' 폴더가 없습니다.")
+    exit()
 
-new_app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
-import subprocess
+# ==========================================
+# SSH Service 수정 (SFTP Batch Mode 적용)
+# ==========================================
+# 특징:
+# 1. SSH mkdir과 SCP를 따로 쓰지 않고, SFTP 명령어 하나로 처리
+# 2. SFTP는 경로(공백, 한글 등)를 훨씬 잘 처리함
+# 3. 윈도우 경로(C:/...) 호환성 강화 (/C:/... 포맷 사용)
+# ==========================================
+
+ssh_service_code = r"""import subprocess
 import os
-import socket
 
-app = Flask(__name__)
-
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'
-DB_USER = 'sa'
-DB_PASSWORD = 'password'
-DB_NAME = 'MyDatabase'
-# =================================================
-
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
-
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
-
-def clean_str(s):
-    """Null Byte 및 공백 제거"""
-    if s:
-        return s.replace('\x00', '').strip()
-    return ""
-
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
-
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
+def send_rule_via_ssh(ip, account, rule_content, project_path):
+    sftp_batch_file = f"sftp_cmds_{ip}.txt"
+    temp_rule_file = f"temp_rule_{ip}.md"
     
-    target_ip = clean_str(data.get('ip'))
-    user = clean_str(data.get('account'))
-    path = clean_str(data.get('path'))
-
-    # [핵심 수정] 윈도우 경로(\)가 들어오면 리눅스에서 안전한 슬래시(/)로 변경
-    # 예: "C:\Projects\App" -> "C:/Projects/App"
-    # 이렇게 하면 리눅스가 백슬래시를 먹어버리는 문제 해결됨
-    if '\\' in path:
-        path = path.replace('\\', '/')
-
-    local_ip = get_local_ip()
-    cmd = ['code', '--no-sandbox', '--new-window']
-    mode_msg = ""
-
-    # 내 IP가 아니면 무조건 SSH (윈도우/리눅스 불문)
-    if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
-        cmd.append(path)
-        mode_msg = "Local Direct"
-    else:
-        # Remote SSH
-        remote_arg = f"ssh-remote+{user}@{target_ip}"
-        cmd.extend(['--remote', remote_arg, path])
-        mode_msg = "Remote SSH"
-
     try:
-        my_env = os.environ.copy()
-        if 'DISPLAY' not in my_env:
-            my_env['DISPLAY'] = ':0'
-
-        print(f"Executing: {cmd}") # 로그 확인용
-        subprocess.Popen(cmd, env=my_env)
+        # 1. 경로 정규화 (윈도우 역슬래시 -> 슬래시)
+        if '\\' in project_path:
+            project_path = project_path.replace('\\', '/')
+            
+        # 2. SFTP용 절대 경로 포맷 변환
+        # 윈도우 OpenSSH SFTP는 절대 경로 사용 시 '/C:/Path' 형태를 가장 선호합니다.
+        # 드라이브 문자(C:)로 시작하면 앞에 슬래시(/)를 붙여줍니다.
+        if len(project_path) > 1 and project_path[1] == ':':
+            if not project_path.startswith('/'):
+                project_path = '/' + project_path
         
-        return jsonify({
-            'status': 'success', 
-            'message': f'[{mode_msg}] Opening {path} on {target_ip}'
-        })
+        target_dir = f"{project_path}/.clinerules"
+        target_file = f"{target_dir}/absoluterule.md"
+        
+        # 3. 로컬에 룰 파일 생성
+        with open(temp_rule_file, 'w', encoding='utf-8') as f:
+            f.write(rule_content)
+            
+        # 4. SFTP 배치 파일 생성
+        # -mkdir : 폴더 생성 (앞에 -를 붙이면 이미 있어도 에러 무시하고 진행됨)
+        # put : 파일 전송
+        with open(sftp_batch_file, 'w', encoding='utf-8') as f:
+            f.write(f'-mkdir "{target_dir}"\n')
+            f.write(f'put "{temp_rule_file}" "{target_file}"\n')
+            f.write('bye\n')
+            
+        # 5. SFTP 실행
+        # -b : 배치 파일 모드
+        # -o StrictHostKeyChecking=no : SSH 키 확인 생략
+        cmd = ['sftp', '-o', 'StrictHostKeyChecking=no', '-b', sftp_batch_file, f'{account}@{ip}']
+        
+        # 실행 결과 확인
+        subprocess.check_call(cmd)
+            
+        return True, "Rule deployed successfully (SFTP)"
+        
+    except subprocess.CalledProcessError as e:
+        return False, f"SFTP Transfer Failed (Exit Code {e.returncode}). Check path or permissions."
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e).replace('\x00', '')}), 500
-
-if __name__ == '__main__':
-    print("🚀 RunCline Server starting on port 1633...")
-    app.run(host='0.0.0.0', port=1633, debug=True)
+        return False, f"Error: {str(e)}"
+        
+    finally:
+        # 청소 (임시 파일 삭제)
+        if os.path.exists(temp_rule_file):
+            os.remove(temp_rule_file)
+        if os.path.exists(sftp_batch_file):
+            os.remove(sftp_batch_file)
 """
 
-def fix_backslash():
-    base_dir = "runcline"
-    target_path = os.path.join(base_dir, "app.py")
-    
-    if not os.path.exists(base_dir):
-        print(f"❌ 오류: '{base_dir}' 폴더가 없습니다.")
-        return
+target_file = os.path.join(base_dir, "app", "services", "ssh_service.py")
+with open(target_file, "w", encoding="utf-8") as f:
+    f.write(ssh_service_code)
 
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(new_app_code)
-        
-    print(f"✅ 수정 완료: {target_path}")
-    print("👉 이제 윈도우 경로(C:\\...)가 C:/... 형태로 변환되어 안전하게 실행됩니다.")
-
-if __name__ == "__main__":
-    fix_backslash()
+print("✅ SFTP 방식 패치 완료!")
+print("👉 이제 'mkdir' 에러나 'scp' 경로 문제 없이 전송될 것입니다.")
+print("👉 SFTP는 윈도우 경로 앞에 슬래시를 붙여(/C:/...) 호환성을 극대화했습니다.")
+print("👉 다시 실행: python3 runcline/run_bridge.py")
