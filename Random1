@@ -1,112 +1,137 @@
-import os
+. SSMS에서 바로 실행하는 SQL (sp_MSforeachdb 활용)
+이 쿼리는 MSSQL의 비공식 시스템 프로시저인 sp_MSforeachdb를 사용하여 모든 DB를 순회하며 검색합니다. TARGET_TABLE_NAME 부분에 찾고자 하는 테이블 이름을 넣으세요.
 
-# app.py 코드를 새로 작성 (윈도우 경로 처리 로직 추가)
-new_app_code = r"""from flask import Flask, render_template, request, jsonify
-import pymssql
-import subprocess
-import os
-import socket
-import platform
+SQL
 
-app = Flask(__name__)
+-- 검색할 테이블 이름을 아래 변수에 입력하세요
+DECLARE @SearchText NVARCHAR(100) = '검색할_테이블명';
 
-# ================= CONFIGURATION =================
-DB_HOST = '192.168.0.10'
-DB_USER = 'sa'
-DB_PASSWORD = 'password'
-DB_NAME = 'MyDatabase'
-# =================================================
+-- 결과를 담을 임시 테이블 생성
+IF OBJECT_ID('tempdb..#SearchResults') IS NOT NULL DROP TABLE #SearchResults;
+CREATE TABLE #SearchResults (
+    DBName NVARCHAR(128),
+    ObjectName NVARCHAR(128),
+    ObjectType NVARCHAR(50),
+    ObjectDefinition NVARCHAR(MAX) -- 내용이 길 경우를 대비
+);
 
-def get_db_connection():
-    return pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+-- 모든 DB를 순회하며 검색 (동적 쿼리)
+DECLARE @Command NVARCHAR(MAX);
+SET @Command = '
+    USE [?];
+    INSERT INTO #SearchResults (DBName, ObjectName, ObjectType, ObjectDefinition)
+    SELECT
+        ''?'' AS DBName,
+        o.name AS ObjectName,
+        o.type_desc AS ObjectType,
+        LEFT(m.definition, 500) -- 내용 앞부분만 일부 저장 (필요시 제거)
+    FROM sys.sql_modules m
+    INNER JOIN sys.objects o ON m.object_id = o.object_id
+    WHERE (o.type = ''P'' OR o.type = ''V'') -- P: 프로시저, V: 뷰
+      AND m.definition LIKE ''%' + @SearchText + '%'';
+';
 
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+-- 실행
+EXEC sp_MSforeachdb @Command;
+
+-- 결과 조회
+SELECT * FROM #SearchResults ORDER BY DBName, ObjectType, ObjectName;
+방법 2. Python 원샷 스크립트 (추천)
+여러 DB에서 쿼리 결과를 취합하여 CSV 파일로 저장해 주는 스크립트입니다. 텍스트가 긴 프로시저 내용도 잘리지 않고 안전하게 확인할 수 있습니다.
+
+준비: pip install pyodbc
+
+설정: DB_CONFIG와 TARGET_TABLE_NAME을 수정 후 실행하세요.
+
+Python
+
+import pyodbc
+import csv
+
+# ---------------------------------------------------------
+# [설정] MSSQL 접속 정보 및 검색 대상
+# ---------------------------------------------------------
+DB_CONFIG = {
+    'server': 'localhost\\SQLEXPRESS',  # 예: 192.168.0.10 또는 localhost
+    'username': 'sa',                   # DB 아이디
+    'password': 'your_password'         # DB 비밀번호
+}
+
+TARGET_TABLE_NAME = "TB_USER"  # [중요] 여기에 찾고 싶은 테이블명을 입력하세요
+OUTPUT_FILE = "table_usage_report.csv"
+
+# ---------------------------------------------------------
+# [로직] 전체 DB 순회 및 검색
+# ---------------------------------------------------------
+def main():
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={DB_CONFIG['server']};"
+        f"UID={DB_CONFIG['username']};"
+        f"PWD={DB_CONFIG['password']};"
+        "DATABASE=master;" # 초기 접속은 master로
+    )
+
     try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
-
-@app.route('/')
-def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT IPAddress, Account, DisplayName, FullPath, CONVERT(VARCHAR, LastUpdated, 120) as LastUpdated FROM FolderIndex ORDER BY LastUpdated DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return render_template('index.html', folders=rows)
-
-@app.route('/open_vscode', methods=['POST'])
-def open_vscode():
-    data = request.json
-    target_ip = data.get('ip')
-    user = data.get('account')
-    path = data.get('path')
-
-    local_ip = get_local_ip()
-    mode_msg = ""
-    cmd = []
-    
-    # [핵심 수정 사항]
-    # 경로에 역슬래시(\)가 있거나 콜론(:)이 있으면 무조건 "윈도우 로컬 프로젝트"로 간주합니다.
-    # 이 경우 SSH나 복잡한 옵션 없이 아주 심플하게 실행합니다.
-    is_windows_path = ('\\' in path) or (':' in path)
-
-    if is_windows_path:
-        # 윈도우: 그냥 새 창으로 경로 열기 (파라미터 최소화)
-        cmd = ['code', '--new-window', path]
-        mode_msg = "Windows Local (Direct)"
+        print(f"[*] 서버에 접속하여 '{TARGET_TABLE_NAME}' 검색을 시작합니다...")
         
-        # 윈도우에서는 환경변수 설정 불필요, 바로 실행
-        try:
-            subprocess.Popen(cmd, shell=True) # shell=True가 윈도우에서 명령 인식에 유리함
-            return jsonify({'status': 'success', 'message': f'[{mode_msg}] Opening {path}'})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
 
-    else:
-        # 리눅스 (우분투) 로직
-        cmd = ['code', '--no-sandbox', '--new-window']
-        
-        if target_ip == local_ip or target_ip in ['127.0.0.1', 'localhost']:
-            cmd.append(path)
-            mode_msg = "Linux Local"
-        else:
-            remote_arg = f"ssh-remote+{user}@{target_ip}"
-            cmd.extend(['--remote', remote_arg, path])
-            mode_msg = "Linux SSH"
+            # 1. 시스템 DB를 제외한 사용자 DB 목록 가져오기
+            cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0")
+            databases = [row[0] for row in cursor.fetchall()]
+            
+            all_results = []
 
-        try:
-            # 리눅스는 DISPLAY 환경변수가 필수
-            my_env = os.environ.copy()
-            if 'DISPLAY' not in my_env:
-                my_env['DISPLAY'] = ':0'
+            # 2. 각 DB를 순회하며 검색
+            for db in databases:
+                print(f"    - 검색 중: [{db}]...")
+                
+                # 해당 DB 내에서 뷰(V)와 프로시저(P)의 정의(Definition) 검색
+                # SQL 2014 호환 쿼리
+                sql = f"""
+                SELECT 
+                    '{db}' AS DBName,
+                    o.name AS ObjectName,
+                    o.type_desc AS ObjectType
+                FROM [{db}].sys.sql_modules m
+                INNER JOIN [{db}].sys.objects o ON m.object_id = o.object_id
+                WHERE (o.type = 'P' OR o.type = 'V')
+                  AND m.definition LIKE ?
+                """
+                
+                try:
+                    cursor.execute(sql, (f'%{TARGET_TABLE_NAME}%',))
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        all_results.append(row)
+                except pyodbc.Error:
+                    # 권한 문제 등으로 특정 DB 접근 불가 시 건너뜀
+                    print(f"      [!] {db} 접근 불가, 건너뜁니다.")
+                    continue
 
-            subprocess.Popen(cmd, env=my_env)
-            return jsonify({'status': 'success', 'message': f'[{mode_msg}] Opening on {target_ip}'})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+            # 3. 결과 저장
+            if not all_results:
+                print(f"\n[결과] '{TARGET_TABLE_NAME}'이(가) 포함된 뷰나 프로시저가 없습니다.")
+                return
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
-"""
+            with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Database', 'Object Name', 'Type']) # 헤더
+                writer.writerows(all_results)
 
-def update_app_final():
-    target_path = os.path.join("NetworkFolderIndexer", "app.py")
-    
-    if not os.path.exists("NetworkFolderIndexer"):
-        print("❌ 오류: 폴더를 찾을 수 없습니다.")
-        return
+            print(f"\n[완료] 총 {len(all_results)}건 발견.")
+            print(f"       결과가 '{OUTPUT_FILE}'에 저장되었습니다.")
 
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(new_app_code)
-        
-    print(f"✅ 최종 수정 완료: {target_path}")
-    print("👉 윈도우 경로는 이제 SSH 없이 'code 경로' 명령어로 바로 실행됩니다.")
+    except Exception as e:
+        print(f"\n[오류] 실행 중 문제가 발생했습니다: {e}")
 
 if __name__ == "__main__":
-    update_app_final()
+    main()
+참고 사항
+LIKE 검색의 특성: LIKE '%테이블명%' 방식을 사용하므로, 만약 찾는 이름이 User인데 UserLog라는 테이블이 쿼리에 있다면 같이 검색될 수 있습니다. (정확히 단어 단위로 끊어서 찾으려면 정규식이 필요하지만, MSSQL 기본 기능으로는 이 방식이 가장 확실하고 빠릅니다.)
+
+성능: 텍스트 검색(sys.sql_modules)은 아주 빠르진 않지만, 프로시저나 뷰 개수가 수천 개 단위라면 몇 초 안에 끝납니다.
+
+두 방법 중 편한 것을 골라 사용하시면
