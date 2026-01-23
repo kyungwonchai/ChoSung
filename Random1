@@ -1,137 +1,584 @@
-. SSMS에서 바로 실행하는 SQL (sp_MSforeachdb 활용)
-이 쿼리는 MSSQL의 비공식 시스템 프로시저인 sp_MSforeachdb를 사용하여 모든 DB를 순회하며 검색합니다. TARGET_TABLE_NAME 부분에 찾고자 하는 테이블 이름을 넣으세요.
+import os
+import pymssql
 
-SQL
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print("❌ 오류: 폴더가 없습니다.")
+    exit()
 
--- 검색할 테이블 이름을 아래 변수에 입력하세요
-DECLARE @SearchText NVARCHAR(100) = '검색할_테이블명';
+# DB 정보
+DB_HOST = '192.168.0.10'
+DB_USER = 'sa'
+DB_PASSWORD = 'password'
+DB_NAME = 'MyDatabase'
 
--- 결과를 담을 임시 테이블 생성
-IF OBJECT_ID('tempdb..#SearchResults') IS NOT NULL DROP TABLE #SearchResults;
-CREATE TABLE #SearchResults (
-    DBName NVARCHAR(128),
-    ObjectName NVARCHAR(128),
-    ObjectType NVARCHAR(50),
-    ObjectDefinition NVARCHAR(MAX) -- 내용이 길 경우를 대비
-);
+print("1️⃣ DB 테이블명 변경 (Migration) 시작...")
 
--- 모든 DB를 순회하며 검색 (동적 쿼리)
-DECLARE @Command NVARCHAR(MAX);
-SET @Command = '
-    USE [?];
-    INSERT INTO #SearchResults (DBName, ObjectName, ObjectType, ObjectDefinition)
-    SELECT
-        ''?'' AS DBName,
-        o.name AS ObjectName,
-        o.type_desc AS ObjectType,
-        LEFT(m.definition, 500) -- 내용 앞부분만 일부 저장 (필요시 제거)
-    FROM sys.sql_modules m
-    INNER JOIN sys.objects o ON m.object_id = o.object_id
-    WHERE (o.type = ''P'' OR o.type = ''V'') -- P: 프로시저, V: 뷰
-      AND m.definition LIKE ''%' + @SearchText + '%'';
-';
-
--- 실행
-EXEC sp_MSforeachdb @Command;
-
--- 결과 조회
-SELECT * FROM #SearchResults ORDER BY DBName, ObjectType, ObjectName;
-방법 2. Python 원샷 스크립트 (추천)
-여러 DB에서 쿼리 결과를 취합하여 CSV 파일로 저장해 주는 스크립트입니다. 텍스트가 긴 프로시저 내용도 잘리지 않고 안전하게 확인할 수 있습니다.
-
-준비: pip install pyodbc
-
-설정: DB_CONFIG와 TARGET_TABLE_NAME을 수정 후 실행하세요.
-
-Python
-
-import pyodbc
-import csv
-
-# ---------------------------------------------------------
-# [설정] MSSQL 접속 정보 및 검색 대상
-# ---------------------------------------------------------
-DB_CONFIG = {
-    'server': 'localhost\\SQLEXPRESS',  # 예: 192.168.0.10 또는 localhost
-    'username': 'sa',                   # DB 아이디
-    'password': 'your_password'         # DB 비밀번호
-}
-
-TARGET_TABLE_NAME = "TB_USER"  # [중요] 여기에 찾고 싶은 테이블명을 입력하세요
-OUTPUT_FILE = "table_usage_report.csv"
-
-# ---------------------------------------------------------
-# [로직] 전체 DB 순회 및 검색
-# ---------------------------------------------------------
-def main():
-    conn_str = (
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-        f"SERVER={DB_CONFIG['server']};"
-        f"UID={DB_CONFIG['username']};"
-        f"PWD={DB_CONFIG['password']};"
-        "DATABASE=master;" # 초기 접속은 master로
-    )
-
-    try:
-        print(f"[*] 서버에 접속하여 '{TARGET_TABLE_NAME}' 검색을 시작합니다...")
-        
-        with pyodbc.connect(conn_str) as conn:
-            cursor = conn.cursor()
-
-            # 1. 시스템 DB를 제외한 사용자 DB 목록 가져오기
-            cursor.execute("SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0")
-            databases = [row[0] for row in cursor.fetchall()]
+try:
+    conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+    cursor = conn.cursor()
+    
+    # 테이블 이름 매핑 (Old -> New)
+    table_map = {
+        'FolderIndex': 'cline_FolderIndex',
+        'ProjectRules': 'cline_ProjectRules',
+        'TaskQueue': 'cline_TaskQueue',
+        'ProjectMemos': 'cline_ProjectMemos'
+    }
+    
+    for old_name, new_name in table_map.items():
+        # 1. 새 테이블이 이미 있는지 확인
+        cursor.execute(f"SELECT OBJECT_ID('{new_name}')")
+        if cursor.fetchone()[0] is not None:
+            print(f"   ℹ️  {new_name} 테이블이 이미 존재합니다. (Skip)")
+            continue
             
-            all_results = []
+        # 2. 옛날 테이블이 있는지 확인
+        cursor.execute(f"SELECT OBJECT_ID('{old_name}')")
+        if cursor.fetchone()[0] is not None:
+            # 3. 이름 변경 실행
+            try:
+                # MSSQL sp_rename 사용
+                cursor.execute(f"EXEC sp_rename '{old_name}', '{new_name}'")
+                conn.commit()
+                print(f"   ✅ {old_name} -> {new_name} 이름 변경 완료.")
+            except Exception as e:
+                print(f"   ⚠️ {old_name} 이름 변경 실패: {e}")
+        else:
+            print(f"   ℹ️  {old_name} 테이블을 찾을 수 없습니다. (이미 변경되었거나 생성 전)")
 
-            # 2. 각 DB를 순회하며 검색
-            for db in databases:
-                print(f"    - 검색 중: [{db}]...")
-                
-                # 해당 DB 내에서 뷰(V)와 프로시저(P)의 정의(Definition) 검색
-                # SQL 2014 호환 쿼리
-                sql = f"""
-                SELECT 
-                    '{db}' AS DBName,
-                    o.name AS ObjectName,
-                    o.type_desc AS ObjectType
-                FROM [{db}].sys.sql_modules m
-                INNER JOIN [{db}].sys.objects o ON m.object_id = o.object_id
-                WHERE (o.type = 'P' OR o.type = 'V')
-                  AND m.definition LIKE ?
-                """
-                
-                try:
-                    cursor.execute(sql, (f'%{TARGET_TABLE_NAME}%',))
-                    rows = cursor.fetchall()
-                    for row in rows:
-                        all_results.append(row)
-                except pyodbc.Error:
-                    # 권한 문제 등으로 특정 DB 접근 불가 시 건너뜀
-                    print(f"      [!] {db} 접근 불가, 건너뜁니다.")
-                    continue
+    conn.close()
+    print("✅ DB 마이그레이션 완료.\n")
 
-            # 3. 결과 저장
-            if not all_results:
-                print(f"\n[결과] '{TARGET_TABLE_NAME}'이(가) 포함된 뷰나 프로시저가 없습니다.")
-                return
+except Exception as e:
+    print(f"❌ DB 연결/작업 실패: {e}")
+    print("   (코드는 계속 패치합니다)")
 
-            with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Database', 'Object Name', 'Type']) # 헤더
-                writer.writerows(all_results)
 
-            print(f"\n[완료] 총 {len(all_results)}건 발견.")
-            print(f"       결과가 '{OUTPUT_FILE}'에 저장되었습니다.")
+print("2️⃣ 파일 코드 업데이트 (새 테이블명 + 기능 추가)...")
 
+# ==========================================
+# 1. Main Routes (app/routes/main_routes.py)
+#    - 테이블명 cline_ 적용
+#    - 그룹명 로직 수정: ISNULL(GroupName, IPAddress) -> IP가 그룹이 됨
+# ==========================================
+main_routes_code = r"""from flask import Blueprint, render_template
+from app.database import get_db_connection, clean_path
+
+main_bp = Blueprint('main', __name__)
+
+@main_bp.route('/')
+def index():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    # [수정] 테이블명 cline_ 접두어 적용
+    # [수정] GroupName이 NULL이면 IPAddress를 그룹명으로 사용
+    query = "SELECT f.IPAddress, f.Account, f.DisplayName, f.FullPath, ISNULL(f.GroupName, f.IPAddress) as GroupName, f.TaskCount, CONVERT(VARCHAR, f.LastTaskDate, 120) as LastTaskDate, f.LastRuleContent, CASE WHEN q.TaskID IS NOT NULL THEN 1 ELSE 0 END as IsQueued, CASE WHEN m.MemoContent IS NOT NULL AND LEN(CAST(m.MemoContent AS NVARCHAR(MAX))) > 0 THEN 1 ELSE 0 END as HasMemo FROM cline_FolderIndex f LEFT JOIN cline_TaskQueue q ON f.DisplayName = q.ProjectName AND q.Status IN ('Pending', 'Processing') LEFT JOIN cline_ProjectMemos m ON f.DisplayName = m.ProjectName ORDER BY f.LastTaskDate DESC, f.DisplayName ASC"
+    
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    
+    for row in rows:
+        row['FullPath'] = clean_path(row['FullPath'])
+        
+    cursor.execute("SELECT SUM(TaskCount) as TotalCalls FROM cline_FolderIndex")
+    stats = cursor.fetchone()
+    total_calls = stats['TotalCalls'] if stats['TotalCalls'] else 0
+
+    conn.close()
+    return render_template('index.html', projects=rows, total_calls=total_calls)
+
+@main_bp.route('/settings')
+def settings():
+    return render_template('settings.html')
+"""
+with open(os.path.join(base_dir, "app", "routes", "main_routes.py"), "w", encoding="utf-8") as f:
+    f.write(main_routes_code)
+
+
+# ==========================================
+# 2. API Routes (app/routes/api_routes.py)
+#    - 테이블명 cline_ 적용
+#    - 룰 CRUD (PUT, DELETE) 추가
+# ==========================================
+api_routes_code = r"""from flask import Blueprint, request, jsonify
+from app.database import get_db_connection
+from app.services.ssh_service import send_rule_via_ssh
+import subprocess
+import os
+
+api_bp = Blueprint('api', __name__)
+BRIDGE_API_URL = "http://192.168.0.10:9111"
+
+@api_bp.route('/open_vscode', methods=['POST'])
+def open_vscode():
+    data = request.json
+    target_ip = data.get('ip')
+    user = data.get('account')
+    path = data.get('path')
+    cmd = ['code', '--no-sandbox', '--new-window']
+    remote_arg = f"ssh-remote+{user}@{target_ip}"
+    cmd.extend(['--remote', remote_arg, path])
+    try:
+        env = os.environ.copy()
+        if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+        subprocess.Popen(cmd, env=env)
+        return jsonify({'status': 'success'})
     except Exception as e:
-        print(f"\n[오류] 실행 중 문제가 발생했습니다: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/stats/dashboard', methods=['GET'])
+def get_dashboard_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    # [수정] 그룹명 -> IPAddress fallback, 테이블명 변경
+    cursor.execute("SELECT ISNULL(GroupName, IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY ISNULL(GroupName, IPAddress)")
+    group_counts = cursor.fetchall()
+    cursor.execute("SELECT ISNULL(f.GroupName, f.IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_TaskQueue q JOIN cline_FolderIndex f ON q.ProjectName = f.DisplayName WHERE q.Status IN ('Pending', 'Processing') GROUP BY ISNULL(f.GroupName, f.IPAddress)")
+    active_counts = cursor.fetchall()
+    conn.close()
+    return jsonify({'groups': group_counts, 'active': active_counts})
+
+# --- Rules CRUD ---
+@api_bp.route('/rules', methods=['GET', 'POST'])
+def handle_rules():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC")
+        rules = cursor.fetchall()
+        conn.close()
+        return jsonify(rules)
+    if request.method == 'POST':
+        data = request.json
+        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (data['name'], data['content']))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/rules/<int:rule_id>', methods=['PUT', 'DELETE'])
+def modify_rule(rule_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if request.method == 'PUT':
+        data = request.json
+        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (data['name'], data['content'], rule_id))
+    elif request.method == 'DELETE':
+        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (rule_id,))
+    
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'success'})
+
+@api_bp.route('/rules/deploy', methods=['POST'])
+def deploy_rule():
+    data = request.json
+    project_name = data.get('project_name')
+    rule_id = data.get('rule_id')
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    cursor.execute("SELECT RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (rule_id,))
+    rule_row = cursor.fetchone()
+    cursor.execute("SELECT IPAddress, Account, FullPath FROM cline_FolderIndex WHERE DisplayName=%s", (project_name,))
+    target = cursor.fetchone()
+    
+    if not rule_row or not target:
+        conn.close()
+        return jsonify({'status': 'error', 'message': 'Not found'}), 404
+        
+    final_content = rule_row['RuleContent']
+    final_content = final_content.replace('{{PROJECT_NAME}}', project_name)
+    final_content = final_content.replace('{{API_URL}}', BRIDGE_API_URL)
+    final_content = final_content.replace('{{TARGET_IP}}', target['IPAddress'])
+    final_content = final_content.replace('{{TARGET_PATH}}', target['FullPath'])
+    final_content = final_content.replace('{SUBJECT}', project_name)
+    final_content = final_content.replace('{SERVER_URL}', BRIDGE_API_URL)
+    final_content = final_content.replace('{VENV}', 'python')
+    final_content = final_content.replace('{TARGET_PATH}', target['FullPath'].replace('\\', '/'))
+    
+    success, msg = send_rule_via_ssh(target['IPAddress'], target['Account'], final_content, target['FullPath'])
+    if success:
+        cursor.execute("UPDATE cline_FolderIndex SET LastRuleContent=%s WHERE DisplayName=%s", (final_content, project_name))
+        conn.commit()
+    conn.close()
+    return jsonify({'status': 'success' if success else 'error', 'message': msg})
+
+@api_bp.route('/memos/<project_name>', methods=['GET', 'POST'])
+def handle_memo(project_name):
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT MemoContent FROM cline_ProjectMemos WHERE ProjectName=%s", (project_name,))
+        row = cursor.fetchone()
+        conn.close()
+        return jsonify({'content': row['MemoContent'] if row else ''})
+    if request.method == 'POST':
+        content = request.json.get('content')
+        sql = "MERGE cline_ProjectMemos AS target USING (SELECT %s as PName) AS source ON (target.ProjectName = source.PName) WHEN MATCHED THEN UPDATE SET MemoContent = %s, UpdatedAt = GETDATE() WHEN NOT MATCHED THEN INSERT (ProjectName, MemoContent) VALUES (%s, %s);"
+        cursor.execute(sql, (project_name, content, project_name, content))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/queue', methods=['GET', 'POST'])
+def handle_queue():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        p_name = request.args.get('project')
+        cursor.execute("SELECT * FROM cline_TaskQueue WHERE ProjectName=%s AND Status IN ('Pending', 'Processing') ORDER BY TaskID", (p_name,))
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify(rows)
+    if request.method == 'POST':
+        data = request.json
+        p_name = data.get('project')
+        content = data.get('content')
+        cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, TaskContent) VALUES (%s, %s)", (p_name, content))
+        cursor.execute("UPDATE cline_FolderIndex SET TaskCount = TaskCount + 1, LastTaskDate = GETDATE() WHERE DisplayName=%s", (p_name,))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/agent/next', methods=['POST'])
+def agent_next_task():
+    data = request.json
+    project_name = data.get('subject')
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT TOP 1 TaskID, TaskContent FROM cline_TaskQueue WHERE ProjectName=%s AND Status='Pending' ORDER BY TaskID ASC", (project_name,))
+    task = cursor.fetchone()
+    if task:
+        cursor.execute("UPDATE cline_TaskQueue SET Status='Processing', StartedAt=GETDATE() WHERE TaskID=%s", (task['TaskID'],))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok", "log_id": task['TaskID'], "command": task['TaskContent']})
+    else:
+        conn.close()
+        return jsonify({"status": "wait"})
+
+@api_bp.route('/agent/result', methods=['POST'])
+def agent_submit_result():
+    data = request.json
+    task_id = data.get('log_id')
+    result_content = data.get('result')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE cline_TaskQueue SET Status='Done', CompletedAt=GETDATE(), ResultContent=%s WHERE TaskID=%s", (result_content, task_id))
+    project_name = data.get('subject')
+    if project_name:
+        cursor.execute("UPDATE cline_FolderIndex SET LastTaskDate=GETDATE() WHERE DisplayName=%s", (project_name,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "received"})
+"""
+with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
+    f.write(api_routes_code)
+
+
+# ==========================================
+# 3. Index HTML (app/templates/index.html)
+#    - 좌측 패널 Sticky 처리 (position: sticky)
+# ==========================================
+index_html = r"""<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Automation Bridge v3</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #1e1e1e; color: #e0e0e0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .table-dark { --bs-table-bg: #2d2d2d; color: #e0e0e0; }
+        .btn-sm { font-size: 0.8rem; }
+        .stats-box { background: #2d2d2d; padding: 10px; border-radius: 5px; border: 1px solid #444; }
+        .total-counter { font-size: 1.2rem; font-weight: bold; color: #4caf50; }
+        .bg-active-job { background-color: #143d26 !important; color: #fff; border-left: 5px solid #28a745; }
+        .bg-memo-exists { background-color: #1c3d4d !important; color: #e0f7fa; border-left: 5px solid #00bcd4; }
+        
+        /* [수정] 좌측 사이드바 고정 (Sticky) */
+        .sticky-sidebar {
+            position: sticky;
+            top: 20px; /* 상단 여백 */
+            height: calc(100vh - 40px);
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#"><i class="bi bi-robot"></i> AI Bridge v3</a>
+            <div class="d-flex align-items-center">
+                <span class="me-3">Total Calls: <span class="total-counter">{{ total_calls }}</span></span>
+                <a href="/settings" class="btn btn-outline-light"><i class="bi bi-gear-fill"></i></a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-3">
+        <div class="row">
+            <div class="col-md-2">
+                <div class="sticky-sidebar">
+                    <div class="stats-box mb-3">
+                        <h6><i class="bi bi-folder"></i> Groups</h6>
+                        <div id="groupStats">Loading...</div>
+                    </div>
+                    <div class="stats-box">
+                        <h6><i class="bi bi-activity"></i> Active Tasks</h6>
+                        <div id="activeStats" class="text-warning">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-10">
+                <table class="table table-dark table-hover align-middle">
+                    <thead>
+                        <tr>
+                            <th>Group</th>
+                            <th>Project (ID)</th>
+                            <th>Path</th>
+                            <th>Last Active</th>
+                            <th>Calls</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for p in projects %}
+                        <tr class="{{ 'bg-active-job' if p.IsQueued else ('bg-memo-exists' if p.HasMemo else '') }}" id="row-{{ p.DisplayName }}">
+                            <td><span class="badge bg-secondary">{{ p.GroupName }}</span></td>
+                            <td class="fw-bold">{{ p.DisplayName }}</td>
+                            <td class="small opacity-75">{{ p.FullPath }}</td>
+                            <td>{{ p.LastTaskDate }}</td>
+                            <td>{{ p.TaskCount }}</td>
+                            <td>
+                                <button class="btn btn-primary btn-sm me-1" onclick="openVsCode('{{ p.IPAddress }}', '{{ p.Account }}', '{{ p.FullPath }}')">Code</button>
+                                <button class="btn btn-success btn-sm me-1" onclick="openTaskModal('{{ p.DisplayName }}')">Task</button>
+                                <button class="btn btn-info btn-sm me-1" onclick="openRuleModal('{{ p.DisplayName }}')">Rule</button>
+                                <button class="btn btn-secondary btn-sm" onclick="openMemoModal('{{ p.DisplayName }}')">Memo</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <div class="modal fade" id="taskModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Task</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><ul class="list-group bg-dark mb-3" id="currentQueueList"></ul><textarea class="form-control bg-dark text-white" id="taskContent" rows="3"></textarea></div><div class="modal-footer"><button class="btn btn-success" onclick="submitTask()">Add</button></div></div></div></div>
+    <div class="modal fade" id="ruleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Deploy Rule</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Project: <span id="ruleProjectName"></span></p><select class="form-select bg-dark text-white" id="ruleSelect"></select></div><div class="modal-footer"><button class="btn btn-info" onclick="deployRule()">Deploy</button></div></div></div></div>
+    <div class="modal fade" id="memoModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Memo</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><textarea class="form-control bg-dark text-white" id="memoContent" rows="10"></textarea></div><div class="modal-footer"><button class="btn btn-primary" onclick="saveMemo()">Save</button></div></div></div></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
+"""
+with open(os.path.join(base_dir, "app", "templates", "index.html"), "w", encoding="utf-8") as f:
+    f.write(index_html)
+
+
+# ==========================================
+# 4. Settings HTML (app/templates/settings.html)
+#    - 룰 수정/삭제 UI 추가
+# ==========================================
+settings_html = r"""<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>Settings - Rule Management</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+</head>
+<body class="bg-dark text-white p-4">
+    <div class="container">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2>Rule Management</h2>
+            <a href="/" class="btn btn-secondary">Back to Dashboard</a>
+        </div>
+        
+        <div class="row">
+            <div class="col-md-5">
+                <div class="card bg-secondary text-white mb-3">
+                    <div class="card-header"><span id="formTitle">Create New Rule</span></div>
+                    <div class="card-body">
+                        <input type="hidden" id="editRuleId">
+                        <input type="text" id="ruleName" class="form-control mb-2" placeholder="Rule Name">
+                        <textarea id="ruleContent" class="form-control mb-2" rows="10" placeholder="Rule Content"></textarea>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-success flex-grow-1" onclick="saveRule()">Save Rule</button>
+                            <button class="btn btn-dark" onclick="resetForm()">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="col-md-7">
+                <div class="card bg-secondary text-white">
+                    <div class="card-header">Existing Rules</div>
+                    <div class="card-body">
+                        <ul class="list-group list-group-flush bg-dark" id="ruleList"></ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', loadRules);
+
+        function loadRules() {
+            fetch('/api/rules')
+            .then(r => r.json())
+            .then(data => {
+                const list = document.getElementById('ruleList');
+                list.innerHTML = '';
+                data.forEach(rule => {
+                    const li = document.createElement('li');
+                    li.className = 'list-group-item bg-dark text-white border-secondary d-flex justify-content-between align-items-start';
+                    li.innerHTML = `
+                        <div class="me-auto">
+                            <div class="fw-bold">${rule.RuleName}</div>
+                            <small class="text-muted" style="white-space: pre-wrap; max-height: 50px; overflow: hidden; display: block;">${rule.RuleContent.substring(0, 100)}...</small>
+                        </div>
+                        <div class="ms-2" style="min-width: 80px;">
+                            <button class="btn btn-sm btn-outline-warning me-1" onclick='editRule(${JSON.stringify(rule)})'><i class="bi bi-pencil"></i></button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteRule(${rule.RuleID})"><i class="bi bi-trash"></i></button>
+                        </div>
+                    `;
+                    list.appendChild(li);
+                });
+            });
+        }
+
+        function saveRule() {
+            const id = document.getElementById('editRuleId').value;
+            const name = document.getElementById('ruleName').value;
+            const content = document.getElementById('ruleContent').value;
+            
+            if(!name || !content) return alert('Input required');
+
+            const method = id ? 'PUT' : 'POST';
+            const url = id ? `/api/rules/${id}` : '/api/rules';
+
+            fetch(url, {
+                method: method,
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name, content})
+            }).then(() => {
+                resetForm();
+                loadRules();
+            });
+        }
+
+        function editRule(rule) {
+            document.getElementById('formTitle').innerText = 'Edit Rule';
+            document.getElementById('editRuleId').value = rule.RuleID;
+            document.getElementById('ruleName').value = rule.RuleName;
+            document.getElementById('ruleContent').value = rule.RuleContent;
+        }
+
+        function deleteRule(id) {
+            if(!confirm('Delete this rule?')) return;
+            fetch(`/api/rules/${id}`, { method: 'DELETE' })
+            .then(() => loadRules());
+        }
+
+        function resetForm() {
+            document.getElementById('formTitle').innerText = 'Create New Rule';
+            document.getElementById('editRuleId').value = '';
+            document.getElementById('ruleName').value = '';
+            document.getElementById('ruleContent').value = '';
+        }
+    </script>
+</body>
+</html>
+"""
+with open(os.path.join(base_dir, "app", "templates", "settings.html"), "w", encoding="utf-8") as f:
+    f.write(settings_html)
+
+# ==========================================
+# 5. Scanner.py Update (필요시 데이터 수집용)
+#    - cline_ 테이블명 적용
+#    - GroupName = IP 자동 할당 로직
+# ==========================================
+scanner_code = r"""import os
+import socket
+import pymssql
+import datetime
+import sys
+
+# CONFIG
+DB_HOST = '192.168.0.10'
+DB_USER = 'sa'
+DB_PASSWORD = 'password'
+DB_NAME = 'MyDatabase'
+
+TARGET_PATHS = ['/home/username/projects'] # 수정 필요
+PREFIX = "MYPRJ_" 
+
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try: s.connect(('10.255.255.255', 1)); IP = s.getsockname()[0]
+    except: IP = '127.0.0.1'
+    finally: s.close()
+    return IP
+
+def scan_and_update():
+    current_ip = get_ip_address()
+    current_user = os.getenv('USER') or os.getenv('USERNAME')
+    
+    conn = None
+    try:
+        conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cursor = conn.cursor()
+        print(f"[{datetime.datetime.now()}] Start Scanning for cline_ tables...")
+
+        for base_path in TARGET_PATHS:
+            if not os.path.exists(base_path): continue
+            
+            try: subfolders = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+            except: continue
+
+            for folder in subfolders:
+                full_path = os.path.join(base_path, folder)
+                display_name = f"{PREFIX}{folder}"
+                
+                # MERGE into cline_FolderIndex
+                # GroupName이 없으면 IP를 기본값으로 넣음
+                sql = \"\"\"
+                MERGE cline_FolderIndex AS target
+                USING (SELECT %s as IP, %s as Path) AS source
+                ON (target.IPAddress = source.IP AND target.FullPath = source.Path)
+                WHEN MATCHED THEN
+                    UPDATE SET DisplayName = %s, Account = %s, LastUpdated = GETDATE(), GroupName = ISNULL(GroupName, %s)
+                WHEN NOT MATCHED THEN
+                    INSERT (IPAddress, Account, DisplayName, FullPath, GroupName, LastUpdated)
+                    VALUES (%s, %s, %s, %s, %s, GETDATE());
+                \"\"\"
+                cursor.execute(sql, (
+                    current_ip, full_path, 
+                    display_name, current_user, current_ip,
+                    current_ip, current_user, display_name, full_path, current_ip
+                ))
+        conn.commit()
+        print("Update Completed.")
+
+    except Exception as e: print(f"Error: {e}")
+    finally:
+        if conn: conn.close()
 
 if __name__ == "__main__":
-    main()
-참고 사항
-LIKE 검색의 특성: LIKE '%테이블명%' 방식을 사용하므로, 만약 찾는 이름이 User인데 UserLog라는 테이블이 쿼리에 있다면 같이 검색될 수 있습니다. (정확히 단어 단위로 끊어서 찾으려면 정규식이 필요하지만, MSSQL 기본 기능으로는 이 방식이 가장 확실하고 빠릅니다.)
+    scan_and_update()
+"""
+with open(os.path.join(base_dir, "scanner.py"), "w", encoding="utf-8") as f:
+    f.write(scanner_code)
 
-성능: 텍스트 검색(sys.sql_modules)은 아주 빠르진 않지만, 프로시저나 뷰 개수가 수천 개 단위라면 몇 초 안에 끝납니다.
 
-두 방법 중 편한 것을 골라 사용하시면
+print("\n✅ 모든 업데이트가 완료되었습니다.")
+print("1. DB 테이블: 'FolderIndex' -> 'cline_FolderIndex' 등 4개 변경됨.")
+print("2. 그룹 문제 해결: 그룹명이 없으면 IP 주소로 자동 분류됨.")
+print("3. UI 개선: 좌측 패널 Sticky(고정) 적용 + 룰 수정/삭제 기능 추가됨.")
+print("👉 다시 실행: python3 runcline/run_bridge.py")
