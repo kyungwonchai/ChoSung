@@ -1,251 +1,558 @@
-SSQL은 테이블 생성 스크립트(CREATE TABLE...)를 텍스트 형태로 저장하지 않기 때문에, 테이블의 경우 파이썬 내부 로직으로 스키마를 읽어 **CREATE 문을 역생성(Reverse Engineering)**하도록 구현했습니다.
-
-사전 준비
-터미널에서 라이브러리를 설치해야 합니다.
-
-Bash
-
-pip install pymssql
-Python 스크립트
-아래 코드를 복사하여 export_db.py로 저장하고, 상단의 설정(Configuration) 부분만 본인 환경에 맞게 수정한 뒤 실행하세요.
-
-Python
-
-import pymssql
 import os
-import sys
+import pymssql
 
-# =========================================================
-# [설정] MSSQL 접속 정보 및 저장 경로 (여기를 수정하세요)
-# =========================================================
-DB_CONFIG = {
-    'server': 'localhost',      # 서버 주소 (예: 127.0.0.1)
-    'port': 1633,               # 요청하신 포트 1633
-    'user': 'sa',               # 접속 계정
-    'password': 'your_password',# 접속 암호
-    'database': 'TargetDB'      # 타겟 데이터베이스 이름
-}
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print("❌ 오류: 'runcline' 폴더가 없습니다.")
+    exit()
 
-# 결과물이 저장될 메인 폴더명
-OUTPUT_DIR = "DB_Export_Result"
+print("🚀 AI Bridge v5: Multi-Project Path Support Update...")
 
-# =========================================================
-# [로직] 스크립트 생성 및 파일 저장 함수
-# =========================================================
+# DB 정보
+DB_HOST = '192.168.0.10'
+DB_USER = 'sa'
+DB_PASSWORD = 'password'
+DB_NAME = 'MyDatabase'
 
-def create_directory(path):
-    """폴더가 없으면 생성"""
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-def save_to_file(folder_name, file_name, content):
-    """내용을 지정된 폴더와 파일명으로 저장 (UTF-8 인코딩)"""
-    # 윈도우 파일명으로 사용할 수 없는 문자 제거
-    safe_name = "".join([c for c in file_name if c.isalpha() or c.isdigit() or c in (' ', '.', '_', '-')]).strip()
-    full_path = os.path.join(OUTPUT_DIR, folder_name)
-    create_directory(full_path)
+# ==========================================
+# 1. DB Migration (컬럼 추가)
+#    - 이름은 같고 경로만 다른 프로젝트 구분을 위해
+#    - TaskQueue, ProjectMemos에 'ProjectPath' 추가
+# ==========================================
+print("1️⃣ DB 스키마 업데이트 (ProjectPath 컬럼 추가)...")
+try:
+    conn = pymssql.connect(server=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+    cursor = conn.cursor()
     
-    file_path = os.path.join(full_path, f"{safe_name}.sql")
-    
+    # 1. TaskQueue에 ProjectPath 추가
     try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"[OK] {folder_name}/{safe_name}.sql 저장 완료")
-    except Exception as e:
-        print(f"[Err] 파일 저장 실패 ({file_name}): {e}")
+        cursor.execute("ALTER TABLE cline_TaskQueue ADD ProjectPath NVARCHAR(500)")
+        conn.commit()
+        print("   ✅ cline_TaskQueue: ProjectPath 컬럼 추가됨")
+    except:
+        print("   ℹ️ cline_TaskQueue: ProjectPath 이미 존재함")
 
-def get_connection():
-    return pymssql.connect(
-        server=DB_CONFIG['server'],
-        user=DB_CONFIG['user'],
-        password=DB_CONFIG['password'],
-        database=DB_CONFIG['database'],
-        port=DB_CONFIG['port'],
-        charset='utf8'
-    )
+    # 2. ProjectMemos에 ProjectPath 추가
+    try:
+        cursor.execute("ALTER TABLE cline_ProjectMemos ADD ProjectPath NVARCHAR(500)")
+        conn.commit()
+        print("   ✅ cline_ProjectMemos: ProjectPath 컬럼 추가됨")
+    except:
+        print("   ℹ️ cline_ProjectMemos: ProjectPath 이미 존재함")
 
-def export_programmable_objects(cursor):
-    """
-    뷰, 프로시저, 함수, 트리거는 sys.sql_modules에 정의가 그대로 들어있음
-    """
-    print("\n--- [1/4] 프로시저, 뷰, 함수, 트리거 추출 중 ---")
+    conn.close()
+
+except Exception as e:
+    print(f"⚠️ DB 작업 중 오류 (무시하고 진행): {e}")
+
+
+# ==========================================
+# 2. Main Routes (app/routes/main_routes.py)
+#    - SQL Join 조건을 이름(DisplayName) -> 경로(FullPath)로 변경
+# ==========================================
+print("2️⃣ Main Routes 업데이트 (경로 기준 Join)...")
+
+main_routes_code = r"""from flask import Blueprint, render_template
+from app.database import get_db_connection, clean_path
+
+main_bp = Blueprint('main', __name__)
+
+@main_bp.route('/')
+def index():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
     
-    # P: 프로시저, V: 뷰, FN/IF/TF: 함수, TR: 트리거
-    sql = """
-    SELECT 
-        o.name AS ObjectName,
-        s.name AS SchemaName,
-        o.type_desc AS ObjectType,
-        m.definition AS Definition
-    FROM sys.sql_modules m
-    INNER JOIN sys.objects o ON m.object_id = o.object_id
-    INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
-    WHERE o.is_ms_shipped = 0
-    """
+    # [핵심 변경]
+    # JOIN 조건을 f.FullPath = q.ProjectPath 로 변경하여 경로가 다르면 다른 프로젝트로 인식하게 함
+    # 메모(m) 또한 f.FullPath = m.ProjectPath 로 조인
+    # SQL은 절대 한 줄 유지
+    query = "SELECT f.IPAddress, f.Account, f.DisplayName, f.FullPath, ISNULL(f.GroupName, f.IPAddress) as GroupName, f.TaskCount, CONVERT(VARCHAR, f.LastTaskDate, 120) as LastTaskDate, f.LastRuleContent, CASE WHEN q.TaskID IS NOT NULL THEN 1 ELSE 0 END as IsQueued, CASE WHEN m.MemoContent IS NOT NULL AND LEN(CAST(m.MemoContent AS NVARCHAR(MAX))) > 0 THEN 1 ELSE 0 END as HasMemo FROM cline_FolderIndex f LEFT JOIN cline_TaskQueue q ON f.FullPath = q.ProjectPath AND q.Status IN ('Pending', 'Processing') LEFT JOIN cline_ProjectMemos m ON f.FullPath = m.ProjectPath ORDER BY f.LastTaskDate DESC, f.DisplayName ASC"
     
-    cursor.execute(sql)
+    cursor.execute(query)
     rows = cursor.fetchall()
-
+    
     for row in rows:
-        obj_name = row[0]
-        schema = row[1]
-        obj_type = row[2]     # 예: SQL_STORED_PROCEDURE
-        definition = row[3]
-
-        # 폴더명을 타입별로 깔끔하게 정리
-        folder_map = {
-            'SQL_STORED_PROCEDURE': 'Procedures',
-            'VIEW': 'Views',
-            'SQL_SCALAR_FUNCTION': 'Functions',
-            'SQL_TABLE_VALUED_FUNCTION': 'Functions',
-            'SQL_INLINE_TABLE_VALUED_FUNCTION': 'Functions',
-            'SQL_TRIGGER': 'Triggers'
-        }
-        folder_name = folder_map.get(obj_type, 'Others')
+        row['FullPath'] = clean_path(row['FullPath'])
         
-        full_name = f"{schema}.{obj_name}"
-        save_to_file(folder_name, full_name, definition)
+    cursor.execute("SELECT SUM(TaskCount) as TotalCalls FROM cline_FolderIndex")
+    stats = cursor.fetchone()
+    total_calls = stats['TotalCalls'] if stats['TotalCalls'] else 0
 
-def export_tables(cursor):
-    """
-    테이블은 정의가 텍스트로 저장되지 않으므로, 컬럼 정보를 읽어 CREATE 문을 생성
-    """
-    print("\n--- [2/4] 테이블 스크립트 생성 중 ---")
-    
-    # 테이블 목록 조회
-    cursor.execute("""
-        SELECT t.name, s.name 
-        FROM sys.tables t
-        JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE t.is_ms_shipped = 0
-    """)
-    tables = cursor.fetchall()
+    conn.close()
+    return render_template('index.html', projects=rows, total_calls=total_calls)
 
-    for tbl in tables:
-        table_name = tbl[0]
-        schema_name = tbl[1]
-        full_table_name = f"{schema_name}.{table_name}"
-        
-        # 컬럼 정보 조회
-        col_sql = """
-        SELECT 
-            COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-        ORDER BY ORDINAL_POSITION
-        """
-        cursor.execute(col_sql, (schema_name, table_name))
-        columns = cursor.fetchall()
+@main_bp.route('/settings')
+def settings():
+    return render_template('settings.html')
+"""
+with open(os.path.join(base_dir, "app", "routes", "main_routes.py"), "w", encoding="utf-8") as f:
+    f.write(main_routes_code)
 
-        # CREATE TABLE 구문 작성
-        script_lines = []
-        script_lines.append(f"CREATE TABLE [{schema_name}].[{table_name}] (")
-        
-        col_defs = []
-        for col in columns:
-            c_name = col[0]
-            c_type = col[1]
-            c_len = col[2]
-            c_null = "NULL" if col[3] == 'YES' else "NOT NULL"
-            
-            # 길이 표시가 필요한 타입 처리 (varchar, nvarchar 등)
-            if c_type in ['varchar', 'nvarchar', 'char', 'nchar', 'varbinary']:
-                length_str = f"({c_len})" if c_len != -1 else "(MAX)"
-                type_str = f"{c_type}{length_str}"
-            else:
-                type_str = c_type
-            
-            col_defs.append(f"    [{c_name}] {type_str} {c_null}")
-        
-        script_lines.append(",\n".join(col_defs))
-        script_lines.append(");")
-        script_lines.append("GO")
 
-        save_to_file("Tables", full_table_name, "\n".join(script_lines))
+# ==========================================
+# 3. API Routes (app/routes/api_routes.py)
+#    - 모든 로직을 'FullPath' 기준으로 변경
+# ==========================================
+print("3️⃣ API Routes 업데이트 (Path 파라미터 필수화)...")
 
-def export_indexes(cursor):
-    """
-    인덱스 생성 스크립트 추출
-    """
-    print("\n--- [3/4] 인덱스 스크립트 추출 중 ---")
-    
-    # 인덱스 정보 쿼리 (PK 제외, 일반 인덱스만)
-    sql = """
-    SELECT 
-        i.name AS IndexName,
-        t.name AS TableName,
-        s.name AS SchemaName,
-        i.type_desc,
-        i.is_unique,
-        STUFF((SELECT ', [' + c.name + ']'
-               FROM sys.index_columns ic
-               JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-               WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
-               ORDER BY ic.key_ordinal
-               FOR XML PATH('')), 1, 2, '') AS ColumnNames
-    FROM sys.indexes i
-    JOIN sys.tables t ON i.object_id = t.object_id
-    JOIN sys.schemas s ON t.schema_id = s.schema_id
-    WHERE i.type > 0 AND i.is_primary_key = 0 AND t.is_ms_shipped = 0
-    """
-    
-    cursor.execute(sql)
-    indexes = cursor.fetchall()
+api_routes_code = r"""from flask import Blueprint, request, jsonify
+from app.database import get_db_connection
+from app.services.ssh_service import send_rule_via_ssh
+import subprocess
+import os
 
-    for idx in indexes:
-        idx_name = idx[0]
-        table_name = idx[1]
-        schema_name = idx[2]
-        type_desc = idx[3]
-        is_unique = "UNIQUE " if idx[4] else ""
-        cols = idx[5]
+api_bp = Blueprint('api', __name__)
+BRIDGE_API_URL = "http://192.168.0.10:9111"
 
-        # CREATE INDEX 구문 조립
-        script = f"CREATE {is_unique}{type_desc} INDEX [{idx_name}] ON [{schema_name}].[{table_name}] ({cols});"
-        
-        save_to_file("Indexes", f"{schema_name}.{table_name}_{idx_name}", script)
-
-def main():
-    print(f"[*] MSSQL 서버({DB_CONFIG['server']}:{DB_CONFIG['port']})에 접속 시도 중...")
-    
+@api_bp.route('/open_vscode', methods=['POST'])
+def open_vscode():
+    data = request.json
+    target_ip = data.get('ip')
+    user = data.get('account')
+    path = data.get('path')
+    cmd = ['code', '--no-sandbox', '--new-window']
+    remote_arg = f"ssh-remote+{user}@{target_ip}"
+    cmd.extend(['--remote', remote_arg, path])
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        print("[+] 접속 성공! 데이터 추출을 시작합니다.\n")
+        env = os.environ.copy()
+        if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+        subprocess.Popen(cmd, env=env)
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/stats/dashboard', methods=['GET'])
+def get_dashboard_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT ISNULL(GroupName, IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY ISNULL(GroupName, IPAddress)")
+    group_counts = cursor.fetchall()
+    cursor.execute("SELECT ISNULL(f.GroupName, f.IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_TaskQueue q JOIN cline_FolderIndex f ON q.ProjectPath = f.FullPath WHERE q.Status IN ('Pending', 'Processing') GROUP BY ISNULL(f.GroupName, f.IPAddress)")
+    active_counts = cursor.fetchall()
+    conn.close()
+    return jsonify({'groups': group_counts, 'active': active_counts})
+
+@api_bp.route('/rules', methods=['GET', 'POST'])
+def handle_rules():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC")
+        rules = cursor.fetchall()
+        conn.close()
+        return jsonify(rules)
+    if request.method == 'POST':
+        data = request.json
+        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (data['name'], data['content']))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/rules/<int:rule_id>', methods=['PUT', 'DELETE'])
+def modify_rule(rule_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if request.method == 'PUT':
+        data = request.json
+        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (data['name'], data['content'], rule_id))
+    elif request.method == 'DELETE':
+        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (rule_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'success'})
+
+@api_bp.route('/rules/deploy', methods=['POST'])
+def deploy_rule():
+    data = request.json
+    project_name = data.get('project_name')
+    project_path = data.get('project_path') # [중요] 경로 수신
+    rule_id = data.get('rule_id')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    cursor.execute("SELECT RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (rule_id,))
+    rule_row = cursor.fetchone()
+    
+    # [중요] FullPath로 정확한 타겟 조회
+    cursor.execute("SELECT IPAddress, Account, FullPath FROM cline_FolderIndex WHERE FullPath=%s", (project_path,))
+    target = cursor.fetchone()
+    
+    if not rule_row or not target:
+        conn.close()
+        return jsonify({'status': 'error', 'message': 'Not found'}), 404
         
-        # 1. Programmable Objects (뷰, 프로시저 등)
-        export_programmable_objects(cursor)
+    final_content = rule_row['RuleContent']
+    # 템플릿 변수 치환
+    final_content = final_content.replace('{{PROJECT_NAME}}', project_name)
+    final_content = final_content.replace('{{API_URL}}', BRIDGE_API_URL)
+    final_content = final_content.replace('{{TARGET_IP}}', target['IPAddress'])
+    final_content = final_content.replace('{{TARGET_PATH}}', target['FullPath']) # 윈도우/리눅스 원본 경로
+    
+    # 호환성 치환
+    final_content = final_content.replace('{SUBJECT}', project_name)
+    final_content = final_content.replace('{SERVER_URL}', BRIDGE_API_URL)
+    final_content = final_content.replace('{TARGET_PATH}', target['FullPath'].replace('\\', '/'))
+    
+    success, msg = send_rule_via_ssh(target['IPAddress'], target['Account'], final_content, target['FullPath'])
+    if success:
+        cursor.execute("UPDATE cline_FolderIndex SET LastRuleContent=%s WHERE FullPath=%s", (final_content, target['FullPath']))
+        conn.commit()
+    conn.close()
+    return jsonify({'status': 'success' if success else 'error', 'message': msg})
+
+@api_bp.route('/memos', methods=['POST']) # URL 단순화
+def handle_memo_post():
+    data = request.json
+    p_name = data.get('project')
+    p_path = data.get('path') # [중요] 경로 기준
+    content = data.get('content')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 경로(ProjectPath)를 Key로 Merge
+    sql = "MERGE cline_ProjectMemos AS target USING (SELECT %s as PPath, %s as PName) AS source ON (target.ProjectPath = source.PPath) WHEN MATCHED THEN UPDATE SET MemoContent = %s, UpdatedAt = GETDATE() WHEN NOT MATCHED THEN INSERT (ProjectName, ProjectPath, MemoContent) VALUES (%s, %s, %s);"
+    cursor.execute(sql, (p_path, p_name, content, p_name, p_path, content))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'success'})
+
+@api_bp.route('/memos/get', methods=['POST']) # GET 대신 POST로 경로 전달 (특수문자 이슈 방지)
+def handle_memo_get():
+    data = request.json
+    p_path = data.get('path')
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT MemoContent FROM cline_ProjectMemos WHERE ProjectPath=%s", (p_path,))
+    row = cursor.fetchone()
+    conn.close()
+    return jsonify({'content': row['MemoContent'] if row else ''})
+
+@api_bp.route('/queue', methods=['GET', 'POST', 'DELETE'])
+def handle_queue():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        p_path = request.args.get('path') # 이름 대신 경로로 조회
+        cursor.execute("SELECT * FROM cline_TaskQueue WHERE ProjectPath=%s AND Status IN ('Pending', 'Processing') ORDER BY TaskID", (p_path,))
+        rows = cursor.fetchall()
+        conn.close()
+        return jsonify(rows)
+    if request.method == 'POST':
+        data = request.json
+        p_name = data.get('project')
+        p_path = data.get('path') # 경로 저장
+        content = data.get('content')
+        cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, ProjectPath, TaskContent) VALUES (%s, %s, %s)", (p_name, p_path, content))
+        cursor.execute("UPDATE cline_FolderIndex SET TaskCount = TaskCount + 1, LastTaskDate = GETDATE() WHERE FullPath=%s", (p_path,))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+    if request.method == 'DELETE':
+        task_id = request.args.get('id')
+        cursor.execute("DELETE FROM cline_TaskQueue WHERE TaskID=%s", (task_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+@api_bp.route('/agent/next', methods=['POST'])
+def agent_next_task():
+    data = request.json
+    # [중요] 에이전트가 요청 시 'path'를 보내면 베스트지만, 
+    # 기존 호환성을 위해 subject(이름)만 오면 이름으로 찾되, 
+    # 만약 에이전트가 path도 보내주면(v2) path로 정확히 찾음.
+    project_name = data.get('subject')
+    # 현 단계에서는 룰에서 {SUBJECT}만 주고 있으므로 이름으로 찾을 수밖에 없음.
+    # 단, 룰에서 {TARGET_PATH}를 같이 줘서 에이전트가 요청에 포함하게 하면 완벽함.
+    # 여기서는 일단 이름 매칭 유지 (추후 에이전트 로직 고도화 가능)
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    # 이름으로 찾되, ProjectPath가 NULL이 아닌 최신작업 우선
+    cursor.execute("SELECT TOP 1 TaskID, TaskContent, ProjectPath FROM cline_TaskQueue WHERE ProjectName=%s AND Status='Pending' ORDER BY TaskID ASC", (project_name,))
+    task = cursor.fetchone()
+    
+    if task:
+        cursor.execute("UPDATE cline_TaskQueue SET Status='Processing', StartedAt=GETDATE() WHERE TaskID=%s", (task['TaskID'],))
+        conn.commit()
+        conn.close()
+        # [중요] 에이전트에게 수행할 경로(Path)를 알려줄 수 있다면 여기서 커맨드 앞에 'cd 경로 &&' 붙여줄 수도 있음
+        return jsonify({"status": "ok", "log_id": task['TaskID'], "command": task['TaskContent'], "path": task['ProjectPath']})
+    else:
+        conn.close()
+        return jsonify({"status": "wait"})
+
+@api_bp.route('/agent/result', methods=['POST'])
+def agent_submit_result():
+    data = request.json
+    task_id = data.get('log_id')
+    result_content = data.get('result')
+    project_name = data.get('subject')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE cline_TaskQueue SET Status='Done', CompletedAt=GETDATE(), ResultContent=%s WHERE TaskID=%s", (result_content, task_id))
+    
+    # 통계 업데이트 (이름 기준)
+    if project_name:
+        cursor.execute("UPDATE cline_FolderIndex SET LastTaskDate=GETDATE() WHERE DisplayName=%s", (project_name,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "received"})
+"""
+with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
+    f.write(api_routes_code)
+
+
+# ==========================================
+# 4. Index HTML (app/templates/index.html)
+#    - View 버튼 삭제
+#    - 이름 아래 경로(노란색) 표시
+#    - JS 함수들이 Path를 인자로 받도록 수정
+# ==========================================
+print("4️⃣ Index HTML 업데이트 (UI 디자인 변경)...")
+
+index_html = r"""<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Bridge v5</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+        .table-dark { --bs-table-bg: #1e1e1e; }
+        .table-hover tbody tr:hover { filter: brightness(1.2); transition: 0.2s; cursor: default; }
+        .bg-active-job { background-color: #0f3d24 !important; color: #e8f5e9; border-left: 4px solid #00e676; }
+        .bg-memo-exists { background-color: #0d3d52 !important; color: #e0f7fa; border-left: 4px solid #00bcd4; }
+        .sticky-sidebar { position: sticky; top: 20px; height: calc(100vh - 40px); overflow-y: auto; }
+        .stats-box { background: #252526; padding: 15px; border-radius: 8px; margin-bottom: 15px; border: 1px solid #333; }
+        .action-btns { display: flex; gap: 6px; flex-wrap: nowrap; }
+        .modal-content { background-color: #252526; border: 1px solid #444; }
         
-        # 2. Tables
-        export_tables(cursor)
+        /* [UI 핵심] 경로 표시 스타일 */
+        .project-path {
+            font-size: 0.8rem;
+            color: #ffc107 !important; /* 노란색 */
+            display: block;
+            margin-top: 2px;
+            font-family: monospace;
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark border-bottom border-secondary py-3">
+        <div class="container-fluid">
+            <a class="navbar-brand fw-bold text-warning" href="#"><i class="bi bi-robot"></i> CLINE BRIDGE v5</a>
+            <div class="d-flex align-items-center gap-4 w-50">
+                <input type="text" id="globalSearch" class="form-control bg-dark text-white border-secondary" placeholder="🔍 Search..." onkeyup="filterTable()">
+            </div>
+            <div class="d-flex align-items-center">
+                <span class="me-3">Calls: <span class="fw-bold text-success">{{ total_calls }}</span></span>
+                <a href="/settings" class="btn btn-outline-light btn-sm"><i class="bi bi-gear-fill"></i> Settings</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        <div class="row">
+            <div class="col-md-2">
+                <div class="sticky-sidebar">
+                    <div class="stats-box">
+                        <h6 class="text-secondary"><i class="bi bi-grid-fill"></i> Groups</h6>
+                        <div id="groupStats" class="mt-2 small">Loading...</div>
+                    </div>
+                    <div class="stats-box">
+                        <h6 class="text-secondary"><i class="bi bi-lightning-fill"></i> Active Queues</h6>
+                        <div id="activeStats" class="mt-2 small text-warning">None</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-10">
+                <table class="table table-dark table-hover align-middle shadow-sm" id="projectTable">
+                    <thead>
+                        <tr class="text-secondary text-uppercase small">
+                            <th>Group</th>
+                            <th>Project & Path</th> <th>Last Active</th>
+                            <th>Calls</th>
+                            <th style="min-width: 280px;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for p in projects %}
+                        <tr class="{{ 'bg-active-job' if p.IsQueued else ('bg-memo-exists' if p.HasMemo else '') }}">
+                            <td><span class="badge bg-secondary opacity-50">{{ p.GroupName }}</span></td>
+                            <td>
+                                <div class="fw-bold text-white" style="font-size: 1.05rem;">{{ p.DisplayName }}</div>
+                                <div class="project-path">{{ p.FullPath }}</div>
+                            </td>
+                            <td class="small opacity-75">{{ p.LastTaskDate }}</td>
+                            <td class="fw-bold opacity-75">{{ p.TaskCount }}</td>
+                            <td>
+                                <div class="action-btns">
+                                    <button class="btn btn-primary btn-sm" onclick="openVsCode('{{ p.IPAddress }}', '{{ p.Account }}', '{{ p.FullPath }}')" title="Code"><i class="bi bi-code-slash"></i></button>
+                                    <button class="btn btn-success btn-sm" onclick="openTaskModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" title="Task"><i class="bi bi-plus-lg"></i> Task</button>
+                                    <button class="btn btn-info btn-sm" onclick="openRuleModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" title="Rule"><i class="bi bi-send"></i> Rule</button>
+                                    <button class="btn btn-secondary btn-sm" onclick="openMemoModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" title="Memo"><i class="bi bi-sticky"></i></button>
+                                </div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="taskModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title">Task Manager - <span id="modalProjectName" class="text-warning"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <h6 class="text-secondary mb-2">Queue</h6>
+                    <ul class="list-group bg-dark mb-4" id="currentQueueList"></ul>
+                    <div class="form-group">
+                        <textarea class="form-control bg-dark text-white border-secondary" id="taskContent" rows="3" placeholder="Command..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer border-secondary"><button class="btn btn-success" onclick="submitTask()">Add</button></div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="modal fade" id="ruleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Deploy Rule</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Project: <span id="ruleProjectName" class="fw-bold"></span></p><select class="form-select bg-dark text-white mb-2" id="ruleSelect"></select></div><div class="modal-footer"><button class="btn btn-info" onclick="deployRule()">Deploy</button></div></div></div></div>
+    <div class="modal fade" id="memoModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Memo</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><textarea class="form-control bg-dark text-white" id="memoContent" rows="10"></textarea></div><div class="modal-footer"><button class="btn btn-primary" onclick="saveMemo()">Save</button></div></div></div></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Global Vars
+        let currentProject = '';
+        let currentPath = ''; // [중요] 경로 저장용 변수 추가
         
-        # 3. Indexes
-        export_indexes(cursor)
+        const taskModal = new bootstrap.Modal(document.getElementById('taskModal'));
+        const ruleModal = new bootstrap.Modal(document.getElementById('ruleModal'));
+        const memoModal = new bootstrap.Modal(document.getElementById('memoModal'));
+
+        document.addEventListener('DOMContentLoaded', () => { updateDashboardStats(); setInterval(updateDashboardStats, 5000); });
+
+        function filterTable() {
+            const input = document.getElementById('globalSearch').value.toUpperCase();
+            const tr = document.getElementById('projectTable').getElementsByTagName('tr');
+            for (let i = 1; i < tr.length; i++) {
+                let txt = tr[i].textContent || tr[i].innerText;
+                tr[i].style.display = txt.toUpperCase().indexOf(input) > -1 ? "" : "none";
+            }
+        }
+
+        function updateDashboardStats() {
+            fetch('/api/stats/dashboard').then(r => r.json()).then(data => {
+                document.getElementById('groupStats').innerHTML = data.groups.map(g => `<div class="d-flex justify-content-between"><span>${g.GroupName}</span> <span class="badge bg-dark border">${g.Cnt}</span></div>`).join('');
+                document.getElementById('activeStats').innerHTML = data.active.length ? data.active.map(a => `<div class="d-flex justify-content-between"><span>${a.GroupName}</span> <span class="badge bg-warning text-dark">${a.Cnt}</span></div>`).join('') : 'None';
+            });
+        }
+
+        // --- Task Functions (Path 기반) ---
+        function openTaskModal(name, path) {
+            currentProject = name;
+            currentPath = path;
+            document.getElementById('modalProjectName').innerText = name;
+            document.getElementById('taskContent').value = ''; 
+            loadQueue(path); // 경로로 조회
+            taskModal.show();
+        }
+
+        function loadQueue(path) {
+            // 특수문자 처리를 위해 encodeURIComponent 사용
+            fetch(`/api/queue?path=${encodeURIComponent(path)}`).then(r => r.json()).then(tasks => {
+                const list = document.getElementById('currentQueueList');
+                list.innerHTML = tasks.length ? tasks.map(t => `
+                    <li class="list-group-item bg-dark text-white border-secondary d-flex justify-content-between align-items-center">
+                        <div><span class="badge bg-warning text-dark me-2">${t.Status}</span> ${t.TaskContent.substring(0, 50)}...</div>
+                        <button class="btn btn-sm btn-outline-danger" onclick="deleteTask(${t.TaskID})"><i class="bi bi-trash"></i></button>
+                    </li>`).join('') : '<li class="list-group-item bg-dark text-secondary text-center">Empty</li>';
+            });
+        }
+
+        function submitTask() {
+            const content = document.getElementById('taskContent').value;
+            if(!content) return;
+            fetch('/api/queue', {
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({project: currentProject, path: currentPath, content}) 
+            }).then(() => {
+                document.getElementById('taskContent').value = '';
+                loadQueue(currentPath);
+                updateDashboardStats();
+            });
+        }
         
-        print(f"\n[완료] 모든 작업이 끝났습니다. '{OUTPUT_DIR}' 폴더를 확인하세요.")
-        
-    except pymssql.Error as e:
-        print(f"\n[치명적 오류] DB 접속 또는 쿼리 실행 중 에러: \n{e}")
-    except Exception as ex:
-        print(f"\n[오류] 알 수 없는 예외 발생: {ex}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
+        function deleteTask(id) {
+            if(!confirm('Delete?')) return;
+            fetch(`/api/queue?id=${id}`, { method: 'DELETE' }).then(() => loadQueue(currentPath));
+        }
 
-if __name__ == "__main__":
-    main()
-작동 방식 설명
-폴더 구조 자동 생성: 스크립트를 실행하면 실행 위치에 DB_Export_Result 폴더가 생기고, 그 안에 Tables, Views, Procedures, Functions, Triggers, Indexes 폴더가 자동으로 나뉩니다.
+        // --- Other Actions ---
+        function openVsCode(ip, account, path) {
+            fetch('/api/open_vscode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ip, account, path}) });
+        }
 
-테이블 (Tables): MSSQL은 CREATE TABLE 문을 저장하지 않으므로, 이 스크립트가 컬럼 정보를 읽어서 기본 구조(컬럼명, 타입, NULL 여부)를 가진 CREATE 문을 새로 작성해 줍니다.
+        function openRuleModal(name, path) {
+            currentProject = name;
+            currentPath = path;
+            document.getElementById('ruleProjectName').innerText = name;
+            fetch('/api/rules').then(r => r.json()).then(rules => {
+                document.getElementById('ruleSelect').innerHTML = rules.map(r => `<option value="${r.RuleID}">${r.RuleName}</option>`).join('');
+                ruleModal.show();
+            });
+        }
 
-프로시저/뷰/트리거: DB 내부에 저장된 원본 SQL 코드를 그대로 가져와 저장합니다.
+        function deployRule() {
+            const ruleId = document.getElementById('ruleSelect').value;
+            fetch('/api/rules/deploy', { 
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({project_name: currentProject, project_path: currentPath, rule_id: ruleId}) 
+            }).then(r => r.json()).then(res => { alert(res.message); ruleModal.hide(); });
+        }
 
-한글 처리: 모든 파일은 UTF-8로 저장되므로 한글 깨짐 없이 열어볼 수 있습니다.
+        function openMemoModal(name, path) {
+            currentProject = name;
+            currentPath = path;
+            // GET 방식 대신 POST로 Path 전달 (경로 내 슬래시 등 특수문자 안전 처리)
+            fetch('/api/memos/get', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: currentPath})
+            }).then(r => r.json()).then(d => {
+                document.getElementById('memoContent').value = d.content;
+                memoModal.show();
+            });
+        }
 
-경원님을 위한 팁
-port 변수에 1633을 적용해 두었습니다. 비밀번호만 바꾸시면 바로 돌아갑니다.
+        function saveMemo() {
+            const content = document.getElementById('memoContent').value;
+            fetch('/api/memos', { 
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({project: currentProject, path: currentPath, content}) 
+            }).then(() => { memoModal.hide(); location.reload(); });
+        }
+    </script>
+</body>
+</html>
+"""
+with open(os.path.join(base_dir, "app", "templates", "index.html"), "w", encoding="utf-8") as f:
+    f.write(index_html)
 
-테이블 스크립트는 기본 구조만 생성합니다. 복잡한 FK(외래키)나 Default 제약조건까지 완벽하게 스크립팅하려면 코드가 매우 복잡해지므로, 이 코드는 데이터 구조 백업 및 확인용으로 쓰기에 가장 적합하고 가볍게 만들었습
+
+print("\n✅ v5 업데이트 완료!")
+print("1. DB: Task/Memo 테이블에 ProjectPath 추가됨.")
+print("2. 로직: 이름이 같아도 '경로'가 다르면 다른 프로젝트로 인식.")
+print("3. UI: View 버튼 삭제 -> 이름 아래에 노란색으로 전체 경로 표시.")
+print("👉 'python3 runcline/run_bridge.py' 실행하세요.")
