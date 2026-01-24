@@ -5,20 +5,125 @@ if not os.path.exists(base_dir):
     print("❌ 오류: 'runcline' 폴더가 없습니다.")
     exit()
 
-print("🚀 AI Bridge v15 Fix: SQL Single-Line Correction...")
+print("🚀 AI Bridge v26: Path Normalization & Debugging Update...")
 
 # ==========================================
-# 1. API Routes (모든 쿼리 한 줄로 변경)
+# 1. Main Routes (경로 슬래시 변환 강제 적용)
 # ==========================================
-print("1️⃣ API Routes 업데이트 (SQL 줄바꿈 제거)...")
+print("1️⃣ Main Routes 업데이트 (역슬래시 -> 슬래시 변환)...")
+main_routes_code = r"""from flask import Blueprint, render_template
+from app.database import get_db_connection
+import os
+
+main_bp = Blueprint('main', __name__)
+
+def normalize_path(path):
+    if not path: return ""
+    # 윈도우 역슬래시를 리눅스/웹 표준 슬래시로 변환
+    return path.replace('\\', '/')
+
+@main_bp.route('/')
+def index():
+    conn = get_db_connection()
+    cursor = conn.cursor(as_dict=True)
+    
+    query = "SELECT f.IPAddress, f.Account, f.DisplayName, f.FullPath, ISNULL(f.GroupName, f.IPAddress) as GroupName, ISNULL(f.TaskCount, 0) as TaskCount, ISNULL(f.TotalDuration, 0) as TotalDuration, CONVERT(VARCHAR, f.LastTaskDate, 120) as LastTaskDate, f.LastRuleContent, f.LastRuleName, f.CommonInstruction, CASE WHEN q.TaskID IS NOT NULL THEN 1 ELSE 0 END as IsQueued, CASE WHEN m.MemoContent IS NOT NULL AND LEN(CAST(m.MemoContent AS NVARCHAR(MAX))) > 0 THEN 1 ELSE 0 END as HasMemo FROM cline_FolderIndex f LEFT JOIN cline_TaskQueue q ON f.FullPath = q.ProjectPath AND q.Status IN ('Pending', 'Processing') LEFT JOIN cline_ProjectMemos m ON f.FullPath = m.ProjectPath ORDER BY f.LastTaskDate DESC, f.DisplayName ASC"
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    
+    # [핵심] 여기서 경로를 강제로 세탁해서 HTML로 보냄
+    for row in rows:
+        row['FullPath'] = normalize_path(row['FullPath'])
+        
+    cursor.execute("SELECT SUM(TaskCount) as TotalCalls FROM cline_FolderIndex")
+    stats = cursor.fetchone()
+    total_calls = stats['TotalCalls'] if stats['TotalCalls'] else 0
+
+    conn.close()
+    return render_template('index.html', projects=rows, total_calls=total_calls)
+
+@main_bp.route('/settings')
+def settings():
+    return render_template('settings.html')
+"""
+with open(os.path.join(base_dir, "app", "routes", "main_routes.py"), "w", encoding="utf-8") as f:
+    f.write(main_routes_code)
+
+
+# ==========================================
+# 2. API Routes (디버깅 로그 추가)
+# ==========================================
+print("2️⃣ API Routes 업데이트 (경로 디버깅 로그 추가)...")
 api_routes_code = r"""from flask import Blueprint, request, jsonify
 from app.database import get_db_connection
 from app.services.ssh_service import send_rule_via_ssh
 import subprocess
 import os
+import json
 
 api_bp = Blueprint('api', __name__)
 BRIDGE_API_URL = "http://192.168.0.10:9111"
+
+# --- [DEBUG] Git Logic ---
+@api_bp.route('/git/commit', methods=['POST'])
+def git_commit():
+    data = request.json
+    raw_path = data.get('path')
+    message = data.get('message') or "Auto-commit via AI Bridge"
+    
+    # [DEBUG] 경로 확인용 로그
+    print(f"\n🔍 [Git Request] Path received: '{raw_path}'")
+    
+    if not raw_path:
+        return jsonify({'status': 'error', 'message': 'Path is empty'}), 400
+
+    # 경로 정규화 (혹시 모르니)
+    project_path = os.path.normpath(raw_path)
+    print(f"   -> Normalized Path: '{project_path}'")
+    
+    if not os.path.exists(project_path):
+        print(f"❌ Error: Path does not exist on server filesystem.")
+        return jsonify({'status': 'error', 'message': f"Path not found on server: {project_path}"}), 404
+
+    logs = []
+    try:
+        is_repo = os.path.exists(os.path.join(project_path, '.git'))
+        
+        if not is_repo:
+            logs.append("✨ New project. Initializing Git...")
+            subprocess.run(['git', 'init'], cwd=project_path, check=True)
+            subprocess.run(['git', 'config', 'http.sslVerify', 'false'], cwd=project_path)
+            subprocess.run(['git', 'add', '.'], cwd=project_path, check=True)
+            subprocess.run(['git', 'commit', '-m', 'Initial commit'], cwd=project_path, check=True)
+            logs.append("✅ Init & Commit Done. (Please set remote manually)")
+            return jsonify({'status': 'success', 'output': '\n'.join(logs)})
+        else:
+            # Existing Repo
+            subprocess.run(['git', 'config', 'http.sslVerify', 'false'], cwd=project_path)
+            subprocess.run(['git', 'add', '.'], cwd=project_path, check=True)
+            
+            commit_res = subprocess.run(['git', 'commit', '-m', message], cwd=project_path, capture_output=True, text=True, encoding='utf-8')
+            if commit_res.returncode == 0: logs.append(f"✅ Committed: {message}")
+            elif "nothing to commit" in commit_res.stdout: logs.append("ℹ️ Nothing to commit.")
+            else: logs.append(f"⚠️ Commit Info: {commit_res.stdout}")
+
+            # Check Remote
+            remote_check = subprocess.run(['git', 'remote'], cwd=project_path, capture_output=True, text=True)
+            if remote_check.stdout.strip():
+                logs.append("🚀 Pushing to remote...")
+                push_res = subprocess.run(['git', 'push'], cwd=project_path, capture_output=True, text=True, encoding='utf-8')
+                if push_res.returncode == 0: logs.append("✅ Push Successful!")
+                else: logs.append(f"❌ Push Failed:\n{push_res.stderr}")
+            else:
+                logs.append("⚠️ Committed, but no Remote URL found.")
+            
+            return jsonify({'status': 'success', 'output': '\n'.join(logs)})
+        
+    except Exception as e:
+        print(f"❌ Git Operation Error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# --- Existing Routes ---
 
 @api_bp.route('/open_vscode', methods=['POST'])
 def open_vscode():
@@ -26,7 +131,20 @@ def open_vscode():
     target_ip = data.get('ip')
     user = data.get('account')
     path = data.get('path')
-    cmd = ['code', '--no-sandbox', '--new-window', '--disable-workspace-trust']
+    try:
+        if '\\' in path: path = path.replace('\\', '/')
+        settings_dir = f"{path}/.vscode"
+        settings_file = f"{settings_dir}/settings.json"
+        clean_config = { "workbench.startupEditor": "none", "workbench.tips.enabled": False, "update.showReleaseNotes": False, "security.workspace.trust.enabled": False }
+        json_str = json.dumps(clean_config).replace('"', '\\"')
+        if target_ip in ['127.0.0.1', 'localhost']:
+            os.makedirs(settings_dir, exist_ok=True)
+            with open(os.path.join(path, '.vscode', 'settings.json'), 'w') as f: json.dump(clean_config, f, indent=4)
+        else:
+            subprocess.run(['ssh', f'{user}@{target_ip}', f'mkdir -p "{settings_dir}"'], check=False)
+            subprocess.run(['ssh', f'{user}@{target_ip}', f'echo "{json_str}" > "{settings_file}"'], check=False)
+    except: pass
+    cmd = ['code', '--no-sandbox', '--new-window', '--disable-workspace-trust', '--skip-release-notes']
     remote_arg = f"ssh-remote+{user}@{target_ip}"
     cmd.extend(['--remote', remote_arg, path])
     try:
@@ -34,8 +152,7 @@ def open_vscode():
         if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
         subprocess.Popen(cmd, env=env)
         return jsonify({'status': 'success'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+    except Exception as e: return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @api_bp.route('/stats/dashboard', methods=['GET'])
 def get_dashboard_stats():
@@ -54,7 +171,6 @@ def get_dashboard_stats():
     conn.close()
     return jsonify({'groups': group_counts, 'active': active_counts, 'counts': {'day': {'cnt': d['Cnt'], 'dur': d['Dur']}, 'week': {'cnt': w['Cnt'], 'dur': w['Dur']}, 'month': {'cnt': m['Cnt'], 'dur': m['Dur']}}})
 
-# [FIX] 한 줄 쿼리로 수정됨
 @api_bp.route('/stats/hourly_speed', methods=['GET'])
 def get_hourly_speed():
     conn = get_db_connection()
@@ -184,6 +300,39 @@ def handle_queue():
         conn.close()
         return jsonify({'status': 'success'})
 
+# [NEW] Git History & Restore
+@api_bp.route('/git/history', methods=['POST'])
+def git_history():
+    data = request.json
+    project_path = data.get('path')
+    if not os.path.exists(project_path) or not os.path.exists(os.path.join(project_path, '.git')):
+        return jsonify({'status': 'error', 'message': 'Not a git repository'}), 400
+    try:
+        cmd = ['git', 'log', '-n', '10', '--pretty=format:%h|%an|%ar|%s']
+        result = subprocess.run(cmd, cwd=project_path, capture_output=True, text=True, encoding='utf-8')
+        logs = []
+        if result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 4:
+                    logs.append({'hash': parts[0], 'author': parts[1], 'date': parts[2], 'message': parts[3]})
+        return jsonify({'status': 'success', 'logs': logs})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@api_bp.route('/git/reset', methods=['POST'])
+def git_reset():
+    data = request.json
+    project_path = data.get('path')
+    commit_hash = data.get('hash')
+    if not project_path or not commit_hash:
+        return jsonify({'status': 'error', 'message': 'Missing data'}), 400
+    try:
+        subprocess.run(['git', 'reset', '--hard', commit_hash], cwd=project_path, check=True)
+        return jsonify({'status': 'success', 'message': f'Restored to {commit_hash} successfully.'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @api_bp.route('/history', methods=['POST'])
 def get_history():
     data = request.json
@@ -236,7 +385,6 @@ def agent_next_task():
         conn.close()
         return jsonify({"status": "wait"})
 
-# [FIX] 한 줄 쿼리로 수정됨
 @api_bp.route('/agent/result', methods=['POST'])
 def agent_submit_result():
     data = request.json
@@ -256,216 +404,7 @@ def agent_submit_result():
 with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
     f.write(api_routes_code)
 
-
-# ==========================================
-# 2. Index HTML (Chart.js 포함 버전)
-# ==========================================
-print("2️⃣ Index HTML 업데이트 (Chart.js 모달 포함)...")
-index_html = r"""<!DOCTYPE html>
-<html lang="ko" data-bs-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <title>UNREAL BRIDGE</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        :root {
-            --bg-body: #050508;
-            --bg-panel: rgba(20, 20, 35, 0.6);
-            --bg-panel-hover: rgba(30, 30, 50, 0.7);
-            --border-color: rgba(100, 100, 255, 0.1);
-            --accent-primary: #5c6bc0;
-            --text-main: #e0e0e0;
-            --text-muted: #9fa8da;
-        }
-        body { background: linear-gradient(135deg, #050508 0%, #0a0a1a 100%); color: var(--text-main); font-family: 'Inter', 'Segoe UI', sans-serif; min-height: 100vh; }
-        .navbar { background-color: rgba(10, 10, 20, 0.95) !important; backdrop-filter: blur(10px); border-bottom: 1px solid var(--border-color); z-index: 1050; }
-        
-        .sidebar-container { position: fixed; top: 100px; left: 20px; width: 260px; height: calc(100vh - 120px); overflow-y: auto; padding-right: 10px; scrollbar-width: thin; scrollbar-color: #333 transparent; }
-        .main-content { margin-left: 290px; width: calc(100% - 310px); }
-
-        .stats-box { background: var(--bg-panel); backdrop-filter: blur(10px); border: 1px solid var(--border-color); padding: 20px; border-radius: 16px; margin-bottom: 16px; text-align: center; }
-        .queue-box { background: linear-gradient(135deg, rgba(40, 40, 60, 0.6), rgba(20, 20, 30, 0.6)); border-left: 4px solid var(--accent-primary); cursor: pointer; text-align: left; }
-        .speed-box { background: linear-gradient(135deg, rgba(30, 50, 60, 0.6), rgba(10, 20, 30, 0.6)); border-left: 4px solid #00e5ff; cursor: pointer; text-align: left; }
-        .stats-num { font-size: 1.8rem; font-weight: 700; color: #fff; line-height: 1; }
-        .stats-dur { font-size: 0.85rem; color: var(--text-muted); font-family: monospace; margin-top: 4px; }
-        .stats-label { font-size: 0.75rem; color: #888; text-transform: uppercase; margin-top: 5px; }
-        
-        .bookmark-btn { display: block; width: 100%; text-align: left; margin-bottom: 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-muted); padding: 14px 18px; border-radius: 12px; transition: all 0.2s; text-decoration: none; font-weight: 500; }
-        .bookmark-btn:hover { background: rgba(92, 107, 192, 0.1); color: #fff; border-color: var(--accent-primary); padding-left: 24px; }
-
-        .gganji-search { width: 100%; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-color); border-radius: 12px; padding: 12px 20px 12px 50px; color: #fff; transition: all 0.3s ease; }
-        .gganji-search:focus { background: rgba(255, 255, 255, 0.1); border-color: var(--accent-primary); box-shadow: 0 0 20px rgba(92, 107, 192, 0.3); outline: none; }
-        .search-container { position: relative; width: 100%; max-width: 600px; }
-        .search-icon { position: absolute; left: 20px; top: 50%; transform: translateY(-50%); color: var(--text-muted); }
-        
-        #projectTable { background: var(--bg-panel); backdrop-filter: blur(5px); border-radius: 16px; overflow: hidden; border: 1px solid var(--border-color); width: 100%; }
-        #projectTable thead { background: rgba(0, 0, 0, 0.3); border-bottom: 1px solid var(--border-color); }
-        #projectTable tbody tr { border-bottom: 1px solid rgba(255, 255, 255, 0.03); transition: background 0.2s; }
-        #projectTable tbody tr:hover { background: var(--bg-panel-hover); }
-        
-        .bg-active-job { background: linear-gradient(90deg, rgba(20, 61, 38, 0.4) 0%, rgba(20, 20, 35, 0) 100%) !important; border-left: 3px solid #2e7d32; }
-        .project-path { font-family: 'Consolas', monospace; font-size: 0.85rem; color: #00e5ff !important; opacity: 1; margin-top: 4px; font-weight: 500; }
-        .count-badge { background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-color); color: #fff; font-weight: 700; padding: 6px 12px; border-radius: 8px; min-width: 40px; display: inline-block; }
-        .duration-badge { font-size: 0.75rem; color: #aaa; display: block; margin-top: 2px; font-family: monospace; }
-        .rule-badge { font-size: 0.75rem; color: #5c6bc0; margin-top: 4px; display: block; font-weight: 500; }
-
-        .btn-primary { background-color: var(--accent-primary); border: none; }
-        .modal-content { background: #121218; border: 1px solid var(--border-color); box-shadow: 0 0 50px rgba(0,0,0,0.5); }
-        .modal-xl-custom { max-width: 95% !important; }
-        .markdown-body { font-size: 0.9rem; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; color: #e0e0e0; }
-        .markdown-body pre { background: #1a1a1a; padding: 15px; border-radius: 8px; border: 1px solid #333; }
-        
-        .history-item { border-left: 2px solid #333; padding-left: 20px; margin-bottom: 30px; position: relative; }
-        .history-item::before { content: ''; position: absolute; left: -7px; top: 0; width: 12px; height: 12px; border-radius: 50%; background: #333; }
-        .history-item.done { border-color: #2e7d32; }
-        .history-item.done::before { background: #2e7d32; box-shadow: 0 0 10px rgba(46, 125, 50, 0.5); }
-    </style>
-</head>
-<body>
-    <nav class="navbar navbar-expand-lg navbar-dark py-4 sticky-top">
-        <div class="container-fluid px-4">
-            <a class="navbar-brand fw-bold fs-3 text-white" href="#"><i class="bi bi-hexagon-fill text-primary me-2"></i>UNREAL</a>
-            <div class="search-container mx-auto"><i class="bi bi-search search-icon"></i><input type="text" id="globalSearch" class="gganji-search" placeholder="Search projects..." onkeyup="filterTable()"></div>
-            <div class="d-flex align-items-center gap-3">
-                <div class="text-end me-3"><div class="text-muted small">TOTAL CALLS</div><div class="fw-bold fs-5 text-white">{{ total_calls }}</div></div>
-                <a href="/settings" class="btn btn-outline-secondary rounded-pill px-4"><i class="bi bi-gear-fill me-1"></i> Settings</a>
-            </div>
-        </div>
-    </nav>
-
-    <div class="container-fluid mt-2">
-        <div class="sidebar-container">
-            <div class="stats-box queue-box p-3 mb-3" onclick="openAllQueueModal()">
-                <div class="d-flex justify-content-between align-items-center mb-2"><span class="stats-label text-warning"><i class="bi bi-lightning-fill me-1"></i> Queue</span><i class="bi bi-chevron-right text-muted small"></i></div>
-                <div id="activeStats" class="fs-4 fw-bold text-white">0</div>
-            </div>
-            
-            <div class="stats-box speed-box p-3 mb-4" onclick="openSpeedChart()">
-                <div class="d-flex justify-content-between align-items-center mb-1"><span class="stats-label text-info"><i class="bi bi-speedometer2 me-1"></i> Response Speed</span><i class="bi bi-bar-chart-line text-white"></i></div>
-                <div class="small text-white-50">View Hourly Trends</div>
-            </div>
-
-            <div class="row g-2 mb-4">
-                <div class="col-12"><div class="stats-box p-3"><div class="stats-num text-success" id="dayCount">0</div><div class="stats-dur" id="dayDur">0s</div><div class="stats-label">Today</div></div></div>
-                <div class="col-6"><div class="stats-box p-2"><div class="fs-4 fw-bold text-white" id="weekCount">0</div><div class="stats-dur" id="weekDur">0s</div><div class="stats-label">7 Days</div></div></div>
-                <div class="col-6"><div class="stats-box p-2"><div class="fs-4 fw-bold text-white" id="monthCount">0</div><div class="stats-dur" id="monthDur">0s</div><div class="stats-label">30 Days</div></div></div>
-            </div>
-            <div class="mb-4"><h6 class="text-muted text-uppercase small fw-bold mb-3 ps-1">Quick Access</h6><div id="sidebarBookmarks"></div></div>
-            <div class="text-muted small mt-5 ps-1"><h6 class="text-uppercase mb-3">Groups</h6><div id="groupStats">Loading...</div></div>
-        </div>
-
-        <div class="main-content">
-            <table class="table table-dark table-hover align-middle" id="projectTable">
-                <thead>
-                    <tr class="text-uppercase text-muted small" style="font-size: 0.75rem; letter-spacing: 1px;">
-                        <th style="width: 100px; padding-left: 20px;">Group</th>
-                        <th style="min-width: 420px;">Actions</th>
-                        <th class="text-center" style="width: 100px;">Count</th>
-                        <th>Project Detail</th>
-                        <th>Last Active</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for p in projects %}
-                    <tr class="{{ 'bg-active-job' if p.IsQueued else '' }}">
-                        <td style="padding-left: 20px;"><span class="badge rounded-pill" style="background: rgba(255,255,255,0.1); color: #ccc; font-weight: 400;">{{ p.GroupName }}</span></td>
-                        <td>
-                            <div class="d-flex gap-2 align-items-center">
-                                <button class="btn btn-primary btn-sm rounded-pill px-3" onclick="openVsCode('{{ p.IPAddress }}', '{{ p.Account }}', '{{ p.FullPath }}')" title="Open Code"><i class="bi bi-code-slash"></i></button>
-                                <button class="btn btn-outline-secondary btn-sm rounded-pill px-3 text-white" style="border-color: #2e7d32; background: rgba(46,125,50,0.1);" onclick="openTaskModal('{{ p.DisplayName }}', '{{ p.FullPath }}', `{{ p.CommonInstruction or '' }}`)"><i class="bi bi-plus-lg text-success"></i> Task</button>
-                                <div class="text-center" style="width: 110px;">
-                                    <button class="btn {{ 'btn-sm w-100 rounded-pill' }}" style="{{ 'background: rgba(92,107,192,0.2); border: 1px solid #5c6bc0; color: #fff;' if p.LastRuleName else 'border: 1px solid #444; color: #888;' }}" onclick="openRuleModal('{{ p.DisplayName }}', '{{ p.FullPath }}')"><i class="bi bi-send me-1"></i> Rule</button>
-                                    {% if p.LastRuleName %}<span class="rule-badge text-truncate">{{ p.LastRuleName }}</span>{% endif %}
-                                </div>
-                                <button class="btn btn-sm rounded-circle {{ 'btn-warning text-dark' if p.HasMemo else 'btn-outline-secondary' }}" onclick="openMemoModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" style="width:34px;height:34px; {{ '' if p.HasMemo else 'border-color: #444;' }}"><i class="bi bi-sticky{{ '-fill' if p.HasMemo else '' }}"></i></button>
-                                <button class="btn btn-outline-secondary btn-sm rounded-circle" onclick="openHistoryModal('{{ p.DisplayName }}', '{{ p.FullPath }}')" style="width:34px;height:34px; border-color: #444;"><i class="bi bi-clock-history"></i></button>
-                            </div>
-                        </td>
-                        <td class="text-center"><span class="count-badge">{{ p.TaskCount }}</span><span class="duration-badge" data-seconds="{{ p.TotalDuration }}">{{ p.TotalDuration }}s</span></td>
-                        <td>
-                            <div class="fw-bold text-white" style="font-size: 1.05rem;">{{ p.DisplayName }} {% if p.HasMemo %}<i class="bi bi-sticky-fill text-warning ms-2" style="font-size: 0.8rem;"></i>{% endif %}</div>
-                            <div class="project-path">{{ p.FullPath }}</div>
-                        </td>
-                        <td class="small text-muted">{{ p.LastTaskDate }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <div class="modal fade" id="chartModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header border-secondary"><h5 class="modal-title text-info"><i class="bi bi-speedometer2"></i> Hourly Response Speed (Last 3 Months)</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body bg-dark"><canvas id="speedChart" height="150"></canvas></div></div></div></div>
-    <div class="modal fade" id="allQueueModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title text-warning"><i class="bi bi-lightning-fill"></i> Active Queues</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><ul class="list-group bg-dark" id="allQueueList"></ul></div></div></div></div>
-    <div class="modal fade" id="historyModal" tabindex="-1"><div class="modal-dialog modal-xl-custom modal-dialog-scrollable"><div class="modal-content"><div class="modal-header bg-dark"><h5 class="modal-title text-white"><i class="bi bi-clock-history text-info"></i> History: <span id="histProjectName" class="text-muted ms-2"></span></h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body bg-black"><div id="historyTimeline" class="p-4 container-fluid"></div></div></div></div></div>
-    <div class="modal fade" id="taskModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">New Task: <span id="modalProjectName" class="text-info fw-bold"></span></h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="mb-3 p-3 rounded" style="background: rgba(255,255,255,0.05);"><h6 class="text-muted small">Active Queue</h6><ul class="list-group bg-transparent" id="currentQueueList"></ul></div><div class="form-group mb-3"><label class="text-info small fw-bold">Common Instruction</label><textarea class="form-control bg-dark text-info border-secondary" id="commonInstruction" rows="2"></textarea></div><div class="form-group"><label class="text-white">Command</label><textarea class="form-control bg-dark text-white border-secondary" id="taskContent" rows="4" placeholder="Enter instructions..."></textarea></div></div><div class="modal-footer"><button class="btn btn-success px-4" onclick="submitTask()">Add to Queue</button></div></div></div></div>
-    <div class="modal fade" id="ruleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Deploy Rule</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p class="text-muted">Target: <span id="ruleProjectName" class="text-white fw-bold"></span></p><select class="form-select bg-dark text-white border-secondary mb-3" id="ruleSelect"></select></div><div class="modal-footer"><button class="btn btn-primary w-100" onclick="deployRule()">Deploy Rule via SSH</button></div></div></div></div>
-    <div class="modal fade" id="memoModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Private Memo</h5><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><textarea class="form-control bg-dark text-white border-secondary" id="memoContent" rows="12" style="font-family: monospace;"></textarea></div><div class="modal-footer"><button class="btn btn-primary" onclick="saveMemo()">Save Memo</button></div></div></div></div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        marked.setOptions({ breaks: true, gfm: true });
-        let currentProject='', currentPath='';
-        
-        const taskModal=new bootstrap.Modal(document.getElementById('taskModal')), ruleModal=new bootstrap.Modal(document.getElementById('ruleModal')), memoModal=new bootstrap.Modal(document.getElementById('memoModal')), historyModal=new bootstrap.Modal(document.getElementById('historyModal')), allQueueModal=new bootstrap.Modal(document.getElementById('allQueueModal')), chartModal=new bootstrap.Modal(document.getElementById('chartModal'));
-        let speedChartInstance = null;
-
-        document.addEventListener('DOMContentLoaded', ()=>{ updateDashboardStats(); loadSidebarBookmarks(); formatAllDurations(); setInterval(updateDashboardStats, 5000); setInterval(updateLiveTimers, 1000); });
-
-        function formatDuration(sec) { if(!sec)return "0s"; const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60), s=Math.floor(sec%60); if(h>0)return `${h}h ${m}m`; if(m>0)return `${m}m ${s}s`; return `${s}s`; }
-        function formatAllDurations() { document.querySelectorAll('.duration-badge').forEach(el=>{ el.innerText=formatDuration(el.dataset.seconds); }); }
-        function updateLiveTimers() { const now=new Date(); document.querySelectorAll('.live-timer').forEach(el=>{ const start=new Date(el.dataset.start); const diff=Math.floor((now-start)/1000); el.innerText=`Running for ${formatDuration(diff)}...`; }); }
-        function filterTable(){ const v=document.getElementById('globalSearch').value.toUpperCase(); const tr=document.getElementById('projectTable').getElementsByTagName('tr'); for(let i=1;i<tr.length;i++){ tr[i].style.display=(tr[i].textContent||tr[i].innerText).toUpperCase().indexOf(v)>-1?"":"none"; } }
-
-        function updateDashboardStats() {
-            fetch('/api/stats/dashboard').then(r=>r.json()).then(data=>{ 
-                document.getElementById('groupStats').innerHTML=data.groups.map(g=>`<div class="d-flex justify-content-between mb-2"><span class="text-muted small">${g.GroupName}</span> <span class="badge bg-secondary rounded-pill">${g.Cnt}</span></div>`).join(''); 
-                document.getElementById('activeStats').innerText=data.active.length||0; 
-                document.getElementById('dayCount').innerText=data.counts.day.cnt; document.getElementById('dayDur').innerText=formatDuration(data.counts.day.dur);
-                document.getElementById('weekCount').innerText=data.counts.week.cnt; document.getElementById('weekDur').innerText=formatDuration(data.counts.week.dur);
-                document.getElementById('monthCount').innerText=data.counts.month.cnt; document.getElementById('monthDur').innerText=formatDuration(data.counts.month.dur);
-            }); 
-        }
-        function loadSidebarBookmarks(){ fetch('/api/bookmarks').then(r=>r.json()).then(data=>{ document.getElementById('sidebarBookmarks').innerHTML=data.map(b=>`<a href="${b.URL}" target="_blank" class="bookmark-btn"><i class="bi bi-star-fill bookmark-icon"></i> ${b.Title}</a>`).join(''); }); }
-        
-        function openAllQueueModal(){ fetch('/api/queue').then(r=>r.json()).then(tasks=>{ const l=document.getElementById('allQueueList'); l.innerHTML=tasks.length?tasks.map(t=>`<li class="list-group-item bg-dark text-white border-secondary mb-2 rounded p-3"><div class="d-flex justify-content-between mb-2"><span class="badge bg-warning text-dark">${t.Status}</span><small class="text-info">${t.ProjectName}</small></div><div class="font-monospace small text-muted">${t.TaskContent}</div>${t.Status==='Processing'?`<div class="text-success small mt-2 fw-bold live-timer" data-start="${t.StartedAt}">Calculating...</div>`:''}</li>`).join(''):'<li class="list-group-item bg-dark text-secondary text-center">No active tasks.</li>'; allQueueModal.show(); }); }
-        
-        function openHistoryModal(n,p){ document.getElementById('histProjectName').innerText=n; const d=document.getElementById('historyTimeline'); d.innerHTML='<div class="text-center p-5 text-muted">Loading...</div>'; fetch('/api/history',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})}).then(r=>r.json()).then(rows=>{ if(rows.length===0){ d.innerHTML='<div class="text-center p-5 text-muted">No history found.</div>';return; } d.innerHTML=rows.map(r=>`<div class="history-item ${r.Status==='Done'?'done':'processing'}"><div class="d-flex justify-content-between mb-2"><div><span class="badge ${r.Status==='Done'?'bg-success':'bg-secondary'}">${r.Status}</span> <span class="text-muted ms-2 small">#${r.TaskID}</span></div><div class="text-end"><div class="text-muted small font-monospace">${r.CompletedAt||r.CreatedAt}</div>${r.DurationSeconds?`<div class="text-info small fw-bold">⏱️ ${formatDuration(r.DurationSeconds)}</div>`:''}</div></div><div class="card bg-dark border-secondary mb-3"><div class="card-header border-secondary py-1 text-muted small fw-bold" style="background:rgba(255,255,255,0.05)">REQUEST</div><div class="card-body py-3 text-light" style="white-space: pre-wrap;">${r.TaskContent}</div></div>${r.ResultContent?`<div class="card bg-dark border-success"><div class="card-header border-success py-1 text-success small fw-bold" style="background:rgba(46,125,50,0.1)">RESULT</div><div class="card-body py-3 markdown-body text-light">${marked.parse(r.ResultContent)}</div></div>`:''}</div>`).join(''); }); historyModal.show(); }
-        
-        function openTaskModal(n,p,c){ currentProject=n;currentPath=p;document.getElementById('modalProjectName').innerText=n;document.getElementById('taskContent').value='';document.getElementById('commonInstruction').value=c||'';loadQueue(p);taskModal.show(); }
-        function loadQueue(p){ fetch(`/api/queue?path=${encodeURIComponent(p)}`).then(r=>r.json()).then(tasks=>{ document.getElementById('currentQueueList').innerHTML=tasks.length?tasks.map(t=>`<li class="list-group-item bg-transparent text-white border-secondary d-flex justify-content-between align-items-center"><div><span class="badge bg-warning text-dark me-2">${t.Status}</span><span class="small">${t.TaskContent.substring(0,40)}...</span></div><div>${t.Status==='Processing'?`<span class="text-success small me-2 live-timer" data-start="${t.StartedAt}">...</span>`:''}<button class="btn btn-sm btn-outline-danger border-0" onclick="deleteTask(${t.TaskID})"><i class="bi bi-trash"></i></button></div></li>`).join(''):'<li class="list-group-item bg-transparent text-muted text-center small">Empty queue</li>'; }); }
-        function submitTask(){ const contentEl=document.getElementById('taskContent'),commonEl=document.getElementById('commonInstruction'); if(!contentEl||!commonEl)return; const c=contentEl.value,ci=commonEl.value; if(!c)return; fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:currentProject,path:currentPath,content:c,common_instruction:ci})}).then(()=>{ contentEl.value='';loadQueue(currentPath);updateDashboardStats();location.reload(); }); }
-        function deleteTask(id){ if(confirm('Delete?'))fetch(`/api/queue?id=${id}`,{method:'DELETE'}).then(()=>loadQueue(currentPath)); }
-        function openVsCode(ip,acc,path){ fetch('/api/open_vscode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,account:acc,path})}); }
-        function openRuleModal(n,p){ currentProject=n;currentPath=p;document.getElementById('ruleProjectName').innerText=n;fetch('/api/rules').then(r=>r.json()).then(rules=>{ document.getElementById('ruleSelect').innerHTML=rules.map(r=>`<option value="${r.RuleID}">${r.RuleName}</option>`).join('');ruleModal.show(); }); }
-        function deployRule(){ const id=document.getElementById('ruleSelect').value;fetch('/api/rules/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project_name:currentProject,project_path:currentPath,rule_id:id})}).then(r=>r.json()).then(res=>{ alert(res.message);ruleModal.hide();location.reload(); }); }
-        function openMemoModal(n,p){ currentProject=n;currentPath=p;fetch('/api/memos/get',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})}).then(r=>r.json()).then(d=>{ document.getElementById('memoContent').value=d.content;memoModal.show(); }); }
-        function saveMemo(){ const c=document.getElementById('memoContent').value;fetch('/api/memos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:currentProject,path:currentPath,content:c})}).then(()=>{ memoModal.hide();location.reload(); }); }
-
-        function openSpeedChart() {
-            fetch('/api/stats/hourly_speed').then(r=>r.json()).then(data=>{
-                const ctx = document.getElementById('speedChart').getContext('2d');
-                const hours = Array.from({length:24},(_,i)=>i);
-                const values = hours.map(h=>{ const f=data.find(d=>d.HourOfDay===h); return f?f.AvgSeconds:0; });
-                
-                if(speedChartInstance) speedChartInstance.destroy();
-                speedChartInstance = new Chart(ctx, {
-                    type:'line', data:{labels:hours.map(h=>`${h}h`), datasets:[{label:'Avg Response (sec)', data:values, borderColor:'#00e5ff', backgroundColor:'rgba(0,229,255,0.1)', borderWidth:2, tension:0.4, fill:true, pointBackgroundColor:'#00e5ff'}]},
-                    options:{responsive:true, plugins:{legend:{display:false}}, scales:{y:{grid:{color:'#333'}, ticks:{color:'#aaa'}, beginAtZero:true}, x:{grid:{display:false}, ticks:{color:'#aaa'}}}}
-                });
-                chartModal.show();
-            });
-        }
-    </script>
-</body>
-</html>
-"""
-with open(os.path.join(base_dir, "app", "templates", "index.html"), "w", encoding="utf-8") as f:
-    f.write(index_html)
-
-print("\n✅ v15 Final Fix 완료!")
-print("1. SQL 오류 수정: 모든 쿼리를 한 줄로 평탄화 (No Multi-line strings).")
-print("2. Chart.js 통합: 좌측 사이드바 버튼으로 시간대별 속도 분석 가능.")
-print("👉 'python3 runcline/run_bridge.py' 실행하세요.")
+print("\n✅ v26 업데이트 완료!")
+print("1. Path Normalization: 모든 경로의 역슬래시(\\)를 슬래시(/)로 자동 변환.")
+print("2. Debug Log: Git 요청 시 서버 터미널에 수신된 경로를 출력.")
+print("👉 'python3 runcline/run_bridge.py' 실행 후 에러가 나면 터미널 로그를 확인해주세요!")
