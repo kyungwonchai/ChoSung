@@ -1,27 +1,277 @@
-3단계: 꼬였을 때 푸는 법 (Reset)
-만약 1, 2단계를 했는데도 뭔가 꼬여서 계속 에러가 난다면, 기존 연결 고리를 끊고 다시 연결하는 게 빠릅니다. (파일은 안 지워집니다)
+import os
+import pymssql
 
-터미널에서 순서대로 치세요.
+base_dir = "runcline"
+if not os.path.exists(base_dir):
+    print("❌ 오류: 'runcline' 폴더가 없습니다.")
+    exit()
 
-기존 연결 삭제:
+print("🚀 AI Bridge v38: Absolute Rule Fix & VSCode Button Restoration...")
 
-Bash
-git remote remove origin
-주소 다시 연결 (주소는 본인 걸로 정확히!):
+# ==========================================
+# 1. API Routes (룰 폴더 구조 & 변수 치환 & VSCode 복구)
+# ==========================================
+api_routes_code = r"""from flask import Blueprint, request, jsonify
+from app.database import get_db_connection
+import subprocess
+import os
+import json
+import shlex
+import urllib.request
+import ssl
+import re
+import base64
 
-Bash
-git remote add origin https://github.sec.samsung.net/아이디/프로젝트명.git
-다시 푸시:
+api_bp = Blueprint('api', __name__)
 
-Bash
-git push -u origin main
-요약
-VS Code 터미널을 연다.
+# --- 설정값 (사용자 환경에 맞게 수정 가능) ---
+BRIDGE_API_URL = "http://192.168.0.10:5000" # 브릿지 서버 본인 IP
 
-git push origin main을 쳐본다.
+# --- [CORE] Helper Functions ---
+def run_command(ip, user, path, cmd_list):
+    if '\\' in path: path = path.replace('\\', '/')
+    cmd_str = ' '.join(shlex.quote(arg) for arg in cmd_list)
+    if ip in ['127.0.0.1', 'localhost']:
+        if not os.path.exists(path): return {'code': 1, 'stderr': 'Path not found'}
+        try:
+            env = os.environ.copy(); env["PYTHONIOENCODING"] = "utf-8"
+            res = subprocess.run(cmd_list, cwd=path, capture_output=True, text=True, encoding='utf-8', env=env)
+            return {'code': res.returncode, 'stdout': res.stdout, 'stderr': res.stderr}
+        except Exception as e: return {'code': 1, 'stderr': str(e)}
+    else:
+        ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', f'{user}@{ip}', f"cd {shlex.quote(path)} && {cmd_str}"]
+        try:
+            res = subprocess.run(ssh_cmd, capture_output=True, text=True, encoding='utf-8')
+            return {'code': res.returncode, 'stdout': res.stdout, 'stderr': res.stderr}
+        except Exception as e: return {'code': 1, 'stderr': str(e)}
 
-**"Repository not found"**면 -> 웹사이트 가서 방부터 만드세요. (제일 확률 높음)
+def sanitize_repo_name(name):
+    return "cline_" + re.sub(r'[^a-zA-Z0-9_-]', '_', name)
 
-로그인 실패면 -> 토큰 다시 확인하세요.
+def quick_git_push(ip, user, path, msg):
+    run_command(ip, user, path, ['git', 'config', 'http.sslVerify', 'false'])
+    run_command(ip, user, path, ['git', 'add', '.'])
+    run_command(ip, user, path, ['git', 'commit', '-m', msg])
+    p = run_command(ip, user, path, ['git', 'push', 'origin', 'main'])
+    if p['code'] != 0: run_command(ip, user, path, ['git', 'push', 'origin', 'master'])
 
-이 과정을 거쳐서 터미널에서 성공하면, 웹앱에서도 무조건 됩니다. 터미널에서 무슨 에러가 뜨는지 확인해 보세요.
+# --- [RULE] Fix: .clinerules/absoluterule.md & Placeholders ---
+@api_bp.route('/rules/deploy', methods=['POST'])
+def deploy_rule():
+    data = request.json
+    project_name, project_path, rule_id = data.get('project_name'), data.get('project_path'), data.get('rule_id')
+    
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (rule_id,))
+    rule = cursor.fetchone()
+    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (project_path,))
+    target = cursor.fetchone()
+    
+    if not rule or not target:
+        conn.close(); return jsonify({'status': 'error', 'message': 'Not found'}), 404
+
+    # 1. 동적 변수 치환 (형님이 원하신 핵심)
+    final_content = rule['RuleContent']
+    final_content = final_content.replace('{SUBJECT}', project_name)
+    final_content = final_content.replace('{{PROJECT_NAME}}', project_name)
+    final_content = final_content.replace('{SERVER_URL}', BRIDGE_API_URL)
+    final_content = final_content.replace('{VENV}', 'python') # 혹은 'venv/bin/python' 등 환경에 맞게
+    final_content = final_content.replace('{TARGET_PATH}', project_path.replace('\\', '/'))
+    
+    ip, user = target['IPAddress'], target['Account']
+    rule_dir = os.path.join(project_path, ".clinerules").replace('\\', '/')
+    rule_file = os.path.join(rule_dir, "absoluterule.md").replace('\\', '/')
+    
+    # 특수문자 깨짐 방지 (Base64)
+    b64_content = base64.b64encode(final_content.encode('utf-8')).decode('utf-8')
+    
+    if ip in ['127.0.0.1', 'localhost']:
+        try:
+            if not os.path.exists(rule_dir): os.makedirs(rule_dir, exist_ok=True)
+            with open(rule_file, 'w', encoding='utf-8') as f: f.write(final_content)
+            success = True
+        except Exception as e: success = False; msg = str(e)
+    else:
+        # Remote SSH: 폴더 만들고 파일 쓰기
+        cmd = f"mkdir -p {shlex.quote(rule_dir)} && echo '{b64_content}' | base64 -d > {shlex.quote(rule_file)}"
+        res = run_command(ip, user, '.', ['bash', '-c', cmd])
+        success = (res['code'] == 0)
+        msg = res['stderr'] if not success else ""
+
+    if success:
+        cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (rule['RuleName'], project_path))
+        conn.commit(); conn.close()
+        return jsonify({'status': 'success', 'message': f'Deployed to .clinerules/absoluterule.md'})
+    else:
+        conn.close(); return jsonify({'status': 'error', 'message': f'Failed: {msg}'}), 500
+
+# --- [VSCODE] Restoration: Full Version ---
+@api_bp.route('/open_vscode', methods=['POST'])
+def open_vscode():
+    data = request.json
+    target_ip, user, path = data.get('ip'), data.get('account'), data.get('path')
+    try:
+        # settings.json 자동 세팅 (신뢰 확인 창 안뜨게)
+        if '\\' in path: path = path.replace('\\', '/')
+        settings_dir = f"{path}/.vscode"
+        settings_file = f"{settings_dir}/settings.json"
+        clean_config = { "workbench.startupEditor": "none", "workbench.tips.enabled": False, "update.showReleaseNotes": False, "security.workspace.trust.enabled": False }
+        json_str = json.dumps(clean_config).replace('"', '\\"')
+        
+        if target_ip in ['127.0.0.1', 'localhost']:
+            os.makedirs(settings_dir, exist_ok=True)
+            with open(os.path.join(path, '.vscode', 'settings.json'), 'w') as f: json.dump(clean_config, f, indent=4)
+        else:
+            run_command(target_ip, user, '.', ['mkdir', '-p', settings_dir])
+            run_command(target_ip, user, '.', ['bash', '-c', f'echo "{json_str}" > {settings_file}'])
+            
+        # VSCode 실행 명령어
+        cmd = ['code', '--no-sandbox', '--new-window', '--disable-workspace-trust', '--skip-release-notes']
+        if target_ip in ['127.0.0.1', 'localhost']:
+            cmd.append(path)
+        else:
+            remote_arg = f"ssh-remote+{user}@{target_ip}"
+            cmd.extend(['--remote', remote_arg, path])
+            
+        env = os.environ.copy()
+        if 'DISPLAY' not in env: env['DISPLAY'] = ':0'
+        subprocess.Popen(cmd, env=env)
+        return jsonify({'status': 'success'})
+    except Exception as e: 
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# --- [GIT/STATS/QUEUE] All other routes (100% complete) ---
+@api_bp.route('/stats/dashboard', methods=['GET'])
+def get_dashboard_stats():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT ISNULL(GroupName, IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY ISNULL(GroupName, IPAddress)")
+    groups = cursor.fetchall()
+    cursor.execute("SELECT ISNULL(f.GroupName, f.IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_TaskQueue q JOIN cline_FolderIndex f ON q.ProjectPath = f.FullPath WHERE q.Status IN ('Pending', 'Processing') GROUP BY ISNULL(f.GroupName, f.IPAddress)")
+    active = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(day, -1, GETDATE()) AND Status='Done'")
+    d = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(day, -7, GETDATE()) AND Status='Done'")
+    w = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(month, -1, GETDATE()) AND Status='Done'")
+    m = cursor.fetchone()
+    conn.close()
+    return jsonify({'groups': groups, 'active': active, 'counts': {'day': d, 'week': w, 'month': m}})
+
+@api_bp.route('/stats/hourly_speed', methods=['GET'])
+def get_hourly_speed():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT DATEPART(HOUR, StartedAt) as HourOfDay, AVG(DATEDIFF(SECOND, StartedAt, CompletedAt)) as AvgSeconds, COUNT(*) as SampleSize FROM cline_TaskQueue WHERE Status='Done' AND CreatedAt >= DATEADD(month, -3, GETDATE()) GROUP BY DATEPART(HOUR, StartedAt) ORDER BY HourOfDay")
+    rows = cursor.fetchall(); conn.close(); return jsonify(rows)
+
+@api_bp.route('/git/auto_connect', methods=['POST'])
+def git_auto_connect():
+    data = request.json; ip, user, path, token, nuke = data.get('ip'), data.get('account'), data.get('path'), data.get('token'), data.get('nuke')
+    logs = []
+    if nuke: run_command(ip, user, path, ['rm', '-rf', '.git']); logs.append("🧨 Nuke .git")
+    if run_command(ip, user, path, ['test', '-d', '.git'])['code'] != 0: run_command(ip, user, path, ['git', 'init']); logs.append("✨ Init")
+    repo = sanitize_repo_name(os.path.basename(path.rstrip('/\\')))
+    try:
+        ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+        req = urllib.request.Request("https://github.sec.samsung.net/api/v3/user/repos", data=json.dumps({"name": repo, "private": True}).encode(), headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as res:
+            real_url = json.loads(res.read().decode())['clone_url']
+            logs.append(f"🎉 Created: {repo}")
+    except urllib.error.HTTPError as e:
+        if e.code == 422: real_url = f"https://github.sec.samsung.net/{user}/{repo}.git"; logs.append("ℹ️ Linking existing repo")
+        else: return jsonify({'status': 'error', 'message': str(e)}), 500
+    auth_url = real_url.replace("https://", f"https://{user}:{token}@", 1)
+    run_command(ip, user, path, ['git', 'remote', 'remove', 'origin'])
+    run_command(ip, user, path, ['git', 'remote', 'add', 'origin', auth_url])
+    run_command(ip, user, path, ['git', 'add', '.'])
+    run_command(ip, user, path, ['git', 'commit', '-m', 'Auto-Link Init'])
+    run_command(ip, user, path, ['git', 'config', 'http.sslVerify', 'false'])
+    p = run_command(ip, user, path, ['git', 'push', '-u', 'origin', 'main'])
+    if p['code'] != 0: p = run_command(ip, user, path, ['git', 'push', '-u', 'origin', 'master'])
+    if p['code'] == 0:
+        conn = get_db_connection(); cursor = conn.cursor()
+        cursor.execute("UPDATE cline_FolderIndex SET RemoteURL=%s, LastGitDate=GETDATE() WHERE FullPath=%s", (real_url, path))
+        conn.commit(); conn.close()
+        return jsonify({'status': 'success', 'output': '\n'.join(logs)})
+    return jsonify({'status': 'error', 'message': p['stderr']})
+
+@api_bp.route('/bookmarks', methods=['GET', 'POST', 'DELETE'])
+def handle_bookmarks():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT * FROM cline_WebBookmarks ORDER BY CreatedAt ASC"); rows = cursor.fetchall(); conn.close(); return jsonify(rows)
+    if request.method == 'POST':
+        d = request.json; cursor.execute("INSERT INTO cline_WebBookmarks (Title, URL) VALUES (%s, %s)", (d.get('title'), d.get('url'))); conn.commit(); conn.close(); return jsonify({'status': 'success'})
+    if request.method == 'DELETE':
+        cursor.execute("DELETE FROM cline_WebBookmarks WHERE BookmarkID=%s", (request.args.get('id'),)); conn.commit(); conn.close(); return jsonify({'status': 'success'})
+
+@api_bp.route('/memos', methods=['POST'])
+def handle_memo_post():
+    d = request.json; conn = get_db_connection(); cursor = conn.cursor()
+    sql = "MERGE cline_ProjectMemos AS t USING (SELECT %s as PPath, %s as PName) AS s ON (t.ProjectPath = s.PPath) WHEN MATCHED THEN UPDATE SET MemoContent = %s, UpdatedAt = GETDATE() WHEN NOT MATCHED THEN INSERT (ProjectName, ProjectPath, MemoContent) VALUES (%s, %s, %s);"
+    cursor.execute(sql, (d['path'], d['project'], d['content'], d['project'], d['path'], d['content'])); conn.commit(); conn.close(); return jsonify({'status': 'success'})
+
+@api_bp.route('/memos/get', methods=['POST'])
+def handle_memo_get():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT MemoContent FROM cline_ProjectMemos WHERE ProjectPath=%s", (request.json.get('path'),)); row = cursor.fetchone(); conn.close(); return jsonify({'content': row['MemoContent'] if row else ''})
+
+@api_bp.route('/queue', methods=['GET', 'POST', 'DELETE'])
+def handle_queue():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        p = request.args.get('path')
+        if p: cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status, CONVERT(VARCHAR, StartedAt, 120) as StartedAt FROM cline_TaskQueue WHERE ProjectPath=%s AND Status IN ('Pending', 'Processing') ORDER BY TaskID", (p,))
+        else: cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status, CONVERT(VARCHAR, StartedAt, 120) as StartedAt FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing') ORDER BY ProjectName, TaskID")
+        rows = cursor.fetchall(); conn.close(); return jsonify(rows)
+    if request.method == 'POST':
+        d = request.json; ci = d.get('common_instruction', '')
+        fc = d['content'] + (f"\n\n[SYSTEM NOTICE: ALWAYS EXECUTE THIS]\n{ci}" if ci.strip() else "")
+        cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, ProjectPath, TaskContent) VALUES (%s, %s, %s)", (d['project'], d['path'], fc))
+        cursor.execute("UPDATE cline_FolderIndex SET TaskCount = ISNULL(TaskCount, 0) + 1, LastTaskDate = GETDATE(), CommonInstruction = %s WHERE FullPath=%s", (ci, d['path']))
+        conn.commit(); conn.close(); return jsonify({'status': 'success'})
+    if request.method == 'DELETE':
+        cursor.execute("DELETE FROM cline_TaskQueue WHERE TaskID=%s", (request.args.get('id'),)); conn.commit(); conn.close(); return jsonify({'status': 'success'})
+
+@api_bp.route('/history', methods=['POST'])
+def get_task_history():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT TaskID, TaskContent, Status, ResultContent, CONVERT(VARCHAR, CreatedAt, 120) as CreatedAt, CONVERT(VARCHAR, CompletedAt, 120) as CompletedAt, DATEDIFF(SECOND, StartedAt, CompletedAt) as DurationSeconds FROM cline_TaskQueue WHERE ProjectPath=%s ORDER BY TaskID DESC", (request.json.get('path'),)); rows = cursor.fetchall(); conn.close(); return jsonify(rows)
+
+@api_bp.route('/agent/next', methods=['POST'])
+def agent_next_task():
+    data = request.json; project_name = data.get('subject'); conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT TOP 1 TaskID, TaskContent, ProjectPath FROM cline_TaskQueue WHERE ProjectName=%s AND Status='Pending' ORDER BY TaskID ASC", (project_name,))
+    task = cursor.fetchone()
+    if task:
+        cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (task['ProjectPath'],))
+        info = cursor.fetchone()
+        if info: quick_git_push(info['IPAddress'], info['Account'], task['ProjectPath'], f"Auto-Backup: Task #{task['TaskID']}")
+        cursor.execute("UPDATE cline_TaskQueue SET Status='Processing', StartedAt=GETDATE() WHERE TaskID=%s", (task['TaskID'],))
+        conn.commit(); conn.close(); return jsonify({"status": "ok", "log_id": task['TaskID'], "command": task['TaskContent'], "path": task['ProjectPath']})
+    conn.close(); return jsonify({"status": "wait"})
+
+@api_bp.route('/agent/result', methods=['POST'])
+def agent_submit_result():
+    data = request.json; task_id, res_cont, proj_name = data.get('log_id'), data.get('result'), data.get('subject'); conn = get_db_connection(); cursor = conn.cursor()
+    cursor.execute("UPDATE cline_TaskQueue SET Status='Done', CompletedAt=GETDATE(), ResultContent=%s WHERE TaskID=%s", (res_cont, task_id))
+    if proj_name:
+        cursor.execute("SELECT FullPath, IPAddress, Account FROM cline_FolderIndex WHERE DisplayName=%s", (proj_name,))
+        row = cursor.fetchone()
+        if row:
+            quick_git_push(row[1], row[2], row[0], f"Auto-Push: Task #{task_id} Done")
+            cursor.execute("UPDATE cline_FolderIndex SET LastTaskDate=GETDATE(), LastGitDate=GETDATE() WHERE DisplayName=%s", (proj_name,))
+    conn.commit(); conn.close(); return jsonify({"status": "received"})
+
+@api_bp.route('/rules', methods=['GET'])
+def get_rules():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC"); rules = cursor.fetchall(); conn.close(); return jsonify(rules)
+"""
+with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
+    f.write(api_routes_code)
+
+# (Index.html은 이전 v37의 검색 유지 로직이 이미 잘 구현되어 있으므로 그대로 유지됩니다)
+print("\n✅ v38 Complete: Rule Path, Placeholders, and VSCode Button Fixed.")
+print("👉 룰 배포 시 이제 .clinerules/absoluterule.md 로 정확히 들어갑니다.")
+print("👉 웹에서 VSCode 실행 버튼도 다시 살려놨습니다.")
