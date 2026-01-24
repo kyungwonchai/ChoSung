@@ -1,157 +1,154 @@
 import os
-import re
 
 base_dir = "runcline"
 if not os.path.exists(base_dir):
-    print("❌ 오류: 'runcline' 폴더가 없습니다. 경로를 확인하세요.")
+    print("❌ 프로젝트 폴더가 없습니다.")
     exit()
 
-print("🔥 AI Bridge v47: Ghost Variable Hunting & System Full Restore...")
+print("🔥 [CORE RESTORE] v56: All Systems Go (Port 9111 & DB 1633)...")
 
-# ---------------------------------------------------------
-# 1단계: 전수 조사 및 오타 수정 (Ghost Hunter)
-# ---------------------------------------------------------
-print("🔎 1. 모든 파일에서 'cline_ip' 오타를 찾아 'visitor_ip'로 강제 치환합니다...")
-for root, dirs, files in os.walk(base_dir):
-    for file in files:
-        if file.endswith(".py") or file.endswith(".html"):
-            path = os.path.join(root, file)
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            if "cline_ip" in content:
-                print(f"   ㄴ [FIXED] 오타 발견 및 수정: {path}")
-                new_content = content.replace("cline_ip", "visitor_ip")
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+# 1. database.py (형님 고정 정보: AgentBuilderSR, 1633)
+db_code = r"""import pymssql
+def get_db_connection():
+    return pymssql.connect(
+        server='127.0.0.1', 
+        port='1633',        
+        user='sa', 
+        password='password', # 본인 비번 확인
+        database='AgentBuilderSR', 
+        charset='utf8'
+    )
+"""
+with open(os.path.join(base_dir, "app", "database.py"), "w", encoding="utf-8") as f: f.write(db_code)
 
-# ---------------------------------------------------------
-# 2단계: run_bridge.py (메인 파일) 깔끔하게 밀어버리기
-# ---------------------------------------------------------
-print("🚿 2. 메인 엔트리 파일(run_bridge.py)을 클린 상태로 복구합니다...")
-run_bridge_code = r"""from flask import Flask, render_template
+# 2. api_routes.py (IP 10.244.120.24, 집계 로직, 큐, 룰 전송 정밀 수리)
+api_code = r"""from flask import Blueprint, request, jsonify, abort
+from app.database import get_db_connection
+import subprocess, os, json, shlex, base64
+
+api_bp = Blueprint('api', __name__)
+
+# 🛡️ [IP WHITELIST]
+IP_WHITELIST = ["127.0.0.1", "localhost", "10.244.120.24"]
+
+@api_bp.before_app_request
+def gate():
+    if request.path.startswith('/static'): return
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    if ip not in IP_WHITELIST:
+        return jsonify({"error": "Unauthorized", "ip": ip}), 403
+
+# --- [STATS] 집계 카운터 (Key: cnt 일치) ---
+@api_bp.route('/api/stats/dashboard', methods=['GET'])
+def get_dash():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    # 그룹별 통계
+    cursor.execute("SELECT ISNULL(GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY GroupName")
+    groups = cursor.fetchall()
+    
+    def gs(days):
+        sql = f"SELECT COUNT(*) as cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as dur FROM cline_TaskQueue WHERE Status='Done' AND CompletedAt >= DATEADD(day, -{days}, GETDATE())"
+        cursor.execute(sql); return cursor.fetchone()
+    
+    res = {'groups': groups, 'counts': {'day': gs(1), 'week': gs(7), 'month': gs(30)}}
+    conn.close(); return jsonify(res)
+
+# --- [RULES] 전송 및 수정 (Undefined 방지) ---
+@api_bp.route('/api/rules', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def handle_rules():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC")
+        res = cursor.fetchall(); conn.close(); return jsonify(res)
+    d = request.json
+    if request.method == 'POST':
+        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (d['name'], d['content']))
+    elif request.method == 'PUT':
+        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (d['name'], d['content'], d['id']))
+    elif request.method == 'DELETE':
+        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (request.args.get('id'),))
+    conn.commit(); conn.close(); return jsonify({'status': 'success'})
+
+@api_bp.route('/api/rules/deploy', methods=['POST'])
+def deploy():
+    d = request.json
+    if not d.get('rule_id'): return jsonify({'status': 'error', 'message': 'Missing rule_id'}), 400
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (d['rule_id'],))
+    r = cursor.fetchone()
+    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (d['project_path'],))
+    t = cursor.fetchone()
+    
+    if not r or not t: return jsonify({'status': 'error', 'message': 'Not Found'})
+    
+    content = r['RuleContent'].replace('{SUBJECT}', d['project_name']).replace('{TARGET_PATH}', d['project_path'].replace('\\', '/'))
+    r_dir = os.path.join(d['project_path'], ".clinerules").replace('\\', '/')
+    r_file = os.path.join(r_dir, "absoluterule.md").replace('\\', '/')
+    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+    
+    if t['IPAddress'] in ['127.0.0.1', 'localhost']:
+        os.makedirs(r_dir, exist_ok=True)
+        with open(r_file, 'w', encoding='utf-8') as f: f.write(content)
+        ok = True
+    else:
+        cmd = f"mkdir -p {shlex.quote(r_dir)} && echo '{b64}' | base64 -d > {shlex.quote(r_file)}"
+        subprocess.run(['ssh', f"{t['Account']}@{t['IPAddress']}", cmd]); ok = True
+    
+    if ok: 
+        cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (r['RuleName'], d['project_path']))
+        conn.commit()
+    conn.close(); return jsonify({'status': 'success'})
+
+# --- [QUEUE/VSCODE] ---
+@api_bp.route('/api/queue', methods=['GET', 'POST', 'DELETE'])
+def handle_q():
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
+    if request.method == 'GET':
+        cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status, CONVERT(VARCHAR, StartedAt, 120) as StartedAt FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing')")
+        r = cursor.fetchall(); conn.close(); return jsonify(r)
+    if request.method == 'POST':
+        d = request.json
+        cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, ProjectPath, TaskContent) VALUES (%s, %s, %s)", (d['project'], d['path'], d['content']))
+        conn.commit(); conn.close(); return jsonify({'status': 'success'})
+    return jsonify([])
+
+@api_bp.route('/api/open_vscode', methods=['POST'])
+def open_v():
+    d = request.json
+    cmd = ['code', '--new-window']
+    if d['ip'] not in ['127.0.0.1', 'localhost']: cmd.extend(['--remote', f"ssh-remote+{d['account']}@{d['ip']}", d['path']])
+    else: cmd.append(d['path'])
+    subprocess.Popen(cmd, env=os.environ.copy()); return jsonify({'status': 'success'})
+"""
+with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f: f.write(api_code)
+
+# 3. run_bridge.py (서비스 포트 9111 설정)
+main_code = r"""from flask import Flask, render_template
 from app.routes.api_routes import api_bp
 from app.database import get_db_connection
-import os
 
 app = Flask(__name__, static_folder='app/static', template_folder='app/templates')
-app.secret_key = 'kw_unreal_secret_key'
-
-# 블루프린트 등록
+app.secret_key = 'kw_final_v56'
 app.register_blueprint(api_bp)
 
 @app.route('/')
 def index():
-    conn = get_db_connection()
-    cursor = conn.cursor(as_dict=True)
+    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
     cursor.execute("SELECT * FROM cline_FolderIndex ORDER BY GroupName, DisplayName")
     projects = cursor.fetchall()
-    
     cursor.execute("SELECT COUNT(*) as cnt FROM cline_TaskQueue")
-    total_calls = cursor.fetchone()['cnt']
+    total = cursor.fetchone()['cnt']
     conn.close()
-    return render_template('index.html', projects=projects, total_calls=total_calls)
+    return render_template('index.html', projects=projects, total_calls=total)
+
+@app.route('/settings')
+def settings():
+    return render_template('settings.html')
 
 if __name__ == '__main__':
-    # 0.0.0.0으로 열어야 외부 접속이 됩니다.
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # 형님이 주신 서비스 포트 9111
+    app.run(host='0.0.0.0', port=9111, debug=True)
 """
-with open(os.path.join(base_dir, "run_bridge.py"), "w", encoding="utf-8") as f:
-    f.write(run_bridge_code)
+with open(os.path.join(base_dir, "run_bridge.py"), "w", encoding="utf-8") as f: f.write(main_code)
 
-# ---------------------------------------------------------
-# 3단계: api_routes.py (진입로) 완벽 재건축
-# ---------------------------------------------------------
-print("🏗️ 3. API 진입로(api_routes.py)를 무결점 상태로 재설치합니다...")
-api_routes_code = r"""from flask import Blueprint, request, jsonify, abort
-from app.database import get_db_connection
-import subprocess, os, json, shlex, urllib.request, ssl, re, base64
-
-api_bp = Blueprint('api', __name__)
-
-# ==========================================
-# 🛡️ [IP 화이트리스트] - 형님 아이피를 여기에 넣으세요
-# ==========================================
-IP_WHITELIST = ["127.0.0.1", "localhost", "192.168.0.10"] 
-
-def get_visitor_ip():
-    # 사내 프록시 등을 고려한 IP 추출 (오타 절대 없음)
-    xf = request.headers.get('X-Forwarded-For')
-    if xf: return xf.split(',')[0].strip()
-    return request.remote_addr
-
-@api_bp.before_app_request
-def security_gate():
-    if request.path.startswith('/static'): return
-    
-    # 변수명 통일: visitor_ip
-    visitor_ip = get_visitor_ip()
-    
-    # 터미널에 대문짝만하게 찍어줍니다.
-    print(f"\n📡 [ACCESS_LOG] IP: {visitor_ip} | PATH: {request.path}")
-
-    if visitor_ip not in IP_WHITELIST:
-        print(f"🚫 [BLOCKED] Unauthorized access from: {visitor_ip}")
-        # 접속 거부 메시지에 현재 아이피를 보여줘서 바로 리스트에 넣게 함
-        abort(403, description=f"Unauthorized IP: {visitor_ip}")
-
-# --- [RESTORED API LIST] ---
-@api_bp.route('/stats/dashboard', methods=['GET'])
-def get_dashboard_stats():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT ISNULL(GroupName, IPAddress) as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY ISNULL(GroupName, IPAddress)")
-    g = cursor.fetchall()
-    def gs(sql):
-        cursor.execute(sql); r = cursor.fetchone()
-        return {'cnt': r['Cnt'], 'dur': r['Dur']} if r else {'cnt': 0, 'dur': 0}
-    d = gs("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(day, -1, GETDATE()) AND Status='Done'")
-    w = gs("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(day, -7, GETDATE()) AND Status='Done'")
-    m = gs("SELECT COUNT(*) as Cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as Dur FROM cline_TaskQueue WHERE CreatedAt >= DATEADD(month, -1, GETDATE()) AND Status='Done'")
-    conn.close(); return jsonify({'groups': g, 'active': [], 'counts': {'day': d, 'week': w, 'month': m}})
-
-@api_bp.route('/rules/deploy', methods=['POST'])
-def deploy_rule():
-    data = request.json
-    p_name, p_path, r_id = data.get('project_name'), data.get('project_path'), data.get('rule_id')
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (r_id,))
-    rule = cursor.fetchone()
-    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (p_path,))
-    tgt = cursor.fetchone()
-    if not rule or not tgt: conn.close(); return jsonify({'status': 'error', 'message': 'Not found'})
-    f_content = rule['RuleContent'].replace('{SUBJECT}', p_name).replace('{TARGET_PATH}', p_path.replace('\\', '/'))
-    r_dir = os.path.join(p_path, ".clinerules").replace('\\', '/')
-    r_file = os.path.join(r_dir, "absoluterule.md").replace('\\', '/')
-    b64 = base64.b64encode(f_content.encode('utf-8')).decode('utf-8')
-    if tgt['IPAddress'] in ['127.0.0.1', 'localhost']:
-        os.makedirs(r_dir, exist_ok=True)
-        with open(r_file, 'w', encoding='utf-8') as f: f.write(f_content)
-        ok = True
-    else:
-        cmd = f"mkdir -p {shlex.quote(r_dir)} && echo '{b64}' | base64 -d > {shlex.quote(r_file)}"
-        res = subprocess.run(['ssh', f"{tgt['Account']}@{tgt['IPAddress']}", cmd], capture_output=True, text=True)
-        ok = (res.returncode == 0)
-    if ok: cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (rule['RuleName'], p_path)); conn.commit()
-    conn.close(); return jsonify({'status': 'success' if ok else 'error'})
-
-@api_bp.route('/queue', methods=['GET', 'POST', 'DELETE'])
-def handle_queue():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing')")
-        r = cursor.fetchall(); conn.close(); return jsonify(r)
-    if request.method == 'POST':
-        d = request.json; cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, ProjectPath, TaskContent) VALUES (%s, %s, %s)", (d['project'], d['path'], d['content']))
-        conn.commit(); conn.close(); return jsonify({'status': 'success'})
-    return jsonify([])
-
-@api_bp.route('/bookmarks', methods=['GET'])
-def get_bookmarks():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True); cursor.execute("SELECT * FROM cline_WebBookmarks"); r = cursor.fetchall(); conn.close(); return jsonify(r)
-"""
-with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f:
-    f.write(api_routes_code)
-
-print("\n✨ [COMPLETE] 모든 파일의 유령 오타를 제거하고 시스템을 복구했습니다.")
-print("👉 이제 'python3 run_bridge.py'를 실행하세요.")
-print("👉 만약 접속이 거부되면 터미널에 찍히는 [ACCESS_LOG]의 아이피를 확인하세요.")
+print("\n✨ v56 복구 완료! 서비스 포트: 9111 / DB: AgentBuilderSR (1633)")
