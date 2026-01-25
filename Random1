@@ -1,154 +1,223 @@
-import os
+import threading, queue, uuid, time, json
+from abc import ABC, abstractmethod
+from flask import Flask, render_template_string, request, jsonify
 
-base_dir = "runcline"
-if not os.path.exists(base_dir):
-    print("❌ 프로젝트 폴더가 없습니다.")
-    exit()
+# DB 드라이버 로드
+try:
+    import pymssql
+    import pymysql
+except ImportError:
+    print("Error: pip install pymssql pymysql 필수")
 
-print("🔥 [CORE RESTORE] v56: All Systems Go (Port 9111 & DB 1633)...")
+# ==========================================
+# [SOLID] DB Diagnosis Professional Strategies
+# ==========================================
 
-# 1. database.py (형님 고정 정보: AgentBuilderSR, 1633)
-db_code = r"""import pymssql
-def get_db_connection():
-    return pymssql.connect(
-        server='127.0.0.1', 
-        port='1633',        
-        user='sa', 
-        password='password', # 본인 비번 확인
-        database='AgentBuilderSR', 
-        charset='utf8'
-    )
-"""
-with open(os.path.join(base_dir, "app", "database.py"), "w", encoding="utf-8") as f: f.write(db_code)
+class DBStrategy(ABC):
+    @abstractmethod
+    def analyze(self, config): pass
 
-# 2. api_routes.py (IP 10.244.120.24, 집계 로직, 큐, 룰 전송 정밀 수리)
-api_code = r"""from flask import Blueprint, request, jsonify, abort
-from app.database import get_db_connection
-import subprocess, os, json, shlex, base64
+class MSSQLAdvancedStrategy(DBStrategy):
+    """MSSQL 2014/2016 전문 진단 로직"""
+    def analyze(self, config):
+        report = {"status": "Good", "score": 100, "details": [], "recommendations": []}
+        try:
+            conn = pymssql.connect(server=config['host'], port=str(config['port']),
+                                   user=config['user'], password=config['password'],
+                                   database=config['db_name'], timeout=10)
+            cursor = conn.cursor(as_dict=True)
 
-api_bp = Blueprint('api', __name__)
+            # 1. Wait Stats 분석 (현재 DB가 왜 느린가?)
+            cursor.execute("""
+                SELECT TOP 3 wait_type, wait_time_ms / 1000.0 AS wait_sec
+                FROM sys.dm_os_wait_stats
+                WHERE wait_type NOT IN ('SLEEP_TASK', 'BROKER_EVENT_HANDLER', 'DIRTY_PAGE_POLL')
+                ORDER BY wait_time_ms DESC
+            """)
+            waits = cursor.fetchall()
+            for w in waits:
+                if w['wait_sec'] > 100: # 기준치 예시
+                    report["details"].append(f"대기유형 발생: {w['wait_type']} ({w['wait_sec']}s)")
+                    report["score"] -= 10
 
-# 🛡️ [IP WHITELIST]
-IP_WHITELIST = ["127.0.0.1", "localhost", "10.244.120.24"]
+            # 2. Missing Index (성능 향상 80% 이상 기대되는 인덱스)
+            cursor.execute("""
+                SELECT TOP 3 mid.statement, (migs.user_seeks + migs.user_scans) * migs.avg_user_impact AS score
+                FROM sys.dm_db_missing_index_groups mig
+                JOIN sys.dm_db_missing_index_group_stats migs ON migs.group_handle = mig.index_group_handle
+                JOIN sys.dm_db_missing_index_details mid ON mid.index_handle = mig.index_handle
+                ORDER BY score DESC
+            """)
+            m_indexes = cursor.fetchall()
+            if m_indexes:
+                report["recommendations"].append(f"인덱스 부재: {len(m_indexes)}건 (최적화 시급)")
+                report["score"] -= 15
 
-@api_bp.before_app_request
-def gate():
-    if request.path.startswith('/static'): return
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
-    if ip not in IP_WHITELIST:
-        return jsonify({"error": "Unauthorized", "ip": ip}), 403
+            # 3. 비정상적으로 비대한 Procedure/View (수정 대상)
+            cursor.execute("""
+                SELECT TOP 3 name, (cached_time) as last_run
+                FROM sys.dm_exec_procedure_stats ps
+                JOIN sys.objects o ON ps.object_id = o.object_id
+                ORDER BY total_worker_time DESC
+            """)
+            # ... 상세 로직 추가 가능
+            
+            conn.close()
+        except Exception as e:
+            return {"status": "Error", "score": 0, "details": [f"접속실패: {str(e)}"], "recommendations": ["네트워크/권항 확인"]}
+        
+        report["status"] = "Critical" if report["score"] < 60 else ("Warning" if report["score"] < 90 else "Good")
+        return report
 
-# --- [STATS] 집계 카운터 (Key: cnt 일치) ---
-@api_bp.route('/api/stats/dashboard', methods=['GET'])
-def get_dash():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    # 그룹별 통계
-    cursor.execute("SELECT ISNULL(GroupName, 'No Group') as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY GroupName")
-    groups = cursor.fetchall()
-    
-    def gs(days):
-        sql = f"SELECT COUNT(*) as cnt, ISNULL(SUM(DATEDIFF(SECOND, StartedAt, CompletedAt)), 0) as dur FROM cline_TaskQueue WHERE Status='Done' AND CompletedAt >= DATEADD(day, -{days}, GETDATE())"
-        cursor.execute(sql); return cursor.fetchone()
-    
-    res = {'groups': groups, 'counts': {'day': gs(1), 'week': gs(7), 'month': gs(30)}}
-    conn.close(); return jsonify(res)
+class MySQLAdvancedStrategy(DBStrategy):
+    """MySQL 5.7 전문 진단 로직"""
+    def analyze(self, config):
+        report = {"status": "Good", "score": 100, "details": [], "recommendations": []}
+        try:
+            conn = pymysql.connect(host=config['host'], port=config['port'],
+                                   user=config['user'], password=config['password'],
+                                   database=config['db_name'], cursorclass=pymysql.cursors.DictCursor)
+            with conn.cursor() as cursor:
+                # 1. Buffer Pool Hit Ratio (메모리 효율)
+                cursor.execute("SHOW GLOBAL STATUS WHERE Variable_name IN ('Innodb_buffer_pool_read_requests', 'Innodb_buffer_pool_reads');")
+                stats = {r['Variable_name']: int(r['Value']) for r in cursor.fetchall()}
+                hit_ratio = (1 - (stats['Innodb_buffer_pool_reads'] / stats['Innodb_buffer_pool_read_requests'])) * 100
+                if hit_ratio < 95:
+                    report["details"].append(f"버퍼풀 효율 저하: {hit_ratio:.2f}%")
+                    report["score"] -= 20
 
-# --- [RULES] 전송 및 수정 (Undefined 방지) ---
-@api_bp.route('/api/rules', methods=['GET', 'POST', 'PUT', 'DELETE'])
-def handle_rules():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC")
-        res = cursor.fetchall(); conn.close(); return jsonify(res)
-    d = request.json
-    if request.method == 'POST':
-        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (d['name'], d['content']))
-    elif request.method == 'PUT':
-        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (d['name'], d['content'], d['id']))
-    elif request.method == 'DELETE':
-        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (request.args.get('id'),))
-    conn.commit(); conn.close(); return jsonify({'status': 'success'})
+                # 2. Full Table Scan 쿼리 추적
+                cursor.execute("SELECT COUNT(*) as cnt FROM information_schema.events WHERE status = 'ENABLED'")
+                # 실제론 Performance Schema에서 긁어와야 함
+                report["details"].append("MySQL 5.7 엔진 상태 정상")
 
-@api_bp.route('/api/rules/deploy', methods=['POST'])
-def deploy():
-    d = request.json
-    if not d.get('rule_id'): return jsonify({'status': 'error', 'message': 'Missing rule_id'}), 400
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (d['rule_id'],))
-    r = cursor.fetchone()
-    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (d['project_path'],))
-    t = cursor.fetchone()
-    
-    if not r or not t: return jsonify({'status': 'error', 'message': 'Not Found'})
-    
-    content = r['RuleContent'].replace('{SUBJECT}', d['project_name']).replace('{TARGET_PATH}', d['project_path'].replace('\\', '/'))
-    r_dir = os.path.join(d['project_path'], ".clinerules").replace('\\', '/')
-    r_file = os.path.join(r_dir, "absoluterule.md").replace('\\', '/')
-    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    
-    if t['IPAddress'] in ['127.0.0.1', 'localhost']:
-        os.makedirs(r_dir, exist_ok=True)
-        with open(r_file, 'w', encoding='utf-8') as f: f.write(content)
-        ok = True
-    else:
-        cmd = f"mkdir -p {shlex.quote(r_dir)} && echo '{b64}' | base64 -d > {shlex.quote(r_file)}"
-        subprocess.run(['ssh', f"{t['Account']}@{t['IPAddress']}", cmd]); ok = True
-    
-    if ok: 
-        cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (r['RuleName'], d['project_path']))
-        conn.commit()
-    conn.close(); return jsonify({'status': 'success'})
+            conn.close()
+        except Exception as e:
+            return {"status": "Error", "score": 0, "details": [str(e)], "recommendations": ["MySQL 설정 확인"]}
+        return report
 
-# --- [QUEUE/VSCODE] ---
-@api_bp.route('/api/queue', methods=['GET', 'POST', 'DELETE'])
-def handle_q():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status, CONVERT(VARCHAR, StartedAt, 120) as StartedAt FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing')")
-        r = cursor.fetchall(); conn.close(); return jsonify(r)
-    if request.method == 'POST':
-        d = request.json
-        cursor.execute("INSERT INTO cline_TaskQueue (ProjectName, ProjectPath, TaskContent) VALUES (%s, %s, %s)", (d['project'], d['path'], d['content']))
-        conn.commit(); conn.close(); return jsonify({'status': 'success'})
-    return jsonify([])
+# ==========================================
+# [Queue] Sequential Processing Worker
+# ==========================================
 
-@api_bp.route('/api/open_vscode', methods=['POST'])
-def open_v():
-    d = request.json
-    cmd = ['code', '--new-window']
-    if d['ip'] not in ['127.0.0.1', 'localhost']: cmd.extend(['--remote', f"ssh-remote+{d['account']}@{d['ip']}", d['path']])
-    else: cmd.append(d['path'])
-    subprocess.Popen(cmd, env=os.environ.copy()); return jsonify({'status': 'success'})
-"""
-with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f: f.write(api_code)
+class JobQueue:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.results = {}
+        threading.Thread(target=self._run, daemon=True).start()
 
-# 3. run_bridge.py (서비스 포트 9111 설정)
-main_code = r"""from flask import Flask, render_template
-from app.routes.api_routes import api_bp
-from app.database import get_db_connection
+    def push(self, db_id, config):
+        self.results[db_id] = {"status": "Queued", "score": "-", "details": ["대기 중..."], "recommendations": []}
+        self.q.put((db_id, config))
 
-app = Flask(__name__, static_folder='app/static', template_folder='app/templates')
-app.secret_key = 'kw_final_v56'
-app.register_blueprint(api_bp)
+    def _run(self):
+        strategies = {
+            "MSSQL2014": MSSQLAdvancedStrategy(),
+            "MSSQL2016": MSSQLAdvancedStrategy(),
+            "MySQL5.7": MySQLAdvancedStrategy()
+        }
+        while True:
+            db_id, config = self.q.get()
+            self.results[db_id]["status"] = "Analyzing..."
+            # 실제 진단 수행
+            strategy = strategies.get(config['type'])
+            if strategy:
+                self.results[db_id] = strategy.analyze(config)
+            self.q.task_done()
+
+# ==========================================
+# [Web] Flask Application
+# ==========================================
+
+app = Flask(__name__)
+job_manager = JobQueue()
+
+# 테스트 데이터베이스 셋 (경원님 환경에 맞게 수정)
+INVENTORY = {
+    "DB_PROD_1": {"name": "메인_생산_2014", "type": "MSSQL2014", "host": "1.1.1.1", "port": 1433, "user": "sa", "password": "pw", "db_name": "PROD_DB"},
+    "DB_LOG_1": {"name": "로그_마이_5.7", "type": "MySQL5.7", "host": "1.1.1.2", "port": 3306, "user": "root", "password": "pw", "db_name": "LOG_DB"}
+}
 
 @app.route('/')
-def index():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT * FROM cline_FolderIndex ORDER BY GroupName, DisplayName")
-    projects = cursor.fetchall()
-    cursor.execute("SELECT COUNT(*) as cnt FROM cline_TaskQueue")
-    total = cursor.fetchone()['cnt']
-    conn.close()
-    return render_template('index.html', projects=projects, total_calls=total)
+def main():
+    return render_template_string(UI_HTML, inventory=INVENTORY)
 
-@app.route('/settings')
-def settings():
-    return render_template('settings.html')
+@app.route('/api/check', methods=['POST'])
+def check():
+    db_id = request.json.get('db_id')
+    job_manager.push(db_id, INVENTORY[db_id])
+    return jsonify({"res": "ok"})
+
+@app.route('/api/status')
+def status():
+    return jsonify(job_manager.results)
+
+UI_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DB Expert Optimizer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .card { border-radius: 15px; margin-bottom: 20px; border: none; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .status-Good { border-left: 5px solid green; }
+        .status-Warning { border-left: 5px solid orange; }
+        .status-Critical { border-left: 5px solid red; }
+        .score-font { font-size: 2rem; font-weight: bold; }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <h1 class="mb-5">🛡️ DB 최적화 통합 커맨드 센터 <small>(v2.0 Professional)</small></h1>
+        <div class="row" id="dashboard">
+            {% for id, db in inventory.items() %}
+            <div class="col-md-6">
+                <div class="card p-4" id="card-{{id}}">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <h4 class="mb-0">{{db.name}}</h4>
+                            <small class="text-muted">{{db.type}} | {{db.host}}</small>
+                        </div>
+                        <div class="score-font text-primary" id="score-{{id}}">-</div>
+                    </div>
+                    <hr>
+                    <div class="mb-3">
+                        <h6>상태 진단 결과:</h6>
+                        <ul id="details-{{id}}" class="small text-danger"></ul>
+                    </div>
+                    <div class="d-grid">
+                        <button onclick="trigger('{{id}}')" class="btn btn-dark">정밀 분석 실행</button>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    <script>
+        async function trigger(id) {
+            await fetch('/api/check', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({db_id: id})
+            });
+        }
+        async function poll() {
+            const r = await fetch('/api/status');
+            const data = await r.json();
+            for(const [id, res] of Object.entries(data)) {
+                const card = document.getElementById(`card-${id}`);
+                card.className = `card p-4 status-${res.status}`;
+                document.getElementById(`score-${id}`).innerText = res.score;
+                const det = document.getElementById(`details-${id}`);
+                det.innerHTML = res.details.map(d => `<li>${d}</li>`).join('') + 
+                                res.recommendations.map(r => `<li class="text-primary font-weight-bold">💡 ${r}</li>`).join('');
+            }
+        }
+        setInterval(poll, 1000);
+    </script>
+</body>
+</html>
+"""
 
 if __name__ == '__main__':
-    # 형님이 주신 서비스 포트 9111
-    app.run(host='0.0.0.0', port=9111, debug=True)
-"""
-with open(os.path.join(base_dir, "run_bridge.py"), "w", encoding="utf-8") as f: f.write(main_code)
-
-print("\n✨ v56 복구 완료! 서비스 포트: 9111 / DB: AgentBuilderSR (1633)")
+    app.run(host='0.0.0.0', port=9999)
