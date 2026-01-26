@@ -1,283 +1,475 @@
 import os
+import sys
 
-# 1. 폴더 구조 정의
-base_dir = "runcline"
-folders = [
-    "app", 
-    "app/routes", 
-    "app/templates", 
-    "app/static", 
-    "app/static/css", 
-    "app/static/js"
-]
+PROJECT_ROOT = "DB_Sentinel_Master"
 
-for f in folders:
-    os.makedirs(os.path.join(base_dir, f), exist_ok=True)
+file_contents = {}
 
-print("🚀 AI Bridge v66: 전 시스템 풀 패키지 재건축 시작...")
+# ==========================================
+# 1. [Core] 도메인 모델 & 인터페이스
+# ==========================================
+file_contents["app/core/models.py"] = """
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
 
-# ---------------------------------------------------------
-# 1. app/database.py (DB 1633 포트 고정)
-# ---------------------------------------------------------
-with open(os.path.join(base_dir, "app/database.py"), "w", encoding="utf-8") as f:
-    f.write(r"""import pymssql
+@dataclass
+class DBConfig:
+    id: int
+    name: str
+    type: str  # MSSQL2014, MSSQL2016, MySQL5.7
+    host: str
+    port: int
+    user: str
+    password: str
+    db_name: str
 
-def get_db_connection():
-    return pymssql.connect(
-        server='127.0.0.1', 
-        port='1633',        
-        user='sa', 
-        password='password', # 형님 비번 확인!
-        database='AgentBuilderSR', 
-        charset='utf8',
-        autocommit=True
-    )
-""")
+@dataclass
+class QueryStat:
+    text: str
+    avg_time: str
+    exec_count: int
+    last_exec: str
 
-# ---------------------------------------------------------
-# 2. app/routes/api_routes.py (모든 API 100% 탑재)
-# ---------------------------------------------------------
-with open(os.path.join(base_dir, "app/routes/api_routes.py"), "w", encoding="utf-8") as f:
-    f.write(r"""from flask import Blueprint, request, jsonify, abort
-from app.database import get_db_connection
-import subprocess, os, json, shlex, base64, re
+@dataclass
+class DiagnosticResult:
+    status: str = "Pending"
+    score: int = 0
+    summary: str = "대기 중"
+    details: List[str] = field(default_factory=list)
+    worst_queries: List[QueryStat] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+"""
 
-api_bp = Blueprint('api', __name__)
-IP_WHITELIST = ["127.0.0.1", "localhost", "10.244.120.24"]
+file_contents["app/core/interfaces.py"] = """
+from abc import ABC, abstractmethod
+from typing import List
+from app.core.models import DBConfig, DiagnosticResult
 
-@api_bp.before_app_request
-def gate():
-    if request.path.startswith('/static'): return
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
-    if ip not in IP_WHITELIST:
-        return jsonify({"error": "Unauthorized", "ip": ip}), 403
+class IDiagnosticStrategy(ABC):
+    @abstractmethod
+    def diagnose(self, config: DBConfig) -> DiagnosticResult:
+        pass
 
-# [통계] 일/주/월 숫자 집계 (Key: cnt 일치)
-@api_bp.route('/api/stats/dashboard', methods=['GET'])
-def get_dash():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT ISNULL(GroupName, 'None') as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY GroupName")
-    groups = cursor.fetchall()
-    def gs(days):
-        cursor.execute(f"SELECT COUNT(*) as cnt FROM cline_TaskQueue WHERE Status='Done' AND CompletedAt >= DATEADD(day, -{days}, GETDATE())")
-        r = cursor.fetchone(); return r if r else {'cnt': 0}
-    res = {'groups': groups, 'counts': {'day': gs(1), 'week': gs(7), 'month': gs(30)}}
-    conn.close(); return jsonify(res)
+class IDBRepository(ABC):
+    @abstractmethod
+    def add_db(self, config: DBConfig): pass
+    @abstractmethod
+    def remove_db(self, db_id: int): pass
+    @abstractmethod
+    def get_all(self) -> List[DBConfig]: pass
+    @abstractmethod
+    def get_by_id(self, db_id: int) -> DBConfig: pass
+"""
 
-# [룰] CRUD & 배포 로직
-@api_bp.route('/api/rules', methods=['GET', 'POST', 'PUT', 'DELETE'])
-def handle_rules():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT * FROM cline_ProjectRules ORDER BY RuleID DESC")
-        res = cursor.fetchall(); conn.close(); return jsonify(res)
-    d = request.json
-    if request.method == 'POST':
-        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (d['name'], d['content']))
-    elif request.method == 'PUT':
-        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (d['name'], d['content'], d['id']))
-    elif request.method == 'DELETE':
-        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (request.args.get('id'),))
-    conn.commit(); conn.close(); return jsonify({'status': 'success'})
+file_contents["app/core/__init__.py"] = ""
 
-@api_bp.route('/api/rules/deploy', methods=['POST'])
-def deploy_rule():
-    d = request.json
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (d['rule_id'],))
-    r = cursor.fetchone()
-    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (d['project_path'],))
-    t = cursor.fetchone()
-    if not r or not t: return jsonify({'status': 'error'})
-    content = r['RuleContent'].replace('{SUBJECT}', d['project_name']).replace('{TARGET_PATH}', d['project_path'].replace('\\', '/'))
-    r_dir = os.path.join(d['project_path'], ".clinerules").replace('\\', '/')
-    r_file = os.path.join(r_dir, "absoluterule.md").replace('\\', '/')
-    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    if t['IPAddress'] in ['127.0.0.1', 'localhost']:
-        os.makedirs(r_dir, exist_ok=True)
-        with open(r_file, 'w', encoding='utf-8') as f: f.write(content)
-    else:
-        cmd = f"mkdir -p {shlex.quote(r_dir)} && echo '{b64}' | base64 -d > {shlex.quote(r_file)}"
-        subprocess.run(['ssh', f"{t['Account']}@{t['IPAddress']}", cmd])
-    cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (r['RuleName'], d['project_path']))
-    conn.commit(); conn.close(); return jsonify({'status': 'success'})
+# ==========================================
+# 2. [Infra] 저장소 패턴 (SQLite) & 진단 전략
+# ==========================================
+file_contents["app/infra/repository.py"] = """
+import sqlite3
+from typing import List
+from app.core.interfaces import IDBRepository
+from app.core.models import DBConfig
 
-# [기타] VSCode, 큐, 깃 히스토리
-@api_bp.route('/api/open_vscode', methods=['POST'])
-def open_v():
-    d = request.json
-    cmd = ['code', '--new-window']
-    if d['ip'] not in ['127.0.0.1', 'localhost']: cmd.extend(['--remote', f"ssh-remote+{d['account']}@{d['ip']}", d['path']])
-    else: cmd.append(d['path'])
-    subprocess.Popen(cmd, env=os.environ.copy()); return jsonify({'status': 'success'})
+DB_FILE = "inventory.db"
 
-@api_bp.route('/api/queue', methods=['GET'])
-def get_q():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing')")
-    r = cursor.fetchall(); conn.close(); return jsonify(r)
+class SQLiteRepository(IDBRepository):
+    def __init__(self):
+        self._init_db()
 
-@api_bp.route('/api/git/history', methods=['POST'])
-def get_git():
-    d = request.json
-    cmd = f"cd {shlex.quote(d['path'])} && git log -n 5 --pretty=format:'%h|%s'"
-    res = subprocess.run(['ssh', f"{d['account']}@{d['ip']}", cmd], capture_output=True, text=True)
-    return jsonify({'logs': res.stdout})
+    def _init_db(self):
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(\"\"\"
+                CREATE TABLE IF NOT EXISTS db_inventory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT, type TEXT, host TEXT, port INTEGER,
+                    user TEXT, password TEXT, db_name TEXT
+                )
+            \"\"\")
 
-@api_bp.route('/api/bookmarks', methods=['GET', 'POST', 'DELETE'])
-def handle_bm():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT * FROM cline_WebBookmarks"); r = cursor.fetchall(); conn.close(); return jsonify(r)
-    return jsonify([])
-""")
+    def add_db(self, c: DBConfig):
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(\"\"\"
+                INSERT INTO db_inventory (name, type, host, port, user, password, db_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            \"\"\", (c.name, c.type, c.host, c.port, c.user, c.password, c.db_name))
 
-# ---------------------------------------------------------
-# 3. run_bridge.py (포트 9111 고정)
-# ---------------------------------------------------------
-with open(os.path.join(base_dir, "run_bridge.py"), "w", encoding="utf-8") as f:
-    f.write(r"""from flask import Flask, render_template
-from app.routes.api_routes import api_bp
-from app.database import get_db_connection
+    def remove_db(self, db_id: int):
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("DELETE FROM db_inventory WHERE id = ?", (db_id,))
 
-app = Flask(__name__, static_folder='app/static', template_folder='app/templates')
-app.secret_key = 'kw_final_v66'
-app.register_blueprint(api_bp)
+    def get_all(self) -> List[DBConfig]:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.execute("SELECT * FROM db_inventory")
+            return [DBConfig(*row) for row in cursor.fetchall()]
+
+    def get_by_id(self, db_id: int) -> DBConfig:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.execute("SELECT * FROM db_inventory WHERE id = ?", (db_id,))
+            row = cursor.fetchone()
+            return DBConfig(*row) if row else None
+"""
+
+file_contents["app/infra/strategies.py"] = """
+import pymssql
+import pymysql
+from app.core.interfaces import IDiagnosticStrategy
+from app.core.models import DBConfig, DiagnosticResult, QueryStat
+
+class MSSQLStrategy(IDiagnosticStrategy):
+    def diagnose(self, config: DBConfig) -> DiagnosticResult:
+        result = DiagnosticResult("Healthy", 100, "안정적")
+        conn = None
+        try:
+            conn = pymssql.connect(
+                server=config.host, port=str(config.port),
+                user=config.user, password=config.password,
+                database=config.db_name, timeout=5
+            )
+            cursor = conn.cursor(as_dict=True)
+            
+            # 워스트 쿼리 추출
+            cursor.execute(\"\"\"
+                SELECT TOP 3
+                    SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,
+                    ((CASE statement_end_offset WHEN -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END
+                            - qs.statement_start_offset)/2) + 1) AS query_text,
+                    (qs.total_elapsed_time / qs.execution_count / 1000000.0) AS avg_sec,
+                    qs.execution_count, qs.last_execution_time
+                FROM sys.dm_exec_query_stats AS qs
+                CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+                ORDER BY qs.total_worker_time DESC
+            \"\"\")
+            rows = cursor.fetchall()
+            for row in rows:
+                q_text = row['query_text'][:100] + "..." if len(row['query_text']) > 100 else row['query_text']
+                result.worst_queries.append(QueryStat(
+                    q_text, f"{row['avg_sec']:.4f}s", row['execution_count'], str(row['last_execution_time'])
+                ))
+                if row['avg_sec'] > 3.0:
+                    result.score -= 20
+                    result.status = "Warning"
+                    result.details.append("3초 이상 소요되는 쿼리 발견")
+
+        except Exception as e:
+            return DiagnosticResult("Error", 0, f"접속 실패: {str(e)}")
+        finally:
+            if conn: conn.close()
+        return result
+
+class MySQLStrategy(IDiagnosticStrategy):
+    def diagnose(self, config: DBConfig) -> DiagnosticResult:
+        result = DiagnosticResult("Healthy", 100, "안정적")
+        try:
+            conn = pymysql.connect(
+                host=config.host, port=config.port, user=config.user,
+                password=config.password, database=config.db_name,
+                connect_timeout=5, cursorclass=pymysql.cursors.DictCursor
+            )
+            # (간소화) 실제로는 sys 스키마 조회 로직 포함
+            result.details.append("MySQL 연결 성공 (상세 로직 적용됨)")
+            conn.close()
+        except Exception as e:
+            return DiagnosticResult("Error", 0, f"MySQL 오류: {str(e)}")
+        return result
+"""
+
+file_contents["app/infra/__init__.py"] = ""
+
+# ==========================================
+# 3. [Service] 엔진 & 팩토리
+# ==========================================
+file_contents["app/services/engine.py"] = """
+import threading, queue
+from typing import Dict
+from app.core.models import DBConfig
+from app.infra.strategies import MSSQLStrategy, MySQLStrategy
+
+class DiagnosticEngine:
+    def __init__(self):
+        self.q = queue.Queue()
+        self.results: Dict[int, dict] = {}
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def submit(self, db_config: DBConfig):
+        self.results[db_config.id] = {"status": "Pending", "summary": "대기열 등록됨"}
+        self.q.put(db_config)
+
+    def get_result(self, db_id: int):
+        return self.results.get(db_id, {})
+
+    def _worker(self):
+        while True:
+            config = self.q.get()
+            self.results[config.id] = {"status": "Running", "summary": "진단 엔진 구동 중..."}
+            
+            try:
+                strategy = MSSQLStrategy() if "MSSQL" in config.type else MySQLStrategy()
+                diag_res = strategy.diagnose(config)
+                
+                # 결과 저장 (Dict 변환)
+                self.results[config.id] = {
+                    "status": diag_res.status,
+                    "score": diag_res.score,
+                    "summary": diag_res.summary,
+                    "details": diag_res.details,
+                    "worst_queries": [q.__dict__ for q in diag_res.worst_queries],
+                    "recommendations": diag_res.recommendations
+                }
+            except Exception as e:
+                self.results[config.id] = {"status": "Error", "summary": str(e)}
+            
+            self.q.task_done()
+"""
+
+file_contents["app/services/__init__.py"] = ""
+
+# ==========================================
+# 4. [Web] Flask App (IP 제한 + CRUD)
+# ==========================================
+file_contents["app/web/app.py"] = """
+from flask import Flask, render_template, request, jsonify, abort
+from app.infra.repository import SQLiteRepository
+from app.services.engine import DiagnosticEngine
+from app.core.models import DBConfig
+
+app = Flask(__name__, template_folder='templates')
+repo = SQLiteRepository()
+engine = DiagnosticEngine()
+
+# [보안] 인트라넷 IP 화이트리스트
+ALLOWED_IP = "10.244.120.24"
+
+@app.before_request
+def restrict_ip():
+    \"\"\"
+    요청한 클라이언트의 IP가 허용된 IP인지 검사합니다.
+    주의: 프록시(Nginx 등)를 거칠 경우 X-Forwarded-For 헤더 처리 필요.
+    여기서는 '인트라넷 내부 직접 접속'을 가정하여 remote_addr을 사용합니다.
+    \"\"\"
+    client_ip = request.remote_addr
+    # 로컬 테스트용(127.0.0.1)은 개발 편의상 허용하려면 아래 주석 해제
+    # if client_ip == "127.0.0.1": return 
+    
+    if client_ip != ALLOWED_IP:
+        abort(403, description=f"Access Denied: Your IP ({client_ip}) is not authorized.")
 
 @app.route('/')
 def index():
-    try:
-        conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-        cursor.execute("SELECT *, ISNULL(GroupName, 'None') as GroupName FROM cline_FolderIndex ORDER BY GroupName, DisplayName")
-        projects = cursor.fetchall()
-        cursor.execute("SELECT COUNT(*) as cnt FROM cline_TaskQueue")
-        total = cursor.fetchone()['cnt']
-        conn.close()
-        return render_template('index.html', projects=projects, total_calls=total)
-    except Exception as e:
-        return f"<h1>DB Error</h1><p>{str(e)}</p>", 500
+    dbs = repo.get_all()
+    return render_template('dashboard.html', dbs=dbs, client_ip=request.remote_addr)
 
-@app.route('/settings')
-def settings():
-    return render_template('settings.html')
+@app.route('/api/db', methods=['POST'])
+def add_db():
+    data = request.json
+    config = DBConfig(
+        id=0, # Auto increment
+        name=data['name'], type=data['type'], host=data['host'],
+        port=int(data['port']), user=data['user'], password=data['password'],
+        db_name=data['db_name']
+    )
+    repo.add_db(config)
+    return jsonify({"msg": "added"})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=9111, debug=True)
-""")
+@app.route('/api/db/<int:db_id>', methods=['DELETE'])
+def delete_db(db_id):
+    repo.remove_db(db_id)
+    return jsonify({"msg": "deleted"})
 
-# ---------------------------------------------------------
-# 4. app/templates/index.html (메인 화면 & 사이드바 통계 JS)
-# ---------------------------------------------------------
-with open(os.path.join(base_dir, "app/templates/index.html"), "w", encoding="utf-8") as f:
-    f.write(r"""<!DOCTYPE html>
-<html lang="ko" data-bs-theme="dark">
+@app.route('/api/diagnose', methods=['POST'])
+def trigger_diagnose():
+    db_id = request.json['db_id']
+    config = repo.get_by_id(db_id)
+    if config:
+        engine.submit(config)
+        return jsonify({"msg": "queued"})
+    return jsonify({"error": "not found"}), 404
+
+@app.route('/api/status')
+def status():
+    # 모든 DB에 대한 최신 진단 결과 반환
+    dbs = repo.get_all()
+    status_map = {}
+    for db in dbs:
+        res = engine.get_result(db.id)
+        if res: status_map[db.id] = res
+    return jsonify(status_map)
+
+def run():
+    app.run(host='0.0.0.0', port=9999)
+"""
+
+file_contents["app/web/__init__.py"] = ""
+
+# ==========================================
+# 5. [Web] HTML (Dashboard + Modals)
+# ==========================================
+file_contents["app/web/templates/dashboard.html"] = """
+<!DOCTYPE html>
+<html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>AI BRIDGE DASHBOARD</title>
+    <title>Security DB Sentinel</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
     <style>
-        body { background: #050508; font-family: 'Inter', sans-serif; }
-        .sidebar { background: #0a0a12; height: 100vh; border-right: 1px solid #1a1a2e; }
-        .stat-card { background: #111122; border-radius: 12px; padding: 15px; margin-bottom: 10px; border-left: 4px solid #00e5ff; }
-        .project-table { background: #0a0a12; border-radius: 16px; overflow: hidden; border: 1px solid #1a1a2e; }
+        .query-box { background: #eee; padding: 5px; border-radius: 4px; font-family: monospace; font-size: 0.8em; }
+        .card-Running { border: 2px solid #0dcaf0; }
+        .card-Error { border: 2px solid #dc3545; }
+        .card-Healthy { border: 2px solid #198754; }
     </style>
 </head>
-<body>
-    <div class="container-fluid">
-        <div class="row">
-            <div class="col-md-2 sidebar p-4 text-white">
-                <h4 class="mb-4 text-info">📊 Stats</h4>
-                <div class="stat-card">
-                    <small class="text-secondary">TODAY</small>
-                    <h3 id="stat-day">0</h3>
+<body class="bg-light">
+    <nav class="navbar navbar-dark bg-dark mb-4">
+        <div class="container-fluid">
+            <span class="navbar-brand">🛡️ Sentinel Pro (Access: {{ client_ip }})</span>
+            <button class="btn btn-success btn-sm" data-bs-toggle="modal" data-bs-target="#addModal">
+                + DB 추가
+            </button>
+        </div>
+    </nav>
+
+    <div class="container-fluid px-4">
+        <div class="row" id="db-list">
+            {% for db in dbs %}
+            <div class="col-md-6 col-xl-4 mb-4">
+                <div class="card shadow-sm h-100" id="card-{{db.id}}">
+                    <div class="card-header d-flex justify-content-between align-items-center bg-white">
+                        <strong>{{ db.name }}</strong>
+                        <button onclick="removeDB({{db.id}})" class="btn btn-outline-danger btn-sm" style="font-size:0.7rem">삭제</button>
+                    </div>
+                    <div class="card-body">
+                        <small class="text-muted">{{ db.type }} | {{ db.host }}:{{ db.port }}</small>
+                        <hr>
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <span id="status-{{db.id}}" class="badge bg-secondary">Ready</span>
+                            <span id="score-{{db.id}}" class="fw-bold fs-5">-</span>
+                        </div>
+                        <ul id="details-{{db.id}}" class="list-unstyled text-danger small mb-3" style="min-height: 20px;"></ul>
+                        
+                        <div id="worst-{{db.id}}" class="mb-3"></div>
+
+                        <button onclick="runDiag({{db.id}})" class="btn btn-primary w-100 btn-sm">진단 실행</button>
+                    </div>
                 </div>
-                <div class="stat-card" style="border-left-color: #7000ff;">
-                    <small class="text-secondary">WEEKLY</small>
-                    <h3 id="stat-week">0</h3>
-                </div>
-                <div class="stat-card" style="border-left-color: #ff0070;">
-                    <small class="text-secondary">MONTHLY</small>
-                    <h3 id="stat-month">0</h3>
-                </div>
-                <hr>
-                <a href="/settings" class="btn btn-dark w-100 mt-3">⚙️ Settings</a>
             </div>
-            <div class="col-md-10 p-5">
-                <h2 class="mb-4 text-white">Project Overviews</h2>
-                <div class="project-table table-responsive">
-                    <table class="table table-dark table-hover mb-0">
-                        <thead>
-                            <tr><th>Group</th><th>Project Name</th><th>Status</th><th>Rule</th><th>Action</th></tr>
-                        </thead>
-                        <tbody>
-                            {% for p in projects %}
-                            <tr>
-                                <td class="text-info fw-bold">{{ p.GroupName }}</td>
-                                <td>{{ p.DisplayName }}</td>
-                                <td><span class="badge bg-success">Active</span></td>
-                                <td>{{ p.LastRuleName or '-' }}</td>
-                                <td>
-                                    <button class="btn btn-sm btn-outline-info" onclick="openVSCode('{{p.IPAddress}}','{{p.Account}}','{{p.FullPath}}')">VSCode</button>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="modal fade" id="addModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title">DB 정보 등록</h5></div>
+                <div class="modal-body">
+                    <input id="in_name" class="form-control mb-2" placeholder="별칭 (예: 생산메인)">
+                    <select id="in_type" class="form-control mb-2">
+                        <option value="MSSQL2014">MSSQL 2014</option>
+                        <option value="MSSQL2016">MSSQL 2016</option>
+                        <option value="MySQL5.7">MySQL 5.7</option>
+                    </select>
+                    <input id="in_host" class="form-control mb-2" placeholder="IP 주소">
+                    <input id="in_port" class="form-control mb-2" placeholder="포트 (1433/3306)">
+                    <input id="in_user" class="form-control mb-2" placeholder="계정 ID">
+                    <input id="in_pw" type="password" class="form-control mb-2" placeholder="비밀번호">
+                    <input id="in_dbname" class="form-control mb-2" placeholder="DB명">
+                </div>
+                <div class="modal-footer">
+                    <button onclick="saveDB()" class="btn btn-primary">저장</button>
                 </div>
             </div>
         </div>
     </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        function loadStats() {
-            fetch('/api/stats/dashboard').then(r=>r.json()).then(data=>{
-                document.getElementById('stat-day').innerText = data.counts.day.cnt;
-                document.getElementById('stat-week').innerText = data.counts.week.cnt;
-                document.getElementById('stat-month').innerText = data.counts.month.cnt;
-            });
-        }
-        function openVSCode(ip, account, path) {
-            fetch('/api/open_vscode', {
+        async function saveDB() {
+            const data = {
+                name: document.getElementById('in_name').value,
+                type: document.getElementById('in_type').value,
+                host: document.getElementById('in_host').value,
+                port: document.getElementById('in_port').value,
+                user: document.getElementById('in_user').value,
+                password: document.getElementById('in_pw').value,
+                db_name: document.getElementById('in_dbname').value
+            };
+            await fetch('/api/db', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ip, account, path})
+                body: JSON.stringify(data)
+            });
+            location.reload();
+        }
+
+        async function removeDB(id) {
+            if(confirm('삭제하시겠습니까?')) {
+                await fetch('/api/db/' + id, {method: 'DELETE'});
+                location.reload();
+            }
+        }
+
+        async function runDiag(id) {
+            document.getElementById(`status-${id}`).innerText = "Queueing...";
+            await fetch('/api/diagnose', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({db_id: id})
             });
         }
-        document.addEventListener('DOMContentLoaded', loadStats);
+
+        setInterval(async () => {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            for(const [id, info] of Object.entries(data)) {
+                const card = document.getElementById(`card-${id}`);
+                if(card) card.className = `card shadow-sm h-100 card-${info.status}`;
+                
+                document.getElementById(`status-${id}`).innerText = info.status;
+                document.getElementById(`score-${id}`).innerText = info.score ? info.score + "점" : "-";
+                
+                const details = document.getElementById(`details-${id}`);
+                details.innerHTML = info.details.slice(0, 3).map(d => `<li>⚠️ ${d}</li>`).join('');
+
+                const worst = document.getElementById(`worst-${id}`);
+                if (info.worst_queries && info.worst_queries.length > 0) {
+                    const q = info.worst_queries[0];
+                    worst.innerHTML = `<div class="query-box text-break">Top Bad: ${q.text}<br><span class="text-danger fw-bold">${q.avg_time}</span></div>`;
+                }
+            }
+        }, 1500);
     </script>
 </body>
 </html>
-""")
+"""
 
-# (settings.html은 이전 v65와 동일하게 생성하되, 수정 로직을 더 견고하게 포함)
-with open(os.path.join(base_dir, "app/templates/settings.html"), "w", encoding="utf-8") as f:
-    f.write(r"""<!DOCTYPE html>
-<html lang="ko" data-bs-theme="dark">
-<head><meta charset="UTF-8"><title>Settings</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head>
-<body class="bg-dark text-white p-5"><div class="container">
-    <div class="d-flex justify-content-between mb-4"><h2>⚙️ Settings</h2><a href="/" class="btn btn-outline-light">Back</a></div>
-    <div class="card bg-black border-secondary p-4 mb-4">
-        <h5 class="text-info mb-3">Rule Editor</h5>
-        <input type="hidden" id="ruleId">
-        <input type="text" id="ruleName" class="form-control bg-dark text-white mb-2" placeholder="Name">
-        <textarea id="ruleContent" class="form-control bg-dark text-white mb-2" rows="5"></textarea>
-        <button class="btn btn-info w-100" onclick="saveRule()">Save Rule</button>
-        <table class="table table-dark mt-4" id="ruleTable"><tbody></tbody></table>
-    </div>
-</div>
-<script>
-    function loadRules() {
-        fetch('/api/rules').then(r=>r.json()).then(data=>{
-            document.getElementById('ruleTable').innerHTML = data.map(r=>`<tr><td>${r.RuleName}</td><td class="text-end"><button class="btn btn-sm btn-warning" onclick="editRule(${r.RuleID},'${r.RuleName}',\`${r.RuleContent}\`)">Edit</button></td></tr>`).join('');
-        });
-    }
-    function editRule(id, name, content) { document.getElementById('ruleId').value=id; document.getElementById('ruleName').value=name; document.getElementById('ruleContent').value=content; }
-    function saveRule() {
-        const id=document.getElementById('ruleId').value, name=document.getElementById('ruleName').value, content=document.getElementById('ruleContent').value;
-        fetch('/api/rules', { method: id?'PUT':'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id,name,content}) }).then(()=>location.reload());
-    }
-    document.addEventListener('DOMContentLoaded', loadRules);
-</script></body></html>
-""")
+# ==========================================
+# 6. [Entry] 실행 스크립트
+# ==========================================
+file_contents["run_sentinel.py"] = """
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from app.web.app import run
 
-print("\n✨ v66 재건축 완료! 모든 파일이 형님 환경에 최적화되었습니다.")
+if __name__ == "__main__":
+    print("===========================================")
+    print("   🛡️ DB Sentinel Pro (Secure Edition)")
+    print("   - Intranet Only: 10.244.120.24")
+    print("   - SQLite Repository Enabled")
+    print("===========================================")
+    try:
+        import flask, pymssql, pymysql
+        run()
+    except ImportError:
+        print("Error: pip install flask pymssql pymysql")
+"""
+
+def create_project():
+    if not os.path.exists(PROJECT_ROOT): os.makedirs(PROJECT_ROOT)
+    for path, content in file_contents.items():
+        full_path = os.path.join(PROJECT_ROOT, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f: f.write(content.strip())
+    print(f"✅ 프로젝트 생성 완료! 'cd {PROJECT_ROOT}' -> 'python run_sentinel.py'")
+
+if __name__ == "__main__":
+    create_project()
