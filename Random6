@@ -1,167 +1,488 @@
 import os
+import sys
 
-base_dir = "runcline"
-os.makedirs(os.path.join(base_dir, "app", "routes"), exist_ok=True)
-os.makedirs(os.path.join(base_dir, "app", "templates"), exist_ok=True)
-os.makedirs(os.path.join(base_dir, "app", "static"), exist_ok=True)
+# 프로젝트 설정
+PROJECT_NAME = "memostandby"
+BASE_DIR = os.path.join(os.getcwd(), PROJECT_NAME)
 
-print("🔥 [FINAL EMERGENCY] v62: Absolute Restoration (DB + API + MAIN)...")
+# 파일 내용 정의
+files = {}
 
-# 1. app/database.py (형님 맞춤형 DB 정보 - pymssql 기반)
-db_code = r"""import pymssql
+# 1. app.py (Flask 서버 로직 - MVC 패턴 적용)
+files['app.py'] = """
+from flask import Flask, render_template, request, jsonify, abort
+import os
+import glob
+from datetime import datetime
 
-def get_db_connection():
-    return pymssql.connect(
-        server='127.0.0.1', 
-        port='1633',        # 형님이 주신 DB 포트
-        user='sa', 
-        password='password', # 형님의 실제 비번으로 수정 필요
-        database='AgentBuilderSR', # 형님이 주신 DB명
-        charset='utf8'
-    )
-"""
-with open(os.path.join(base_dir, "app", "database.py"), "w", encoding="utf-8") as f: f.write(db_code)
+app = Flask(__name__)
 
-# 2. app/routes/api_routes.py (모든 집계, 그룹, 룰, 큐, VSCode 복구)
-api_code = r"""from flask import Blueprint, request, jsonify, abort
-from app.database import get_db_connection
-import subprocess, os, json, shlex, base64, re
+# 설정
+ALLOWED_IP = '10.244.120.24'
+PORT = 9992
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'standby')
 
-api_bp = Blueprint('api', __name__)
+# 데이터 폴더 생성
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
-# 🛡️ [IP WHITELIST] - 형님 아이피
-IP_WHITELIST = ["127.0.0.1", "localhost", "10.244.120.24"]
+# 미들웨어: IP 접근 제어
+@app.before_request
+def limit_remote_addr():
+    # 로컬호스트(127.0.0.1)는 테스트를 위해 허용하거나, 
+    # 실제 운영 시 주석 처리하여 엄격하게 10.244.120.24만 허용할 수 있음
+    # 여기서는 요청대로 특정 IP만 허용
+    client_ip = request.remote_addr
+    if client_ip != ALLOWED_IP:
+        # 403 Forbidden 리턴
+        abort(403)
 
-@api_bp.before_app_request
-def security_gate():
-    if request.path.startswith('/static'): return
-    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
-    if ip not in IP_WHITELIST:
-        return jsonify({"error": "Unauthorized Access", "your_ip": ip}), 403
-
-# --- [STATS] 사이드바 숫자 집계 (Key: cnt 소문자 고정) ---
-@api_bp.route('/api/stats/dashboard', methods=['GET'])
-def get_dash():
-    try:
-        conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-        # 그룹별 집계
-        cursor.execute("SELECT ISNULL(GroupName, 'None') as GroupName, COUNT(*) as Cnt FROM cline_FolderIndex GROUP BY GroupName")
-        groups = cursor.fetchall()
-        
-        def gs(days):
-            cursor.execute(f"SELECT COUNT(*) as cnt FROM cline_TaskQueue WHERE Status='Done' AND CompletedAt >= DATEADD(day, -{days}, GETDATE())")
-            r = cursor.fetchone()
-            return r if r else {'cnt': 0}
-            
-        res = {
-            'groups': groups,
-            'counts': { 'day': gs(1), 'week': gs(7), 'month': gs(30) }
-        }
-        conn.close(); return jsonify(res)
-    except Exception as e: return jsonify({"error": str(e)}), 500
-
-# --- [RULES] 수정(PUT) 및 배포(Deploy) 복구 ---
-@api_bp.route('/api/rules', methods=['GET', 'POST', 'PUT', 'DELETE'])
-def handle_rules():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    if request.method == 'GET':
-        cursor.execute("SELECT RuleID, RuleName, RuleContent FROM cline_ProjectRules ORDER BY RuleID DESC")
-        res = cursor.fetchall(); conn.close(); return jsonify(res)
+# 헬퍼 함수: 파일 목록 가져오기 (최신순)
+def get_memo_list():
+    files = glob.glob(os.path.join(DATA_DIR, "*.txt"))
+    files.sort(key=os.path.getmtime, reverse=True) # 수정 시간 기준 내림차순
     
-    d = request.json
-    if request.method == 'POST':
-        cursor.execute("INSERT INTO cline_ProjectRules (RuleName, RuleContent) VALUES (%s, %s)", (d['name'], d['content']))
-    elif request.method == 'PUT':
-        cursor.execute("UPDATE cline_ProjectRules SET RuleName=%s, RuleContent=%s WHERE RuleID=%s", (d['name'], d['content'], d['id']))
-    elif request.method == 'DELETE':
-        cursor.execute("DELETE FROM cline_ProjectRules WHERE RuleID=%s", (request.args.get('id'),))
-    conn.commit(); conn.close(); return jsonify({'status': 'success'})
+    memo_list = []
+    for f in files:
+        filename = os.path.basename(f)
+        try:
+            with open(f, 'r', encoding='utf-8') as file:
+                content = file.read()
+            memo_list.append({
+                'filename': filename,
+                'content': content,
+                'timestamp': filename.replace('memo_', '').replace('.txt', '')
+            })
+        except Exception as e:
+            print(f"Error reading {f}: {e}")
+    return memo_list
 
-@api_bp.route('/api/rules/deploy', methods=['POST'])
-def deploy_rule():
-    d = request.json
-    if not d.get('rule_id'): return jsonify({'status': 'error', 'message': 'Missing Rule ID'})
-    
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT RuleName, RuleContent FROM cline_ProjectRules WHERE RuleID=%s", (d['rule_id'],))
-    r = cursor.fetchone()
-    cursor.execute("SELECT IPAddress, Account FROM cline_FolderIndex WHERE FullPath=%s", (d['project_path'],))
-    t = cursor.fetchone()
-    
-    if not r or not t: return jsonify({'status': 'error', 'message': 'Not Found'})
-    
-    content = r['RuleContent'].replace('{SUBJECT}', d['project_name']).replace('{TARGET_PATH}', d['project_path'].replace('\\', '/'))
-    r_dir = os.path.join(d['project_path'], ".clinerules").replace('\\', '/')
-    r_file = os.path.join(r_dir, "absoluterule.md").replace('\\', '/')
-    b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    
-    if t['IPAddress'] in ['127.0.0.1', 'localhost']:
-        os.makedirs(r_dir, exist_ok=True)
-        with open(r_file, 'w', encoding='utf-8') as f: f.write(content)
-        ok = True
-    else:
-        cmd = f"mkdir -p {shlex.quote(r_dir)} && echo '{b64}' | base64 -d > {shlex.quote(r_file)}"
-        subprocess.run(['ssh', f"{t['Account']}@{t['IPAddress']}", cmd]); ok = True
-    
-    if ok: 
-        cursor.execute("UPDATE cline_FolderIndex SET LastRuleName=%s WHERE FullPath=%s", (r['RuleName'], d['project_path']))
-        conn.commit()
-    conn.close(); return jsonify({'status': 'success'})
-
-# --- [SYSTEM] 큐 & VSCode 실행 ---
-@api_bp.route('/api/queue', methods=['GET'])
-def get_queue():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-    cursor.execute("SELECT TaskID, ProjectName, TaskContent, Status FROM cline_TaskQueue WHERE Status IN ('Pending', 'Processing')")
-    r = cursor.fetchall(); conn.close(); return jsonify(r)
-
-@api_bp.route('/api/open_vscode', methods=['POST'])
-def open_vscode():
-    d = request.json
-    cmd = ['code', '--new-window']
-    if d['ip'] not in ['127.0.0.1', 'localhost']:
-        cmd.extend(['--remote', f"ssh-remote+{d['account']}@{d['ip']}", d['path']])
-    else: cmd.append(d['path'])
-    subprocess.Popen(cmd, env=os.environ.copy()); return jsonify({'status': 'success'})
-
-@api_bp.route('/api/bookmarks', methods=['GET'])
-def get_bookmarks():
-    conn = get_db_connection(); cursor = conn.cursor(as_dict=True); cursor.execute("SELECT * FROM cline_WebBookmarks"); r = cursor.fetchall(); conn.close(); return jsonify(r)
-"""
-with open(os.path.join(base_dir, "app", "routes", "api_routes.py"), "w", encoding="utf-8") as f: f.write(api_code)
-
-# 3. run_bridge.py (심장: 포트 9111 고정)
-main_code = r"""from flask import Flask, render_template
-from app.routes.api_routes import api_bp
-from app.database import get_db_connection
-
-app = Flask(__name__, static_folder='app/static', template_folder='app/templates')
-app.secret_key = 'kw_final_restoration_v62'
-app.register_blueprint(api_bp)
-
+# 라우트: 메인 페이지
 @app.route('/')
 def index():
-    try:
-        conn = get_db_connection(); cursor = conn.cursor(as_dict=True)
-        # [그룹 표시] GroupName을 필수로 조회
-        cursor.execute("SELECT *, ISNULL(GroupName, 'None') as GroupName FROM cline_FolderIndex ORDER BY GroupName, DisplayName")
-        projects = cursor.fetchall()
-        cursor.execute("SELECT COUNT(*) as cnt FROM cline_TaskQueue")
-        total = cursor.fetchone()['cnt']
-        conn.close()
-        return render_template('index.html', projects=projects, total_calls=total)
-    except Exception as e:
-        return f"<h1>Database Connectivity Error</h1><p>{str(e)}</p>", 500
+    return render_template('index.html')
 
-@app.route('/settings')
-def settings():
-    return render_template('settings.html')
+# API: 목록 조회
+@app.route('/api/list', methods=['GET'])
+def api_list():
+    return jsonify(get_memo_list())
+
+# API: 저장 (신규 및 수정)
+@app.route('/api/save', methods=['POST'])
+def api_save():
+    data = request.json
+    content = data.get('content')
+    filename = data.get('filename') # 수정일 경우 파일명이 옴
+
+    if not content:
+        return jsonify({'status': 'error', 'message': '내용이 없습니다.'}), 400
+
+    if filename:
+        # 수정 모드: 기존 파일 덮어쓰기
+        filepath = os.path.join(DATA_DIR, filename)
+    else:
+        # 신규 모드: 새 파일 생성
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"memo_{timestamp}.txt"
+        filepath = os.path.join(DATA_DIR, filename)
+
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# API: 삭제
+@app.route('/api/delete', methods=['POST'])
+def api_delete():
+    data = request.json
+    filename = data.get('filename')
+    
+    if not filename:
+        return jsonify({'status': 'error', 'message': '파일명이 없습니다.'}), 400
+        
+    filepath = os.path.join(DATA_DIR, filename)
+    
+    try:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': '파일을 찾을 수 없습니다.'}), 404
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
-    # 형님의 서비스 포트 9111
-    app.run(host='0.0.0.0', port=9111, debug=True)
+    # 호스트 0.0.0.0으로 열어야 외부(인트라넷) IP에서 접근 가능
+    app.run(host='0.0.0.0', port=PORT, debug=True)
 """
-with open(os.path.join(base_dir, "run_bridge.py"), "w", encoding="utf-8") as f: f.write(main_code)
 
-print("\n✨ [RECONSTRUCTION COMPLETE] v62: 모든 파일이 완벽하게 생성되었습니다.")
-print("👉 이제 'python3 run_bridge.py'를 실행하고 9111 포트로 접속하세요.")
+# 2. templates/index.html (구조)
+files['templates/index.html'] = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Night Sky Memo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Nanum+Pen+Script&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="stars">
+        <div class="star"></div>
+        <div class="star"></div>
+        <div class="star"></div>
+        <div class="star"></div>
+        <div class="star"></div>
+        <div class="star"></div>
+    </div>
+
+    <div class="container">
+        <div class="list-panel">
+            <div id="memo-list" class="memo-list">
+                </div>
+        </div>
+
+        <div class="input-panel">
+            <div class="chalkboard">
+                <textarea id="memo-content" placeholder="여기에 내용을 입력하세요..."></textarea>
+                <input type="hidden" id="current-filename">
+                <div class="controls">
+                    <button onclick="resetForm()" class="btn-cancel">새로 쓰기</button>
+                    <button onclick="saveMemo()" class="btn-save">저장</button>
+                </div>
+            </div>
+            <div id="delete-zone" style="display:none; margin-top:10px; text-align:right;">
+                 <button onclick="deleteMemo()" class="btn-delete">현재 메모 삭제</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
+"""
+
+# 3. static/style.css (디자인 & 애니메이션)
+files['static/style.css'] = """
+/* 기본 설정 */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: radial-gradient(ellipse at bottom, #1b2735 0%, #090a0f 100%);
+    height: 100vh;
+    color: #fff;
+    font-family: 'Malgun Gothic', sans-serif;
+    overflow: hidden;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+/* 별 애니메이션 (드물게 반짝임) */
+.stars {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: -1;
+    pointer-events: none;
+}
+
+.star {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    background: white;
+    border-radius: 50%;
+    opacity: 0;
+    animation: twinkle 5s infinite ease-in-out;
+}
+
+/* 별 위치 및 딜레이 랜덤화 (CSS 하드코딩) */
+.star:nth-child(1) { top: 10%; left: 20%; animation-delay: 0s; }
+.star:nth-child(2) { top: 30%; left: 80%; animation-delay: 2s; }
+.star:nth-child(3) { top: 70%; left: 40%; animation-delay: 4s; }
+.star:nth-child(4) { top: 15%; left: 60%; animation-delay: 1s; }
+.star:nth-child(5) { top: 80%; left: 10%; animation-delay: 3s; }
+.star:nth-child(6) { top: 50%; left: 90%; animation-delay: 5s; }
+
+@keyframes twinkle {
+    0% { opacity: 0; transform: scale(0.5); }
+    50% { opacity: 1; transform: scale(1.2); box-shadow: 0 0 5px #fff; }
+    100% { opacity: 0; transform: scale(0.5); }
+}
+
+/* 레이아웃 */
+.container {
+    display: flex;
+    width: 90%;
+    height: 80vh;
+    gap: 20px;
+}
+
+/* 왼쪽 리스트 패널 */
+.list-panel {
+    flex: 1;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 20px;
+    overflow-y: auto;
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(255,255,255,0.1);
+}
+
+.memo-item {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 15px;
+    margin-bottom: 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border-left: 3px solid transparent;
+}
+
+.memo-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.memo-item.active {
+    border-left: 3px solid #f1c40f;
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.memo-preview {
+    font-size: 0.9rem;
+    color: #ddd;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.memo-date {
+    font-size: 0.7rem;
+    color: #888;
+    margin-top: 5px;
+    text-align: right;
+}
+
+/* 오른쪽 입력 패널 */
+.input-panel {
+    flex: 2;
+    display: flex;
+    flex-direction: column;
+}
+
+/* 칠판 스타일 */
+.chalkboard {
+    flex: 1;
+    background-color: #2b5938; /* 칠판 녹색 */
+    border: 10px solid #5c4033; /* 나무 테두리 느낌 */
+    border-radius: 5px;
+    padding: 20px;
+    box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+    display: flex;
+    flex-direction: column;
+}
+
+textarea {
+    width: 100%;
+    flex: 1;
+    background: transparent;
+    border: none;
+    resize: none;
+    color: #f1c40f; /* 노란색 분필 */
+    font-family: 'Nanum Pen Script', cursive; /* 손글씨 폰트 */
+    font-size: 1.8rem;
+    line-height: 1.5;
+    outline: none;
+}
+
+textarea::placeholder {
+    color: rgba(241, 196, 15, 0.5);
+}
+
+.controls {
+    margin-top: 15px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
+button {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: transform 0.1s;
+}
+
+button:active {
+    transform: scale(0.95);
+}
+
+.btn-save {
+    background-color: #f1c40f;
+    color: #2b5938;
+}
+
+.btn-cancel {
+    background-color: transparent;
+    color: #aaa;
+    border: 1px solid #aaa;
+}
+
+.btn-delete {
+    background-color: #c0392b;
+    color: white;
+    padding: 5px 15px;
+    font-size: 0.8rem;
+}
+"""
+
+# 4. static/script.js (클라이언트 로직)
+files['static/script.js'] = """
+document.addEventListener('DOMContentLoaded', () => {
+    loadList();
+});
+
+// 메모 목록 로드
+function loadList() {
+    fetch('/api/list')
+        .then(response => response.json())
+        .then(data => {
+            const listEl = document.getElementById('memo-list');
+            listEl.innerHTML = '';
+            
+            data.forEach(memo => {
+                const div = document.createElement('div');
+                div.className = 'memo-item';
+                div.onclick = () => selectMemo(memo.filename, memo.content, div);
+                
+                // 미리보기 (첫 줄 혹은 앞부분)
+                const preview = memo.content.length > 30 ? memo.content.substring(0, 30) + '...' : memo.content;
+                
+                div.innerHTML = `
+                    <div class="memo-preview">${preview.replace(/</g, "&lt;")}</div>
+                    <div class="memo-date">${formatDate(memo.timestamp)}</div>
+                `;
+                listEl.appendChild(div);
+            });
+        });
+}
+
+// 메모 선택 (수정 모드)
+function selectMemo(filename, content, element) {
+    document.getElementById('current-filename').value = filename;
+    document.getElementById('memo-content').value = content;
+    document.getElementById('delete-zone').style.display = 'block';
+    
+    // UI 활성화 표시
+    document.querySelectorAll('.memo-item').forEach(el => el.classList.remove('active'));
+    element.classList.add('active');
+}
+
+// 폼 초기화 (새 메모 모드)
+function resetForm() {
+    document.getElementById('current-filename').value = '';
+    document.getElementById('memo-content').value = '';
+    document.getElementById('delete-zone').style.display = 'none';
+    document.querySelectorAll('.memo-item').forEach(el => el.classList.remove('active'));
+}
+
+// 저장 (추가/수정)
+function saveMemo() {
+    const content = document.getElementById('memo-content').value;
+    const filename = document.getElementById('current-filename').value;
+    
+    if (!content.trim()) {
+        alert('내용을 입력해주세요.');
+        return;
+    }
+
+    fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: filename, content: content })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === 'success') {
+            resetForm();
+            loadList();
+        } else {
+            alert('저장 실패: ' + data.message);
+        }
+    });
+}
+
+// 삭제
+function deleteMemo() {
+    const filename = document.getElementById('current-filename').value;
+    if (!filename) return;
+
+    if (!confirm('정말 삭제하시겠습니까?')) return;
+
+    fetch('/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: filename })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === 'success') {
+            resetForm();
+            loadList();
+        } else {
+            alert('삭제 실패: ' + data.message);
+        }
+    });
+}
+
+// 날짜 포맷팅 헬퍼
+function formatDate(ts) {
+    // YYYYmmddHHmmss -> YYYY-mm-dd HH:mm:ss
+    if (ts.length !== 14) return ts;
+    return `${ts.substring(0,4)}-${ts.substring(4,6)}-${ts.substring(6,8)} ${ts.substring(8,10)}:${ts.substring(10,12)}`;
+}
+"""
+
+def create_project():
+    # 루트 디렉토리 생성
+    if not os.path.exists(BASE_DIR):
+        os.makedirs(BASE_DIR)
+        print(f"Created directory: {BASE_DIR}")
+    
+    # 하위 디렉토리 생성 (templates, static, standby)
+    subdirs = ['templates', 'static', 'standby']
+    for sd in subdirs:
+        path = os.path.join(BASE_DIR, sd)
+        if not os.path.exists(path):
+            os.makedirs(path)
+            print(f"Created directory: {path}")
+
+    # 파일 생성
+    for filepath, content in files.items():
+        full_path = os.path.join(BASE_DIR, filepath)
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(content.strip())
+        print(f"Created file: {full_path}")
+
+    print("\n" + "="*50)
+    print("Project [memostandby] created successfully!")
+    print("="*50)
+    print("1. cd memostandby")
+    print("2. pip install flask")
+    print("3. python app.py")
+    print(f"Server will run on port 9992, accessible only from 10.244.120.24")
+
+if __name__ == "__main__":
+    create_project()
