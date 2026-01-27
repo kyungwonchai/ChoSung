@@ -1,47 +1,144 @@
-이건 네트워크나 프록시 문제가 아니라, VS Code Server가 윈도우의 '권한'이나 '환경 변수' 때문에 설치 프로세스를 제대로 실행하지 못하고 먹통이 된 상태일 가능성이 99%입니다. 특히 cine ai 같은 사내 확장은 설치 시 특정 스크립트를 실행하는데, 윈도우에서 이게 막히면 우하단 알림도 없이 조용히 실패(Silent Fail)하곤 합니다.
+원하시는 대로 비유 없이 기술적인 로직과 코드로 바로 설명하겠습니다.
 
-우분투 대 우분투는 잘 된다고 하셨으니, 윈도우 11 환경에서 다음 3가지를 집중적으로 점검해야 합니다.
+핵심은 messages 배열(Context)을 유지하면서 while 루프로 LLM의 응답 상태(stop_reason 또는 tool_calls)를 체크하는 것입니다.
 
-1. 윈도우 PowerShell 실행 정책(Execution Policy) 확인
-윈도우는 기본적으로 외부 스크립트 실행을 제한합니다. VS Code가 확장을 설치할 때 내부적으로 스크립트를 돌리는데, 이게 막히면 반응이 없습니다.
+사용자가 한 번 질문했을 때, 서버 내부에서 LLM과 2회 이상 통신하는 Function Calling Loop 구현 예제입니다.
 
-방법: 윈도우에서 PowerShell을 관리자 권한으로 열고 아래 명령어를 입력하세요.
+Python Flask 구현 예시 (단일 파일)
+이 코드는 User -> Flask -> LLM(tool_call) -> Flask(DB exec) -> LLM(final_answer) -> User 흐름을 처리합니다.
 
-PowerShell
+Python
 
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine
-그 후 Y를 눌러 변경한 뒤, 다시 우분투에서 접속해 보세요.
+import requests
+import json
+from flask import Flask, request, jsonify
 
-2. VS Code Server가 'Stable'인지 'Insiders'인지 확인
-우분투와 윈도우 양쪽의 VS Code 버전이 미세하게 다를 때 발생합니다. 윈도우에 이전에 설치된 서버 버전이 꼬여서 신규 확장(cine ai) 설치 명령을 못 알아먹는 경우입니다.
+app = Flask(__name__)
 
-해결: 우분투 VS Code에서 F1 키를 누르고 **Remote-SSH: Uninstall VS Code Server from Host...**를 선택해 윈도우 쪽 서버를 아예 삭제한 뒤 재접속하세요. (1단계에서 말씀드린 폴더 삭제보다 더 깔끔하게 서버 프로세스를 밀어버립니다.)
+# 1. 실제 DB/시스템을 조회하는 함수 (Tool)
+def get_mounter_count():
+    # 실제로는 여기서 MSSQL/MySQL 커넥션 맺고 쿼리 수행
+    # cursor.execute("SELECT COUNT(*) FROM Mounter_Status WHERE Active='Y'")
+    # return str(cursor.fetchone()[0])
+    return "15"  # 테스트용 더미 리턴값
 
-3. PATH 환경 변수 및 '기본 셸' 문제
-윈도우 11의 기본 SSH 셸이 cmd로 되어 있는지 powershell로 되어 있는지 확인해야 합니다. cmd가 기본일 경우, 유닉스 계열(우분투)에서 보내는 설치 명령어가 윈도우에서 제대로 해석되지 않을 때가 많습니다.
+# 2. LLM에게 알려줄 함수 정의서 (JSON Schema)
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_mounter_count",
+            "description": "현재 공장에서 가동 중인 마운터 설비의 총 대수를 조회한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    }
+]
 
-방법: 윈도우 터미널(관리자)에서 아래 명령어로 기본 셸을 확인/변경하세요.
+# 함수 매핑 테이블 (문자열 이름 -> 실제 파이썬 함수 객체)
+available_functions = {
+    "get_mounter_count": get_mounter_count,
+}
 
-PowerShell
+# LLM API 호출 헬퍼 함수 (curl 대용)
+def call_llm_api(messages):
+    url = "YOUR_INTERNAL_LLM_URL" # 사내 LLM 엔드포인트
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": "your-model-name",
+        "messages": messages,
+        "tools": tools_schema, # 핵심: 도구 정의를 같이 전송
+        "tool_choice": "auto"
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()
 
-# 현재 기본 셸 확인
-Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name "DefaultShell"
+@app.route('/chat', methods=['POST'])
+def chat_endpoint():
+    user_question = request.json.get('question')
+    
+    # 대화 히스토리 초기화
+    messages = [{"role": "user", "content": user_question}]
 
-# 만약 결과가 없거나 cmd.exe라면 PowerShell로 변경 (권장)
-New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name "DefaultShell" -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force
-왜 윈도우만 반응이 없을까? (경원님이 궁금해하신 이유)
-우분투(Linux)는 SSH 접속 시 바로 bash라는 표준화된 환경에서 작업을 수행하지만, 윈도우 11은 SSH로 들어온 명령을 넘겨줄 때 cmd, PowerShell, OpenSSH 간의 핸드셰이킹이 훨씬 복잡합니다.
+    # === [핵심 로직] LLM이 만족할 때까지 반복 (최대 5회 제한 등으로 무한루프 방지 권장) ===
+    while True:
+        # 1. LLM에게 요청 전송
+        response_data = call_llm_api(messages)
+        response_message = response_data['choices'][0]['message']
 
-특히 cine ai 같은 AI 확장 프로그램은 설치 시 node.js 기반의 서버 사이드 프로세스를 띄워야 하는데, 윈도우 보안 정책이 이 프로세스 생성을 "사용자 알림 없이" 차단해버리면 말씀하신 것처럼 우하단에 아무 반응이 없게 됩니다.
+        # 2. LLM 응답에 'tool_calls'가 있는지 확인
+        tool_calls = response_message.get('tool_calls')
 
-결론적으로 추천드리는 순서:
+        if tool_calls:
+            # === Case A: LLM이 "함수 실행해라"고 응답함 ===
+            
+            # 2-1. LLM의 응답(함수 호출 요청)을 대화 내역에 추가 (문맥 유지)
+            messages.append(response_message)
 
-윈도우에서 PowerShell 실행 정책 변경 (1번 항목)
+            # 2-2. 요청된 함수들을 순회하며 파이썬 코드 실행
+            for tool_call in tool_calls:
+                function_name = tool_call['function']['name']
+                function_to_call = available_functions[function_name]
+                
+                # 실제 파이썬 함수 실행 (DB 조회 등)
+                function_response = function_to_call() 
+                
+                # 2-3. 실행 결과를 대화 내역에 'tool' 역할로 추가
+                messages.append({
+                    "tool_call_id": tool_call['id'],
+                    "role": "tool",
+                    "name": function_name,
+                    "content": str(function_response) # "15"
+                })
+            
+            # 루프가 다시 돌면서, 실행 결과(15)가 포함된 messages를 LLM에게 다시 보냄
+            continue 
 
-VS Code에서 Uninstall VS Code Server from Host 실행 후 재접속
+        else:
+            # === Case B: LLM이 함수 호출 없이 최종 답변을 내놓음 ===
+            final_content = response_message['content']
+            return jsonify({"answer": final_content})
 
-그래도 안 되면 윈도우 기본 셸을 PowerShell로 고정 (3번 항목)
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+동작 프로세스 (기술적 흐름)
+초기 요청 (User Request)
 
-이렇게 하면 윈도우가 우분투에서 넘어오는 확장 프로그램 설치 명령을 정상적인 스크립트로 인식하고 처리하기 시작할 겁니다.
+messages: [{"role": "user", "content": "마운터 설비 몇 대야?"}]
 
-혹시 윈도우 쪽에서 Task Manager(작업 관리자)를 켰을 때, vscode-server 관련 프로세스가 여러 개 떠 있지는 않나요? (떠 있다면 모두 강제 종료하고 시도해 보세요.)
+LLM으로 전송 (tools 스키마 포함).
+
+LLM 1차 응답 (Tool Call Request)
+
+LLM은 답변 텍스트(content) 대신 tool_calls 필드를 포함한 JSON을 반환합니다.
+
+의미: "텍스트 생성 중단. get_mounter_count 함수를 실행하시오."
+
+Loop: if tool_calls: 조건문에 걸려 DB 조회 로직으로 진입합니다.
+
+Local Execution (Python)
+
+messages 배열에 LLM의 요청(role: assistant, tool_calls: ...)을 append 합니다.
+
+매핑된 파이썬 함수 get_mounter_count()를 실행 -> 리턴값 "15" 획득.
+
+messages 배열에 결과(role: tool, content: "15")를 append 합니다.
+
+재요청 (Follow-up Request)
+
+이제 messages에는 [질문, 함수호출요청, 함수실행결과("15")]가 들어있습니다.
+
+continue를 만나 다시 call_llm_api(messages)를 호출합니다.
+
+LLM 2차 응답 (Final Answer)
+
+LLM은 문맥(질문+결과)을 보고 최종 자연어 답변을 생성합니다.
+
+응답: "현재 마운터 설비는 총 15대입니다."
+
+Loop: tool_calls가 없으므로 else 문으로 빠져나가 사용자에게 return 합니다.
+
+요약
+사용자의 질문을 알고리즘으로 분석해서 DB를 찌르는 게 아니라, 대화 내역(messages) 전체를 LLM에게 계속 던지면서 LLM이 Stop(답변완료) 플래그를 보낼 때까지 파이썬이 뒤치다꺼리(함수 실행 -> 결과 첨부 -> 재전송)를 반복하는 구조입니다.
