@@ -1,99 +1,520 @@
-조를 갖추셨군요. 아주 좋은 출발점입니다. 이제 **MCP(Model Context Protocol)**를 도입하려고 할 때 가장 헷갈리는 부분이 바로 "LLM이 내 서버를 어떻게 알고, 어떻게 뒤지는가?"에 대한 개념입니다.
+import os
+import json
 
-결론부터 말씀드리면, LLM은 경원님의 서버로 직접 들어와서 파일을 뒤질 능력이 전혀 없습니다. MCP는 LLM에게 "나에게 이런 기능(함수)이 있어"라고 알려주고, LLM이 시키는 심부름을 대신 수행해서 결과값만 텍스트로 던져주는 '대리인' 역할을 합니다.
+# === 프로젝트 루트 ===
+ROOT = "db_master_tool"
+TEMPLATES = os.path.join(ROOT, "templates")
 
-이 원리를 개발자 관점에서 명확하게 해부해 드리겠습니다.
+# === 디렉토리 생성 ===
+if not os.path.exists(TEMPLATES):
+    os.makedirs(TEMPLATES)
 
-1. MCP의 핵심 오해 풀기 (Q&A)
-가장 궁금해하셨던 부분부터 명확히 짚고 넘어가겠습니다.
+# ==============================================================================
+# 1. app.py (백엔드 로직: 설정 관리 + 진단 엔진)
+# ==============================================================================
+app_code = r"""
+import os
+import json
+import traceback
+import datetime
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+import pymysql
+import pymssql
 
-Q1. MCP 서버에는 파일들이나 DB가 저장되어 있는 건가요?
+app = Flask(__name__)
+CONFIG_FILE = 'db_config.json'
 
-아니요. MCP 서버는 데이터 자체를 저장하는 창고가 아니라, **창고지기(Interface)**입니다.
+# === [설정 관리] JSON 파일로 DB 정보 영구 저장 ===
+def load_configs():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return {}
 
-실제 데이터는 기존처럼 로컬 파일 시스템(log/*.txt)이나 데이터베이스(MySQL, MSSQL 등)에 그대로 있습니다.
+def save_configs(configs):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(configs, f, indent=4, ensure_ascii=False)
 
-MCP 서버는 이 데이터에 접근할 수 있는 **파이썬 코드(함수)**들의 집합일 뿐입니다. (예: def search_db(query): ...)
+# === [유틸] HTML 로그 포매터 ===
+def log_msg(msg, level="INFO"):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    colors = {"INFO":"#ccc", "OK":"#28a745", "WARN":"#ffc107", "ERROR":"#dc3545", "HEADER":"#17a2b8"}
+    c = colors.get(level, "#ccc")
+    icon = {"INFO":"ℹ️", "OK":"✅", "WARN":"⚠️", "ERROR":"❌", "HEADER":"🚀"}.get(level, "")
+    return f'<div style="color:{c}; font-family:monospace; margin:4px 0;">[{ts}] {icon} {msg}</div>\n'
 
-Q2. LLM이 서버로 직접 들어와서 데이터를 읽고 처리하나요?
+def table_html(data):
+    if not data: return '<div style="color:#666; margin-left:15px; font-style:italic;">데이터가 없습니다.</div>'
+    headers = data[0].keys()
+    html = '<table class="table table-dark table-sm table-bordered" style="font-size:0.85rem; margin-top:5px;">'
+    html += '<thead class="thead-light"><tr>' + ''.join([f'<th>{h}</th>' for h in headers]) + '</tr></thead><tbody>'
+    for row in data:
+        html += '<tr>' + ''.join([f'<td>{str(v)[:100]}</td>' for v in row.values()]) + '</tr>'
+    html += '</tbody></table>'
+    return html
 
-절대 아닙니다. 보안상으로도 불가능합니다.
+# === [라우트] 페이지 이동 ===
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-LLM은 오직 **텍스트(JSON)**만 주고받습니다. LLM은 경원님의 서버 IP도 모르고, 파일 경로도 볼 수 없습니다.
+@app.route('/settings')
+def settings():
+    return render_template('settings.html')
 
-단지 **"이 함수를 실행해줘"**라고 요청(Function Call)만 할 뿐입니다.
+# === [API] 설정 CRUD ===
+@app.route('/api/config', methods=['GET', 'POST', 'DELETE'])
+def api_config():
+    configs = load_configs()
+    
+    if request.method == 'GET':
+        return jsonify(configs)
+    
+    if request.method == 'POST':
+        data = request.json
+        name = data.get('alias')
+        if not name: return jsonify({"error": "별칭(Alias)은 필수입니다."}), 400
+        configs[name] = data
+        save_configs(configs)
+        return jsonify({"success": True})
+    
+    if request.method == 'DELETE':
+        name = request.json.get('alias')
+        if name in configs:
+            del configs[name]
+            save_configs(configs)
+        return jsonify({"success": True})
 
-Q3. 검색 능력은 어디에 있나요?
+# === [핵심] 진단 실행 (Streaming) ===
+@app.route('/run_diag', methods=['POST'])
+def run_diag():
+    target_name = request.form.get('target_name')
+    checked_items = request.form.getlist('checks[]') # 체크된 항목 리스트
+    
+    configs = load_configs()
+    target_cfg = configs.get(target_name)
 
-MCP 서버 코드 안에 경원님이 직접 구현해야 합니다.
+    def generate():
+        if not target_cfg:
+            yield log_msg("설정 정보를 찾을 수 없습니다.", "ERROR")
+            return
 
-예를 들어 grep 명령어를 실행하는 파이썬 코드를 짜거나, SQL SELECT 쿼리를 날리는 코드를 MCP 서버에 넣어두는 것입니다. LLM은 그저 "검색해줘"라고 명령만 내립니다.
+        db_type = target_cfg.get('db_type')
+        host = target_cfg.get('host')
+        
+        yield log_msg(f"[{target_name}] {db_type.upper()} 진단 시작... ({host})", "HEADER")
+        
+        conn = None
+        try:
+            # 1. DB 연결
+            if db_type == 'mssql':
+                conn = pymssql.connect(
+                    server=target_cfg['host'], 
+                    port=int(target_cfg['port']), 
+                    user=target_cfg['user'], 
+                    password=target_cfg['password'], 
+                    database=target_cfg.get('db_name', 'master')
+                )
+                cursor = conn.cursor(as_dict=True)
+            elif db_type == 'mysql':
+                conn = pymysql.connect(
+                    host=target_cfg['host'], 
+                    port=int(target_cfg['port']), 
+                    user=target_cfg['user'], 
+                    password=target_cfg['password'], 
+                    charset='utf8mb4',
+                    cursorclass=pymysql.cursors.DictCursor
+                )
+                cursor = conn.cursor()
+            
+            yield log_msg("DB 연결 성공. 선택된 항목 점검 시작.", "OK")
+            
+            # 2. 체크 항목별 실행 로직
+            # === [MSSQL] ===
+            if db_type == 'mssql':
+                if 'cpu' in checked_items:
+                    yield log_msg("1. CPU 과부하 악성 쿼리 분석", "WARN")
+                    sql = "SELECT TOP 10 SUBSTRING(qt.text, (qs.statement_start_offset/2)+1, ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(qt.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS [Query], qs.execution_count, qs.total_worker_time/1000 AS [TotalCPU_ms], qs.last_execution_time FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt ORDER BY qs.total_worker_time DESC"
+                    cursor.execute(sql)
+                    yield table_html(cursor.fetchall())
 
-2. MCP 동작 프로세스 (개발자 관점)
-현재 curl만으로는 부족하고, 중간에서 조율해주는 **MCP Host(클라이언트 앱)**가 필요합니다. 전체 흐름은 다음과 같습니다.
+                if 'lock' in checked_items:
+                    yield log_msg("2. Blocking / Deadlock 세션 추적", "WARN")
+                    sql = "SELECT spid, blocked, status, loginame, hostname, cmd, wait_time, lastwaittype FROM sys.sysprocesses WHERE blocked > 0 OR spid IN (SELECT blocked FROM sys.sysprocesses)"
+                    cursor.execute(sql)
+                    yield table_html(cursor.fetchall())
 
-[구성 요소]
-Host (경원님의 Python 앱): 사용자의 질문을 받고, LLM과 MCP 서버 사이를 중계하는 컨트롤 타워.
+                if 'missing_idx' in checked_items:
+                    yield log_msg("3. 누락 인덱스 추천", "WARN")
+                    sql = "SELECT TOP 10 d.statement AS [Table], ROUND(s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans),0) AS [Score], mid.equality_columns FROM sys.dm_db_missing_index_group_stats s JOIN sys.dm_db_missing_index_groups g ON s.group_handle = g.index_group_handle JOIN sys.dm_db_missing_index_details mid ON mid.index_handle = g.index_handle ORDER BY [Score] DESC"
+                    cursor.execute(sql)
+                    yield table_html(cursor.fetchall())
 
-MCP Server: 실제 DB/파일에 접근하는 도구(Tool)들을 정의한 서버.
+                if 'storage' in checked_items:
+                    yield log_msg("4. 파일 용량 점검", "INFO")
+                    sql = "SELECT d.name, ROUND(SUM(mf.size) * 8 / 1024, 0) AS SizeMB FROM sys.master_files mf JOIN sys.databases d ON mf.database_id = d.database_id GROUP BY d.name ORDER BY SizeMB DESC"
+                    cursor.execute(sql)
+                    yield table_html(cursor.fetchall())
+            
+            # === [MySQL] ===
+            elif db_type == 'mysql':
+                if 'process' in checked_items:
+                    yield log_msg("1. 현재 실행 중인 프로세스 (Processlist)", "WARN")
+                    cursor.execute("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE command != 'Sleep' ORDER BY time DESC LIMIT 20")
+                    yield table_html(cursor.fetchall())
 
-LLM: 논리적인 판단을 내리는 뇌.
+                if 'storage' in checked_items:
+                    yield log_msg("2. 테이블 용량 TOP 20", "INFO")
+                    cursor.execute("SELECT table_schema, table_name, round(((data_length + index_length) / 1024 / 1024), 2) as SizeMB, table_rows FROM information_schema.TABLES WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY SizeMB DESC LIMIT 20")
+                    yield table_html(cursor.fetchall())
 
-[실행 흐름]
-상황: 사용자가 *"지난주 에러 로그 찾아줘"*라고 질문함.
+                if 'status' in checked_items:
+                    yield log_msg("3. 주요 상태 변수 (Connections, Aborted)", "WARN")
+                    cursor.execute("SHOW GLOBAL STATUS WHERE Variable_name IN ('Aborted_connects', 'Threads_connected', 'Threads_running', 'Slow_queries', 'Uptime')")
+                    yield table_html(cursor.fetchall())
 
-초기 요청 (Host → LLM):
+            yield log_msg("✨ 선택된 모든 진단이 완료되었습니다.", "HEADER")
 
-Host가 LLM에게 질문을 보낼 때, MCP 서버에 정의된 **도구 목록(Tools List)**을 함께 보냅니다.
+        except Exception as e:
+            yield log_msg(f"에러 발생: {str(e)}", "ERROR")
+            yield log_msg(traceback.format_exc(), "ERROR")
+        finally:
+            if conn: conn.close()
 
-프롬프트 예시: "사용자가 '에러 로그 찾아줘'라고 했어. 근데 나한테는 read_log_file(date)이라는 도구가 있어. 어떻게 할까?"
+    return Response(stream_with_context(generate()), mimetype='text/html')
 
-판단 및 도구 호출 (LLM → Host):
+if __name__ == '__main__':
+    # 0.0.0.0으로 열어서 외부 접속 가능하게 함
+    app.run(host='0.0.0.0', port=5000, debug=True)
+"""
 
-LLM은 직접 로그를 못 봅니다. 대신 판단을 합니다.
+# ==============================================================================
+# 2. templates/index.html (메인 화면: DB 선택 -> 체크박스 -> 실행)
+# ==============================================================================
+index_html = r"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>DB Master Tool</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+    <style>
+        body { background-color: #1e1e1e; color: #ddd; }
+        .card { background-color: #2b2b2b; border: 1px solid #444; }
+        .form-control, .custom-select { background-color: #333; color: #fff; border: 1px solid #555; }
+        #log-window { height: 600px; overflow-y: auto; background: #000; border: 1px solid #444; padding: 10px; font-family: 'Consolas', monospace; font-size: 0.9rem; }
+        .btn-primary { background-color: #007bff; border-color: #007bff; }
+        .section-title { border-bottom: 2px solid #555; padding-bottom: 10px; margin-bottom: 20px; color: #17a2b8; }
+    </style>
+</head>
+<body class="p-4">
+    <div class="container-fluid">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2 class="text-light">🛠️ DB Master Diagnostic Tool</h2>
+            <a href="/settings" class="btn btn-outline-light">⚙️ 설정(DB 관리) 화면으로 이동</a>
+        </div>
 
-응답: "그럼 read_log_file(date='last_week') 함수를 실행해."
+        <div class="row">
+            <div class="col-md-3">
+                <div class="card p-3 mb-3">
+                    <h5 class="section-title">1. 대상 DB 선택</h5>
+                    <div class="form-group">
+                        <select id="target_db" class="custom-select" onchange="updateCheckboxes()">
+                            <option value="">-- DB를 선택하세요 --</option>
+                        </select>
+                        <small class="text-muted mt-2 d-block">* 설정 화면에서 추가한 목록이 보입니다.</small>
+                    </div>
+                </div>
 
-실제 실행 (Host → MCP Server):
+                <div class="card p-3">
+                    <h5 class="section-title">2. 점검 항목 체크</h5>
+                    <form id="diagForm">
+                        <div id="mssql_checks" style="display:none;">
+                            <h6 class="text-warning">MSSQL Checks</h6>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_m_cpu" name="checks[]" value="cpu" checked>
+                                <label class="custom-control-label" for="chk_m_cpu">CPU 과점유 쿼리</label>
+                            </div>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_m_lock" name="checks[]" value="lock" checked>
+                                <label class="custom-control-label" for="chk_m_lock">Lock / Blocking</label>
+                            </div>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_m_idx" name="checks[]" value="missing_idx">
+                                <label class="custom-control-label" for="chk_m_idx">누락 인덱스 추천</label>
+                            </div>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_m_st" name="checks[]" value="storage">
+                                <label class="custom-control-label" for="chk_m_st">파일 용량 점검</label>
+                            </div>
+                        </div>
 
-Host는 LLM의 응답을 보고, 실제 MCP 서버에 있는 파이썬 함수를 실행합니다.
+                        <div id="mysql_checks" style="display:none;">
+                            <h6 class="text-info">MySQL Checks</h6>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_y_proc" name="checks[]" value="process" checked>
+                                <label class="custom-control-label" for="chk_y_proc">실행 중인 프로세스</label>
+                            </div>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_y_st" name="checks[]" value="storage">
+                                <label class="custom-control-label" for="chk_y_st">테이블 용량 TOP 20</label>
+                            </div>
+                            <div class="custom-control custom-checkbox mb-2">
+                                <input type="checkbox" class="custom-control-input" id="chk_y_stat" name="checks[]" value="status">
+                                <label class="custom-control-label" for="chk_y_stat">주요 상태 변수</label>
+                            </div>
+                        </div>
+                    </form>
+                    <button class="btn btn-success btn-block mt-3 font-weight-bold" onclick="startDiag()">🚀 진단 시작 (Start)</button>
+                </div>
+            </div>
 
-이때 MCP 서버가 grep을 돌리든 DB를 조회하든 해서 실제 텍스트 데이터를 가져옵니다.
+            <div class="col-md-9">
+                <div class="card">
+                    <div class="card-header bg-secondary text-white font-weight-bold">
+                        📺 실시간 진단 로그
+                    </div>
+                    <div id="log-window">
+                        <div style="color:gray; text-align:center; margin-top:250px;">
+                            좌측에서 DB와 항목을 선택하고 [시작]을 누르세요.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-결과 반환 (MCP Server → Host):
+    <script>
+        let dbConfigs = {};
 
-MCP 서버가 로그 내용(텍스트)을 Host에게 줍니다.
+        // 페이지 로드 시 설정 불러오기
+        async function loadConfigs() {
+            const res = await fetch('/api/config');
+            dbConfigs = await res.json();
+            const select = document.getElementById('target_db');
+            select.innerHTML = '<option value="">-- DB를 선택하세요 --</option>';
+            
+            for (const [alias, cfg] of Object.entries(dbConfigs)) {
+                const opt = document.createElement('option');
+                opt.value = alias;
+                opt.innerText = `[${cfg.db_type.toUpperCase()}] ${alias} (${cfg.host})`;
+                select.appendChild(opt);
+            }
+        }
 
-최종 답변 생성 (Host → LLM):
+        // DB 선택 시 해당되는 체크박스만 보여주기
+        function updateCheckboxes() {
+            const alias = document.getElementById('target_db').value;
+            const mSection = document.getElementById('mssql_checks');
+            const ySection = document.getElementById('mysql_checks');
 
-Host는 이 로그 내용을 다시 LLM에게 던져줍니다.
+            mSection.style.display = 'none';
+            ySection.style.display = 'none';
 
-프롬프트: "아까 그 도구 실행했더니 이런 결과가 나왔어: [Error] 2026-01-20 Connection Timeout.... 이걸로 답변해줘."
+            if (!alias) return;
 
-사용자 답변:
+            const type = dbConfigs[alias].db_type;
+            if (type === 'mssql') mSection.style.display = 'block';
+            if (type === 'mysql') ySection.style.display = 'block';
+        }
 
-LLM: "지난주 로그를 보니 연결 시간 초과 에러가 있었네요."
+        // 진단 실행
+        async function startDiag() {
+            const alias = document.getElementById('target_db').value;
+            if (!alias) { alert('대상 DB를 선택해주세요.'); return; }
 
-3. 왜 이렇게 복잡하게 할까요? (MCP의 장점)
-그냥 파이썬 스크립트 하나로 짜도 되는데 굳이 MCP라는 프로토콜을 쓰는 이유는 "표준화" 때문입니다.
+            const log = document.getElementById('log-window');
+            log.innerHTML = `<div style="color:cyan">--- 시스템 연결 준비 중... ---</div>`;
 
-확장성: 한 번 MCP 서버(예: MSSQL 조회 서버)를 만들어두면, Claude Desktop 앱이든, Cursor 에디터든, 경원님이 만든 사내 챗봇이든 어디서든 똑같이 가져다 쓸 수 있습니다.
+            const formData = new FormData(document.getElementById('diagForm'));
+            formData.append('target_name', alias);
 
-유연성: LLM 모델을 GPT에서 Claude로, 혹은 사내 로컬 모델로 바꿔도 도구(MCP 서버)는 수정할 필요가 없습니다.
+            try {
+                const response = await fetch('/run_diag', { method: 'POST', body: formData });
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
 
-4. 경원님이 구축해야 할 것
-지금 curl로 질문하는 단계에서 나아가려면 딱 두 가지가 더 필요합니다.
+                log.innerHTML = ''; // 초기화
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    log.innerHTML += decoder.decode(value);
+                    log.scrollTop = log.scrollHeight;
+                }
+            } catch (err) {
+                log.innerHTML += `<div style="color:red">[Error] 통신 실패: ${err}</div>`;
+            }
+        }
 
-MCP Server (Python):
+        loadConfigs();
+    </script>
+</body>
+</html>
+"""
 
-실제 DB나 로그 파일에 접근해서 데이터를 가져오는 함수(Tools)를 정의하고 실행하는 서버.
+# ==============================================================================
+# 3. templates/settings.html (설정 관리 화면)
+# ==============================================================================
+settings_html = r"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>DB 설정 관리</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+    <style>body { background-color: #1e1e1e; color: #ddd; }</style>
+</head>
+<body class="p-4">
+    <div class="container">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h3>⚙️ DB 연결 설정 관리</h3>
+            <a href="/" class="btn btn-secondary">🔙 메인으로 돌아가기</a>
+        </div>
 
-MCP Client (Host, Python):
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card bg-dark border-secondary p-3">
+                    <h5 class="text-info border-bottom pb-2">새 DB 추가</h5>
+                    <form id="configForm">
+                        <div class="form-group">
+                            <label>별칭 (Alias) *고유값</label>
+                            <input type="text" class="form-control" id="alias" placeholder="예: 운영서버_MES">
+                        </div>
+                        <div class="form-group">
+                            <label>DB 타입</label>
+                            <select class="form-control" id="db_type" onchange="togglePort()">
+                                <option value="mssql">MSSQL (SQL Server)</option>
+                                <option value="mysql">MySQL / MariaDB</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Host IP</label>
+                            <input type="text" class="form-control" id="host" placeholder="127.0.0.1">
+                        </div>
+                        <div class="form-group">
+                            <label>Port</label>
+                            <input type="number" class="form-control" id="port" value="1433">
+                        </div>
+                        <div class="form-group">
+                            <label>User ID</label>
+                            <input type="text" class="form-control" id="user">
+                        </div>
+                        <div class="form-group">
+                            <label>Password</label>
+                            <input type="password" class="form-control" id="password">
+                        </div>
+                        <div class="form-group" id="db_name_group">
+                            <label>DB Name (MSSQL Only)</label>
+                            <input type="text" class="form-control" id="db_name" value="master">
+                        </div>
+                        <button type="button" class="btn btn-primary btn-block" onclick="saveConfig()">저장 (Save)</button>
+                    </form>
+                </div>
+            </div>
 
-curl 대신, LLM과 MCP 서버 사이에서 "도구 목록 전달 -> LLM의 도구 호출 요청 -> 도구 실행 -> 결과 재전송"의 **루프(Loop)**를 돌려주는 파이썬 스크립트.
+            <div class="col-md-8">
+                <div class="card bg-dark border-secondary p-3">
+                    <h5 class="text-success border-bottom pb-2">저장된 DB 목록</h5>
+                    <table class="table table-dark table-hover">
+                        <thead>
+                            <tr>
+                                <th>별칭</th>
+                                <th>타입</th>
+                                <th>Host</th>
+                                <th>User</th>
+                                <th>관리</th>
+                            </tr>
+                        </thead>
+                        <tbody id="configList">
+                            </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
 
-요약하자면: LLM은 "손발이 없는 천재"입니다. MCP 서버는 그 천재에게 "망치"와 "드라이버"를 쥐여주는 것이고, 이 도구들을 실제로 휘두르는 건 경원님이 작성할 코드가 됩니다.
+    <script>
+        function togglePort() {
+            const type = document.getElementById('db_type').value;
+            document.getElementById('port').value = (type === 'mssql') ? 1433 : 3306;
+            document.getElementById('db_name_group').style.display = (type === 'mssql') ? 'block' : 'none';
+        }
 
-이제 원리가 좀 이해되셨나요?
+        async function loadList() {
+            const res = await fetch('/api/config');
+            const data = await res.json();
+            const tbody = document.getElementById('configList');
+            tbody.innerHTML = '';
 
-Next Step: 개념이 잡히셨다면, **"실제 사내 DB(혹은 로그파일)를 조회하는 간단한 MCP 서버 코드"**와 "이를 사내 LLM과 연결하는 Client(Host) 코드" 예시를 작성해 드릴까요? (어떤 데이터 소스를 연결하고 싶으신지 말씀해 주시면 더 좋습니다. 예: MSSQL, 특정 폴더의 로그파일 등)
+            for (const [alias, cfg] of Object.entries(data)) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="font-weight-bold text-warning">${alias}</td>
+                    <td><span class="badge badge-${cfg.db_type === 'mssql' ? 'primary' : 'info'}">${cfg.db_type}</span></td>
+                    <td>${cfg.host}:${cfg.port}</td>
+                    <td>${cfg.user}</td>
+                    <td><button class="btn btn-danger btn-sm" onclick="deleteConfig('${alias}')">삭제</button></td>
+                `;
+                tbody.appendChild(tr);
+            }
+        }
+
+        async function saveConfig() {
+            const alias = document.getElementById('alias').value;
+            if(!alias) { alert('별칭을 입력하세요.'); return; }
+
+            const payload = {
+                alias: alias,
+                db_type: document.getElementById('db_type').value,
+                host: document.getElementById('host').value,
+                port: document.getElementById('port').value,
+                user: document.getElementById('user').value,
+                password: document.getElementById('password').value,
+                db_name: document.getElementById('db_name').value
+            };
+
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            alert('저장되었습니다.');
+            loadList();
+        }
+
+        async function deleteConfig(alias) {
+            if(!confirm(alias + ' 설정을 삭제하시겠습니까?')) return;
+            await fetch('/api/config', {
+                method: 'DELETE',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({alias: alias})
+            });
+            loadList();
+        }
+
+        loadList();
+    </script>
+</body>
+</html>
+"""
+
+# === 파일 쓰기 작업 ===
+def write_file(path, content):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content.strip())
+    print(f"✅ Created: {path}")
+
+write_file(os.path.join(ROOT, "app.py"), app_code)
+write_file(os.path.join(TEMPLATES, "index.html"), index_html)
+write_file(os.path.join(TEMPLATES, "settings.html"), settings_html)
+
+print("\n" + "="*50)
+print("구축 완료. 아래 명령어로 실행하세요.")
+print(f"1. cd {ROOT}")
+print("2. pip install flask pymysql pymssql")
+print("3. python app.py")
+print("4. 접속: http://localhost:5000 (설정 메뉴 먼저 들어가세요)")
+print("="*50)
