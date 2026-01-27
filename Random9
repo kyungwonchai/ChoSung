@@ -1,107 +1,230 @@
-이 스크립트는 requests 라이브러리를 사용하므로, 실행 전 설치가 필요할 수 있습니다 (pip install requests).
+import os
 
-GitHub 일괄 정리 스크립트
-이 코드는 delete_repo 권한이 있는 Personal Access Token(PAT)이 필요합니다.
+# === 프로젝트 이름: DB Inspector ===
+ROOT = "db_inspector"
 
-Python
+files = {}
 
-import requests
-import sys
+# 1. 메인 실행 파일 (Flask App)
+# - 설정 파일 없음. 요청 올 때마다 화면에서 입력받은 정보로 접속함.
+files[f"{ROOT}/app.py"] = r"""
+from flask import Flask, render_template, request, Response, stream_with_context
+import pymysql
+import pymssql
+import traceback
+import datetime
 
-# ==========================================
-# [설정] 아래 정보를 본인의 정보로 수정하세요.
-# ==========================================
-GITHUB_USERNAME = '사용자_아이디'  # 예: kyoungwon
-GITHUB_TOKEN = 'ghp_xxxxxxxxxxxx'  # 'delete_repo' 권한이 체크된 토큰
-# ==========================================
+app = Flask(__name__)
 
-def get_all_repos(username, token):
-    """사용자의 모든 리포지토리를 가져옵니다 (페이지네이션 처리)."""
-    repos = []
-    page = 1
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    print("🔄 리포지토리 목록을 불러오는 중...")
-    
-    while True:
-        url = f"https://api.github.com/users/{username}/repos"
-        params = {
-            "type": "owner",  # 본인 소유의 리포지토리만 대상
-            "per_page": 100,
-            "page": page
+# === [유틸] HTML 로그 포매터 ===
+def log(msg, level="INFO"):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    colors = {"INFO":"#ccc", "OK":"#0f0", "WARN":"#fa0", "ERROR":"#f44", "HEADER":"#0cf"}
+    c = colors.get(level, "#ccc")
+    return f'<div style="color:{c}; font-family:monospace; margin:2px;">[{ts}] {msg}</div>\n'
+
+def table(data):
+    if not data: return '<div style="color:#666; margin-left:10px;">데이터 없음</div>'
+    h = data[0].keys()
+    html = '<table style="width:98%; border-collapse:collapse; border:1px solid #444; font-size:12px; margin:5px auto;">'
+    html += '<thead style="background:#333; color:#fff;"><tr>' + ''.join([f'<th style="border:1px solid #555; padding:5px;">{k}</th>' for k in h]) + '</tr></thead><tbody>'
+    for row in data:
+        html += '<tr style="background:#1e1e1e;">' + ''.join([f'<td style="border:1px solid #555; padding:5px; color:#ccc;">{str(v)[:100]}</td>' for v in row.values()]) + '</tr>'
+    html += '</tbody></table>'
+    return html
+
+# === [라우트] 메인 화면 ===
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# === [라우트] 진단 실행 (POST로 접속정보 받음) ===
+@app.route('/scan', methods=['POST'])
+def scan():
+    # 화면에서 입력받은 접속 정보
+    db_type = request.form.get('db_type')
+    host = request.form.get('host')
+    port = int(request.form.get('port'))
+    user = request.form.get('user')
+    password = request.form.get('password')
+    db_name = request.form.get('db_name', 'master') # MSSQL default
+
+    def generate():
+        yield log(f"🚀 [{db_type.upper()}] {host}:{port} 접속 시도 중...", "HEADER")
+        
+        conn = None
+        try:
+            # === 1. MSSQL 진단 로직 ===
+            if db_type == 'mssql':
+                conn = pymssql.connect(server=host, port=port, user=user, password=password, database=db_name)
+                cursor = conn.cursor(as_dict=True)
+                yield log("접속 성공! 정밀 진단 쿼리 실행 시작...", "OK")
+
+                # (1) 악성 쿼리 TOP 10
+                yield log("1. CPU 과부하 유발 악성 쿼리 TOP 10", "WARN")
+                cursor.execute("SELECT TOP 10 SUBSTRING(qt.text, (qs.statement_start_offset/2)+1, ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(qt.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS [Query], qs.execution_count AS [Execs], qs.total_worker_time/1000 AS [TotalCPU_ms], qs.last_execution_time FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt ORDER BY qs.total_worker_time DESC")
+                yield table(cursor.fetchall())
+
+                # (2) 블로킹 세션
+                yield log("2. 현재 실행 중인 블로킹(Lock) 세션 추적", "ERROR")
+                cursor.execute("SELECT spid, blocked, status, loginame, hostname, cmd, wait_time FROM sys.sysprocesses WHERE blocked > 0 OR spid IN (SELECT blocked FROM sys.sysprocesses)")
+                yield table(cursor.fetchall())
+
+                # (3) 누락 인덱스
+                yield log("3. 성능 향상을 위한 누락 인덱스 추천", "WARN")
+                cursor.execute("SELECT TOP 10 d.statement AS [Table], ROUND(s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans),0) AS [Score], mid.equality_columns FROM sys.dm_db_missing_index_group_stats s JOIN sys.dm_db_missing_index_groups g ON s.group_handle = g.index_group_handle JOIN sys.dm_db_missing_index_details mid ON mid.index_handle = g.index_handle ORDER BY [Score] DESC")
+                yield table(cursor.fetchall())
+
+                # (4) 파일 용량
+                yield log("4. DB 파일별 용량 점검", "INFO")
+                cursor.execute("SELECT d.name AS [DB], ROUND(SUM(mf.size) * 8 / 1024, 0) AS [SizeMB] FROM sys.master_files mf JOIN sys.databases d ON mf.database_id = d.database_id GROUP BY d.name ORDER BY [SizeMB] DESC")
+                yield table(cursor.fetchall())
+
+            # === 2. MySQL 진단 로직 ===
+            elif db_type == 'mysql':
+                conn = pymysql.connect(host=host, port=port, user=user, password=password, charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
+                cursor = conn.cursor()
+                yield log("접속 성공! 정밀 진단 쿼리 실행 시작...", "OK")
+
+                # (1) 프로세스 리스트
+                yield log("1. 현재 실행 중인 쿼리 (Processlist)", "WARN")
+                cursor.execute("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE command != 'Sleep' ORDER BY time DESC LIMIT 20")
+                yield table(cursor.fetchall())
+
+                # (2) 테이블 용량
+                yield log("2. 용량 상위 테이블 TOP 20", "INFO")
+                cursor.execute("SELECT table_schema AS [DB], table_name AS [Table], round(((data_length + index_length) / 1024 / 1024), 2) AS [SizeMB], table_rows FROM information_schema.TABLES WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY (data_length + index_length) DESC LIMIT 20")
+                yield table(cursor.fetchall())
+
+                # (3) 상태 변수
+                yield log("3. 주요 DB 상태 변수", "OK")
+                cursor.execute("SHOW GLOBAL STATUS WHERE Variable_name IN ('Aborted_connects', 'Threads_connected', 'Threads_running', 'Slow_queries', 'Uptime')")
+                yield table(cursor.fetchall())
+
+            yield log("✨ 모든 진단이 완료되었습니다.", "HEADER")
+
+        except Exception as e:
+            yield log(f"⛔ 연결/진단 실패: {str(e)}", "ERROR")
+            yield log(traceback.format_exc(), "ERROR")
+        finally:
+            if conn: conn.close()
+
+    return Response(stream_with_context(generate()), mimetype='text/html')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+"""
+
+# 2. UI 템플릿 (templates/index.html)
+# - 여기서 접속 정보를 입력받습니다.
+files[f"{ROOT}/templates/index.html"] = r"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>DB Remote Inspector</title>
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: sans-serif; display: flex; height: 100vh; margin: 0; }
+        .sidebar { width: 300px; background: #1e1e1e; padding: 20px; border-right: 1px solid #333; display: flex; flex-direction: column; gap: 15px; }
+        .main { flex: 1; background: #000; padding: 20px; display: flex; flex-direction: column; }
+        
+        input, select, button { width: 100%; padding: 10px; background: #2d2d2d; border: 1px solid #444; color: #fff; box-sizing: border-box; margin-top: 5px; }
+        label { font-size: 12px; color: #aaa; font-weight: bold; }
+        button { background: #007acc; border-color: #005f9e; cursor: pointer; font-weight: bold; margin-top: 20px; }
+        button:hover { background: #0098ff; }
+        
+        #log { flex: 1; border: 1px solid #333; padding: 10px; overflow-y: auto; font-family: monospace; background: #080808; }
+        h2 { margin: 0 0 20px 0; color: #fff; border-bottom: 2px solid #007acc; padding-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h2>Target DB Info</h2>
+        <form id="diagForm" onsubmit="return false;">
+            
+            <label>Database Type</label>
+            <select name="db_type" id="db_type" onchange="toggleDbFields()">
+                <option value="mssql">MSSQL (SQL Server)</option>
+                <option value="mysql">MySQL / MariaDB</option>
+            </select>
+
+            <label>Host IP</label>
+            <input type="text" name="host" value="localhost" placeholder="127.0.0.1">
+
+            <label>Port</label>
+            <input type="number" name="port" id="port" value="1433">
+
+            <label>User ID</label>
+            <input type="text" name="user" value="sa" placeholder="username">
+
+            <label>Password</label>
+            <input type="password" name="password" value="" placeholder="password">
+
+            <div id="mssql_fields">
+                <label>Initial DB (MSSQL Only)</label>
+                <input type="text" name="db_name" value="master">
+            </div>
+
+            <button onclick="startDiag()">Connect & Diagnose</button>
+        </form>
+    </div>
+
+    <div class="main">
+        <div id="log">
+            <div style="color:#007acc; text-align:center; margin-top:20%;">
+                <h3>DB 접속 정보를 입력하고 진단 버튼을 누르세요.</h3>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function toggleDbFields() {
+            const type = document.getElementById('db_type').value;
+            document.getElementById('port').value = (type === 'mssql') ? 1433 : 3306;
+            document.getElementById('mssql_fields').style.display = (type === 'mssql') ? 'block' : 'none';
         }
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            print(f"❌ 목록 조회 실패: {response.status_code}")
-            print(response.json())
-            sys.exit(1)
+
+        async function startDiag() {
+            const log = document.getElementById('log');
+            const form = document.getElementById('diagForm');
+            const formData = new FormData(form);
+
+            log.innerHTML = `<div style="color:cyan">--- [System] 접속 시도 중... ---</div>`;
             
-        data = response.json()
-        if not data:
-            break
-            
-        repos.extend(data)
-        page += 1
-        
-    return repos
+            try {
+                const response = await fetch('/scan', { method: 'POST', body: formData });
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
 
-def delete_repository(username, token, repo_name):
-    """리포지토리를 삭제합니다."""
-    url = f"https://api.github.com/repos/{username}/{repo_name}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    response = requests.delete(url, headers=headers)
-    
-    if response.status_code == 204:
-        print(f"✅ 삭제 완료: {repo_name}")
-    else:
-        print(f"❌ 삭제 실패: {repo_name} (Status: {response.status_code})")
+                log.innerHTML = ''; // Clear previous log
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    log.innerHTML += decoder.decode(value);
+                    log.scrollTop = log.scrollHeight;
+                }
+            } catch (err) {
+                log.innerHTML += `<div style="color:red">[Error] 통신 실패: ${err}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
-def main():
-    # 1. 모든 리포지토리 조회
-    all_repos = get_all_repos(GITHUB_USERNAME, GITHUB_TOKEN)
-    
-    # 2. 삭제 대상 필터링 (cline_ 으로 시작하지 않는 것들)
-    repos_to_delete = [
-        repo['name'] for repo in all_repos 
-        if not repo['name'].startswith('cline_')
-    ]
-    
-    if not repos_to_delete:
-        print("\n✨ 삭제할 리포지토리가 없습니다. ('cline_'으로 시작하지 않는 리포지토리가 없음)")
-        return
+# === 디렉토리 및 파일 생성 ===
+for path, content in files.items():
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content.strip())
+    print(f"✅ Created: {path}")
 
-    # 3. 삭제 대상 목록 출력 및 최종 확인
-    print(f"\n총 {len(all_repos)}개의 리포지토리 중 {len(repos_to_delete)}개를 삭제합니다.")
-    print("=" * 40)
-    for name in repos_to_delete:
-        print(f"- {name}")
-    print("=" * 40)
-    print("⚠️  주의: 이 작업은 되돌릴 수 없습니다!")
-    
-    confirm = input("정말로 위 리포지토리들을 삭제하시겠습니까? (삭제하려면 'DELETE' 입력): ")
-    
-    if confirm == 'DELETE':
-        print("\n🚀 삭제 작업을 시작합니다...")
-        for name in repos_to_delete:
-            delete_repository(GITHUB_USERNAME, GITHUB_TOKEN, name)
-        print("\n모든 작업이 완료되었습니다.")
-    else:
-        print("\n작업이 취소되었습니다.")
-
-if __name__ == "__main__":
-    main()
-사용 전 체크리스트
-토큰 발급: GitHub Settings > Developer settings > Personal access tokens > Tokens (classic)에서 delete_repo 항목을 반드시 체크하여 토큰을 생성하세요.
-
-안전 실행: 스크립트를 실행하면 삭제될 목록을 먼저 보여줍니다. 목록을 확인한 후 DELETE를 입력해야만 실제로 삭제됩니다.
-
-혹시 이 스크립트를 실행하기 위해 requests 라이브러리 설치가 필요하신가요?
+print("\n" + "="*50)
+print("이제 설정 파일 수정할 필요 없습니다.")
+print("1. 폴더 이동: cd db_inspector")
+print("2. 패키지 설치: pip install flask pymysql pymssql")
+print("3. 실행: python app.py")
+print("4. 브라우저(http://localhost:5000)를 열면 입력창이 나옵니다.")
+print("="*50)
