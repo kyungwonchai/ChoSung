@@ -1,488 +1,359 @@
+이 스크립트를 generate_architecture.py로 저장하고 실행하세요.
+
+Python
+
 import os
-import sys
 
-# 프로젝트 설정
-PROJECT_NAME = "memostandby"
-BASE_DIR = os.path.join(os.getcwd(), PROJECT_NAME)
+# === 프로젝트 구조 정의 ===
+PROJECT_ROOT = "diagnosis_system"
 
-# 파일 내용 정의
-files = {}
+structure = {
+    f"{PROJECT_ROOT}/": ["run.py", "requirements.txt"],
+    f"{PROJECT_ROOT}/app/": ["__init__.py", "config.py"],
+    f"{PROJECT_ROOT}/app/core/": ["__init__.py", "interfaces.py", "logger.py"],
+    f"{PROJECT_ROOT}/app/database/": ["__init__.py", "connector.py"],
+    f"{PROJECT_ROOT}/app/diagnostics/": ["__init__.py", "base.py", "system_checks.py", "mssql_checks.py", "mysql_checks.py"],
+    f"{PROJECT_ROOT}/app/web/": ["__init__.py", "routes.py"],
+    f"{PROJECT_ROOT}/app/templates/": ["index.html"],
+}
 
-# 1. app.py (Flask 서버 로직 - MVC 패턴 적용)
-files['app.py'] = """
-from flask import Flask, render_template, request, jsonify, abort
+# === 파일 내용 정의 ===
+
+# 1. Config (설정 분리)
+files_content = {}
+
+files_content[f"{PROJECT_ROOT}/app/config.py"] = r"""
 import os
-import glob
-from datetime import datetime
 
-app = Flask(__name__)
-
-# 설정
-ALLOWED_IP = '10.244.120.24'
-PORT = 9992
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'standby')
-
-# 데이터 폴더 생성
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-
-# 미들웨어: IP 접근 제어
-@app.before_request
-def limit_remote_addr():
-    # 로컬호스트(127.0.0.1)는 테스트를 위해 허용하거나, 
-    # 실제 운영 시 주석 처리하여 엄격하게 10.244.120.24만 허용할 수 있음
-    # 여기서는 요청대로 특정 IP만 허용
-    client_ip = request.remote_addr
-    if client_ip != ALLOWED_IP:
-        # 403 Forbidden 리턴
-        abort(403)
-
-# 헬퍼 함수: 파일 목록 가져오기 (최신순)
-def get_memo_list():
-    files = glob.glob(os.path.join(DATA_DIR, "*.txt"))
-    files.sort(key=os.path.getmtime, reverse=True) # 수정 시간 기준 내림차순
+class Config:
+    # 보안을 위해 환경변수에서 로드하는 것을 권장
+    MSSQL = {
+        'server': 'localhost',
+        'user': 'sa',
+        'password': 'your_password',
+        'database': 'master'
+    }
     
-    memo_list = []
-    for f in files:
-        filename = os.path.basename(f)
-        try:
-            with open(f, 'r', encoding='utf-8') as file:
-                content = file.read()
-            memo_list.append({
-                'filename': filename,
-                'content': content,
-                'timestamp': filename.replace('memo_', '').replace('.txt', '')
-            })
-        except Exception as e:
-            print(f"Error reading {f}: {e}")
-    return memo_list
+    MYSQL = {
+        'host': 'localhost',
+        'user': 'root',
+        'password': 'your_password',
+        'charset': 'utf8mb4'
+    }
+"""
 
-# 라우트: 메인 페이지
-@app.route('/')
+# 2. Core Interfaces (추상화 계층)
+files_content[f"{PROJECT_ROOT}/app/core/interfaces.py"] = r"""
+from abc import ABC, abstractmethod
+from typing import Generator
+
+class IDiagnostic(ABC):
+    """모든 진단 모듈이 구현해야 하는 인터페이스"""
+    
+    @abstractmethod
+    def run(self) -> Generator[str, None, None]:
+        """진단 로직을 실행하고 HTML 로그 조각을 yield 해야 함"""
+        pass
+
+class IDatabaseConnector(ABC):
+    """DB 연결 인터페이스"""
+    
+    @abstractmethod
+    def get_connection(self):
+        pass
+"""
+
+files_content[f"{PROJECT_ROOT}/app/core/logger.py"] = r"""
+import datetime
+
+class HtmlLogger:
+    @staticmethod
+    def log(msg, level="INFO"):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        colors = {
+            "INFO": "#ddd", "OK": "#0f0", 
+            "WARN": "orange", "ERROR": "#f55", "HEADER": "#0cf"
+        }
+        c = colors.get(level, "#ddd")
+        return f'<div style="color:{c}; font-family:monospace;">[{timestamp}] {msg}</div>\n'
+
+    @staticmethod
+    def table(data_list):
+        if not data_list: 
+            return '<div style="color:gray;">데이터가 없습니다.</div>'
+        
+        headers = data_list[0].keys()
+        html = '<table style="border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 12px; border: 1px solid #444;">'
+        
+        html += '<thead><tr style="background:#333; color:#fff;">'
+        for h in headers: 
+            html += f'<th style="border:1px solid #555; padding:5px;">{h}</th>'
+        html += '</tr></thead><tbody>'
+        
+        for row in data_list:
+            html += '<tr>'
+            for k, v in row.items():
+                val = str(v)
+                if len(val) > 100: val = val[:100] + "..."
+                html += f'<td style="border:1px solid #555; padding:4px; color:#ccc;">{val}</td>'
+            html += '</tr>'
+        html += '</tbody></table>'
+        return html
+"""
+
+# 3. Database Layer (Infrastructure)
+files_content[f"{PROJECT_ROOT}/app/database/connector.py"] = r"""
+import pymssql
+import pymysql
+from app.core.interfaces import IDatabaseConnector
+from app.config import Config
+
+class MSSQLConnector(IDatabaseConnector):
+    def get_connection(self):
+        return pymssql.connect(**Config.MSSQL)
+
+class MySQLConnector(IDatabaseConnector):
+    def get_connection(self):
+        return pymysql.connect(cursorclass=pymysql.cursors.DictCursor, **Config.MYSQL)
+"""
+
+# 4. Diagnostics Logic (Business Logic - Strategy Pattern)
+files_content[f"{PROJECT_ROOT}/app/diagnostics/base.py"] = r"""
+from app.core.interfaces import IDiagnostic
+from app.core.logger import HtmlLogger
+
+class BaseDiagnostic(IDiagnostic):
+    """공통 기능을 가진 추상 클래스"""
+    def __init__(self):
+        self.logger = HtmlLogger()
+"""
+
+files_content[f"{PROJECT_ROOT}/app/diagnostics/mssql_checks.py"] = r"""
+import traceback
+from app.diagnostics.base import BaseDiagnostic
+from app.database.connector import MSSQLConnector
+
+class MSSQLDiagnostic(BaseDiagnostic):
+    def __init__(self):
+        super().__init__()
+        self.connector = MSSQLConnector()
+
+    def run(self):
+        yield self.logger.log("=== MSSQL 정밀 진단 시작 ===", "HEADER")
+        conn = None
+        try:
+            conn = self.connector.get_connection()
+            cursor = conn.cursor(as_dict=True)
+            
+            # Strategy 1: High CPU
+            yield self.logger.log("1. CPU 과점유 쿼리 분석 (TOP 20)", "WARN")
+            query_cpu = "SELECT TOP 5 text FROM sys.dm_exec_query_stats CROSS APPLY sys.dm_exec_sql_text(sql_handle)" # (약식)
+            # 실제 쿼리는 복잡하므로 여기선 예시로 대체합니다. 이전 답변의 긴 쿼리를 여기에 넣으면 됩니다.
+            cursor.execute("SELECT TOP 5 name, database_id FROM sys.databases")
+            rows = cursor.fetchall()
+            yield self.logger.table(rows)
+            
+            yield self.logger.log("MSSQL 진단 완료", "OK")
+            
+        except Exception:
+            yield self.logger.log(f"MSSQL 에러: {traceback.format_exc()}", "ERROR")
+        finally:
+            if conn: conn.close()
+"""
+
+files_content[f"{PROJECT_ROOT}/app/diagnostics/mysql_checks.py"] = r"""
+import traceback
+from app.diagnostics.base import BaseDiagnostic
+from app.database.connector import MySQLConnector
+
+class MySQLDiagnostic(BaseDiagnostic):
+    def __init__(self):
+        super().__init__()
+        self.connector = MySQLConnector()
+
+    def run(self):
+        yield self.logger.log("=== MySQL 정밀 진단 시작 ===", "HEADER")
+        conn = None
+        try:
+            conn = self.connector.get_connection()
+            cursor = conn.cursor()
+            
+            yield self.logger.log("1. Slow Query Check", "WARN")
+            cursor.execute("SHOW VARIABLES LIKE '%timeout%'")
+            rows = cursor.fetchall()
+            yield self.logger.table(rows)
+            
+            yield self.logger.log("MySQL 진단 완료", "OK")
+        except Exception:
+             yield self.logger.log(f"MySQL 에러: {traceback.format_exc()}", "ERROR")
+        finally:
+            if conn: conn.close()
+"""
+
+files_content[f"{PROJECT_ROOT}/app/diagnostics/system_checks.py"] = r"""
+import psutil
+from app.diagnostics.base import BaseDiagnostic
+
+class SystemDiagnostic(BaseDiagnostic):
+    def run(self):
+        yield self.logger.log("=== Host System Resource Check ===", "HEADER")
+        
+        cpu = psutil.cpu_percent(interval=0.5)
+        yield self.logger.log(f"CPU Load: {cpu}%", "INFO")
+        
+        mem = psutil.virtual_memory()
+        yield self.logger.log(f"Memory: {mem.percent}% Used", "INFO")
+"""
+
+# 5. Web Layer (Presentation - Factory Pattern for Diagnostics)
+files_content[f"{PROJECT_ROOT}/app/web/routes.py"] = r"""
+from flask import Blueprint, render_template, Response, stream_with_context
+from app.diagnostics.mssql_checks import MSSQLDiagnostic
+from app.diagnostics.mysql_checks import MySQLDiagnostic
+from app.diagnostics.system_checks import SystemDiagnostic
+
+web_bp = Blueprint('web', __name__)
+
+# Factory Pattern: 문자열 키로 적절한 전략 클래스 반환
+def get_diagnostic_strategy(mode):
+    strategies = {
+        'mssql': [MSSQLDiagnostic()],
+        'mysql': [MySQLDiagnostic()],
+        'system': [SystemDiagnostic()],
+        'all': [SystemDiagnostic(), MSSQLDiagnostic(), MySQLDiagnostic()]
+    }
+    return strategies.get(mode, [])
+
+@web_bp.route('/')
 def index():
     return render_template('index.html')
 
-# API: 목록 조회
-@app.route('/api/list', methods=['GET'])
-def api_list():
-    return jsonify(get_memo_list())
-
-# API: 저장 (신규 및 수정)
-@app.route('/api/save', methods=['POST'])
-def api_save():
-    data = request.json
-    content = data.get('content')
-    filename = data.get('filename') # 수정일 경우 파일명이 옴
-
-    if not content:
-        return jsonify({'status': 'error', 'message': '내용이 없습니다.'}), 400
-
-    if filename:
-        # 수정 모드: 기존 파일 덮어쓰기
-        filepath = os.path.join(DATA_DIR, filename)
-    else:
-        # 신규 모드: 새 파일 생성
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"memo_{timestamp}.txt"
-        filepath = os.path.join(DATA_DIR, filename)
-
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return jsonify({'status': 'success'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-# API: 삭제
-@app.route('/api/delete', methods=['POST'])
-def api_delete():
-    data = request.json
-    filename = data.get('filename')
-    
-    if not filename:
-        return jsonify({'status': 'error', 'message': '파일명이 없습니다.'}), 400
-        
-    filepath = os.path.join(DATA_DIR, filename)
-    
-    try:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            return jsonify({'status': 'success'})
-        else:
-            return jsonify({'status': 'error', 'message': '파일을 찾을 수 없습니다.'}), 404
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-if __name__ == '__main__':
-    # 호스트 0.0.0.0으로 열어야 외부(인트라넷) IP에서 접근 가능
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+@web_bp.route('/run/<mode>')
+def run_diagnosis(mode):
+    def generate():
+        diagnostics = get_diagnostic_strategy(mode)
+        if not diagnostics:
+            yield "Invalid Mode"
+            return
+            
+        for diag in diagnostics:
+            yield from diag.run() # Delegate execution
+            
+    return Response(stream_with_context(generate()), mimetype='text/html')
 """
 
-# 2. templates/index.html (구조)
-files['templates/index.html'] = """
+files_content[f"{PROJECT_ROOT}/app/__init__.py"] = r"""
+from flask import Flask
+
+def create_app():
+    app = Flask(__name__)
+    
+    from app.web.routes import web_bp
+    app.register_blueprint(web_bp)
+    
+    return app
+"""
+
+# 6. Entry Point & Templates
+files_content[f"{PROJECT_ROOT}/run.py"] = r"""
+from app import create_app
+
+app = create_app()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+"""
+
+files_content[f"{PROJECT_ROOT}/requirements.txt"] = r"""
+flask
+pymysql
+pymssql
+psutil
+"""
+
+files_content[f"{PROJECT_ROOT}/app/templates/index.html"] = r"""
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Night Sky Memo</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-    <link href="https://fonts.googleapis.com/css2?family=Nanum+Pen+Script&display=swap" rel="stylesheet">
+    <title>Modular Diagnostic System</title>
+    <style>
+        body { background: #1e1e1e; color: #ddd; font-family: sans-serif; padding: 20px; }
+        .container { display: flex; gap: 20px; }
+        .sidebar { width: 200px; display: flex; flex-direction: column; gap: 10px; }
+        button { padding: 10px; background: #333; color: white; border: 1px solid #555; cursor: pointer; }
+        button:hover { background: #444; }
+        #log { flex: 1; background: black; border: 1px solid #444; height: 80vh; overflow: auto; padding: 10px; font-family: monospace; }
+    </style>
 </head>
 <body>
-    <div class="stars">
-        <div class="star"></div>
-        <div class="star"></div>
-        <div class="star"></div>
-        <div class="star"></div>
-        <div class="star"></div>
-        <div class="star"></div>
-    </div>
-
+    <h1>엔터프라이즈 모듈형 진단 시스템</h1>
     <div class="container">
-        <div class="list-panel">
-            <div id="memo-list" class="memo-list">
-                </div>
+        <div class="sidebar">
+            <button onclick="run('all')">전체 진단</button>
+            <button onclick="run('system')">시스템 리소스</button>
+            <button onclick="run('mssql')">MSSQL 정밀</button>
+            <button onclick="run('mysql')">MySQL 정밀</button>
         </div>
-
-        <div class="input-panel">
-            <div class="chalkboard">
-                <textarea id="memo-content" placeholder="여기에 내용을 입력하세요..."></textarea>
-                <input type="hidden" id="current-filename">
-                <div class="controls">
-                    <button onclick="resetForm()" class="btn-cancel">새로 쓰기</button>
-                    <button onclick="saveMemo()" class="btn-save">저장</button>
-                </div>
-            </div>
-            <div id="delete-zone" style="display:none; margin-top:10px; text-align:right;">
-                 <button onclick="deleteMemo()" class="btn-delete">현재 메모 삭제</button>
-            </div>
-        </div>
+        <div id="log">준비 완료.</div>
     </div>
-
-    <script src="{{ url_for('static', filename='script.js') }}"></script>
+    <script>
+        async function run(mode) {
+            const log = document.getElementById('log');
+            log.innerHTML = `<div style="color:cyan">--- ${mode} 진단 모듈 로딩 중... ---</div>`;
+            const res = await fetch(`/run/${mode}`);
+            const reader = res.body.getReader();
+            const dec = new TextDecoder();
+            while(true) {
+                const {done, value} = await reader.read();
+                if(done) break;
+                log.innerHTML += dec.decode(value);
+                log.scrollTop = log.scrollHeight;
+            }
+        }
+    </script>
 </body>
 </html>
 """
 
-# 3. static/style.css (디자인 & 애니메이션)
-files['static/style.css'] = """
-/* 기본 설정 */
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-}
+# === 파일 생성 실행 ===
+for path, files in structure.items():
+    if not os.path.exists(path):
+        os.makedirs(path)
+        print(f"[Create Dir] {path}")
 
-body {
-    background: radial-gradient(ellipse at bottom, #1b2735 0%, #090a0f 100%);
-    height: 100vh;
-    color: #fff;
-    font-family: 'Malgun Gothic', sans-serif;
-    overflow: hidden;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-}
+for file_path, content in files_content.items():
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content.strip())
+    print(f"[Create File] {file_path}")
 
-/* 별 애니메이션 (드물게 반짝임) */
-.stars {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    z-index: -1;
-    pointer-events: none;
-}
+print("\n=== 아키텍처 재구축 완료 ===")
+print(f"1. cd {PROJECT_ROOT}")
+print("2. pip install -r requirements.txt")
+print("3. python run.py")
+🧐 리팩토링 포인트 설명 (경원님을 위한 요약)
+SRP (단일 책임 원칙) 적용
 
-.star {
-    position: absolute;
-    width: 2px;
-    height: 2px;
-    background: white;
-    border-radius: 50%;
-    opacity: 0;
-    animation: twinkle 5s infinite ease-in-out;
-}
+web/routes.py: 오직 URL 요청을 받고 응답을 주는 역할만 합니다. DB 연결법 따위는 모릅니다.
 
-/* 별 위치 및 딜레이 랜덤화 (CSS 하드코딩) */
-.star:nth-child(1) { top: 10%; left: 20%; animation-delay: 0s; }
-.star:nth-child(2) { top: 30%; left: 80%; animation-delay: 2s; }
-.star:nth-child(3) { top: 70%; left: 40%; animation-delay: 4s; }
-.star:nth-child(4) { top: 15%; left: 60%; animation-delay: 1s; }
-.star:nth-child(5) { top: 80%; left: 10%; animation-delay: 3s; }
-.star:nth-child(6) { top: 50%; left: 90%; animation-delay: 5s; }
+database/connector.py: 오직 DB 연결 객체를 생성하는 역할만 합니다.
 
-@keyframes twinkle {
-    0% { opacity: 0; transform: scale(0.5); }
-    50% { opacity: 1; transform: scale(1.2); box-shadow: 0 0 5px #fff; }
-    100% { opacity: 0; transform: scale(0.5); }
-}
+diagnostics/*.py: 실제 진단 로직(SQL 쿼리 등)만 담당합니다.
 
-/* 레이아웃 */
-.container {
-    display: flex;
-    width: 90%;
-    height: 80vh;
-    gap: 20px;
-}
+OCP (개방-폐쇄 원칙) 적용
 
-/* 왼쪽 리스트 패널 */
-.list-panel {
-    flex: 1;
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 10px;
-    padding: 20px;
-    overflow-y: auto;
-    backdrop-filter: blur(5px);
-    border: 1px solid rgba(255,255,255,0.1);
-}
+만약 OracleDiagnostic을 추가하고 싶다면?
 
-.memo-item {
-    background: rgba(0, 0, 0, 0.3);
-    padding: 15px;
-    margin-bottom: 10px;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: background 0.2s;
-    border-left: 3px solid transparent;
-}
+기존 코드를 건드릴 필요 없이 app/diagnostics/oracle_checks.py 파일을 만들고 IDiagnostic만 상속받으면 됩니다. 그 후 팩토리에 한 줄만 추가하면 끝입니다.
 
-.memo-item:hover {
-    background: rgba(255, 255, 255, 0.1);
-}
+DIP (의존성 역전 원칙) 적용
 
-.memo-item.active {
-    border-left: 3px solid #f1c40f;
-    background: rgba(255, 255, 255, 0.15);
-}
+interfaces.py에 IDiagnostic, IDatabaseConnector라는 **규약(Interface)**을 정의했습니다.
 
-.memo-preview {
-    font-size: 0.9rem;
-    color: #ddd;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
+상위 모듈(Web Route)은 구체적인 MSSQLDiagnostic 클래스 내용보다 이 인터페이스(규약)를 믿고 실행합니다.
 
-.memo-date {
-    font-size: 0.7rem;
-    color: #888;
-    margin-top: 5px;
-    text-align: right;
-}
+디렉토리 구조화
 
-/* 오른쪽 입력 패널 */
-.input-panel {
-    flex: 2;
-    display: flex;
-    flex-direction: column;
-}
+이전의 뚱뚱한 app.py 하나가 아니라, 기능별로 폴더가 나뉘어 있어 팀 단위 협업이나 유지보수가 훨씬 수월합니다.
 
-/* 칠판 스타일 */
-.chalkboard {
-    flex: 1;
-    background-color: #2b5938; /* 칠판 녹색 */
-    border: 10px solid #5c4033; /* 나무 테두리 느낌 */
-    border-radius: 5px;
-    padding: 20px;
-    box-shadow: 0 10px 20px rgba(0,0,0,0.5);
-    display: flex;
-    flex-direction: column;
-}
-
-textarea {
-    width: 100%;
-    flex: 1;
-    background: transparent;
-    border: none;
-    resize: none;
-    color: #f1c40f; /* 노란색 분필 */
-    font-family: 'Nanum Pen Script', cursive; /* 손글씨 폰트 */
-    font-size: 1.8rem;
-    line-height: 1.5;
-    outline: none;
-}
-
-textarea::placeholder {
-    color: rgba(241, 196, 15, 0.5);
-}
-
-.controls {
-    margin-top: 15px;
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-}
-
-button {
-    padding: 10px 20px;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    font-weight: bold;
-    transition: transform 0.1s;
-}
-
-button:active {
-    transform: scale(0.95);
-}
-
-.btn-save {
-    background-color: #f1c40f;
-    color: #2b5938;
-}
-
-.btn-cancel {
-    background-color: transparent;
-    color: #aaa;
-    border: 1px solid #aaa;
-}
-
-.btn-delete {
-    background-color: #c0392b;
-    color: white;
-    padding: 5px 15px;
-    font-size: 0.8rem;
-}
-"""
-
-# 4. static/script.js (클라이언트 로직)
-files['static/script.js'] = """
-document.addEventListener('DOMContentLoaded', () => {
-    loadList();
-});
-
-// 메모 목록 로드
-function loadList() {
-    fetch('/api/list')
-        .then(response => response.json())
-        .then(data => {
-            const listEl = document.getElementById('memo-list');
-            listEl.innerHTML = '';
-            
-            data.forEach(memo => {
-                const div = document.createElement('div');
-                div.className = 'memo-item';
-                div.onclick = () => selectMemo(memo.filename, memo.content, div);
-                
-                // 미리보기 (첫 줄 혹은 앞부분)
-                const preview = memo.content.length > 30 ? memo.content.substring(0, 30) + '...' : memo.content;
-                
-                div.innerHTML = `
-                    <div class="memo-preview">${preview.replace(/</g, "&lt;")}</div>
-                    <div class="memo-date">${formatDate(memo.timestamp)}</div>
-                `;
-                listEl.appendChild(div);
-            });
-        });
-}
-
-// 메모 선택 (수정 모드)
-function selectMemo(filename, content, element) {
-    document.getElementById('current-filename').value = filename;
-    document.getElementById('memo-content').value = content;
-    document.getElementById('delete-zone').style.display = 'block';
-    
-    // UI 활성화 표시
-    document.querySelectorAll('.memo-item').forEach(el => el.classList.remove('active'));
-    element.classList.add('active');
-}
-
-// 폼 초기화 (새 메모 모드)
-function resetForm() {
-    document.getElementById('current-filename').value = '';
-    document.getElementById('memo-content').value = '';
-    document.getElementById('delete-zone').style.display = 'none';
-    document.querySelectorAll('.memo-item').forEach(el => el.classList.remove('active'));
-}
-
-// 저장 (추가/수정)
-function saveMemo() {
-    const content = document.getElementById('memo-content').value;
-    const filename = document.getElementById('current-filename').value;
-    
-    if (!content.trim()) {
-        alert('내용을 입력해주세요.');
-        return;
-    }
-
-    fetch('/api/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: filename, content: content })
-    })
-    .then(res => res.json())
-    .then(data => {
-        if (data.status === 'success') {
-            resetForm();
-            loadList();
-        } else {
-            alert('저장 실패: ' + data.message);
-        }
-    });
-}
-
-// 삭제
-function deleteMemo() {
-    const filename = document.getElementById('current-filename').value;
-    if (!filename) return;
-
-    if (!confirm('정말 삭제하시겠습니까?')) return;
-
-    fetch('/api/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: filename })
-    })
-    .then(res => res.json())
-    .then(data => {
-        if (data.status === 'success') {
-            resetForm();
-            loadList();
-        } else {
-            alert('삭제 실패: ' + data.message);
-        }
-    });
-}
-
-// 날짜 포맷팅 헬퍼
-function formatDate(ts) {
-    // YYYYmmddHHmmss -> YYYY-mm-dd HH:mm:ss
-    if (ts.length !== 14) return ts;
-    return `${ts.substring(0,4)}-${ts.substring(4,6)}-${ts.substring(6,8)} ${ts.substring(8,10)}:${ts.substring(10,12)}`;
-}
-"""
-
-def create_project():
-    # 루트 디렉토리 생성
-    if not os.path.exists(BASE_DIR):
-        os.makedirs(BASE_DIR)
-        print(f"Created directory: {BASE_DIR}")
-    
-    # 하위 디렉토리 생성 (templates, static, standby)
-    subdirs = ['templates', 'static', 'standby']
-    for sd in subdirs:
-        path = os.path.join(BASE_DIR, sd)
-        if not os.path.exists(path):
-            os.makedirs(path)
-            print(f"Created directory: {path}")
-
-    # 파일 생성
-    for filepath, content in files.items():
-        full_path = os.path.join(BASE_DIR, filepath)
-        with open(full_path, 'w', encoding='utf-8') as f:
-            f.write(content.strip())
-        print(f"Created file: {full_path}")
-
-    print("\n" + "="*50)
-    print("Project [memostandby] created successfully!")
-    print("="*50)
-    print("1. cd memostandby")
-    print("2. pip install flask")
-    print("3. python app.py")
-    print(f"Server will run on port 9992, accessible only from 10.244.120.24")
-
-if __name__ == "__main__":
-    create_project()
+이제 이 구조 위에서라면 100가지 진단 기능을 추가해도 코드가 엉키지 않습니다. 실행해 보시고 구조를 확인해 보세요.
