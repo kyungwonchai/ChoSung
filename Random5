@@ -1,387 +1,353 @@
 import os
 import sys
 
-PROJECT_ROOT = "DB_Sherlock_Pro"
+# 1. 프로젝트 폴더 생성 (소문자)
+project_folder = "diagnosis_tool"
+templates_folder = os.path.join(project_folder, "templates")
 
-file_contents = {}
+if not os.path.exists(templates_folder):
+    os.makedirs(templates_folder)
+    print(f"[INFO] 폴더 생성 완료: {project_folder}, {templates_folder}")
 
-# ==========================================
-# 1. [Core] 데이터 모델 정의
-# ==========================================
-file_contents["app/core/interfaces.py"] = """
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import List, Dict, Any
-
-@dataclass
-class QueryStat:
-    text: str          # 쿼리 내용
-    avg_time: str      # 평균 소요 시간 (초)
-    exec_count: int    # 실행 횟수
-    last_exec: str     # 마지막 실행 시간
-
-@dataclass
-class DiagnosticResult:
-    status: str
-    score: int
-    summary: str
-    details: List[str] = field(default_factory=list)
-    worst_queries: List[QueryStat] = field(default_factory=list) # 워스트 쿼리 리스트
-    recommendations: List[str] = field(default_factory=list)
-
-class IDiagnosticStrategy(ABC):
-    @abstractmethod
-    def diagnose(self, config: Dict[str, Any]) -> DiagnosticResult:
-        pass
-"""
-
-file_contents["app/core/__init__.py"] = ""
-
-# ==========================================
-# 2. [Infra] MSSQL 정밀 타격 전략 (범인 색출)
-# ==========================================
-file_contents["app/infra/mssql_strategy.py"] = """
-import pymssql
-from app.core.interfaces import IDiagnosticStrategy, DiagnosticResult, QueryStat
-
-class MSSQLStrategy(IDiagnosticStrategy):
-    def diagnose(self, config: dict) -> DiagnosticResult:
-        result = DiagnosticResult("Healthy", 100, "안정적")
-        conn = None
-        try:
-            conn = pymssql.connect(
-                server=config['host'], port=str(config['port']),
-                user=config['user'], password=config['password'],
-                database=config['db_name'], timeout=10
-            )
-            cursor = conn.cursor(as_dict=True)
-
-            # ---------------------------------------------------------
-            # [핵심] 워스트 쿼리 추출 (CPU & 소요시간 기준 정렬)
-            # ---------------------------------------------------------
-            cursor.execute(\"\"\"
-                SELECT TOP 5
-                    SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,
-                    ((CASE statement_end_offset WHEN -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END
-                            - qs.statement_start_offset)/2) + 1) AS query_text,
-                    (qs.total_elapsed_time / qs.execution_count / 1000000.0) AS avg_seconds,
-                    qs.execution_count,
-                    qs.last_execution_time
-                FROM sys.dm_exec_query_stats AS qs
-                CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-                WHERE qs.last_execution_time > DATEADD(day, -1, GETDATE()) -- 최근 1일 내 실행된 것만
-                ORDER BY qs.total_worker_time DESC -- [정렬 기준] CPU 사용량 높은 순 (가장 무거운 놈)
-            \"\"\")
-            
-            rows = cursor.fetchall()
-            if rows:
-                for row in rows:
-                    q_text = row['query_text'][:200] + "..." if len(row['query_text']) > 200 else row['query_text']
-                    result.worst_queries.append(QueryStat(
-                        text=q_text,
-                        avg_time=f"{row['avg_seconds']:.4f}s",
-                        exec_count=row['execution_count'],
-                        last_exec=str(row['last_execution_time'])
-                    ))
-                
-                # 점수 깎기 (가장 느린 쿼리가 3초 이상이면 감점)
-                if rows[0]['avg_seconds'] > 3.0:
-                    result.score -= 20
-                    result.details.append("3초 이상 소요되는 쿼리가 발견되었습니다.")
-                    result.status = "Warning"
-
-            # ---------------------------------------------------------
-            # [보조] 대기 유형 분석 (락 걸리는지 확인)
-            # ---------------------------------------------------------
-            cursor.execute(\"\"\"
-                SELECT TOP 3 wait_type, wait_time_ms / 1000.0 AS wait_sec
-                FROM sys.dm_os_wait_stats
-                WHERE wait_type NOT IN ('SLEEP_TASK', 'BROKER_EVENT_HANDLER', 'DIRTY_PAGE_POLL')
-                ORDER BY wait_time_ms DESC
-            \"\"\")
-            waits = cursor.fetchall()
-            if waits and waits[0]['wait_sec'] > 60:
-                result.recommendations.append(f"주요 대기: {waits[0]['wait_type']} (병목 의심)")
-                result.score -= 10
-
-        except Exception as e:
-            return DiagnosticResult("Error", 0, f"접속 불가: {str(e)}")
-        finally:
-            if conn: conn.close()
-            
-        return result
-"""
-
-# ==========================================
-# 3. [Infra] MySQL 정밀 타격 전략 (sys 스키마 활용)
-# ==========================================
-file_contents["app/infra/mysql_strategy.py"] = """
+# 2. app.py 생성 (Flask 서버 및 진단 로직)
+app_code = r"""
+import time
+import traceback
+import psutil
 import pymysql
-from app.core.interfaces import IDiagnosticStrategy, DiagnosticResult, QueryStat
+import pymssql
+import socket
+import os
+from flask import Flask, render_template, Response, stream_with_context
 
-class MySQLStrategy(IDiagnosticStrategy):
-    def diagnose(self, config: dict) -> DiagnosticResult:
-        result = DiagnosticResult("Healthy", 100, "안정적")
-        conn = None
-        try:
-            conn = pymysql.connect(
-                host=config['host'], port=config['port'],
-                user=config['user'], password=config['password'],
-                database=config['db_name'], connect_timeout=10,
-                cursorclass=pymysql.cursors.DictCursor
-            )
-            with conn.cursor() as cursor:
-                # ---------------------------------------------------------
-                # [핵심] 워스트 쿼리 추출 (sys.statement_analysis 활용)
-                # ---------------------------------------------------------
-                try:
-                    cursor.execute(\"\"\"
-                        SELECT query, exec_count, 
-                               format_pico_time(avg_latency) as avg_time_str, 
-                               (avg_latency / 1000000000000.0) as avg_seconds,
-                               last_seen
-                        FROM sys.statement_analysis 
-                        ORDER BY avg_latency DESC 
-                        LIMIT 5
-                    \"\"\")
-                    rows = cursor.fetchall()
-                    for row in rows:
-                        q_text = row['query'][:200] + "..." if len(row['query']) > 200 else row['query']
-                        result.worst_queries.append(QueryStat(
-                            text=q_text,
-                            avg_time=f"{row['avg_seconds']:.4f}s",
-                            exec_count=row['exec_count'],
-                            last_exec=str(row['last_seen'])
-                        ))
-                        
-                    if rows and rows[0]['avg_seconds'] > 3.0:
-                        result.score -= 20
-                        result.details.append("평균 3초 이상 소요되는 느린 쿼리 존재")
-                        result.status = "Warning"
+app = Flask(__name__)
 
-                except Exception:
-                    # sys 스키마가 없거나 권한이 없는 경우 fallback
-                    result.details.append("sys 스키마 권한 없음 (쿼리 분석 제한됨)")
-
-                # ---------------------------------------------------------
-                # [보조] 전체 스캔 비율 확인
-                # ---------------------------------------------------------
-                cursor.execute("SHOW GLOBAL STATUS LIKE 'Select_full_join'")
-                val = cursor.fetchone()
-                if val and int(val['Value']) > 100:
-                    result.recommendations.append("인덱스 없이 조인하는 쿼리가 많습니다 (Full Join)")
-                    result.score -= 10
-
-        except Exception as e:
-            return DiagnosticResult("Error", 0, f"MySQL 오류: {str(e)}")
-        finally:
-            if conn: conn.close()
-        return result
-"""
-
-file_contents["app/infra/__init__.py"] = ""
-
-# ==========================================
-# 4. [Service] 큐 엔진
-# ==========================================
-file_contents["app/services/engine.py"] = """
-import threading, queue, time
-from app.infra.mssql_strategy import MSSQLStrategy
-from app.infra.mysql_strategy import MySQLStrategy
-
-class DiagnosticEngine:
-    def __init__(self):
-        self.q = queue.Queue()
-        self.results = {}
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def submit(self, db_id, config):
-        self.results[db_id] = {"status": "Pending", "summary": "대기 중..."}
-        self.q.put((db_id, config))
-
-    def get_results(self):
-        return self.results
-
-    def _worker(self):
-        while True:
-            db_id, config = self.q.get()
-            self.results[db_id] = {"status": "Running", "summary": "분석 중..."}
-            
-            try:
-                strategy = MSSQLStrategy() if "MSSQL" in config['type'] else MySQLStrategy()
-                res = strategy.diagnose(config)
-                self.results[db_id] = res.__dict__ # Dataclass to dict
-                # dataclass 내부 list of dataclass를 dict로 변환
-                self.results[db_id]['worst_queries'] = [q.__dict__ for q in res.worst_queries]
-            except Exception as e:
-                self.results[db_id] = {"status": "Error", "summary": str(e), "worst_queries": []}
-            
-            self.q.task_done()
-"""
-
-file_contents["app/services/__init__.py"] = ""
-
-# ==========================================
-# 5. [Web] Flask & UI (워스트 쿼리 테이블 표시)
-# ==========================================
-file_contents["app/web/app.py"] = """
-from flask import Flask, render_template, request, jsonify
-from app.services.engine import DiagnosticEngine
-
-app = Flask(__name__, template_folder='templates')
-engine = DiagnosticEngine()
-
-# [설정] 50개 DB 리스트 예시
-INVENTORY = {
-    "DB_1": {"name": "MES_Main", "type": "MSSQL2014", "host": "127.0.0.1", "port": 1433, "user": "sa", "password": "pw", "db_name": "TestDB"},
-    "DB_2": {"name": "ERP_Sub", "type": "MSSQL2016", "host": "127.0.0.1", "port": 1433, "user": "sa", "password": "pw", "db_name": "TestDB2"},
-    "DB_3": {"name": "Web_Log", "type": "MySQL5.7", "host": "127.0.0.1", "port": 3306, "user": "root", "password": "pw", "db_name": "LogDB"}
+# === [설정] DB 접속 정보 (여기에 실제 정보를 입력하세요) ===
+MYSQL_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'your_password',
+    'charset': 'utf8mb4',
+    'cursorclass': pymysql.cursors.DictCursor
 }
 
+MSSQL_CONFIG = {
+    'server': 'localhost',
+    'user': 'sa',
+    'password': 'your_password',
+    'database': 'master'
+}
+
+# === 진단 함수 모음 (Generator 사용으로 실시간 로그 전송) ===
+
+def log(msg, level="INFO"):
+    timestamp = time.strftime("%H:%M:%S")
+    color = "white"
+    if level == "OK": color = "#00ff00"
+    if level == "ERROR": color = "#ff4444"
+    if level == "WARN": color = "orange"
+    if level == "HEADER": color = "#00ccff"
+    
+    return f'<div style="color:{color};">[{timestamp}] {msg}</div>\n'
+
+def check_system_resource():
+    yield log("=== 시스템 리소스 점검 시작 ===", "HEADER")
+    try:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        yield log(f"CPU 사용량: {cpu}%")
+        yield log(f"메모리: {mem.percent}% (사용: {mem.used // (1024**2)}MB / 전체: {mem.total // (1024**2)}MB)")
+        yield log(f"디스크: {disk.percent}% (여유: {disk.free // (1024**3)}GB)")
+        yield log("시스템 리소스 점검 완료", "OK")
+    except Exception:
+        yield log(f"시스템 점검 실패: {traceback.format_exc()}", "ERROR")
+
+def check_network_basic():
+    yield log("=== 네트워크 기본 점검 (Google Ping) ===", "HEADER")
+    try:
+        host = "8.8.8.8"
+        port = 53
+        timeout = 3
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        yield log(f"외부 네트워크 연결 성공 ({host})", "OK")
+    except Exception:
+        yield log(f"외부 네트워크 연결 실패: {traceback.format_exc()}", "ERROR")
+
+def check_mysql_connect():
+    yield log("=== MySQL 단순 연결 점검 ===", "HEADER")
+    try:
+        conn = pymysql.connect(**MYSQL_CONFIG)
+        conn.close()
+        yield log("MySQL 연결 성공", "OK")
+    except Exception:
+        yield log(f"MySQL 연결 에러 발생:\n{traceback.format_exc()}", "ERROR")
+
+def check_mssql_connect():
+    yield log("=== MSSQL 단순 연결 점검 ===", "HEADER")
+    try:
+        conn = pymssql.connect(**MSSQL_CONFIG)
+        conn.close()
+        yield log("MSSQL 연결 성공", "OK")
+    except Exception:
+        yield log(f"MSSQL 연결 에러 발생:\n{traceback.format_exc()}", "ERROR")
+
+def check_mysql_full():
+    yield log("=== MySQL 전체 데이터베이스 순차 정밀 진단 ===", "HEADER")
+    conn = None
+    try:
+        conn = pymysql.connect(**MYSQL_CONFIG)
+        cursor = conn.cursor()
+        
+        # 시스템 DB 제외 목록
+        exclude_dbs = ['information_schema', 'mysql', 'performance_schema', 'sys']
+        
+        cursor.execute("SHOW DATABASES")
+        dbs = [row['Database'] for row in cursor.fetchall()]
+        
+        target_dbs = [db for db in dbs if db not in exclude_dbs]
+        yield log(f"진단 대상 DB 목록: {target_dbs}")
+        
+        for db_name in target_dbs:
+            yield log(f"--> [MySQL] '{db_name}' 데이터베이스 진입 중...", "WARN")
+            try:
+                conn.select_db(db_name)
+                cursor.execute("SHOW TABLES")
+                tables = cursor.fetchall()
+                table_count = len(tables)
+                yield log(f"    - '{db_name}' 접속 성공. 테이블 수: {table_count}개", "OK")
+                
+                # 간단한 쿼리 테스트 (예: 첫 번째 테이블 조회 시도)
+                if table_count > 0:
+                    first_table = list(tables[0].values())[0]
+                    cursor.execute(f"SELECT count(*) as cnt FROM `{first_table}`")
+                    row_cnt = cursor.fetchone()['cnt']
+                    yield log(f"    - '{first_table}' 테이블 조회 테스트 성공 (행 수: {row_cnt})", "OK")
+                    
+            except Exception as e:
+                yield log(f"    - '{db_name}' 진단 중 에러: {str(e)}", "ERROR")
+            
+            time.sleep(0.5) # 시각적 로그 확인을 위한 약간의 지연
+            
+    except Exception:
+        yield log(f"MySQL 전체 진단 실패:\n{traceback.format_exc()}", "ERROR")
+    finally:
+        if conn: conn.close()
+
+def check_mssql_full():
+    yield log("=== MSSQL 전체 데이터베이스 순차 정밀 진단 ===", "HEADER")
+    conn = None
+    try:
+        conn = pymssql.connect(**MSSQL_CONFIG)
+        cursor = conn.cursor(as_dict=True)
+        
+        # 시스템 DB 제외
+        exclude_dbs = ['master', 'tempdb', 'model', 'msdb']
+        
+        cursor.execute("SELECT name FROM sys.databases")
+        dbs = [row['name'] for row in cursor.fetchall()]
+        
+        target_dbs = [db for db in dbs if db not in exclude_dbs]
+        yield log(f"진단 대상 DB 목록: {target_dbs}")
+        
+        for db_name in target_dbs:
+            yield log(f"--> [MSSQL] '{db_name}' 데이터베이스 진입 중...", "WARN")
+            try:
+                # MSSQL은 USE 명령어로 전환
+                cursor.execute(f"USE [{db_name}]")
+                cursor.execute("SELECT count(*) as cnt FROM information_schema.tables")
+                row = cursor.fetchone()
+                yield log(f"    - '{db_name}' 접속 성공. 테이블 수: {row['cnt']}개", "OK")
+            except Exception as e:
+                yield log(f"    - '{db_name}' 진단 중 에러: {str(e)}", "ERROR")
+            
+            time.sleep(0.5)
+            
+    except Exception:
+        yield log(f"MSSQL 전체 진단 실패:\n{traceback.format_exc()}", "ERROR")
+    finally:
+        if conn: conn.close()
+
+def check_env_vars():
+    yield log("=== 환경 변수 및 경로 점검 ===", "HEADER")
+    try:
+        cwd = os.getcwd()
+        user = os.getenv('USERNAME') or os.getenv('USER')
+        yield log(f"현재 작업 경로: {cwd}")
+        yield log(f"실행 유저: {user}")
+        yield log("환경 변수 읽기 성공", "OK")
+    except Exception:
+        yield log(f"환경 변수 점검 실패: {traceback.format_exc()}", "ERROR")
+
+def check_file_permissions():
+    yield log("=== 로그 폴더 쓰기 권한 점검 ===", "HEADER")
+    try:
+        test_file = "test_permission.tmp"
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        yield log("현재 폴더 쓰기/삭제 권한 정상", "OK")
+    except Exception:
+        yield log(f"파일 권한 에러: {traceback.format_exc()}", "ERROR")
+
+def check_python_libs():
+    yield log("=== 필수 라이브러리 버전 점검 ===", "HEADER")
+    yield log(f"Flask Version: {Flask.__version__}")
+    yield log(f"PyMySQL Version: {pymysql.__version__}")
+    yield log(f"Psutil Version: {psutil.__version__}")
+    yield log("라이브러리 로드 완료", "OK")
+
+def check_port_listener():
+    yield log("=== 80/443 포트 리스닝 상태 (간이) ===", "HEADER")
+    # 실제 구현 시에는 netstat subprocess 호출 등이 필요하나 여기선 생략
+    yield log("포트 점검 로직은 OS 권한 문제로 생략합니다 (코드 참고)", "WARN")
+
+# === 라우팅 및 스트리밍 처리 ===
+
 @app.route('/')
-def index(): return render_template('dashboard.html', inventory=INVENTORY)
+def index():
+    return render_template('index.html')
 
-@app.route('/diagnose', methods=['POST'])
-def diagnose():
-    db_id = request.json['db_id']
-    if db_id in INVENTORY:
-        engine.submit(db_id, INVENTORY[db_id])
-        return jsonify("ok")
-    return jsonify("error"), 404
+@app.route('/diagnose/<target>')
+def diagnose(target):
+    def generate():
+        yield log(f"=== 진단 시작: {target} ===", "HEADER")
+        time.sleep(0.5)
+        
+        # 전체 진단
+        if target == 'all':
+            yield from check_system_resource()
+            yield from check_network_basic()
+            yield from check_env_vars()
+            yield from check_file_permissions()
+            yield from check_python_libs()
+            yield from check_mysql_full()
+            yield from check_mssql_full()
+        
+        # 개별 진단 매핑
+        elif target == 'resource': yield from check_system_resource()
+        elif target == 'network': yield from check_network_basic()
+        elif target == 'mysql_conn': yield from check_mysql_connect()
+        elif target == 'mssql_conn': yield from check_mssql_connect()
+        elif target == 'mysql_full': yield from check_mysql_full()
+        elif target == 'mssql_full': yield from check_mssql_full()
+        elif target == 'env': yield from check_env_vars()
+        elif target == 'perm': yield from check_file_permissions()
+        elif target == 'libs': yield from check_python_libs()
+        else:
+            yield log("알 수 없는 진단 명령입니다.", "ERROR")
+            
+        yield log("=== 모든 진단 프로세스 종료 ===", "HEADER")
 
-@app.route('/status')
-def status(): return jsonify(engine.get_results())
+    return Response(stream_with_context(generate()), mimetype='text/html')
 
-def run(): app.run(host='0.0.0.0', port=9999)
+if __name__ == '__main__':
+    # 디버깅 모드 활성화 (에러 상세 출력)
+    app.run(host='0.0.0.0', port=5000, debug=True)
 """
 
-file_contents["app/web/templates/dashboard.html"] = """
+# 3. index.html 생성 (실시간 로그 뷰어 UI)
+html_code = r"""
 <!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
-    <title>DB Sherlock Pro</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>시스템 상세 진단 도구</title>
     <style>
-        .query-text { font-family: monospace; font-size: 0.85em; color: #d63384; background: #f8f9fa; padding: 2px 4px; border-radius: 3px; }
-        .card { transition: all 0.3s; }
-        .status-Healthy { border-top: 4px solid #198754; }
-        .status-Warning { border-top: 4px solid #ffc107; }
-        .status-Error { border-top: 4px solid #dc3545; }
+        body { font-family: 'Consolas', sans-serif; background-color: #1e1e1e; color: #ddd; padding: 20px; }
+        h1 { color: #fff; border-bottom: 2px solid #444; padding-bottom: 10px; }
+        .control-panel { margin-bottom: 20px; background: #252526; padding: 15px; border-radius: 5px; }
+        button {
+            background-color: #333; color: white; border: 1px solid #555;
+            padding: 8px 15px; margin: 5px; cursor: pointer; transition: 0.2s;
+            font-family: inherit;
+        }
+        button:hover { background-color: #444; border-color: #888; }
+        button.btn-danger { background-color: #800; border-color: #a00; font-weight: bold; }
+        button.btn-danger:hover { background-color: #a00; }
+        
+        #log-container {
+            background-color: #000; color: #0f0;
+            border: 1px solid #444; padding: 15px;
+            height: 600px; overflow-y: auto;
+            white-space: pre-wrap; line-height: 1.4;
+            font-size: 14px; box-shadow: inset 0 0 10px #000;
+        }
     </style>
 </head>
-<body class="bg-light p-4">
-    <h2 class="mb-4">🕵️‍♂️ DB 범인 쿼리 추적 시스템 <small class="text-muted">(Port: 9999)</small></h2>
+<body>
+    <h1>🛠️ 통합 시스템 정밀 진단기 (Debug Mode)</h1>
     
-    <div class="row">
-        {% for id, db in inventory.items() %}
-        <div class="col-12 mb-4">
-            <div class="card shadow-sm" id="card-{{id}}">
-                <div class="card-header d-flex justify-content-between align-items-center bg-white">
-                    <h5 class="m-0">{{ db.name }} <span class="badge bg-secondary ms-2">{{ db.type }}</span></h5>
-                    <button onclick="check('{{id}}')" class="btn btn-dark btn-sm">범인 색출 시작</button>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-3 border-end text-center">
-                            <h2 id="score-{{id}}" class="display-6 fw-bold text-muted">-</h2>
-                            <span id="status-{{id}}" class="badge bg-light text-dark border">대기 중</span>
-                        </div>
-                        <div class="col-md-9">
-                            <ul id="issues-{{id}}" class="list-unstyled text-danger mb-3"></ul>
-                            
-                            <h6 class="fw-bold border-bottom pb-2">🚨 워스트 쿼리 TOP 5 (소요시간 순)</h6>
-                            <div class="table-responsive">
-                                <table class="table table-sm table-bordered" style="font-size: 0.9rem;">
-                                    <thead class="table-light">
-                                        <tr>
-                                            <th style="width: 60%;">쿼리 내용 (Query Text)</th>
-                                            <th style="width: 15%;">평균 시간</th>
-                                            <th style="width: 10%;">횟수</th>
-                                            <th style="width: 15%;">마지막 실행</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="worst-{{id}}">
-                                        <tr><td colspan="4" class="text-center text-muted">진단 버튼을 눌러주세요.</td></tr>
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        {% endfor %}
+    <div class="control-panel">
+        <h3>🚀 전체 진단</h3>
+        <button class="btn-danger" onclick="startDiagnosis('all')">전체 시스템 및 DB 풀스캔 시작</button>
+        
+        <h3>🔍 개별 정밀 진단 (10종)</h3>
+        <button onclick="startDiagnosis('resource')">1. 시스템 리소스(CPU/RAM/Disk)</button>
+        <button onclick="startDiagnosis('network')">2. 외부 네트워크(Ping)</button>
+        <button onclick="startDiagnosis('env')">3. 환경변수 점검</button>
+        <button onclick="startDiagnosis('perm')">4. 파일 쓰기 권한</button>
+        <button onclick="startDiagnosis('libs')">5. 파이썬 라이브러리</button>
+        <br>
+        <button onclick="startDiagnosis('mysql_conn')">6. MySQL 단순 연결</button>
+        <button onclick="startDiagnosis('mssql_conn')">7. MSSQL 단순 연결</button>
+        <button onclick="startDiagnosis('mysql_full')">8. MySQL DB 순차 정밀진단</button>
+        <button onclick="startDiagnosis('mssql_full')">9. MSSQL DB 순차 정밀진단</button>
     </div>
 
+    <h3>🖥️ 실시간 진단 로그 (Real-time Output)</h3>
+    <div id="log-container">대기 중... 버튼을 눌러 진단을 시작하세요.</div>
+
     <script>
-        function check(id) {
-            document.getElementById(`status-${id}`).innerText = "추적 중...";
-            fetch('/diagnose', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({db_id: id})
-            });
-        }
-
-        setInterval(async () => {
-            const res = await fetch('/status');
-            const data = await res.json();
+        async function startDiagnosis(target) {
+            const logContainer = document.getElementById('log-container');
+            logContainer.innerHTML = `<div style='color:yellow'>[SYSTEM] '${target}' 진단 요청 시작... 연결 중...</div>`;
             
-            for(const [id, res] of Object.entries(data)) {
-                // 카드 상태 업데이트
-                const card = document.getElementById(`card-${id}`);
-                card.className = `card shadow-sm status-${res.status || 'Pending'}`;
-                
-                document.getElementById(`score-${id}`).innerText = res.score ? res.score + "점" : "-";
-                document.getElementById(`status-${id}`).innerText = res.status || "대기";
-                
-                // 이슈 리스트
-                const issues = (res.details || []).concat(res.recommendations || []);
-                document.getElementById(`issues-${id}`).innerHTML = issues.map(i => `<li>⚠️ ${i}</li>`).join('');
+            try {
+                const response = await fetch(`/diagnose/${target}`);
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
 
-                // 워스트 쿼리 테이블
-                const tbody = document.getElementById(`worst-${id}`);
-                if (res.worst_queries && res.worst_queries.length > 0) {
-                    tbody.innerHTML = res.worst_queries.map(q => `
-                        <tr>
-                            <td><div class="query-text text-break">${q.text}</div></td>
-                            <td class="fw-bold text-danger">${q.avg_time}</td>
-                            <td>${q.exec_count}</td>
-                            <td>${q.last_exec}</td>
-                        </tr>
-                    `).join('');
-                } else if (res.status === 'Healthy') {
-                    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-success">🎉 발견된 악성 쿼리가 없습니다.</td></tr>';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value, { stream: true });
+                    // HTML 태그가 포함된 텍스트를 누적해서 보여줌
+                    logContainer.innerHTML += chunk;
+                    
+                    // 스크롤을 항상 최하단으로
+                    logContainer.scrollTop = logContainer.scrollHeight;
                 }
+                logContainer.innerHTML += "<div style='color:cyan'>[SYSTEM] 스트림 연결 종료.</div><br>";
+            } catch (error) {
+                logContainer.innerHTML += `<div style='color:red'>[FATAL ERROR] 자바스크립트 통신 오류: ${error}</div>`;
             }
-        }, 1500);
+        }
     </script>
 </body>
 </html>
 """
 
-file_contents["run_sherlock.py"] = """
-import sys, os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from app.web.app import run
+# 파일 쓰기
+with open(os.path.join(project_folder, "app.py"), "w", encoding="utf-8") as f:
+    f.write(app_code)
+    print(f"[INFO] 생성 완료: {os.path.join(project_folder, 'app.py')}")
 
-if __name__ == "__main__":
-    try:
-        import pymssql, pymysql, flask
-        print(">>> DB Sherlock Pro 가동 시작 (Port: 9999)")
-        run()
-    except ImportError as e:
-        print(f"필수 라이브러리 누락: {e.name}")
-        print("pip install pymssql pymysql flask")
-"""
+with open(os.path.join(templates_folder, "index.html"), "w", encoding="utf-8") as f:
+    f.write(html_code)
+    print(f"[INFO] 생성 완료: {os.path.join(templates_folder, 'index.html')}")
 
-def create_project():
-    if not os.path.exists(PROJECT_ROOT): os.makedirs(PROJECT_ROOT)
-    for path, content in file_contents.items():
-        full_path = os.path.join(PROJECT_ROOT, path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "w", encoding="utf-8") as f: f.write(content.strip())
-    print(f"✅ 설치 완료! 'cd {PROJECT_ROOT}' 후 'python run_sherlock.py' 실행하세요.")
-
-if __name__ == "__main__":
-    create_project()
+# 마무리 안내 메시지
+print("\n" + "="*50)
+print("✅ 설치가 완료되었습니다.")
+print("1. 아래 명령어로 필수 라이브러리를 설치하세요:")
+print("   pip install flask pymysql pymssql psutil")
+print("\n2. app.py를 열어 DB 접속 정보(MYSQL_CONFIG, MSSQL_CONFIG)를 수정하세요.")
+print("\n3. 앱 실행:")
+print(f"   cd {project_folder}")
+print("   python app.py")
+print("="*50)
