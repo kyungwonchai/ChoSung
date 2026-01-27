@@ -1,475 +1,100 @@
-import os
-import sys
+경원님, 질문의 핵심을 정확히 짚으셨습니다. 사내 LLM API의 JSON 구조가 {"data": {"input": "...", "output": "...", "inputvalue": "..."}} 이런 식으로 고정되어 있다면, **"여기에 내 마음대로 파라미터를 추가해도 LLM이 알아먹을까?"**가 가장 궁금하실 겁니다.
 
-PROJECT_ROOT = "DB_Sentinel_Master"
+결론부터 말씀드리면, **"API의 JSON 구조(껍데기)는 유지하되, input이나 inputvalue라는 필드 안에 LLM이 해석할 수 있는 '도구 설명서'를 텍스트로 밀어 넣는 것"**이 핵심입니다.
 
-file_contents = {}
+LLM은 JSON의 키(Key) 이름을 보고 동작하는 게 아니라, 그 키 안에 담긴 텍스트 내용을 읽고 판단하기 때문입니다. 개발자 관점에서 이 구조를 어떻게 비틀어 활용해야 하는지 명해드리겠습니다.
 
-# ==========================================
-# 1. [Core] 도메인 모델 & 인터페이스
-# ==========================================
-file_contents["app/core/models.py"] = """
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+1. 사내 API 구조를 유지하며 MCP 적용하기
+회사 API가 고정되어 있다면, 우리는 그 고정된 필드(예: inputvalue)를 LLM과의 대화 창구로만 사용하면 됩니다.
 
-@dataclass
-class DBConfig:
-    id: int
-    name: str
-    type: str  # MSSQL2014, MSSQL2016, MySQL5.7
-    host: str
-    port: int
-    user: str
-    password: str
-    db_name: str
+기존 방식 (단순 질의응답)
+보낼 때: {"inputvalue": "어제 에러 로그 좀 보여줘"}
 
-@dataclass
-class QueryStat:
-    text: str
-    avg_time: str
-    exec_count: int
-    last_exec: str
+받을 때: {"output": "죄송합니다, 저는 실시간 로그에 접근할 권한이 없습니다."}
 
-@dataclass
-class DiagnosticResult:
-    status: str = "Pending"
-    score: int = 0
-    summary: str = "대기 중"
-    details: List[str] = field(default_factory=list)
-    worst_queries: List[QueryStat] = field(default_factory=list)
-    recommendations: List[str] = field(default_factory=list)
+MCP 방식 (도구 설명서 주입)
+경원님이 만드신 **Host(중계 앱)**가 LLM에게 보낼 때, inputvalue 안에 질문만 넣는 게 아니라 **"설명서(System Prompt)"**를 같이 합쳐서 보냅니다.
+
+보낼 때 (Host가 가공):
+
+JSON
+
+{
+  "inputvalue": "너는 로그 분석 전문가야. 너에게는 [read_log]라는 도구가 있어. 
+                 사용자가 로그를 물어보면 반드시 'CALL: read_log(date=...)'라고 답변해.
+                 질문: 어제 에러 로그 좀 보여줘"
+}
+받을 때 (LLM의 응답):
+
+JSON
+
+{
+  "output": "CALL: read_log(date='2026-01-26')"
+}
+2. 파라미터를 내 마음대로 넣어도 되나?
+API 서버(백엔드)가 input, output, inputvalue 외의 다른 키를 허용하지 않는다면, JSON 구조 자체에 새 키를 추가하는 것은 에러가 날 확률이 높습니다. (서버에서 Validation을 할 경우)
+
+하지만 inputvalue라는 문자열 내부에는 어떤 형식이든 넣을 수 있습니다.
+
+핵심 전략: LLM에게 "답변할 때 JSON 형식으로 답변해줘"라고 시키는 것입니다.
+
+경원님의 Host 앱 시나리오:
+
+사용자가 "DB 조회해줘"라고 함.
+
+Host 앱이 사내 API에 보낼 때: inputvalue에 **"너는 DB 조회가 가능해. 만약 조회가 필요하면 다른 말 하지 말고 반드시 { "action": "query_db", "sql": "..." } 형식으로만 대답해"**라고 프롬프트를 보냄.
+
+LLM의 응답(output)에 { "action": "query_db", ... }라는 텍스트가 들어있음.
+
+Host 앱이 이 텍스트를 파싱해서 진짜 MSSQL에 쿼리를 날림.
+
+3. "알아서 동작하나?"에 대한 답변
+아니요, 저절로 되지는 않습니다. LLM은 그저 "텍스트를 뱉는 기계"일 뿐입니다.
+
+LLM이 하는 일: "아, 내가 지금 DB를 뒤져야 하는구나? 그럼 시킨 대로 { "action": "query_db" }라고 글자를 써야지." (판단)
+
+경원님의 코드가 하는 일: LLM이 뱉은 output 글자 중에서 {...} 부분을 찾아내서, 진짜 파이썬 pymssql 라이브러리로 DB를 찌름. (실행)
+
+즉, 사내 API의 규격이 빡빡하더라도 그 안의 텍스트(Value)를 조작함으로써 MCP의 기능을 완벽하게 구현할 수 있습니다.
+
+4. 경원님이 작성하실 "Host 코드"의 로직 (Pseudo Code)
+Python
+
+# 1. 사용자 질문 받기
+user_input = "MSSQL에서 어제자 불량 개수 조회해줘"
+
+# 2. 도구 설명서(System Prompt)와 질문 합치기
+# 사내 API 규격에 맞게 inputvalue에 몰아넣음
+prompt = f"""
+너는 사내 데이터 전문가야. 아래 도구를 쓸 수 있어.
+- query_mssql(sql_query): SQL을 실행함.
+반드시 도구가 필요하면 'ACTION: [함수명] 파라미터' 형식으로 대답해.
+
+질문: {user_input}
 """
 
-file_contents["app/core/interfaces.py"] = """
-from abc import ABC, abstractmethod
-from typing import List
-from app.core.models import DBConfig, DiagnosticResult
+# 3. 사내 API 호출 (기존 curl 방식)
+response = call_company_llm_api(inputvalue=prompt) 
+# 결과: {"output": "ACTION: query_mssql(sql_query='SELECT count(*) FROM ...')"}
 
-class IDiagnosticStrategy(ABC):
-    @abstractmethod
-    def diagnose(self, config: DBConfig) -> DiagnosticResult:
-        pass
-
-class IDBRepository(ABC):
-    @abstractmethod
-    def add_db(self, config: DBConfig): pass
-    @abstractmethod
-    def remove_db(self, db_id: int): pass
-    @abstractmethod
-    def get_all(self) -> List[DBConfig]: pass
-    @abstractmethod
-    def get_by_id(self, db_id: int) -> DBConfig: pass
-"""
-
-file_contents["app/core/__init__.py"] = ""
-
-# ==========================================
-# 2. [Infra] 저장소 패턴 (SQLite) & 진단 전략
-# ==========================================
-file_contents["app/infra/repository.py"] = """
-import sqlite3
-from typing import List
-from app.core.interfaces import IDBRepository
-from app.core.models import DBConfig
-
-DB_FILE = "inventory.db"
-
-class SQLiteRepository(IDBRepository):
-    def __init__(self):
-        self._init_db()
-
-    def _init_db(self):
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(\"\"\"
-                CREATE TABLE IF NOT EXISTS db_inventory (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT, type TEXT, host TEXT, port INTEGER,
-                    user TEXT, password TEXT, db_name TEXT
-                )
-            \"\"\")
-
-    def add_db(self, c: DBConfig):
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(\"\"\"
-                INSERT INTO db_inventory (name, type, host, port, user, password, db_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            \"\"\", (c.name, c.type, c.host, c.port, c.user, c.password, c.db_name))
-
-    def remove_db(self, db_id: int):
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("DELETE FROM db_inventory WHERE id = ?", (db_id,))
-
-    def get_all(self) -> List[DBConfig]:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.execute("SELECT * FROM db_inventory")
-            return [DBConfig(*row) for row in cursor.fetchall()]
-
-    def get_by_id(self, db_id: int) -> DBConfig:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.execute("SELECT * FROM db_inventory WHERE id = ?", (db_id,))
-            row = cursor.fetchone()
-            return DBConfig(*row) if row else None
-"""
-
-file_contents["app/infra/strategies.py"] = """
-import pymssql
-import pymysql
-from app.core.interfaces import IDiagnosticStrategy
-from app.core.models import DBConfig, DiagnosticResult, QueryStat
-
-class MSSQLStrategy(IDiagnosticStrategy):
-    def diagnose(self, config: DBConfig) -> DiagnosticResult:
-        result = DiagnosticResult("Healthy", 100, "안정적")
-        conn = None
-        try:
-            conn = pymssql.connect(
-                server=config.host, port=str(config.port),
-                user=config.user, password=config.password,
-                database=config.db_name, timeout=5
-            )
-            cursor = conn.cursor(as_dict=True)
-            
-            # 워스트 쿼리 추출
-            cursor.execute(\"\"\"
-                SELECT TOP 3
-                    SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,
-                    ((CASE statement_end_offset WHEN -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END
-                            - qs.statement_start_offset)/2) + 1) AS query_text,
-                    (qs.total_elapsed_time / qs.execution_count / 1000000.0) AS avg_sec,
-                    qs.execution_count, qs.last_execution_time
-                FROM sys.dm_exec_query_stats AS qs
-                CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-                ORDER BY qs.total_worker_time DESC
-            \"\"\")
-            rows = cursor.fetchall()
-            for row in rows:
-                q_text = row['query_text'][:100] + "..." if len(row['query_text']) > 100 else row['query_text']
-                result.worst_queries.append(QueryStat(
-                    q_text, f"{row['avg_sec']:.4f}s", row['execution_count'], str(row['last_execution_time'])
-                ))
-                if row['avg_sec'] > 3.0:
-                    result.score -= 20
-                    result.status = "Warning"
-                    result.details.append("3초 이상 소요되는 쿼리 발견")
-
-        except Exception as e:
-            return DiagnosticResult("Error", 0, f"접속 실패: {str(e)}")
-        finally:
-            if conn: conn.close()
-        return result
-
-class MySQLStrategy(IDiagnosticStrategy):
-    def diagnose(self, config: DBConfig) -> DiagnosticResult:
-        result = DiagnosticResult("Healthy", 100, "안정적")
-        try:
-            conn = pymysql.connect(
-                host=config.host, port=config.port, user=config.user,
-                password=config.password, database=config.db_name,
-                connect_timeout=5, cursorclass=pymysql.cursors.DictCursor
-            )
-            # (간소화) 실제로는 sys 스키마 조회 로직 포함
-            result.details.append("MySQL 연결 성공 (상세 로직 적용됨)")
-            conn.close()
-        except Exception as e:
-            return DiagnosticResult("Error", 0, f"MySQL 오류: {str(e)}")
-        return result
-"""
-
-file_contents["app/infra/__init__.py"] = ""
-
-# ==========================================
-# 3. [Service] 엔진 & 팩토리
-# ==========================================
-file_contents["app/services/engine.py"] = """
-import threading, queue
-from typing import Dict
-from app.core.models import DBConfig
-from app.infra.strategies import MSSQLStrategy, MySQLStrategy
-
-class DiagnosticEngine:
-    def __init__(self):
-        self.q = queue.Queue()
-        self.results: Dict[int, dict] = {}
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def submit(self, db_config: DBConfig):
-        self.results[db_config.id] = {"status": "Pending", "summary": "대기열 등록됨"}
-        self.q.put(db_config)
-
-    def get_result(self, db_id: int):
-        return self.results.get(db_id, {})
-
-    def _worker(self):
-        while True:
-            config = self.q.get()
-            self.results[config.id] = {"status": "Running", "summary": "진단 엔진 구동 중..."}
-            
-            try:
-                strategy = MSSQLStrategy() if "MSSQL" in config.type else MySQLStrategy()
-                diag_res = strategy.diagnose(config)
-                
-                # 결과 저장 (Dict 변환)
-                self.results[config.id] = {
-                    "status": diag_res.status,
-                    "score": diag_res.score,
-                    "summary": diag_res.summary,
-                    "details": diag_res.details,
-                    "worst_queries": [q.__dict__ for q in diag_res.worst_queries],
-                    "recommendations": diag_res.recommendations
-                }
-            except Exception as e:
-                self.results[config.id] = {"status": "Error", "summary": str(e)}
-            
-            self.q.task_done()
-"""
-
-file_contents["app/services/__init__.py"] = ""
-
-# ==========================================
-# 4. [Web] Flask App (IP 제한 + CRUD)
-# ==========================================
-file_contents["app/web/app.py"] = """
-from flask import Flask, render_template, request, jsonify, abort
-from app.infra.repository import SQLiteRepository
-from app.services.engine import DiagnosticEngine
-from app.core.models import DBConfig
-
-app = Flask(__name__, template_folder='templates')
-repo = SQLiteRepository()
-engine = DiagnosticEngine()
-
-# [보안] 인트라넷 IP 화이트리스트
-ALLOWED_IP = "10.244.120.24"
-
-@app.before_request
-def restrict_ip():
-    \"\"\"
-    요청한 클라이언트의 IP가 허용된 IP인지 검사합니다.
-    주의: 프록시(Nginx 등)를 거칠 경우 X-Forwarded-For 헤더 처리 필요.
-    여기서는 '인트라넷 내부 직접 접속'을 가정하여 remote_addr을 사용합니다.
-    \"\"\"
-    client_ip = request.remote_addr
-    # 로컬 테스트용(127.0.0.1)은 개발 편의상 허용하려면 아래 주석 해제
-    # if client_ip == "127.0.0.1": return 
+# 4. 결과 해석 (Parsing)
+if "ACTION: query_mssql" in response['output']:
+    sql = extract_sql(response['output']) # 텍스트에서 쿼리만 추출
+    db_result = run_actual_mssql(sql)    # 경원님이 짠 파이썬 함수 실행
     
-    if client_ip != ALLOWED_IP:
-        abort(403, description=f"Access Denied: Your IP ({client_ip}) is not authorized.")
+    # 5. DB 결과를 들고 LLM에게 최종 답변 요청
+    final_prompt = f"DB 결과는 {db_result}야. 이걸로 사용자에게 친절히 답해줘."
+    final_response = call_company_llm_api(inputvalue=final_prompt)
+    print(final_response['output'])
+결론 및 다음 단계
+사내 API의 JSON 키를 바꾸실 필요 없습니다. **inputvalue에 들어가는 "내용"**을 똑똑하게 구성하면 됩니다.
 
-@app.route('/')
-def index():
-    dbs = repo.get_all()
-    return render_template('dashboard.html', dbs=dbs, client_ip=request.remote_addr)
+현재 경원님 업무 환경에서 가장 먼저 자동화하고 싶은 **"도구"**가 무엇인가요?
 
-@app.route('/api/db', methods=['POST'])
-def add_db():
-    data = request.json
-    config = DBConfig(
-        id=0, # Auto increment
-        name=data['name'], type=data['type'], host=data['host'],
-        port=int(data['port']), user=data['user'], password=data['password'],
-        db_name=data['db_name']
-    )
-    repo.add_db(config)
-    return jsonify({"msg": "added"})
+MSSQL 특정 테이블 조회 (예: SMD 제조 로그)
 
-@app.route('/api/db/<int:db_id>', methods=['DELETE'])
-def delete_db(db_id):
-    repo.remove_db(db_id)
-    return jsonify({"msg": "deleted"})
+특정 폴더의 텍스트 파일(로그) 검색
 
-@app.route('/api/diagnose', methods=['POST'])
-def trigger_diagnose():
-    db_id = request.json['db_id']
-    config = repo.get_by_id(db_id)
-    if config:
-        engine.submit(config)
-        return jsonify({"msg": "queued"})
-    return jsonify({"error": "not found"}), 404
+라즈베리파이 제어 명령 전송
 
-@app.route('/api/status')
-def status():
-    # 모든 DB에 대한 최신 진단 결과 반환
-    dbs = repo.get_all()
-    status_map = {}
-    for db in dbs:
-        res = engine.get_result(db.id)
-        if res: status_map[db.id] = res
-    return jsonify(status_map)
-
-def run():
-    app.run(host='0.0.0.0', port=9999)
-"""
-
-file_contents["app/web/__init__.py"] = ""
-
-# ==========================================
-# 5. [Web] HTML (Dashboard + Modals)
-# ==========================================
-file_contents["app/web/templates/dashboard.html"] = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>Security DB Sentinel</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        .query-box { background: #eee; padding: 5px; border-radius: 4px; font-family: monospace; font-size: 0.8em; }
-        .card-Running { border: 2px solid #0dcaf0; }
-        .card-Error { border: 2px solid #dc3545; }
-        .card-Healthy { border: 2px solid #198754; }
-    </style>
-</head>
-<body class="bg-light">
-    <nav class="navbar navbar-dark bg-dark mb-4">
-        <div class="container-fluid">
-            <span class="navbar-brand">🛡️ Sentinel Pro (Access: {{ client_ip }})</span>
-            <button class="btn btn-success btn-sm" data-bs-toggle="modal" data-bs-target="#addModal">
-                + DB 추가
-            </button>
-        </div>
-    </nav>
-
-    <div class="container-fluid px-4">
-        <div class="row" id="db-list">
-            {% for db in dbs %}
-            <div class="col-md-6 col-xl-4 mb-4">
-                <div class="card shadow-sm h-100" id="card-{{db.id}}">
-                    <div class="card-header d-flex justify-content-between align-items-center bg-white">
-                        <strong>{{ db.name }}</strong>
-                        <button onclick="removeDB({{db.id}})" class="btn btn-outline-danger btn-sm" style="font-size:0.7rem">삭제</button>
-                    </div>
-                    <div class="card-body">
-                        <small class="text-muted">{{ db.type }} | {{ db.host }}:{{ db.port }}</small>
-                        <hr>
-                        <div class="d-flex justify-content-between align-items-center mb-2">
-                            <span id="status-{{db.id}}" class="badge bg-secondary">Ready</span>
-                            <span id="score-{{db.id}}" class="fw-bold fs-5">-</span>
-                        </div>
-                        <ul id="details-{{db.id}}" class="list-unstyled text-danger small mb-3" style="min-height: 20px;"></ul>
-                        
-                        <div id="worst-{{db.id}}" class="mb-3"></div>
-
-                        <button onclick="runDiag({{db.id}})" class="btn btn-primary w-100 btn-sm">진단 실행</button>
-                    </div>
-                </div>
-            </div>
-            {% endfor %}
-        </div>
-    </div>
-
-    <div class="modal fade" id="addModal" tabindex="-1">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header"><h5 class="modal-title">DB 정보 등록</h5></div>
-                <div class="modal-body">
-                    <input id="in_name" class="form-control mb-2" placeholder="별칭 (예: 생산메인)">
-                    <select id="in_type" class="form-control mb-2">
-                        <option value="MSSQL2014">MSSQL 2014</option>
-                        <option value="MSSQL2016">MSSQL 2016</option>
-                        <option value="MySQL5.7">MySQL 5.7</option>
-                    </select>
-                    <input id="in_host" class="form-control mb-2" placeholder="IP 주소">
-                    <input id="in_port" class="form-control mb-2" placeholder="포트 (1433/3306)">
-                    <input id="in_user" class="form-control mb-2" placeholder="계정 ID">
-                    <input id="in_pw" type="password" class="form-control mb-2" placeholder="비밀번호">
-                    <input id="in_dbname" class="form-control mb-2" placeholder="DB명">
-                </div>
-                <div class="modal-footer">
-                    <button onclick="saveDB()" class="btn btn-primary">저장</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        async function saveDB() {
-            const data = {
-                name: document.getElementById('in_name').value,
-                type: document.getElementById('in_type').value,
-                host: document.getElementById('in_host').value,
-                port: document.getElementById('in_port').value,
-                user: document.getElementById('in_user').value,
-                password: document.getElementById('in_pw').value,
-                db_name: document.getElementById('in_dbname').value
-            };
-            await fetch('/api/db', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(data)
-            });
-            location.reload();
-        }
-
-        async function removeDB(id) {
-            if(confirm('삭제하시겠습니까?')) {
-                await fetch('/api/db/' + id, {method: 'DELETE'});
-                location.reload();
-            }
-        }
-
-        async function runDiag(id) {
-            document.getElementById(`status-${id}`).innerText = "Queueing...";
-            await fetch('/api/diagnose', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({db_id: id})
-            });
-        }
-
-        setInterval(async () => {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            for(const [id, info] of Object.entries(data)) {
-                const card = document.getElementById(`card-${id}`);
-                if(card) card.className = `card shadow-sm h-100 card-${info.status}`;
-                
-                document.getElementById(`status-${id}`).innerText = info.status;
-                document.getElementById(`score-${id}`).innerText = info.score ? info.score + "점" : "-";
-                
-                const details = document.getElementById(`details-${id}`);
-                details.innerHTML = info.details.slice(0, 3).map(d => `<li>⚠️ ${d}</li>`).join('');
-
-                const worst = document.getElementById(`worst-${id}`);
-                if (info.worst_queries && info.worst_queries.length > 0) {
-                    const q = info.worst_queries[0];
-                    worst.innerHTML = `<div class="query-box text-break">Top Bad: ${q.text}<br><span class="text-danger fw-bold">${q.avg_time}</span></div>`;
-                }
-            }
-        }, 1500);
-    </script>
-</body>
-</html>
-"""
-
-# ==========================================
-# 6. [Entry] 실행 스크립트
-# ==========================================
-file_contents["run_sentinel.py"] = """
-import sys, os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from app.web.app import run
-
-if __name__ == "__main__":
-    print("===========================================")
-    print("   🛡️ DB Sentinel Pro (Secure Edition)")
-    print("   - Intranet Only: 10.244.120.24")
-    print("   - SQLite Repository Enabled")
-    print("===========================================")
-    try:
-        import flask, pymssql, pymysql
-        run()
-    except ImportError:
-        print("Error: pip install flask pymssql pymysql")
-"""
-
-def create_project():
-    if not os.path.exists(PROJECT_ROOT): os.makedirs(PROJECT_ROOT)
-    for path, content in file_contents.items():
-        full_path = os.path.join(PROJECT_ROOT, path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "w", encoding="utf-8") as f: f.write(content.strip())
-    print(f"✅ 프로젝트 생성 완료! 'cd {PROJECT_ROOT}' -> 'python run_sentinel.py'")
-
-if __name__ == "__main__":
-    create_project()
+이 중 하나만 골라주시면, 경원님의 사내 API 규격(inputvalue)에 딱 맞춘 실제 파이썬 MCP 서버/호스트 예제 코드를 짜드리겠습니다. 어느 것을 먼저 해볼까요?
