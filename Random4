@@ -1,144 +1,70 @@
-원하시는 대로 비유 없이 기술적인 로직과 코드로 바로 설명하겠습니다.
+사용자가 느끼는 데이터 크기(10MB)와 SSMS 상의 할당 공간(139GB)의 차이가 크고, '사용 가능한 공간'조차 거의 없다면(10MB), 트랜잭션 로그 파일(.ldf)이 비대해진 경우일 확률이 매우 높습니다.
 
-핵심은 messages 배열(Context)을 유지하면서 while 루프로 LLM의 응답 상태(stop_reason 또는 tool_calls)를 체크하는 것입니다.
+SQL Server에서 데이터베이스 용량은 **데이터 파일(.mdf)**과 **로그 파일(.ldf)**의 합입니다. 실제 테이블 데이터가 적더라도, 로그 파일이 관리가 안 되면 수백 GB까지 커질 수 있습니다.
 
-사용자가 한 번 질문했을 때, 서버 내부에서 LLM과 2회 이상 통신하는 Function Calling Loop 구현 예제입니다.
+아래 순서대로 원인을 파악하고 축소하십시오.
 
-Python Flask 구현 예시 (단일 파일)
-이 코드는 User -> Flask -> LLM(tool_call) -> Flask(DB exec) -> LLM(final_answer) -> User 흐름을 처리합니다.
+1단계: 어떤 파일이 비만인지 확인 (MDF vs LDF)
+먼저 139GB가 데이터 때문인지, 로그 때문인지 정확히 구분해야 합니다.
 
-Python
+SQL
 
-import requests
-import json
-from flask import Flask, request, jsonify
+SELECT 
+    name AS [FileName],
+    type_desc AS [FileType],
+    CAST((size * 8.0) / 1024 AS NUMERIC(18, 2)) AS [SizeMB],
+    CAST((size * 8.0) / 1024 / 1024 AS NUMERIC(18, 2)) AS [SizeGB],
+    physical_name AS [FilePath]
+FROM sys.database_files;
+결과 해석:
 
-app = Flask(__name__)
+FileType이 LOG인 파일이 130GB 이상이라면 -> 트랜잭션 로그 문제 (99% 확률) -> [해결책 A]로 이동.
 
-# 1. 실제 DB/시스템을 조회하는 함수 (Tool)
-def get_mounter_count():
-    # 실제로는 여기서 MSSQL/MySQL 커넥션 맺고 쿼리 수행
-    # cursor.execute("SELECT COUNT(*) FROM Mounter_Status WHERE Active='Y'")
-    # return str(cursor.fetchone()[0])
-    return "15"  # 테스트용 더미 리턴값
+FileType이 ROWS인 파일이 130GB 이상이라면 -> 데이터 파일 문제 -> [해결책 B]로 이동.
 
-# 2. LLM에게 알려줄 함수 정의서 (JSON Schema)
-tools_schema = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_mounter_count",
-            "description": "현재 공장에서 가동 중인 마운터 설비의 총 대수를 조회한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    }
-]
+[해결책 A] 로그 파일(.ldf)이 거대한 경우 (가장 유력)
+복구 모델이 'Full(전체)'로 되어 있는데 트랜잭션 로그 백업을 하지 않으면 로그가 무한정 쌓여 디스크를 차지합니다.
 
-# 함수 매핑 테이블 (문자열 이름 -> 실제 파이썬 함수 객체)
-available_functions = {
-    "get_mounter_count": get_mounter_count,
-}
+방법 1: 복구 모델을 'Simple(단순)'로 변경 후 축소 (특정 시점 복구가 필요 없고, 마지막 전체 백업 이후의 데이터 손실을 감수할 수 있는 개발/테스트 서버나 일반적인 운영 환경인 경우)
 
-# LLM API 호출 헬퍼 함수 (curl 대용)
-def call_llm_api(messages):
-    url = "YOUR_INTERNAL_LLM_URL" # 사내 LLM 엔드포인트
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "model": "your-model-name",
-        "messages": messages,
-        "tools": tools_schema, # 핵심: 도구 정의를 같이 전송
-        "tool_choice": "auto"
-    }
-    response = requests.post(url, headers=headers, json=payload)
-    return response.json()
+SQL
 
-@app.route('/chat', methods=['POST'])
-def chat_endpoint():
-    user_question = request.json.get('question')
-    
-    # 대화 히스토리 초기화
-    messages = [{"role": "user", "content": user_question}]
+-- 1. 복구 모델을 Simple로 변경 (로그를 자동으로 비움)
+ALTER DATABASE [데이터베이스명] SET RECOVERY SIMPLE;
+GO
 
-    # === [핵심 로직] LLM이 만족할 때까지 반복 (최대 5회 제한 등으로 무한루프 방지 권장) ===
-    while True:
-        # 1. LLM에게 요청 전송
-        response_data = call_llm_api(messages)
-        response_message = response_data['choices'][0]['message']
+-- 2. 로그 파일 축소 (목표 크기: 10MB)
+-- 아래 '논리적로그파일명'은 위 1단계 쿼리의 name 컬럼 값입니다 (보통 _log로 끝남)
+DBCC SHRINKFILE ('논리적로그파일명', 10);
+GO
 
-        # 2. LLM 응답에 'tool_calls'가 있는지 확인
-        tool_calls = response_message.get('tool_calls')
+-- 3. 필요시 다시 Full로 복구 (선택 사항)
+-- ALTER DATABASE [데이터베이스명] SET RECOVERY FULL;
+방법 2: 로그 백업 수행 후 축소 (운영 환경 권장) 데이터 유실이 절대 없어야 한다면, 로그 백업을 수행하여 로그 공간을 '사용 가능' 상태로 만든 뒤 축소해야 합니다.
 
-        if tool_calls:
-            # === Case A: LLM이 "함수 실행해라"고 응답함 ===
-            
-            # 2-1. LLM의 응답(함수 호출 요청)을 대화 내역에 추가 (문맥 유지)
-            messages.append(response_message)
+[해결책 B] 데이터 파일(.mdf)이 거대한 경우
+데이터는 없는데 데이터 파일이 크다면, 과거에 대량의 데이터를 지웠으나(DELETE) 디스크 공간이 OS로 반환되지 않은 상태입니다. 하지만 '사용 가능한 공간'이 10MB뿐이라면, SQL Server는 그 공간을 **"사용 중"**이라고 인식하고 있을 수 있습니다.
 
-            # 2-2. 요청된 함수들을 순회하며 파이썬 코드 실행
-            for tool_call in tool_calls:
-                function_name = tool_call['function']['name']
-                function_to_call = available_functions[function_name]
-                
-                # 실제 파이썬 함수 실행 (DB 조회 등)
-                function_response = function_to_call() 
-                
-                # 2-3. 실행 결과를 대화 내역에 'tool' 역할로 추가
-                messages.append({
-                    "tool_call_id": tool_call['id'],
-                    "role": "tool",
-                    "name": function_name,
-                    "content": str(function_response) # "15"
-                })
-            
-            # 루프가 다시 돌면서, 실행 결과(15)가 포함된 messages를 LLM에게 다시 보냄
-            continue 
+1. 통계 갱신 오류 확인 (유령 데이터) SSMS가 용량을 잘못 표시하는 경우가 있습니다. 실제 사용량을 다시 계산하도록 강제합니다.
 
-        else:
-            # === Case B: LLM이 함수 호출 없이 최종 답변을 내놓음 ===
-            final_content = response_message['content']
-            return jsonify({"answer": final_content})
+SQL
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
-동작 프로세스 (기술적 흐름)
-초기 요청 (User Request)
+-- 실제 사용량을 재계산하여 카탈로그 뷰 갱신
+DBCC UPDATEUSAGE ([데이터베이스명]);
+이후 다시 SSMS 속성을 확인해보세요. '사용 가능한 공간'이 늘어났다면 SHRINKFILE로 줄일 수 있습니다.
 
-messages: [{"role": "user", "content": "마운터 설비 몇 대야?"}]
+2. 데이터 파일 강제 축소 여유 공간이 확보되었다면 아래 명령어로 파일을 줄입니다.
 
-LLM으로 전송 (tools 스키마 포함).
+SQL
 
-LLM 1차 응답 (Tool Call Request)
+-- 데이터 파일 축소 (여유 공간을 OS로 반환)
+-- '논리적데이터파일명'은 1단계 쿼리의 name 값
+DBCC SHRINKFILE ('논리적데이터파일명', TRUNCATEONLY);
+TRUNCATEONLY: 파일 끝의 빈 공간만 잘라냅니다. (빠르고 부하가 적음)
 
-LLM은 답변 텍스트(content) 대신 tool_calls 필드를 포함한 JSON을 반환합니다.
-
-의미: "텍스트 생성 중단. get_mounter_count 함수를 실행하시오."
-
-Loop: if tool_calls: 조건문에 걸려 DB 조회 로직으로 진입합니다.
-
-Local Execution (Python)
-
-messages 배열에 LLM의 요청(role: assistant, tool_calls: ...)을 append 합니다.
-
-매핑된 파이썬 함수 get_mounter_count()를 실행 -> 리턴값 "15" 획득.
-
-messages 배열에 결과(role: tool, content: "15")를 append 합니다.
-
-재요청 (Follow-up Request)
-
-이제 messages에는 [질문, 함수호출요청, 함수실행결과("15")]가 들어있습니다.
-
-continue를 만나 다시 call_llm_api(messages)를 호출합니다.
-
-LLM 2차 응답 (Final Answer)
-
-LLM은 문맥(질문+결과)을 보고 최종 자연어 답변을 생성합니다.
-
-응답: "현재 마운터 설비는 총 15대입니다."
-
-Loop: tool_calls가 없으므로 else 문으로 빠져나가 사용자에게 return 합니다.
+그래도 안 줄어들면 뒤의 TRUNCATEONLY를 빼고 실행해야 하지만, 이는 데이터 조각화(Fragmentation)를 유발하므로 야간에 수행해야 합니다.
 
 요약
-사용자의 질문을 알고리즘으로 분석해서 DB를 찌르는 게 아니라, 대화 내역(messages) 전체를 LLM에게 계속 던지면서 LLM이 Stop(답변완료) 플래그를 보낼 때까지 파이썬이 뒤치다꺼리(함수 실행 -> 결과 첨부 -> 재전송)를 반복하는 구조입니다.
+대부분의 경우 [해결책 A]의 방법 1 (복구 모델 Simple 변경 -> DBCC SHRINKFILE)을 수행하면 139GB가 즉시 줄어들 것입니다.
+
+실행 전 반드시 **[데이터베이스명]**과 **[논리적파일명]**을 확인하고 백업을 먼저 받아두시
