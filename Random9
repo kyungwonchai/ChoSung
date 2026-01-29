@@ -1,230 +1,66 @@
-import os
+사내망 환경, 특히 보안이 강력한 곳에서 git clone이 실패하는 문제는 90% 이상이 'SSL 인증서(Man-in-the-Middle)'와 '프록시 설정의 적용 범위' 문제입니다. 시스템 전체에 인증서를 깔아도, Git은 **자체적인 인증서 저장소(CABundle)**를 따로 쓰거나, 프록시 설정을 셸 환경변수(export)에서 제대로 못 가져오는 경우가 허다합니다.
 
-# === 프로젝트 이름: DB Inspector ===
-ROOT = "db_inspector"
+경원 님께서 요청하신 대로 스크립트가 아닌 '설명' 위주로, 커맨드 라인에서 강제로 설정을 주입하는 방법과 안 될 때의 우회법을 단계별로 정리해 드립니다.
 
-files = {}
+1. 원인: 왜 다 설정했는데 안 될까?
+Git의 독립성: 우분투 시스템(update-ca-certificates)에 사내 보안 인증서(.crt)를 등록했어도, Git은 윈도우나 리눅스나 보통 자체 내장된 ca-bundle.crt 파일만 신뢰하도록 기본 설정되어 있습니다. 그래서 시스템 인증서를 무시하고 "이거 해킹(중간자 공격) 당한 것 같은데?"라며 연결을 끊어버립니다.
 
-# 1. 메인 실행 파일 (Flask App)
-# - 설정 파일 없음. 요청 올 때마다 화면에서 입력받은 정보로 접속함.
-files[f"{ROOT}/app.py"] = r"""
-from flask import Flask, render_template, request, Response, stream_with_context
-import pymysql
-import pymssql
-import traceback
-import datetime
+프로토콜 차단: git:// 프로토콜(포트 9418)이나 ssh://(포트 22)가 방화벽에서 막혀있을 수 있습니다. 오직 https://만 열려 있을 텐데, 이마저도 SSL 감청(Inspection) 때문에 막히는 것입니다.
 
-app = Flask(__name__)
+2. 해결책: 커맨드 라인(CLI)에 설정 주입하기
+설정 파일(.gitconfig)을 건드리지 않고, 이번 명령어 한 번만 설정을 적용(주입)하는 방법입니다. git -c 옵션을 사용하면 됩니다.
 
-# === [유틸] HTML 로그 포매터 ===
-def log(msg, level="INFO"):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    colors = {"INFO":"#ccc", "OK":"#0f0", "WARN":"#fa0", "ERROR":"#f44", "HEADER":"#0cf"}
-    c = colors.get(level, "#ccc")
-    return f'<div style="color:{c}; font-family:monospace; margin:2px;">[{ts}] {msg}</div>\n'
+방법 A: SSL 검증 무시 (가장 확실하고 빠른 방법)
+사내망이라 보안 위험이 낮다고 판단되면, Git에게 "인증서가 이상해도 그냥 받아와"라고 명령하는 것입니다.
 
-def table(data):
-    if not data: return '<div style="color:#666; margin-left:10px;">데이터 없음</div>'
-    h = data[0].keys()
-    html = '<table style="width:98%; border-collapse:collapse; border:1px solid #444; font-size:12px; margin:5px auto;">'
-    html += '<thead style="background:#333; color:#fff;"><tr>' + ''.join([f'<th style="border:1px solid #555; padding:5px;">{k}</th>' for k in h]) + '</tr></thead><tbody>'
-    for row in data:
-        html += '<tr style="background:#1e1e1e;">' + ''.join([f'<td style="border:1px solid #555; padding:5px; color:#ccc;">{str(v)[:100]}</td>' for v in row.values()]) + '</tr>'
-    html += '</tbody></table>'
-    return html
+Bash
 
-# === [라우트] 메인 화면 ===
-@app.route('/')
-def index():
-    return render_template('index.html')
+git -c http.sslVerify=false clone https://github.com/주소/리포지토리.git
+설명: -c http.sslVerify=false 파라미터가 이번 명령에만 SSL 보안 검사를 끕니다. 인증서 오류(self signed certificate...)가 뜬다면 이게 직빵입니다.
 
-# === [라우트] 진단 실행 (POST로 접속정보 받음) ===
-@app.route('/scan', methods=['POST'])
-def scan():
-    # 화면에서 입력받은 접속 정보
-    db_type = request.form.get('db_type')
-    host = request.form.get('host')
-    port = int(request.form.get('port'))
-    user = request.form.get('user')
-    password = request.form.get('password')
-    db_name = request.form.get('db_name', 'master') # MSSQL default
+방법 B: 프록시 강제 주입
+환경 변수 설정이 꼬였을 수 있으니, 명령어로 프록시 서버를 직접 박아넣습니다.
 
-    def generate():
-        yield log(f"🚀 [{db_type.upper()}] {host}:{port} 접속 시도 중...", "HEADER")
-        
-        conn = None
-        try:
-            # === 1. MSSQL 진단 로직 ===
-            if db_type == 'mssql':
-                conn = pymssql.connect(server=host, port=port, user=user, password=password, database=db_name)
-                cursor = conn.cursor(as_dict=True)
-                yield log("접속 성공! 정밀 진단 쿼리 실행 시작...", "OK")
+Bash
 
-                # (1) 악성 쿼리 TOP 10
-                yield log("1. CPU 과부하 유발 악성 쿼리 TOP 10", "WARN")
-                cursor.execute("SELECT TOP 10 SUBSTRING(qt.text, (qs.statement_start_offset/2)+1, ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(qt.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS [Query], qs.execution_count AS [Execs], qs.total_worker_time/1000 AS [TotalCPU_ms], qs.last_execution_time FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt ORDER BY qs.total_worker_time DESC")
-                yield table(cursor.fetchall())
+git -c http.proxy=http://아이디:비번@프록시서버IP:포트 clone https://github.com/주소/리포지토리.git
+설명: -c http.proxy=...를 통해 시스템 설정을 무시하고 직접 지정한 프록시를 타고 나갑니다.
 
-                # (2) 블로킹 세션
-                yield log("2. 현재 실행 중인 블로킹(Lock) 세션 추적", "ERROR")
-                cursor.execute("SELECT spid, blocked, status, loginame, hostname, cmd, wait_time FROM sys.sysprocesses WHERE blocked > 0 OR spid IN (SELECT blocked FROM sys.sysprocesses)")
-                yield table(cursor.fetchall())
+방법 C: (A + B) 짬뽕 (끝판왕)
+Bash
 
-                # (3) 누락 인덱스
-                yield log("3. 성능 향상을 위한 누락 인덱스 추천", "WARN")
-                cursor.execute("SELECT TOP 10 d.statement AS [Table], ROUND(s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans),0) AS [Score], mid.equality_columns FROM sys.dm_db_missing_index_group_stats s JOIN sys.dm_db_missing_index_groups g ON s.group_handle = g.index_group_handle JOIN sys.dm_db_missing_index_details mid ON mid.index_handle = g.index_handle ORDER BY [Score] DESC")
-                yield table(cursor.fetchall())
+git -c http.sslVerify=false -c http.proxy=http://프록시IP:포트 clone https://github.com/주소/리포지토리.git
+3. 이것도 안 될 때의 대안 (우회로)
+git clone 자체가 막혔다면, Git 프로토콜을 쓰지 않고 파일만 가져오는 방법을 써야 합니다. 어차피 소스 코드만 필요하신 거라면 이 방법이 스트레스가 덜합니다.
 
-                # (4) 파일 용량
-                yield log("4. DB 파일별 용량 점검", "INFO")
-                cursor.execute("SELECT d.name AS [DB], ROUND(SUM(mf.size) * 8 / 1024, 0) AS [SizeMB] FROM sys.master_files mf JOIN sys.databases d ON mf.database_id = d.database_id GROUP BY d.name ORDER BY [SizeMB] DESC")
-                yield table(cursor.fetchall())
+대안 1: wget으로 ZIP 파일 다운로드
+Git이 아니라 단순 웹 다운로드는 허용되는 경우가 많습니다. GitHub 리포지토리는 주소 뒤에 /archive/refs/heads/main.zip을 붙이면 다운로드됩니다.
 
-            # === 2. MySQL 진단 로직 ===
-            elif db_type == 'mysql':
-                conn = pymysql.connect(host=host, port=port, user=user, password=password, charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
-                cursor = conn.cursor()
-                yield log("접속 성공! 정밀 진단 쿼리 실행 시작...", "OK")
+Bash
 
-                # (1) 프로세스 리스트
-                yield log("1. 현재 실행 중인 쿼리 (Processlist)", "WARN")
-                cursor.execute("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE command != 'Sleep' ORDER BY time DESC LIMIT 20")
-                yield table(cursor.fetchall())
+# --no-check-certificate 옵션으로 SSL 무시
+wget --no-check-certificate https://github.com/유저명/리포지토리명/archive/refs/heads/main.zip
 
-                # (2) 테이블 용량
-                yield log("2. 용량 상위 테이블 TOP 20", "INFO")
-                cursor.execute("SELECT table_schema AS [DB], table_name AS [Table], round(((data_length + index_length) / 1024 / 1024), 2) AS [SizeMB], table_rows FROM information_schema.TABLES WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY (data_length + index_length) DESC LIMIT 20")
-                yield table(cursor.fetchall())
+# 다운로드 후 압축 해제
+unzip main.zip
+설명: wget은 Git보다 훨씬 가볍고, --no-check-certificate 옵션으로 사내 인증서 문제를 아주 쉽게 회피할 수 있습니다.
 
-                # (3) 상태 변수
-                yield log("3. 주요 DB 상태 변수", "OK")
-                cursor.execute("SHOW GLOBAL STATUS WHERE Variable_name IN ('Aborted_connects', 'Threads_connected', 'Threads_running', 'Slow_queries', 'Uptime')")
-                yield table(cursor.fetchall())
+대안 2: 외부망 PC에서 받아서 옮기기 (Sneakernet)
+만약 wget조차 막힌다면, 인터넷이 되는 외부망 PC(혹은 폰)에서 ZIP으로 다운로드한 뒤, 사내망으로 파일 전송(USB, 메일, 사내 파일 서버 등)을 하는 게 정신 건강에 좋습니다.
 
-            yield log("✨ 모든 진단이 완료되었습니다.", "HEADER")
+외부 PC에서 GitHub 접속 -> [Code] 버튼 클릭 -> [Download ZIP].
 
-        except Exception as e:
-            yield log(f"⛔ 연결/진단 실패: {str(e)}", "ERROR")
-            yield log(traceback.format_exc(), "ERROR")
-        finally:
-            if conn: conn.close()
+해당 파일을 우분투 서버로 전송.
 
-    return Response(stream_with_context(generate()), mimetype='text/html')
+unzip으로 풀어서 사용.
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
-"""
+4. 참고: "유니파이(Unify)" 관련
+말씀하신 "유니파이"가 최근 AI 에이전트나 LLM 관련 툴인 Unify AI (IVY 등) 혹은 **Unify(LLM Router)**라면, 단순 클론 후에도 Python 패키지 설치(pip install) 단계에서 똑같은 인증서 문제가 발생할 확률이 99%입니다.
 
-# 2. UI 템플릿 (templates/index.html)
-# - 여기서 접속 정보를 입력받습니다.
-files[f"{ROOT}/templates/index.html"] = r"""
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>DB Remote Inspector</title>
-    <style>
-        body { background: #121212; color: #e0e0e0; font-family: sans-serif; display: flex; height: 100vh; margin: 0; }
-        .sidebar { width: 300px; background: #1e1e1e; padding: 20px; border-right: 1px solid #333; display: flex; flex-direction: column; gap: 15px; }
-        .main { flex: 1; background: #000; padding: 20px; display: flex; flex-direction: column; }
-        
-        input, select, button { width: 100%; padding: 10px; background: #2d2d2d; border: 1px solid #444; color: #fff; box-sizing: border-box; margin-top: 5px; }
-        label { font-size: 12px; color: #aaa; font-weight: bold; }
-        button { background: #007acc; border-color: #005f9e; cursor: pointer; font-weight: bold; margin-top: 20px; }
-        button:hover { background: #0098ff; }
-        
-        #log { flex: 1; border: 1px solid #333; padding: 10px; overflow-y: auto; font-family: monospace; background: #080808; }
-        h2 { margin: 0 0 20px 0; color: #fff; border-bottom: 2px solid #007acc; padding-bottom: 10px; }
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <h2>Target DB Info</h2>
-        <form id="diagForm" onsubmit="return false;">
-            
-            <label>Database Type</label>
-            <select name="db_type" id="db_type" onchange="toggleDbFields()">
-                <option value="mssql">MSSQL (SQL Server)</option>
-                <option value="mysql">MySQL / MariaDB</option>
-            </select>
+그때는 다음 명령어를 기억해 두세요:
 
-            <label>Host IP</label>
-            <input type="text" name="host" value="localhost" placeholder="127.0.0.1">
+Bash
 
-            <label>Port</label>
-            <input type="number" name="port" id="port" value="1433">
-
-            <label>User ID</label>
-            <input type="text" name="user" value="sa" placeholder="username">
-
-            <label>Password</label>
-            <input type="password" name="password" value="" placeholder="password">
-
-            <div id="mssql_fields">
-                <label>Initial DB (MSSQL Only)</label>
-                <input type="text" name="db_name" value="master">
-            </div>
-
-            <button onclick="startDiag()">Connect & Diagnose</button>
-        </form>
-    </div>
-
-    <div class="main">
-        <div id="log">
-            <div style="color:#007acc; text-align:center; margin-top:20%;">
-                <h3>DB 접속 정보를 입력하고 진단 버튼을 누르세요.</h3>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function toggleDbFields() {
-            const type = document.getElementById('db_type').value;
-            document.getElementById('port').value = (type === 'mssql') ? 1433 : 3306;
-            document.getElementById('mssql_fields').style.display = (type === 'mssql') ? 'block' : 'none';
-        }
-
-        async function startDiag() {
-            const log = document.getElementById('log');
-            const form = document.getElementById('diagForm');
-            const formData = new FormData(form);
-
-            log.innerHTML = `<div style="color:cyan">--- [System] 접속 시도 중... ---</div>`;
-            
-            try {
-                const response = await fetch('/scan', { method: 'POST', body: formData });
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                log.innerHTML = ''; // Clear previous log
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    log.innerHTML += decoder.decode(value);
-                    log.scrollTop = log.scrollHeight;
-                }
-            } catch (err) {
-                log.innerHTML += `<div style="color:red">[Error] 통신 실패: ${err}</div>`;
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-# === 디렉토리 및 파일 생성 ===
-for path, content in files.items():
-    dir_name = os.path.dirname(path)
-    if dir_name and not os.path.exists(dir_name):
-        os.makedirs(dir_name)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content.strip())
-    print(f"✅ Created: {path}")
-
-print("\n" + "="*50)
-print("이제 설정 파일 수정할 필요 없습니다.")
-print("1. 폴더 이동: cd db_inspector")
-print("2. 패키지 설치: pip install flask pymysql pymssql")
-print("3. 실행: python app.py")
-print("4. 브라우저(http://localhost:5000)를 열면 입력창이 나옵니다.")
-print("="*50)
+# pip도 신뢰할 수 있는 호스트로 지정해서 설치
+pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org 패키지명
+요약하자면: 가장 먼저 git -c http.sslVerify=false clone ... 이 명령어를 터미널에 쳐보시길 권장합니다. 대부분의 사내망 문제는 이걸로 뚫립니다.
