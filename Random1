@@ -1,520 +1,59 @@
-import os
-import json
+복잡한 설명 다 치우고, [1. 기존 찌꺼기 완전 삭제] -> [2. 가장 확실한 공식 스크립트 설치] 순서로 진행합니다. 터미널 열고 아래 명령어들을 그대로 복사해 넣으세요.
 
-# === 프로젝트 루트 ===
-ROOT = "db_master_tool"
-TEMPLATES = os.path.join(ROOT, "templates")
+1단계: 기존 도커 완전 삭제 (Clean Uninstall)
+설치하다 만 파일, 꼬인 설정, 기존 이미지 전부 날립니다.
 
-# === 디렉토리 생성 ===
-if not os.path.exists(TEMPLATES):
-    os.makedirs(TEMPLATES)
+Bash
+# 1. 도커 서비스 중지
+sudo systemctl stop docker
+sudo systemctl stop docker.socket
+sudo systemctl stop containerd
 
-# ==============================================================================
-# 1. app.py (백엔드 로직: 설정 관리 + 진단 엔진)
-# ==============================================================================
-app_code = r"""
-import os
-import json
-import traceback
-import datetime
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
-import pymysql
-import pymssql
+# 2. apt 패키지 싹 삭제 (설정파일 포함)
+sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+sudo apt-get purge -y docker-ce-cli
+sudo apt-get autoremove -y --purge docker-ce
 
-app = Flask(__name__)
-CONFIG_FILE = 'db_config.json'
+# 3. (중요) 우분투 기본 패키지 삭제
+sudo apt-get remove -y docker docker-engine docker.io containerd runc
 
-# === [설정 관리] JSON 파일로 DB 정보 영구 저장 ===
-def load_configs():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return {}
+# 4. (중요) Snap으로 깔린 도커 삭제 (우분투 24가 멋대로 까는 경우 있음)
+sudo snap remove docker
 
-def save_configs(configs):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(configs, f, indent=4, ensure_ascii=False)
+# 5. 찌꺼기 폴더 삭제 (주의: 기존 컨테이너/이미지 다 날아감)
+sudo rm -rf /var/lib/docker
+sudo rm -rf /var/lib/containerd
+sudo rm -rf /etc/docker
+sudo rm -rf ~/.docker
 
-# === [유틸] HTML 로그 포매터 ===
-def log_msg(msg, level="INFO"):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    colors = {"INFO":"#ccc", "OK":"#28a745", "WARN":"#ffc107", "ERROR":"#dc3545", "HEADER":"#17a2b8"}
-    c = colors.get(level, "#ccc")
-    icon = {"INFO":"ℹ️", "OK":"✅", "WARN":"⚠️", "ERROR":"❌", "HEADER":"🚀"}.get(level, "")
-    return f'<div style="color:{c}; font-family:monospace; margin:4px 0;">[{ts}] {icon} {msg}</div>\n'
+# 6. 그룹 삭제
+sudo groupdel docker
+2단계: 공식 설치 스크립트로 재설치 (One-Shot)
+우분투 24.04 저장소 잡는 게 까다로우니, 도커 공식 팀에서 제공하는 자동 설치 스크립트를 씁니다. 이게 실패 확률 0%입니다.
 
-def table_html(data):
-    if not data: return '<div style="color:#666; margin-left:15px; font-style:italic;">데이터가 없습니다.</div>'
-    headers = data[0].keys()
-    html = '<table class="table table-dark table-sm table-bordered" style="font-size:0.85rem; margin-top:5px;">'
-    html += '<thead class="thead-light"><tr>' + ''.join([f'<th>{h}</th>' for h in headers]) + '</tr></thead><tbody>'
-    for row in data:
-        html += '<tr>' + ''.join([f'<td>{str(v)[:100]}</td>' for v in row.values()]) + '</tr>'
-    html += '</tbody></table>'
-    return html
+Bash
+# 1. 설치 스크립트 다운로드
+curl -fsSL https://get.docker.com -o get-docker.sh
 
-# === [라우트] 페이지 이동 ===
-@app.route('/')
-def index():
-    return render_template('index.html')
+# 2. 실행 (알아서 우분투 버전 감지해서 설치함)
+sudo sh get-docker.sh
+3단계: 권한 설정 (sudo 안 쓰게)
+이거 안 하면 permission denied 에러 납니다.
 
-@app.route('/settings')
-def settings():
-    return render_template('settings.html')
+Bash
+# 1. 현재 사용자(kw)를 docker 그룹에 추가
+sudo usermod -aG docker $USER
 
-# === [API] 설정 CRUD ===
-@app.route('/api/config', methods=['GET', 'POST', 'DELETE'])
-def api_config():
-    configs = load_configs()
-    
-    if request.method == 'GET':
-        return jsonify(configs)
-    
-    if request.method == 'POST':
-        data = request.json
-        name = data.get('alias')
-        if not name: return jsonify({"error": "별칭(Alias)은 필수입니다."}), 400
-        configs[name] = data
-        save_configs(configs)
-        return jsonify({"success": True})
-    
-    if request.method == 'DELETE':
-        name = request.json.get('alias')
-        if name in configs:
-            del configs[name]
-            save_configs(configs)
-        return jsonify({"success": True})
+# 2. ★중요★ 변경 사항 즉시 적용 (재부팅 대신 이거 입력)
+newgrp docker
+4단계: 확인
+이제 아래 명령어 쳤을 때 에러 없이 버전 나오면 성공입니다.
 
-# === [핵심] 진단 실행 (Streaming) ===
-@app.route('/run_diag', methods=['POST'])
-def run_diag():
-    target_name = request.form.get('target_name')
-    checked_items = request.form.getlist('checks[]') # 체크된 항목 리스트
-    
-    configs = load_configs()
-    target_cfg = configs.get(target_name)
+Bash
+docker version
+성공하셨으면 아까 하던 Dify 설치 명령어 다시 입력하시면 됩니다. (혹시 모르니 다시 적어둡니다.)
 
-    def generate():
-        if not target_cfg:
-            yield log_msg("설정 정보를 찾을 수 없습니다.", "ERROR")
-            return
-
-        db_type = target_cfg.get('db_type')
-        host = target_cfg.get('host')
-        
-        yield log_msg(f"[{target_name}] {db_type.upper()} 진단 시작... ({host})", "HEADER")
-        
-        conn = None
-        try:
-            # 1. DB 연결
-            if db_type == 'mssql':
-                conn = pymssql.connect(
-                    server=target_cfg['host'], 
-                    port=int(target_cfg['port']), 
-                    user=target_cfg['user'], 
-                    password=target_cfg['password'], 
-                    database=target_cfg.get('db_name', 'master')
-                )
-                cursor = conn.cursor(as_dict=True)
-            elif db_type == 'mysql':
-                conn = pymysql.connect(
-                    host=target_cfg['host'], 
-                    port=int(target_cfg['port']), 
-                    user=target_cfg['user'], 
-                    password=target_cfg['password'], 
-                    charset='utf8mb4',
-                    cursorclass=pymysql.cursors.DictCursor
-                )
-                cursor = conn.cursor()
-            
-            yield log_msg("DB 연결 성공. 선택된 항목 점검 시작.", "OK")
-            
-            # 2. 체크 항목별 실행 로직
-            # === [MSSQL] ===
-            if db_type == 'mssql':
-                if 'cpu' in checked_items:
-                    yield log_msg("1. CPU 과부하 악성 쿼리 분석", "WARN")
-                    sql = "SELECT TOP 10 SUBSTRING(qt.text, (qs.statement_start_offset/2)+1, ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(qt.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS [Query], qs.execution_count, qs.total_worker_time/1000 AS [TotalCPU_ms], qs.last_execution_time FROM sys.dm_exec_query_stats qs CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt ORDER BY qs.total_worker_time DESC"
-                    cursor.execute(sql)
-                    yield table_html(cursor.fetchall())
-
-                if 'lock' in checked_items:
-                    yield log_msg("2. Blocking / Deadlock 세션 추적", "WARN")
-                    sql = "SELECT spid, blocked, status, loginame, hostname, cmd, wait_time, lastwaittype FROM sys.sysprocesses WHERE blocked > 0 OR spid IN (SELECT blocked FROM sys.sysprocesses)"
-                    cursor.execute(sql)
-                    yield table_html(cursor.fetchall())
-
-                if 'missing_idx' in checked_items:
-                    yield log_msg("3. 누락 인덱스 추천", "WARN")
-                    sql = "SELECT TOP 10 d.statement AS [Table], ROUND(s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans),0) AS [Score], mid.equality_columns FROM sys.dm_db_missing_index_group_stats s JOIN sys.dm_db_missing_index_groups g ON s.group_handle = g.index_group_handle JOIN sys.dm_db_missing_index_details mid ON mid.index_handle = g.index_handle ORDER BY [Score] DESC"
-                    cursor.execute(sql)
-                    yield table_html(cursor.fetchall())
-
-                if 'storage' in checked_items:
-                    yield log_msg("4. 파일 용량 점검", "INFO")
-                    sql = "SELECT d.name, ROUND(SUM(mf.size) * 8 / 1024, 0) AS SizeMB FROM sys.master_files mf JOIN sys.databases d ON mf.database_id = d.database_id GROUP BY d.name ORDER BY SizeMB DESC"
-                    cursor.execute(sql)
-                    yield table_html(cursor.fetchall())
-            
-            # === [MySQL] ===
-            elif db_type == 'mysql':
-                if 'process' in checked_items:
-                    yield log_msg("1. 현재 실행 중인 프로세스 (Processlist)", "WARN")
-                    cursor.execute("SELECT id, user, host, db, command, time, state, info FROM information_schema.processlist WHERE command != 'Sleep' ORDER BY time DESC LIMIT 20")
-                    yield table_html(cursor.fetchall())
-
-                if 'storage' in checked_items:
-                    yield log_msg("2. 테이블 용량 TOP 20", "INFO")
-                    cursor.execute("SELECT table_schema, table_name, round(((data_length + index_length) / 1024 / 1024), 2) as SizeMB, table_rows FROM information_schema.TABLES WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY SizeMB DESC LIMIT 20")
-                    yield table_html(cursor.fetchall())
-
-                if 'status' in checked_items:
-                    yield log_msg("3. 주요 상태 변수 (Connections, Aborted)", "WARN")
-                    cursor.execute("SHOW GLOBAL STATUS WHERE Variable_name IN ('Aborted_connects', 'Threads_connected', 'Threads_running', 'Slow_queries', 'Uptime')")
-                    yield table_html(cursor.fetchall())
-
-            yield log_msg("✨ 선택된 모든 진단이 완료되었습니다.", "HEADER")
-
-        except Exception as e:
-            yield log_msg(f"에러 발생: {str(e)}", "ERROR")
-            yield log_msg(traceback.format_exc(), "ERROR")
-        finally:
-            if conn: conn.close()
-
-    return Response(stream_with_context(generate()), mimetype='text/html')
-
-if __name__ == '__main__':
-    # 0.0.0.0으로 열어서 외부 접속 가능하게 함
-    app.run(host='0.0.0.0', port=5000, debug=True)
-"""
-
-# ==============================================================================
-# 2. templates/index.html (메인 화면: DB 선택 -> 체크박스 -> 실행)
-# ==============================================================================
-index_html = r"""
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>DB Master Tool</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
-    <style>
-        body { background-color: #1e1e1e; color: #ddd; }
-        .card { background-color: #2b2b2b; border: 1px solid #444; }
-        .form-control, .custom-select { background-color: #333; color: #fff; border: 1px solid #555; }
-        #log-window { height: 600px; overflow-y: auto; background: #000; border: 1px solid #444; padding: 10px; font-family: 'Consolas', monospace; font-size: 0.9rem; }
-        .btn-primary { background-color: #007bff; border-color: #007bff; }
-        .section-title { border-bottom: 2px solid #555; padding-bottom: 10px; margin-bottom: 20px; color: #17a2b8; }
-    </style>
-</head>
-<body class="p-4">
-    <div class="container-fluid">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h2 class="text-light">🛠️ DB Master Diagnostic Tool</h2>
-            <a href="/settings" class="btn btn-outline-light">⚙️ 설정(DB 관리) 화면으로 이동</a>
-        </div>
-
-        <div class="row">
-            <div class="col-md-3">
-                <div class="card p-3 mb-3">
-                    <h5 class="section-title">1. 대상 DB 선택</h5>
-                    <div class="form-group">
-                        <select id="target_db" class="custom-select" onchange="updateCheckboxes()">
-                            <option value="">-- DB를 선택하세요 --</option>
-                        </select>
-                        <small class="text-muted mt-2 d-block">* 설정 화면에서 추가한 목록이 보입니다.</small>
-                    </div>
-                </div>
-
-                <div class="card p-3">
-                    <h5 class="section-title">2. 점검 항목 체크</h5>
-                    <form id="diagForm">
-                        <div id="mssql_checks" style="display:none;">
-                            <h6 class="text-warning">MSSQL Checks</h6>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_m_cpu" name="checks[]" value="cpu" checked>
-                                <label class="custom-control-label" for="chk_m_cpu">CPU 과점유 쿼리</label>
-                            </div>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_m_lock" name="checks[]" value="lock" checked>
-                                <label class="custom-control-label" for="chk_m_lock">Lock / Blocking</label>
-                            </div>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_m_idx" name="checks[]" value="missing_idx">
-                                <label class="custom-control-label" for="chk_m_idx">누락 인덱스 추천</label>
-                            </div>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_m_st" name="checks[]" value="storage">
-                                <label class="custom-control-label" for="chk_m_st">파일 용량 점검</label>
-                            </div>
-                        </div>
-
-                        <div id="mysql_checks" style="display:none;">
-                            <h6 class="text-info">MySQL Checks</h6>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_y_proc" name="checks[]" value="process" checked>
-                                <label class="custom-control-label" for="chk_y_proc">실행 중인 프로세스</label>
-                            </div>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_y_st" name="checks[]" value="storage">
-                                <label class="custom-control-label" for="chk_y_st">테이블 용량 TOP 20</label>
-                            </div>
-                            <div class="custom-control custom-checkbox mb-2">
-                                <input type="checkbox" class="custom-control-input" id="chk_y_stat" name="checks[]" value="status">
-                                <label class="custom-control-label" for="chk_y_stat">주요 상태 변수</label>
-                            </div>
-                        </div>
-                    </form>
-                    <button class="btn btn-success btn-block mt-3 font-weight-bold" onclick="startDiag()">🚀 진단 시작 (Start)</button>
-                </div>
-            </div>
-
-            <div class="col-md-9">
-                <div class="card">
-                    <div class="card-header bg-secondary text-white font-weight-bold">
-                        📺 실시간 진단 로그
-                    </div>
-                    <div id="log-window">
-                        <div style="color:gray; text-align:center; margin-top:250px;">
-                            좌측에서 DB와 항목을 선택하고 [시작]을 누르세요.
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let dbConfigs = {};
-
-        // 페이지 로드 시 설정 불러오기
-        async function loadConfigs() {
-            const res = await fetch('/api/config');
-            dbConfigs = await res.json();
-            const select = document.getElementById('target_db');
-            select.innerHTML = '<option value="">-- DB를 선택하세요 --</option>';
-            
-            for (const [alias, cfg] of Object.entries(dbConfigs)) {
-                const opt = document.createElement('option');
-                opt.value = alias;
-                opt.innerText = `[${cfg.db_type.toUpperCase()}] ${alias} (${cfg.host})`;
-                select.appendChild(opt);
-            }
-        }
-
-        // DB 선택 시 해당되는 체크박스만 보여주기
-        function updateCheckboxes() {
-            const alias = document.getElementById('target_db').value;
-            const mSection = document.getElementById('mssql_checks');
-            const ySection = document.getElementById('mysql_checks');
-
-            mSection.style.display = 'none';
-            ySection.style.display = 'none';
-
-            if (!alias) return;
-
-            const type = dbConfigs[alias].db_type;
-            if (type === 'mssql') mSection.style.display = 'block';
-            if (type === 'mysql') ySection.style.display = 'block';
-        }
-
-        // 진단 실행
-        async function startDiag() {
-            const alias = document.getElementById('target_db').value;
-            if (!alias) { alert('대상 DB를 선택해주세요.'); return; }
-
-            const log = document.getElementById('log-window');
-            log.innerHTML = `<div style="color:cyan">--- 시스템 연결 준비 중... ---</div>`;
-
-            const formData = new FormData(document.getElementById('diagForm'));
-            formData.append('target_name', alias);
-
-            try {
-                const response = await fetch('/run_diag', { method: 'POST', body: formData });
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                log.innerHTML = ''; // 초기화
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    log.innerHTML += decoder.decode(value);
-                    log.scrollTop = log.scrollHeight;
-                }
-            } catch (err) {
-                log.innerHTML += `<div style="color:red">[Error] 통신 실패: ${err}</div>`;
-            }
-        }
-
-        loadConfigs();
-    </script>
-</body>
-</html>
-"""
-
-# ==============================================================================
-# 3. templates/settings.html (설정 관리 화면)
-# ==============================================================================
-settings_html = r"""
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>DB 설정 관리</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
-    <style>body { background-color: #1e1e1e; color: #ddd; }</style>
-</head>
-<body class="p-4">
-    <div class="container">
-        <div class="d-flex justify-content-between align-items-center mb-4">
-            <h3>⚙️ DB 연결 설정 관리</h3>
-            <a href="/" class="btn btn-secondary">🔙 메인으로 돌아가기</a>
-        </div>
-
-        <div class="row">
-            <div class="col-md-4">
-                <div class="card bg-dark border-secondary p-3">
-                    <h5 class="text-info border-bottom pb-2">새 DB 추가</h5>
-                    <form id="configForm">
-                        <div class="form-group">
-                            <label>별칭 (Alias) *고유값</label>
-                            <input type="text" class="form-control" id="alias" placeholder="예: 운영서버_MES">
-                        </div>
-                        <div class="form-group">
-                            <label>DB 타입</label>
-                            <select class="form-control" id="db_type" onchange="togglePort()">
-                                <option value="mssql">MSSQL (SQL Server)</option>
-                                <option value="mysql">MySQL / MariaDB</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Host IP</label>
-                            <input type="text" class="form-control" id="host" placeholder="127.0.0.1">
-                        </div>
-                        <div class="form-group">
-                            <label>Port</label>
-                            <input type="number" class="form-control" id="port" value="1433">
-                        </div>
-                        <div class="form-group">
-                            <label>User ID</label>
-                            <input type="text" class="form-control" id="user">
-                        </div>
-                        <div class="form-group">
-                            <label>Password</label>
-                            <input type="password" class="form-control" id="password">
-                        </div>
-                        <div class="form-group" id="db_name_group">
-                            <label>DB Name (MSSQL Only)</label>
-                            <input type="text" class="form-control" id="db_name" value="master">
-                        </div>
-                        <button type="button" class="btn btn-primary btn-block" onclick="saveConfig()">저장 (Save)</button>
-                    </form>
-                </div>
-            </div>
-
-            <div class="col-md-8">
-                <div class="card bg-dark border-secondary p-3">
-                    <h5 class="text-success border-bottom pb-2">저장된 DB 목록</h5>
-                    <table class="table table-dark table-hover">
-                        <thead>
-                            <tr>
-                                <th>별칭</th>
-                                <th>타입</th>
-                                <th>Host</th>
-                                <th>User</th>
-                                <th>관리</th>
-                            </tr>
-                        </thead>
-                        <tbody id="configList">
-                            </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function togglePort() {
-            const type = document.getElementById('db_type').value;
-            document.getElementById('port').value = (type === 'mssql') ? 1433 : 3306;
-            document.getElementById('db_name_group').style.display = (type === 'mssql') ? 'block' : 'none';
-        }
-
-        async function loadList() {
-            const res = await fetch('/api/config');
-            const data = await res.json();
-            const tbody = document.getElementById('configList');
-            tbody.innerHTML = '';
-
-            for (const [alias, cfg] of Object.entries(data)) {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td class="font-weight-bold text-warning">${alias}</td>
-                    <td><span class="badge badge-${cfg.db_type === 'mssql' ? 'primary' : 'info'}">${cfg.db_type}</span></td>
-                    <td>${cfg.host}:${cfg.port}</td>
-                    <td>${cfg.user}</td>
-                    <td><button class="btn btn-danger btn-sm" onclick="deleteConfig('${alias}')">삭제</button></td>
-                `;
-                tbody.appendChild(tr);
-            }
-        }
-
-        async function saveConfig() {
-            const alias = document.getElementById('alias').value;
-            if(!alias) { alert('별칭을 입력하세요.'); return; }
-
-            const payload = {
-                alias: alias,
-                db_type: document.getElementById('db_type').value,
-                host: document.getElementById('host').value,
-                port: document.getElementById('port').value,
-                user: document.getElementById('user').value,
-                password: document.getElementById('password').value,
-                db_name: document.getElementById('db_name').value
-            };
-
-            await fetch('/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            alert('저장되었습니다.');
-            loadList();
-        }
-
-        async function deleteConfig(alias) {
-            if(!confirm(alias + ' 설정을 삭제하시겠습니까?')) return;
-            await fetch('/api/config', {
-                method: 'DELETE',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({alias: alias})
-            });
-            loadList();
-        }
-
-        loadList();
-    </script>
-</body>
-</html>
-"""
-
-# === 파일 쓰기 작업 ===
-def write_file(path, content):
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(content.strip())
-    print(f"✅ Created: {path}")
-
-write_file(os.path.join(ROOT, "app.py"), app_code)
-write_file(os.path.join(TEMPLATES, "index.html"), index_html)
-write_file(os.path.join(TEMPLATES, "settings.html"), settings_html)
-
-print("\n" + "="*50)
-print("구축 완료. 아래 명령어로 실행하세요.")
-print(f"1. cd {ROOT}")
-print("2. pip install flask pymysql pymssql")
-print("3. python app.py")
-print("4. 접속: http://localhost:5000 (설정 메뉴 먼저 들어가세요)")
-print("="*50)
+Bash
+cd /home/kw/dify/docker
+cp .env.example .env
+docker compose up -d
