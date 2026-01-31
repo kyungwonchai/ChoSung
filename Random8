@@ -1,31 +1,261 @@
-가장 안전한 방법은 삼성 공식 서버에서 추출된 파일을 제공하는 신뢰도 높은 사이트를 이용하는 것입니다.
+pip install 잘 된다고 하시니, 쫄지 않고 가장 성능 좋은 벡터 검색(FAISS) 방식으로 짭니다.
 
-1. APK 파일 다운로드 (PC에서 수행)
-아래 사이트 중 하나에 접속하여 최신 버전의 Samsung Calculator APK를 받으세요. (삼성 공식 패키지명: com.sec.android.app.popupcalculator)
+1. 설치 명령어 (터미널에 복붙)
+이거 한 방이면 최신 랭체인 쪼개진 패키지들 다 깔립니다.
 
-APKMirror (추천): Samsung Calculator 검색 결과
+Bash
+pip install flask requests langchain langchain-community langchain-core langchain-text-splitters langchain-huggingface faiss-cpu sentence-transformers
+2. 완벽 호환 app.py (복붙 후 실행)
+버전 호환성: text_splitter가 어디에 붙어있든 찾아내게 짰습니다.
 
-가장 공신력 있는 사이트입니다. 최신 날짜의 버전을 선택해 다운로드하세요.
+기능: data.txt 로드 -> 벡터 임베딩 -> FAISS 검색 -> 사내 LLM 질문 -> Flask 웹
 
-Uptodown: Samsung Calculator 다운로드
+수정할 곳: 상단 COMPANY_API_URL (사내 모델 주소)
 
-2. 스마트폰으로 파일 옮기기
-PC와 폰을 USB 케이블로 연결합니다.
+Python
+import os
+import requests
+import logging
+from flask import Flask, request, jsonify, render_template_string
+from typing import Any, List, Optional, Dict
 
-다운로드한 .apk 파일을 폰의 Download 폴더나 찾기 쉬운 곳으로 복사합니다.
+# ========================================================
+# [중요] 최신/구버전 랭체인 import 호환성 강제 처리
+# ========================================================
+try:
+    # 최신 버전 (0.1, 0.2, 0.3~)
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    # 구버전
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-3. 설치 방법 (폰에서 수행)
-내 파일 앱을 엽니다.
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
 
-APK 파일을 복사해둔 폴더로 가서 해당 파일을 터치합니다.
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.language_models.llms import LLM
+from langchain_core.documents import Document
 
-"출처를 알 수 없는 앱 설치" 경고가 뜨면 **[설정]**을 눌러 '내 파일' 앱에 대해 허용으로 바꿔줍니다.
+# ========================================================
+# 1. 설정 (여기를 사내 환경에 맞게 고치세요)
+# ========================================================
+COMPANY_API_URL = "http://192.168.0.1:5000/v1/chat/completions" # <-- 변경 필수
+COMPANY_API_KEY = "any-key"  # 없으면 비워둠
+PORT_NUMBER = 10200
+DATA_FILE = "data.txt"       # 엑셀 내용을 복붙한 파일
 
-설치를 진행합니다.
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-주의사항
-안드로이드 버전 확인: 경원님의 폰 기종이 최신(S24 등)이라면, APK 파일 정보에서 Architecture가 arm64-v8a인 것을 받으시는 게 가장 좋습니다.
+# ========================================================
+# 2. 사내 LLM 연결 모듈 (Requests로 직접 쏘기)
+# ========================================================
+class MyCompanyLLM(LLM):
+    api_url: str = COMPANY_API_URL
+    api_key: str = COMPANY_API_KEY
 
-보안 정책: 회사 보안 앱(V3 Mobile Enterprise 등)이 설치되어 있다면 외부 APK 설치를 차단할 수도 있습니다. 이 경우 설치 시 '보안 정책에 의해 차단됨' 메시지가 뜰 수 있습니다.
+    @property
+    def _llm_type(self) -> str:
+        return "company_llm"
 
-혹시 설치 중에 특정 에러 코드(예: '패키지가 손상되었습니다' 등)가 뜨면 말씀해 주세요.
+    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        # 사내 API 요청 바디 (OpenAI 포맷 기준)
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.1, # 사실 기반 답변을 위해 낮춤
+            "stop": stop
+        }
+
+        try:
+            # verify=False : 사내망 SSL 인증서 에러 무시
+            response = requests.post(self.api_url, json=payload, headers=headers, verify=False, timeout=60)
+            response.raise_for_status()
+            
+            # 응답 파싱 (자동 감지)
+            data = response.json()
+            if "choices" in data:
+                return data['choices'][0]['message']['content']
+            elif "generated_text" in data:
+                return data['generated_text']
+            elif "result" in data:
+                return data['result']
+            else:
+                return str(data) # 모르겠으면 통째로 리턴
+                
+        except Exception as e:
+            logger.error(f"API Error: {e}")
+            return f"모델 응답 실패: {e}"
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        return {"api_url": self.api_url}
+
+# ========================================================
+# 3. RAG 엔진 (최신 FAISS + Sentence-Transformers)
+# ========================================================
+def initialize_rag():
+    if not os.path.exists(DATA_FILE):
+        logger.error(f"파일 없음: {DATA_FILE}")
+        return None
+
+    # 1. 파일 읽기
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        raw_text = f.read()
+
+    # 2. 텍스트 분할 (500자 단위)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        separators=["\n", "\r\n", " ", ""]
+    )
+    docs = text_splitter.create_documents([raw_text])
+    logger.info(f"데이터 로드 완료: {len(docs)}개 조각")
+
+    # 3. 임베딩 (무료, 고성능, 로컬 구동)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'}
+    )
+
+    # 4. 벡터 DB 생성
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    
+    return retriever
+
+# ========================================================
+# 4. Flask 웹 서버 및 UI
+# ========================================================
+app = Flask(__name__)
+chain = None
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>사내 LLM 부품 검색</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #eef2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .container { width: 800px; height: 80vh; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; }
+        .header { background: #2c3e50; color: white; padding: 20px; text-align: center; font-weight: bold; font-size: 1.2em; }
+        .chat-area { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        .message { padding: 12px 18px; border-radius: 20px; max-width: 75%; line-height: 1.5; font-size: 0.95em; }
+        .user { align-self: flex-end; background: #3498db; color: white; border-bottom-right-radius: 2px; }
+        .bot { align-self: flex-start; background: #f1f0f0; color: #333; border-bottom-left-radius: 2px; border: 1px solid #ddd; }
+        .input-area { padding: 20px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; }
+        input { flex: 1; padding: 15px; border: 1px solid #ddd; border-radius: 30px; outline: none; font-size: 1em; }
+        button { padding: 0 30px; border: none; background: #2c3e50; color: white; border-radius: 30px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #34495e; }
+        .loading { text-align: center; color: #888; font-size: 0.8em; margin-bottom: 10px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">사내 부품 라이브러리 (RAG)</div>
+        <div class="chat-area" id="chatBox">
+            <div class="message bot">data.txt 내용을 학습했습니다.<br>부품 번호나 스펙을 물어보세요.</div>
+        </div>
+        <div class="loading" id="loading">AI가 문서를 분석 중입니다...</div>
+        <div class="input-area">
+            <input type="text" id="userInput" placeholder="질문을 입력하세요..." onkeypress="if(event.key==='Enter') send()">
+            <button onclick="send()">전송</button>
+        </div>
+    </div>
+    <script>
+        async function send() {
+            const input = document.getElementById('userInput');
+            const chatBox = document.getElementById('chatBox');
+            const loading = document.getElementById('loading');
+            const text = input.value.trim();
+            if(!text) return;
+
+            chatBox.innerHTML += `<div class="message user">${text}</div>`;
+            input.value = '';
+            chatBox.scrollTop = chatBox.scrollHeight;
+            loading.style.display = 'block';
+
+            try {
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message: text})
+                });
+                const data = await res.json();
+                chatBox.innerHTML += `<div class="message bot">${data.answer}</div>`;
+            } catch (e) {
+                chatBox.innerHTML += `<div class="message bot" style="color:red">통신 에러: ${e}</div>`;
+            }
+            loading.style.display = 'none';
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    user_input = request.json.get('message')
+    if not chain:
+        return jsonify({"answer": "시스템 초기화 중입니다. 잠시 후 다시 시도하세요."})
+    
+    # LangChain 실행 (검색 -> 프롬프트 -> LLM)
+    try:
+        response = chain.invoke(user_input)
+        return jsonify({"answer": response})
+    except Exception as e:
+        logger.error(f"Chain Error: {e}")
+        return jsonify({"answer": f"처리 중 오류 발생: {str(e)}"})
+
+if __name__ == '__main__':
+    # SSL 경고 무시
+    import urllib3
+    urllib3.disable_warnings()
+
+    print(">>> [1/3] RAG 데이터베이스 구축 중...")
+    retriever = initialize_rag()
+
+    if retriever:
+        print(">>> [2/3] 사내 모델 연결 및 체인 구성...")
+        llm = MyCompanyLLM()
+        
+        template = """당신은 사내 부품 데이터베이스 검색 도우미입니다.
+다음 [검색된 내용]을 바탕으로 질문에 답하세요. 내용은 있는 그대로 참조해야 합니다.
+
+[검색된 내용]:
+{context}
+
+질문: {question}
+답변:"""
+        prompt = ChatPromptTemplate.from_template(template)
+
+        chain = (
+            {"context": retriever, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        print(f">>> [3/3] 서버 실행 완료: http://localhost:{PORT_NUMBER}")
+        app.run(host='0.0.0.0', port=PORT_NUMBER)
+    else:
+        print("!!! [오류] data.txt 파일을 찾을 수 없습니다. 같은 폴더에 넣어주세요.")
