@@ -1,8 +1,102 @@
-# -k: SSL 인증서 검증 무시 (Insecure)
-# -x: 프록시 지정
-curl -fsSL -k -x "$PROXY_URL" https://get.docker.com -o get-docker.sh
+import os
+import shutil
+import sys
 
-# =================================================================
-# 5. 실행 (sudo -E 옵션으로 위에서 설정한 프록시 변수를 유지한 채 실행)
-# =================================================================
-sudo -E sh get-docker.sh
+def patch_docker_compose():
+    print("--- Dify 오리지널 docker-compose.yaml 직접 수정 도구 ---")
+
+    # 1. 설정값 입력 (그냥 엔터치면 스킵)
+    proxy_url = input("1. 프록시 주소 입력 (예: http://1.2.3.4:8080)\n>> ").strip()
+    cert_path = input("2. 인증서 파일 경로 입력 (없으면 엔터)\n>> ").strip().replace("'", "").replace('"', '')
+
+    if not proxy_url and not cert_path:
+        print("변경할 내용이 없어 종료합니다.")
+        return
+
+    yaml_file = "docker-compose.yaml"
+    
+    if not os.path.exists(yaml_file):
+        print(f"오류: {yaml_file} 파일이 없습니다. dify/docker 폴더가 맞는지 확인하세요.")
+        return
+
+    # 2. 백업 생성
+    shutil.copy(yaml_file, yaml_file + ".backup")
+    print(f"[-] 원본 백업 완료: {yaml_file}.backup")
+
+    # 3. 인증서 준비
+    has_cert = False
+    if cert_path and os.path.exists(cert_path):
+        os.makedirs("certs", exist_ok=True)
+        shutil.copy(cert_path, "certs/company-ca.crt")
+        has_cert = True
+        print("[-] 인증서 파일 복사 완료 (certs/company-ca.crt)")
+
+    # 4. 주입할 설정 문자열 준비 (들여쓰기 6칸 기준)
+    # 리스트 형식(-)을 사용하여 문법 에러 방지
+    proxy_lines = []
+    if proxy_url:
+        proxy_lines = [
+            f"      - HTTP_PROXY={proxy_url}\n",
+            f"      - HTTPS_PROXY={proxy_url}\n",
+            f"      - NO_PROXY=localhost,127.0.0.1,host.docker.internal,dify-api,dify-web,dify-db,dify-redis,dify-sandbox,dify-ssrf-proxy,weaviate,qdrant,milvus,myscale,pgvector,elasticsearch\n"
+        ]
+
+    cert_env_lines = []
+    cert_vol_lines = []
+    if has_cert:
+        cert_env_lines = [
+            "      - REQUESTS_CA_BUNDLE=/app/certs/company-ca.crt\n",
+            "      - SSL_CERT_FILE=/app/certs/company-ca.crt\n"
+        ]
+        cert_vol_lines = [
+            "      - ./certs/company-ca.crt:/app/certs/company-ca.crt\n"
+        ]
+
+    # 5. 파일 읽어서 수정 (api, worker 섹션 찾기)
+    with open(yaml_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    current_service = None
+    
+    for line in lines:
+        new_lines.append(line)
+        
+        # 서비스 섹션 감지 (공백 2칸 + 이름)
+        if line.startswith("  api:"):
+            current_service = "api"
+        elif line.startswith("  worker:"):
+            current_service = "worker"
+        elif line.startswith("  ") and line.strip().endswith(":") and "api" not in line and "worker" not in line:
+            current_service = None
+
+        # 환경변수 주입 (environment: 찾기)
+        if current_service in ["api", "worker"] and line.strip() == "environment:":
+            # 프록시 설정 주입
+            new_lines.extend(proxy_lines)
+            # 인증서 환경변수 주입
+            new_lines.extend(cert_env_lines)
+            print(f"[-] {current_service}: 환경변수 추가됨")
+
+        # 볼륨 주입 (volumes: 찾기)
+        if current_service in ["api", "worker"] and line.strip() == "volumes:" and has_cert:
+            new_lines.extend(cert_vol_lines)
+            print(f"[-] {current_service}: 볼륨 마운트 추가됨")
+
+    # 6. 파일 저장
+    with open(yaml_file, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    # 7. 충돌 방지를 위해 override 파일 삭제
+    if os.path.exists("docker-compose.override.yaml"):
+        os.remove("docker-compose.override.yaml")
+        print("[-] 충돌 방지: docker-compose.override.yaml 삭제함")
+
+    print("\n" + "="*30)
+    print("완료되었습니다. 아래 명령어로 실행하세요:")
+    print("docker compose down")
+    print("docker compose up -d")
+    print("="*30)
+
+if __name__ == "__main__":
+    patch_docker_compose()
