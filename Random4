@@ -1,52 +1,86 @@
-와야 할 수도 있습니다.
+import os
+import sys
 
-GPG 키 추가 (인증서 등록이 완벽하다면 아래 명령어가 막힘없이 돌아갑니다):
+def force_patch_docker_compose():
+    print("--- Dify 설정 강제 주입 도구 ---")
 
-Bash
-curl -fsSL -x http://10.244.254.254:8080 https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-저장소 설정:
+    # 1. 설정값 입력
+    proxy_url = input("1. 프록시 주소 (예: http://1.2.3.4:8080)\n>> ").strip()
+    if not proxy_url:
+        print("프록시 주소가 없어 종료합니다.")
+        return
 
-Bash
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-4단계: 도커 패키지 클린 설치
-이제 apt update 시 에러가 나지 않아야 합니다.
+    # 인증서 경로 (없으면 엔터)
+    cert_path = input("2. 인증서 파일 경로 (없으면 엔터)\n>> ").strip().replace("'", "").replace('"', '')
 
-Bash
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-5단계: 도커 서비스(Daemon) 프록시 설정 (필수)
-도커가 깔렸어도 docker pull을 하려면 도커 서비스 자체에도 프록시를 알려줘야 합니다.
+    target_file = "docker-compose.yaml"
+    if not os.path.exists(target_file):
+        print(f"오류: {target_file} 파일이 없습니다.")
+        return
 
-디렉토리 생성:
+    # 2. 주입할 텍스트 블록 준비 (들여쓰기 6칸)
+    # 리스트 형식(-)을 써서 문법 에러 원천 차단
+    insert_env_lines = [
+        f"      - HTTP_PROXY={proxy_url}\n",
+        f"      - HTTPS_PROXY={proxy_url}\n",
+        f"      - NO_PROXY=localhost,127.0.0.1,host.docker.internal,dify-api,dify-web,dify-db,dify-redis,dify-sandbox,dify-ssrf-proxy,weaviate,qdrant,milvus,myscale,pgvector,elasticsearch\n"
+    ]
+    
+    if cert_path:
+        insert_env_lines.append(f"      - REQUESTS_CA_BUNDLE=/app/certs/company-ca.crt\n")
+        insert_env_lines.append(f"      - SSL_CERT_FILE=/app/certs/company-ca.crt\n")
 
-Bash
-sudo mkdir -p /etc/systemd/system/docker.service.d
-설정 파일 작성:
+    # 3. 파일 읽기 및 수정
+    with open(target_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-Bash
-sudo nano /etc/systemd/system/docker.service.d/http-proxy.conf
-아래 내용을 복사해서 넣으세요.
+    new_lines = []
+    in_target_service = False
+    modified_count = 0
 
-Ini, TOML
-[Service]
-Environment="HTTP_PROXY=http://10.244.254.254:8080"
-Environment="HTTPS_PROXY=http://10.244.254.254:8080"
-Environment="NO_PROXY=localhost,127.0.0.1,*.samsung.com"
-서비스 재시작:
+    print("\n--- 처리 시작 ---")
+    
+    for line in lines:
+        new_lines.append(line)
+        stripped = line.strip()
 
-Bash
-sudo systemctl daemon-reload
-sudo systemctl restart docker
-6단계: 사용자 권한 부여 (sudo 없이 사용)
-Bash
-sudo usermod -aG docker $USER
-🚨 중요: 이 명령 후 로그아웃 했다가 다시 로그인해야 docker 명령어를 바로 쓸 수 있습니다.
+        # 서비스 구간 진입 확인
+        if stripped == "api:" or stripped == "worker:":
+            in_target_service = True
+            print(f"[*] 서비스 발견: {stripped}")
+        
+        # 다른 서비스로 넘어가면 플래그 해제
+        if line.startswith("  ") and line.strip().endswith(":") and stripped not in ["api:", "worker:", "environment:", "volumes:", "deploy:", "depends_on:"]:
+            in_target_service = False
 
-요약: 설치 후 관리 명령어
-설치가 끝났다면 아래 명령어로 상태를 확인해 보세요.
+        # environment 항목 찾으면 바로 밑에 때려박기
+        # startswith로 바꿔서 주석이 달려있어도 찾음
+        if in_target_service and stripped.startswith("environment:"):
+            print(f"  -> {stripped} 항목에 프록시 설정 주입 중...")
+            new_lines.extend(insert_env_lines)
+            modified_count += 1
+            in_target_service = False # 중복 주입 방지 (한 서비스당 한 번만)
 
-실행 확인: docker ps
+    # 4. 결과 저장
+    if modified_count > 0:
+        with open(target_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        print(f"\n[성공] 총 {modified_count}군데(api, worker)에 설정이 추가되었습니다.")
+        
+        # 인증서 파일 복사 로직
+        if cert_path and os.path.exists(cert_path):
+            os.makedirs("certs", exist_ok=True)
+            import shutil
+            shutil.copy(cert_path, "certs/company-ca.crt")
+            print("[성공] 인증서 파일이 certs/company-ca.crt 로 복사되었습니다.")
+            
+        print("-" * 30)
+        print("이제 아래 명령어로 재시작하세요:")
+        print("docker compose down")
+        print("docker compose up -d")
+    else:
+        print("\n[실패] 'api:'나 'worker:' 서비스의 'environment:' 항목을 찾지 못했습니다.")
+        print("파일 내용이 표준과 너무 다릅니다. 수동 수정이 필요합니다.")
 
-이미지 다운로드 테스트: docker pull hello-world
-
-컴포즈 확인: docker compose version
+if __name__ == "__main__":
+    force_patch_docker_compose()
