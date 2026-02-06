@@ -1,86 +1,40 @@
-import os
-import sys
+데스크톱(RDP)이 갑자기 안 될 때, SSH로 접속하신 상태라면 다음 단계별 명령어로 서비스를 강제 재시작하고 상태를 점검해 보시기 바랍니다.
 
-def force_patch_docker_compose():
-    print("--- Dify 설정 강제 주입 도구 ---")
+윈도우 터미널(PowerShell/CMD)이 아닌 SSH(Linux Shell)를 통해 윈도우를 제어하는 상황이므로, powershell 명령어를 앞에 붙여서 실행해야 합니다.
 
-    # 1. 설정값 입력
-    proxy_url = input("1. 프록시 주소 (예: http://1.2.3.4:8080)\n>> ").strip()
-    if not proxy_url:
-        print("프록시 주소가 없어 종료합니다.")
-        return
+1. RDP 서비스 재시작 (가장 기본)
+가장 먼저 RDP의 핵심 서비스인 TermService를 재시작합니다.
 
-    # 인증서 경로 (없으면 엔터)
-    cert_path = input("2. 인증서 파일 경로 (없으면 엔터)\n>> ").strip().replace("'", "").replace('"', '')
+Bash
+# 서비스 강제 재시작
+powershell "Restart-Service -Name TermService -Force"
+2. 방화벽 상태 확인 및 허용
+방화벽 설정이 꼬였을 수 있습니다. RDP 포트(3389)가 열려 있는지 확인하고 다시 허용합니다.
 
-    target_file = "docker-compose.yaml"
-    if not os.path.exists(target_file):
-        print(f"오류: {target_file} 파일이 없습니다.")
-        return
+Bash
+# RDP 방화벽 규칙 활성화
+powershell "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'"
+3. RDP 허용 레지스트리 강제 활성화
+간혹 설정 값이 풀리는 경우가 있습니다. 레지스트리 값을 직접 수정하여 외부 접속을 허용합니다.
 
-    # 2. 주입할 텍스트 블록 준비 (들여쓰기 6칸)
-    # 리스트 형식(-)을 써서 문법 에러 원천 차단
-    insert_env_lines = [
-        f"      - HTTP_PROXY={proxy_url}\n",
-        f"      - HTTPS_PROXY={proxy_url}\n",
-        f"      - NO_PROXY=localhost,127.0.0.1,host.docker.internal,dify-api,dify-web,dify-db,dify-redis,dify-sandbox,dify-ssrf-proxy,weaviate,qdrant,milvus,myscale,pgvector,elasticsearch\n"
-    ]
-    
-    if cert_path:
-        insert_env_lines.append(f"      - REQUESTS_CA_BUNDLE=/app/certs/company-ca.crt\n")
-        insert_env_lines.append(f"      - SSL_CERT_FILE=/app/certs/company-ca.crt\n")
+Bash
+# RDP 접속 허용 (fDenyTSConnections를 0으로 설정)
+powershell "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0"
 
-    # 3. 파일 읽기 및 수정
-    with open(target_file, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+# 네트워크 수준 인증(NLA) 일시적 비활성화 (접속 트러블슈팅용)
+powershell "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0"
+4. 포트 리스닝 상태 확인
+현재 윈도우가 3389 포트로 신호를 기다리고 있는지 확인합니다.
 
-    new_lines = []
-    in_target_service = False
-    modified_count = 0
+Bash
+powershell "netstat -an | findstr 3389"
+결과에 LISTENING이 뜨지 않는다면 서비스가 정상적으로 올라오지 않은 것입니다.
 
-    print("\n--- 처리 시작 ---")
-    
-    for line in lines:
-        new_lines.append(line)
-        stripped = line.strip()
+💡 경원님을 위한 추가 체크리스트
+만약 위 명령어로도 안 된다면, 최근 윈도우 업데이트로 인해 네트워크 프로필이 '공용(Public)'으로 바뀌었을 가능성이 큽니다. 공용 네트워크에서는 보안상 RDP가 차단됩니다.
 
-        # 서비스 구간 진입 확인
-        if stripped == "api:" or stripped == "worker:":
-            in_target_service = True
-            print(f"[*] 서비스 발견: {stripped}")
-        
-        # 다른 서비스로 넘어가면 플래그 해제
-        if line.startswith("  ") and line.strip().endswith(":") and stripped not in ["api:", "worker:", "environment:", "volumes:", "deploy:", "depends_on:"]:
-            in_target_service = False
+네트워크를 '개인(Private)'으로 강제 변경:
 
-        # environment 항목 찾으면 바로 밑에 때려박기
-        # startswith로 바꿔서 주석이 달려있어도 찾음
-        if in_target_service and stripped.startswith("environment:"):
-            print(f"  -> {stripped} 항목에 프록시 설정 주입 중...")
-            new_lines.extend(insert_env_lines)
-            modified_count += 1
-            in_target_service = False # 중복 주입 방지 (한 서비스당 한 번만)
-
-    # 4. 결과 저장
-    if modified_count > 0:
-        with open(target_file, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-        print(f"\n[성공] 총 {modified_count}군데(api, worker)에 설정이 추가되었습니다.")
-        
-        # 인증서 파일 복사 로직
-        if cert_path and os.path.exists(cert_path):
-            os.makedirs("certs", exist_ok=True)
-            import shutil
-            shutil.copy(cert_path, "certs/company-ca.crt")
-            print("[성공] 인증서 파일이 certs/company-ca.crt 로 복사되었습니다.")
-            
-        print("-" * 30)
-        print("이제 아래 명령어로 재시작하세요:")
-        print("docker compose down")
-        print("docker compose up -d")
-    else:
-        print("\n[실패] 'api:'나 'worker:' 서비스의 'environment:' 항목을 찾지 못했습니다.")
-        print("파일 내용이 표준과 너무 다릅니다. 수동 수정이 필요합니다.")
-
-if __name__ == "__main__":
-    force_patch_docker_compose()
+Bash
+powershell "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"
+위 명령어들을 순서대로 입력해 보시고, 여전히 접속이 안 된다면 발생하는 에러 메시지를 알려주세요. 바로 다음 해결책을 찾아보겠습니다. 어떤 단계부터 진행해 볼까요?
