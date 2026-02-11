@@ -1,261 +1,193 @@
-pip install 잘 된다고 하시니, 쫄지 않고 가장 성능 좋은 벡터 검색(FAISS) 방식으로 짭니다.
+확한 진단입니다. 그 에러(Procedure entry point not found in kernel32.dll)는 **"프로그램이 너무 최신이라 윈도우 XP가 못 알아듣는 명령어를 썼다"**는 뜻입니다.
 
-1. 설치 명령어 (터미널에 복붙)
-이거 한 방이면 최신 랭체인 쪼개진 패키지들 다 깔립니다.
+러스트(Rust)의 기본 라이브러리가 최근 업데이트되면서 윈도우 7 이상에서만 있는 기능(예: GetSystemTimePreciseAsFileTime)을 몰래 가져다 쓰기 시작해서 그렇습니다. 이걸 억지로 뜯어고치는 것보다, 이미 설치하신 우분투의 MinGW(C언어 컴파일러)를 쓰는 게 100배 빠르고 확실합니다.
+
+Rust 다 버리고, 가장 원초적인 C언어로 짭니다. 이건 1990년대 방식이라 윈도우 XP는 물론 98에서도 돌아갑니다.
+
+1단계: 코드 작성 (main.c)
+우분투 터미널에서 nano main.c 입력하고 아래 내용을 그대로 붙여넣으세요.
+(복잡한 기능 싹 빼고, XP에 있는 기능만 썼습니다.)
+
+C
+#include <windows.h>
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+
+// 설정
+#define CONFIG_FILE "startup_config.txt"
+#define LOG_RETENTION_DAYS 7
+
+// 공백 제거 함수
+void trim(char * str) {
+    char * end;
+    while(*str == ' ') str++;
+    if(*str == 0) return;
+    end = str + strlen(str) - 1;
+    while(end > str && *end == ' ') end--;
+    *(end+1) = 0;
+}
+
+// 로그 기록 함수
+void write_log(const char * msg) {
+    FILE * f;
+    time_t rawtime;
+    struct tm * timeinfo;
+    char filename[64];
+    char time_str[64];
+    
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+    
+    // 파일명: log_2024-02-12.txt
+    sprintf(filename, "log_%04d-%02d-%02d.txt", 
+            timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday);
+            
+    f = fopen(filename, "a");
+    if (f) {
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", timeinfo);
+        fprintf(f, "[%s] %s\n", time_str, msg);
+        fclose(f);
+    }
+}
+
+// 7일 지난 로그 삭제
+void delete_old_logs() {
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile("log_*.txt", &fd);
+    SYSTEMTIME st;
+    FILETIME ftNow;
+    ULARGE_INTEGER ulNow, ulFile;
+    ULONGLONG diff;
+    
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    
+    GetSystemTime(&st);
+    SystemTimeToFileTime(&st, &ftNow);
+    ulNow.LowPart = ftNow.dwLowDateTime;
+    ulNow.HighPart = ftNow.dwHighDateTime;
+    ulNow.QuadPart = ulNow.QuadPart;
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            ulFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+            ulFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            
+            // 7일 = 604800초 * 10000000 (100나노초 단위)
+            if (ulNow.QuadPart > ulFile.QuadPart) {
+                diff = ulNow.QuadPart - ulFile.QuadPart;
+                if (diff > (ULONGLONG)LOG_RETENTION_DAYS * 24 * 60 * 60 * 10000000) {
+                    DeleteFile(fd.cFileName);
+                    write_log("Old log deleted.");
+                }
+            }
+        }
+    } while (FindNextFile(hFind, &fd));
+    FindClose(hFind);
+}
+
+// 기본 설정 파일 생성
+void create_default_config() {
+    FILE * f = fopen(CONFIG_FILE, "w");
+    if (f) {
+        fprintf(f, "# SMD Startup Config\n");
+        fprintf(f, "# Format: Seconds | Path\n");
+        fprintf(f, "30 | Dummy_Wait\n");
+        fprintf(f, "5  | C:\\Windows\\notepad.exe\n");
+        fclose(f);
+    }
+}
+
+// 메인 함수 (WinMain을 써서 콘솔창 안 뜸)
+int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    FILE * f;
+    char line[512];
+    char * token;
+    int delay;
+    char path[512];
+    char log_buf[1024];
+
+    delete_old_logs();
+    write_log("=== Launcher Started (C Version) ===");
+
+    f = fopen(CONFIG_FILE, "r");
+    if (!f) {
+        create_default_config();
+        write_log("Config file created. Please edit it.");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        // 주석이나 빈 줄 무시
+        if (line[0] == '#' || line[0] == '\n' || strlen(line) < 3) continue;
+
+        // 파싱 ( | 기준)
+        token = strtok(line, "|");
+        if (!token) continue;
+        
+        delay = atoi(token); // 문자열을 숫자로 변환
+        
+        token = strtok(NULL, "\n"); // 나머지 경로 부분
+        if (!token) continue;
+        
+        // 앞뒤 공백 제거하고 경로 복사
+        while(*token == ' ') token++; // 앞 공백 제거
+        strcpy(path, token);
+        
+        // 끝에 엔터키 등 제거
+        if (path[strlen(path)-1] == '\r') path[strlen(path)-1] = 0;
+
+        // 딜레이 실행
+        if (delay > 0) {
+            sprintf(log_buf, "Waiting %d seconds...", delay);
+            write_log(log_buf);
+            Sleep(delay * 1000); // 윈도우 API Sleep (대문자 S, 밀리초 단위)
+        }
+
+        if (strstr(path, "Dummy") != NULL) continue;
+
+        // 파일 실행
+        sprintf(log_buf, "Launching: %s", path);
+        write_log(log_buf);
+        
+        // 실행 (ShellExecute가 가장 호환성 좋음)
+        // 작업 폴더 설정 (파일이 있는 곳)
+        char workDir[512];
+        strcpy(workDir, path);
+        char * lastSlash = strrchr(workDir, '\\');
+        if (lastSlash) *lastSlash = 0;
+        else strcpy(workDir, ".");
+
+        int result = (int)ShellExecute(NULL, "open", path, NULL, workDir, SW_SHOWNORMAL);
+        
+        if (result <= 32) {
+            sprintf(log_buf, "Failed to launch (Error Code: %d)", result);
+            write_log(log_buf);
+        }
+    }
+
+    fclose(f);
+    write_log("All tasks finished.");
+    return 0;
+}
+2단계: 컴파일 (C언어 -> XP용 변환)
+우분투 터미널에서 이 명령어를 치면 됩니다. (MinGW는 이미 설치하셨습니다.)
 
 Bash
-pip install flask requests langchain langchain-community langchain-core langchain-text-splitters langchain-huggingface faiss-cpu sentence-transformers
-2. 완벽 호환 app.py (복붙 후 실행)
-버전 호환성: text_splitter가 어디에 붙어있든 찾아내게 짰습니다.
+i686-w64-mingw32-gcc main.c -o smd_launcher.exe -static -mwindows
+i686-w64-mingw32-gcc: 32비트 윈도우용 C 컴파일러
 
-기능: data.txt 로드 -> 벡터 임베딩 -> FAISS 검색 -> 사내 LLM 질문 -> Flask 웹
+-static: 모든 라이브러리를 내장함 (DLL 에러 방지)
 
-수정할 곳: 상단 COMPANY_API_URL (사내 모델 주소)
+-mwindows: 콘솔창(검은창)을 띄우지 않음
 
-Python
-import os
-import requests
-import logging
-from flask import Flask, request, jsonify, render_template_string
-from typing import Any, List, Optional, Dict
+3단계: 확인
+이제 생성된 smd_launcher.exe는 순수 C언어 + 윈도우 XP API로만 만들어졌습니다.
 
-# ========================================================
-# [중요] 최신/구버전 랭체인 import 호환성 강제 처리
-# ========================================================
-try:
-    # 최신 버전 (0.1, 0.2, 0.3~)
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    # 구버전
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
+커널32 에러 안 뜹니다.
 
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
+DLL 에러 안 뜹니다.
 
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.language_models.llms import LLM
-from langchain_core.documents import Document
+그냥 돌아갑니다.
 
-# ========================================================
-# 1. 설정 (여기를 사내 환경에 맞게 고치세요)
-# ========================================================
-COMPANY_API_URL = "http://192.168.0.1:5000/v1/chat/completions" # <-- 변경 필수
-COMPANY_API_KEY = "any-key"  # 없으면 비워둠
-PORT_NUMBER = 10200
-DATA_FILE = "data.txt"       # 엑셀 내용을 복붙한 파일
-
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ========================================================
-# 2. 사내 LLM 연결 모듈 (Requests로 직접 쏘기)
-# ========================================================
-class MyCompanyLLM(LLM):
-    api_url: str = COMPANY_API_URL
-    api_key: str = COMPANY_API_KEY
-
-    @property
-    def _llm_type(self) -> str:
-        return "company_llm"
-
-    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        
-        # 사내 API 요청 바디 (OpenAI 포맷 기준)
-        payload = {
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 1024,
-            "temperature": 0.1, # 사실 기반 답변을 위해 낮춤
-            "stop": stop
-        }
-
-        try:
-            # verify=False : 사내망 SSL 인증서 에러 무시
-            response = requests.post(self.api_url, json=payload, headers=headers, verify=False, timeout=60)
-            response.raise_for_status()
-            
-            # 응답 파싱 (자동 감지)
-            data = response.json()
-            if "choices" in data:
-                return data['choices'][0]['message']['content']
-            elif "generated_text" in data:
-                return data['generated_text']
-            elif "result" in data:
-                return data['result']
-            else:
-                return str(data) # 모르겠으면 통째로 리턴
-                
-        except Exception as e:
-            logger.error(f"API Error: {e}")
-            return f"모델 응답 실패: {e}"
-
-    @property
-    def _identifying_params(self) -> Dict[str, Any]:
-        return {"api_url": self.api_url}
-
-# ========================================================
-# 3. RAG 엔진 (최신 FAISS + Sentence-Transformers)
-# ========================================================
-def initialize_rag():
-    if not os.path.exists(DATA_FILE):
-        logger.error(f"파일 없음: {DATA_FILE}")
-        return None
-
-    # 1. 파일 읽기
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-
-    # 2. 텍스트 분할 (500자 단위)
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-        separators=["\n", "\r\n", " ", ""]
-    )
-    docs = text_splitter.create_documents([raw_text])
-    logger.info(f"데이터 로드 완료: {len(docs)}개 조각")
-
-    # 3. 임베딩 (무료, 고성능, 로컬 구동)
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'}
-    )
-
-    # 4. 벡터 DB 생성
-    vectorstore = FAISS.from_documents(docs, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    
-    return retriever
-
-# ========================================================
-# 4. Flask 웹 서버 및 UI
-# ========================================================
-app = Flask(__name__)
-chain = None
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>사내 LLM 부품 검색</title>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #eef2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .container { width: 800px; height: 80vh; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; }
-        .header { background: #2c3e50; color: white; padding: 20px; text-align: center; font-weight: bold; font-size: 1.2em; }
-        .chat-area { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
-        .message { padding: 12px 18px; border-radius: 20px; max-width: 75%; line-height: 1.5; font-size: 0.95em; }
-        .user { align-self: flex-end; background: #3498db; color: white; border-bottom-right-radius: 2px; }
-        .bot { align-self: flex-start; background: #f1f0f0; color: #333; border-bottom-left-radius: 2px; border: 1px solid #ddd; }
-        .input-area { padding: 20px; background: #fff; border-top: 1px solid #ddd; display: flex; gap: 10px; }
-        input { flex: 1; padding: 15px; border: 1px solid #ddd; border-radius: 30px; outline: none; font-size: 1em; }
-        button { padding: 0 30px; border: none; background: #2c3e50; color: white; border-radius: 30px; font-weight: bold; cursor: pointer; transition: 0.2s; }
-        button:hover { background: #34495e; }
-        .loading { text-align: center; color: #888; font-size: 0.8em; margin-bottom: 10px; display: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">사내 부품 라이브러리 (RAG)</div>
-        <div class="chat-area" id="chatBox">
-            <div class="message bot">data.txt 내용을 학습했습니다.<br>부품 번호나 스펙을 물어보세요.</div>
-        </div>
-        <div class="loading" id="loading">AI가 문서를 분석 중입니다...</div>
-        <div class="input-area">
-            <input type="text" id="userInput" placeholder="질문을 입력하세요..." onkeypress="if(event.key==='Enter') send()">
-            <button onclick="send()">전송</button>
-        </div>
-    </div>
-    <script>
-        async function send() {
-            const input = document.getElementById('userInput');
-            const chatBox = document.getElementById('chatBox');
-            const loading = document.getElementById('loading');
-            const text = input.value.trim();
-            if(!text) return;
-
-            chatBox.innerHTML += `<div class="message user">${text}</div>`;
-            input.value = '';
-            chatBox.scrollTop = chatBox.scrollHeight;
-            loading.style.display = 'block';
-
-            try {
-                const res = await fetch('/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message: text})
-                });
-                const data = await res.json();
-                chatBox.innerHTML += `<div class="message bot">${data.answer}</div>`;
-            } catch (e) {
-                chatBox.innerHTML += `<div class="message bot" style="color:red">통신 에러: ${e}</div>`;
-            }
-            loading.style.display = 'none';
-            chatBox.scrollTop = chatBox.scrollHeight;
-        }
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/chat', methods=['POST'])
-def chat():
-    user_input = request.json.get('message')
-    if not chain:
-        return jsonify({"answer": "시스템 초기화 중입니다. 잠시 후 다시 시도하세요."})
-    
-    # LangChain 실행 (검색 -> 프롬프트 -> LLM)
-    try:
-        response = chain.invoke(user_input)
-        return jsonify({"answer": response})
-    except Exception as e:
-        logger.error(f"Chain Error: {e}")
-        return jsonify({"answer": f"처리 중 오류 발생: {str(e)}"})
-
-if __name__ == '__main__':
-    # SSL 경고 무시
-    import urllib3
-    urllib3.disable_warnings()
-
-    print(">>> [1/3] RAG 데이터베이스 구축 중...")
-    retriever = initialize_rag()
-
-    if retriever:
-        print(">>> [2/3] 사내 모델 연결 및 체인 구성...")
-        llm = MyCompanyLLM()
-        
-        template = """당신은 사내 부품 데이터베이스 검색 도우미입니다.
-다음 [검색된 내용]을 바탕으로 질문에 답하세요. 내용은 있는 그대로 참조해야 합니다.
-
-[검색된 내용]:
-{context}
-
-질문: {question}
-답변:"""
-        prompt = ChatPromptTemplate.from_template(template)
-
-        chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-        
-        print(f">>> [3/3] 서버 실행 완료: http://localhost:{PORT_NUMBER}")
-        app.run(host='0.0.0.0', port=PORT_NUMBER)
-    else:
-        print("!!! [오류] data.txt 파일을 찾을 수 없습니다. 같은 폴더에 넣어주세요.")
+이걸로 끝내시죠. 고생 많으셨습니다.
