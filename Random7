@@ -1,28 +1,286 @@
-리고 XP 임베디드(저사양)에 맞춰서 용량을 확 줄이고 안정성을 높이는 설정을 추가했습니다. 아래 내용을 그대로 복사해서 Cargo.toml에 덮어쓰세요.
+import os
+import sys
+import sqlite3
+import requests
+import json
+import re
+from abc import ABC, abstractmethod
+from flask import Flask, render_template_string, request, jsonify
 
-1. Cargo.toml (덮어쓰기)
-Ini, TOML
-[package]
-name = "smd_launcher"
-version = "0.1.0"
-edition = "2021"
+# ========================================================
+# [시스템 설정] EffBoost Configuration
+# ========================================================
+PORT = 9345
+APP_NAME = "EffBoost"
+BASE_DIR = "effboost_workspace"
+DB_PATH = os.path.join(BASE_DIR, "storage.db")
+ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-[dependencies]
-# 날짜와 시간을 로그에 찍기 위한 필수 라이브러리
-chrono = "0.4"
+# ========================================================
+# 1. Configuration Manager (Singleton)
+# ========================================================
+class Config:
+    _instance = None
+    _env_cache = {}
 
-[profile.release]
-# ▼ XP 임베디드용 최적화 설정 (중요) ▼
-opt-level = "z"     # 용량 최소화 (메모리 절약)
-lto = true          # 링킹 최적화 (파일 크기 더 줄임)
-codegen-units = 1   # 느리게 빌드하더라도 파일 크기를 줄임
-panic = "abort"     # 에러 발생 시 복잡한 처리 없이 즉시 종료 (XP에서 훨씬 안정적)
-strip = true        # 디버그 정보를 제거해서 용량을 획기적으로 줄임
-2. 빌드하기 (DLL 에러 해결)
-중요: Cargo.toml은 라이브러리 관리용이고, "DLL 없음 에러"를 잡으려면 아까 알려드린 명령어(static 옵션)로 빌드해야 합니다.
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Config, cls).__new__(cls)
+            cls._instance._initialize_environment()
+        return cls._instance
 
-우분투 터미널에서 이 명령어를 복사해서 실행하세요. (한 줄입니다)
+    def _initialize_environment(self):
+        # 작업 디렉토리 생성 (이게 먼저 실행되어야 함)
+        if not os.path.exists(BASE_DIR):
+            os.makedirs(BASE_DIR)
+            print(f"[{APP_NAME}] Initialized workspace: {BASE_DIR}")
 
-Bash
-RUSTFLAGS="-C link-args=-static" cargo build --release --target i686-pc-windows-gnu
-이렇게 하면 target/i686-pc-windows-gnu/release/ 폴더에 진짜로 아무것도 필요 없는, 혼자 돌아가는 EXE가 생성됩니다. 이걸 가
+        # .env 파일 생성
+        if not os.path.exists(ENV_PATH):
+            template = """# [EffBoost Configuration]
+# Security: Do not commit this file.
+API_KEY=
+
+# Agent Endpoints (Leave blank if unused)
+URL_GENERAL=
+URL_UBUNTU=
+URL_SQL=
+URL_REASON=
+"""
+            with open(ENV_PATH, "w", encoding="utf-8") as f:
+                f.write(template)
+            print(f"[{APP_NAME}] Created config file: {ENV_PATH}")
+
+        # 환경변수 로드
+        if os.path.exists(ENV_PATH):
+            with open(ENV_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        key, val = line.split("=", 1)
+                        self._env_cache[key] = val
+
+    def get(self, key):
+        return self._env_cache.get(key, "").strip()
+
+# ========================================================
+# 2. Local Memory (Repository Pattern) - [FIXED HERE]
+# ========================================================
+class MemoryRepo:
+    def __init__(self):
+        # [핵심 수정] DB 연결 전 폴더 존재 여부 강제 확인
+        db_folder = os.path.dirname(DB_PATH)
+        if not os.path.exists(db_folder):
+            os.makedirs(db_folder)
+            
+        self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._init_table()
+
+    def _init_table(self):
+        self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT,
+                tag TEXT DEFAULT 'General',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self._conn.commit()
+
+    def add_note(self, text, tag="Memo"):
+        self._conn.execute('INSERT INTO notes (content, tag) VALUES (?, ?)', (text, tag))
+        self._conn.commit()
+
+    def retrieve(self, query, limit=3):
+        keywords = query.split()
+        if not keywords: return []
+        
+        sql = "SELECT content FROM notes WHERE " + " OR ".join(["content LIKE ?"] * len(keywords))
+        params = [f"%{k}%" for k in keywords]
+        
+        cursor = self._conn.execute(sql + f" ORDER BY id DESC LIMIT {limit}", params)
+        return [r[0] for r in cursor.fetchall()]
+
+# ========================================================
+# 3. Agent Strategies
+# ========================================================
+class BaseAgent(ABC):
+    @abstractmethod
+    def run(self, prompt, context): pass
+
+class RemoteLLMAgent(BaseAgent):
+    def __init__(self, endpoint_key, label):
+        self.config = Config() # 여기서 Config 호출하여 환경 초기화 보장
+        self.endpoint_key = endpoint_key
+        self.label = label
+
+    def run(self, prompt, context):
+        url = self.config.get(self.endpoint_key)
+        api_key = self.config.get("API_KEY")
+
+        if not url or not api_key:
+            return f"⚠️ Config Error: '{ENV_PATH}' 파일에 URL과 API_KEY를 입력해주세요."
+
+        final_input = f"Context:\n{context}\n\nTask: {prompt}" if context else prompt
+
+        payload = {
+            "input_type": "chat",
+            "output_type": "chat",
+            "input_value": final_input
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key
+        }
+
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+            response.raise_for_status()
+            return self._extract_text(response.json())
+        except Exception as e:
+            return f"Error ({self.label}): {str(e)}"
+
+    def _extract_text(self, data):
+        try:
+            return data["outputs"][0]["outputs"]["results"]["message"]["text"]
+        except (KeyError, IndexError):
+            return f"Parsing Error. Raw: {str(data)[:100]}..."
+
+# ========================================================
+# 4. Orchestrator
+# ========================================================
+class AgentOrchestrator:
+    def __init__(self):
+        # MemoryRepo 생성 시점에 폴더가 확실히 있게 됨
+        self.memory = MemoryRepo()
+        self.agents = {
+            "GENERAL": RemoteLLMAgent("URL_GENERAL", "Assistant"),
+            "UBUNTU": RemoteLLMAgent("URL_UBUNTU", "Linux Expert"),
+            "SQL": RemoteLLMAgent("URL_SQL", "DB Admin"),
+            "REASON": RemoteLLMAgent("URL_REASON", "Analyst"),
+        }
+
+    def process(self, user_msg):
+        if user_msg.startswith(("/save", "/memo", "/저장")):
+            content = re.sub(r'^(/save|/memo|/저장)\s*', '', user_msg)
+            self.memory.add_note(content)
+            return {"type": "sys", "msg": "Saved to local memory.", "agent": "SYS"}
+
+        intent = "GENERAL"
+        msg_lower = user_msg.lower()
+        
+        if any(x in msg_lower for x in ['ubuntu', 'linux', 'bash', 'terminal', 'shell']):
+            intent = "UBUNTU"
+        elif any(x in msg_lower for x in ['sql', 'query', 'database', 'select', 'join']):
+            intent = "SQL"
+        elif any(x in msg_lower for x in ['plan', 'reason', 'analyze', 'think', 'why']):
+            intent = "REASON"
+
+        context_data = self.memory.retrieve(user_msg)
+        context_str = "\n".join(context_data)
+
+        # Config가 초기화되었는지 확인 (안전장치)
+        if not self.agents[intent].config.get("API_KEY"):
+             return {
+                "type": "chat",
+                "msg": f"⚠️ 설정이 필요합니다.\n'{ENV_PATH}' 파일을 열어 API Key와 URL을 입력하고 다시 시도하세요.",
+                "agent": "SYSTEM",
+                "refs": []
+            }
+
+        response_text = self.agents[intent].run(user_msg, context_str)
+
+        return {
+            "type": "chat",
+            "msg": response_text,
+            "agent": self.agents[intent].label,
+            "refs": context_data
+        }
+
+# ========================================================
+# 5. Web Interface (Flask)
+# ========================================================
+app = Flask(__name__)
+
+# 전역 객체 생성 전 Config 강제 초기화 (가장 안전한 방법)
+Config() 
+orchestrator = AgentOrchestrator()
+
+HTML_UI = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EffBoost Workspace</title>
+    <style>
+        :root { --bg-primary: #1e1e1e; --bg-secondary: #252526; --text-main: #d4d4d4; --accent: #007acc; --border: #3e3e42; }
+        body { margin: 0; background-color: var(--bg-primary); color: var(--text-main); font-family: 'Segoe UI', 'Roboto', monospace; display: flex; justify-content: center; height: 100vh; overflow: hidden; }
+        .app-frame { width: 100%; max-width: 900px; display: flex; flex-direction: column; background: var(--bg-secondary); border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+        header { padding: 15px 20px; background: #2d2d2d; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        header h1 { margin: 0; font-size: 16px; font-weight: 600; color: #fff; }
+        .status { width: 8px; height: 8px; background-color: #4caf50; border-radius: 50%; box-shadow: 0 0 8px #4caf50; }
+        .chat-container { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        .message { padding: 12px 16px; border-radius: 6px; max-width: 85%; font-size: 14px; line-height: 1.5; }
+        .msg-user { align-self: flex-end; background-color: #0e639c; color: white; }
+        .msg-bot { align-self: flex-start; background-color: #333333; border: 1px solid var(--border); }
+        .agent-label { font-size: 10px; color: #9cdcfe; margin-bottom: 4px; display: block; font-weight: bold; text-transform: uppercase; }
+        .ref-box { margin-top: 8px; padding-top: 8px; border-top: 1px solid #444; font-size: 11px; color: #858585; }
+        pre { background: #000; padding: 10px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', monospace; border: 1px solid #444; color: #ce9178; }
+        .input-zone { padding: 20px; background: #2d2d2d; border-top: 1px solid var(--border); display: flex; gap: 10px; }
+        input { flex: 1; padding: 12px; background: #3c3c3c; border: 1px solid #3c3c3c; color: white; border-radius: 4px; outline: none; font-family: inherit; }
+        input:focus { border-color: var(--accent); }
+        button { padding: 0 20px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="app-frame">
+        <header><h1>EffBoost :: Workspace</h1><div class="status"></div></header>
+        <div class="chat-container" id="chatBox">
+            <div class="message msg-bot"><span class="agent-label">System</span>Welcome. Ready to boost efficiency.<br>Commands: <code>/save [text]</code> to memorize.</div>
+        </div>
+        <div class="input-zone">
+            <input type="text" id="userInput" placeholder="Type a command or query..." autocomplete="off">
+            <button onclick="send()">RUN</button>
+        </div>
+    </div>
+    <script>
+        const input = document.getElementById('userInput');
+        const box = document.getElementById('chatBox');
+        input.addEventListener('keypress', (e) => { if(e.key === 'Enter') send(); });
+        async function send() {
+            const text = input.value.trim();
+            if (!text) return;
+            box.innerHTML += `<div class="message msg-user">${esc(text)}</div>`;
+            input.value = ''; box.scrollTop = box.scrollHeight;
+            try {
+                const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({msg: text}) });
+                const data = await res.json();
+                let content = fmt(data.msg);
+                if (data.refs && data.refs.length > 0) content += `<div class="ref-box">Recall: ${data.refs.length} item(s) found.</div>`;
+                box.innerHTML += `<div class="message msg-bot"><span class="agent-label">${data.agent}</span>${content}</div>`;
+            } catch (err) { box.innerHTML += `<div class="message msg-bot" style="color:#f48771">Connection Error.</div>`; }
+            box.scrollTop = box.scrollHeight;
+        }
+        function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+        function fmt(t) { return t.replace(/\\n/g, '<br>').replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>'); }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index(): return render_template_string(HTML_UI)
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.json
+    return jsonify(orchestrator.process(data.get('msg', '')))
+
+if __name__ == '__main__':
+    print("="*50)
+    print(f" EffBoost Server Running on Port {PORT}")
+    print(f" [!] Edit Config File: {ENV_PATH}")
+    print(f" [>] http://localhost:{PORT}")
+    print("="*50)
+    app.run(host='0.0.0.0', port=PORT)
