@@ -1,330 +1,55 @@
-import os
-import sys
-import sqlite3
-import requests
-import json
-import re
-from abc import ABC, abstractmethod
-from flask import Flask, render_template_string, request, jsonify
+1. 원인 분석 (Why?)
+"왜 암호까지 쳤는데 튕기는가?"
 
-# ========================================================
-# [시스템 설정] EffBoost Configuration
-# ========================================================
-PORT = 9345
-APP_NAME = "EffBoost"
-BASE_DIR = "effboost_workspace"
-DB_PATH = os.path.join(BASE_DIR, "storage.db")
-ENV_PATH = os.path.join(BASE_DIR, ".env")
+충돌 메커니즘: RDP로 접속하면 윈도우는 가상 디스플레이 어댑터를 생성합니다. 이때 백그라운드에 있던 Intel HDCP 서비스가 "어? 화면이 켜졌네? 저작권 보호(DRM) 핸드셰이크 해야지!" 하고 끼어듭니다.
 
-# ========================================================
-# 1. Configuration Manager (Singleton)
-# ========================================================
-class Config:
-    _instance = None
-    _env_cache = {}
+치명적 오류: 하지만 RDP의 가상 화면은 물리적인 HDCP(모니터 케이블 암호화)를 지원하지 않습니다. 인텔 서비스는 이를 "보안 위협"이나 "하드웨어 오류"로 인식하고 그래픽 드라이버단에서 응답을 멈추거나, LogonUI.exe(로그인 화면 프로세스)를 강제 종료시켜버립니다.
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(Config, cls).__new__(cls)
-            cls._instance._initialize_environment()
-        return cls._instance
+결과: 사용자는 암호를 쳤지만, 로그인 프로세스가 죽어버리므로 연결이 끊기는 것입니다.
 
-    def _initialize_environment(self):
-        # 작업 디렉토리 생성
-        if not os.path.exists(BASE_DIR):
-            os.makedirs(BASE_DIR)
-            print(f"[{APP_NAME}] Initialized workspace: {BASE_DIR}")
+2. 해결 절차 (터미널 명령어)
+지금 로컬에 로그인되어 있으니, 마우스 클릭할 필요 없이 관리자 권한 명령 프롬프트(CMD) 또는 PowerShell을 열고 아래 명령어를 순서대로 복사해 붙여넣으세요.
 
-        # .env 파일 생성 (내용 비워둠)
-        if not os.path.exists(ENV_PATH):
-            template = """# [EffBoost Configuration]
-# Security: Do not commit this file.
-# Enter your LLM platform credentials below.
+이 명령어들은 1) 문제의 서비스 즉시 사살 및 불구 만들기, 2) RDP가 인텔 그래픽 드라이버를 쓰지 않도록 우회 설정 하는 조치입니다.
 
-API_KEY=
+[Step 1] 관리자 CMD 실행
+Win키 누르고 cmd 입력 → [관리자 권한으로 실행] 엔터.
 
-# Agent Endpoints (Leave blank if unused)
-# Example: https://api.yourservice.com/v1/run/uuid?stream=false
-URL_GENERAL=
-URL_UBUNTU=
-URL_SQL=
-URL_REASON=
-"""
-            with open(ENV_PATH, "w", encoding="utf-8") as f:
-                f.write(template)
-            print(f"[{APP_NAME}] Created config file: {ENV_PATH} (Please edit this file)")
+[Step 2] 복구 명령어 입력 (한 줄씩 실행)
+1. 범인(Intel HDCP) 서비스 강제 중지 및 비활성화
+(서비스명이 버전마다 cphs 또는 풀네임일 수 있어 둘 다 때려넣습니다. 오류 떠도 무시하고 진행하세요.)
 
-        # 환경변수 로드
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    key, val = line.split("=", 1)
-                    self._env_cache[key] = val
+DOS
+sc stop "cphs"
+sc config "cphs" start= disabled
+sc stop "IntelContentProtectionHDCPService"
+sc config "IntelContentProtectionHDCPService" start= disabled
+2. RDP 연결 시 WDDM 그래픽 드라이버 사용 끄기 (★핵심★)
+(RDP가 인텔 드라이버를 안 쓰고, 안전한 기본 드라이버(XDDM)를 쓰게 강제합니다. 튕김 현상 100% 잡는 레지스트리입니다.)
 
-    def get(self, key):
-        return self._env_cache.get(key, "").strip()
+DOS
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v "fEnableWddmDriver" /t REG_DWORD /d 0 /f
+3. 빠른 시작 끄기 (드라이버 꼬임 방지)
+(재부팅 시 깨끗한 커널로 로드되도록 합니다.)
 
-# ========================================================
-# 2. Local Memory (Repository Pattern)
-# ========================================================
-class MemoryRepo:
-    def __init__(self):
-        self._conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self._init_table()
+DOS
+powercfg -h off
+4. 그룹 정책 강제 업데이트
+(위 레지스트리 설정을 즉시 적용합니다.)
 
-    def _init_table(self):
-        self._conn.execute('''
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT,
-                tag TEXT DEFAULT 'General',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self._conn.commit()
+DOS
+gpupdate /force
+3. 마무리 및 확인
+모든 명령어가 입력되었으면 반드시 재부팅 하십시오.
 
-    def add_note(self, text, tag="Memo"):
-        self._conn.execute('INSERT INTO notes (content, tag) VALUES (?, ?)', (text, tag))
-        self._conn.commit()
+DOS
+shutdown /r /t 0
+PC가 켜지면 로컬에서 먼저 로그인이 잘 되는지 확인합니다.
 
-    def retrieve(self, query, limit=3):
-        # Simple Keyword Matching for RAG
-        keywords = query.split()
-        if not keywords: return []
-        
-        sql = "SELECT content FROM notes WHERE " + " OR ".join(["content LIKE ?"] * len(keywords))
-        params = [f"%{k}%" for k in keywords]
-        
-        cursor = self._conn.execute(sql + f" ORDER BY id DESC LIMIT {limit}", params)
-        return [r[0] for r in cursor.fetchall()]
+그 다음, 다른 기기에서 **원격 데스크톱(RDP)**을 걸어보십시오.
 
-# ========================================================
-# 3. Agent Strategies (Strategy Pattern)
-# ========================================================
-class BaseAgent(ABC):
-    @abstractmethod
-    def run(self, prompt, context): pass
+조치 결과:
 
-class RemoteLLMAgent(BaseAgent):
-    def __init__(self, endpoint_key, label):
-        self.config = Config()
-        self.endpoint_key = endpoint_key
-        self.label = label
+sc config 명령어로 인텔 HDCP 서비스를 disabled 시켰으므로, 부팅 시 해당 서비스가 올라오지 않아 모니터 블랙 스크린이 해결됩니다.
 
-    def run(self, prompt, context):
-        url = self.config.get(self.endpoint_key)
-        api_key = self.config.get("API_KEY")
-
-        if not url or not api_key:
-            return f"⚠️ Configuration Missing: Please set {self.endpoint_key} and API_KEY in '{ENV_PATH}'."
-
-        # RAG Context Injection
-        final_input = f"Context:\n{context}\n\nTask: {prompt}" if context else prompt
-
-        payload = {
-            "input_type": "chat",
-            "output_type": "chat",
-            "input_value": final_input
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": api_key
-        }
-
-        try:
-            # 타임아웃 45초
-            response = requests.post(url, json=payload, headers=headers, timeout=45)
-            response.raise_for_status()
-            return self._extract_text(response.json())
-        except Exception as e:
-            return f"Error ({self.label}): {str(e)}"
-
-    def _extract_text(self, data):
-        # 복잡한 JSON 구조 파싱 (LangFlow 호환)
-        try:
-            return data["outputs"][0]["outputs"]["results"]["message"]["text"]
-        except (KeyError, IndexError):
-            # 구조가 다를 경우 Raw Data의 일부 반환 (디버깅용)
-            return f"Parsing Error. Raw response: {str(data)[:100]}..."
-
-# ========================================================
-# 4. Orchestrator (Facade Pattern)
-# ========================================================
-class AgentOrchestrator:
-    def __init__(self):
-        self.memory = MemoryRepo()
-        self.agents = {
-            "GENERAL": RemoteLLMAgent("URL_GENERAL", "Assistant"),
-            "UBUNTU": RemoteLLMAgent("URL_UBUNTU", "Linux Expert"),
-            "SQL": RemoteLLMAgent("URL_SQL", "DB Admin"),
-            "REASON": RemoteLLMAgent("URL_REASON", "Analyst"),
-        }
-
-    def process(self, user_msg):
-        # 1. System Command (/save)
-        if user_msg.startswith(("/save", "/memo", "/저장")):
-            content = re.sub(r'^(/save|/memo|/저장)\s*', '', user_msg)
-            self.memory.add_note(content)
-            return {"type": "sys", "msg": "Saved to local memory.", "agent": "SYS"}
-
-        # 2. Intent Classification (Simple Router)
-        intent = "GENERAL"
-        msg_lower = user_msg.lower()
-        
-        if any(x in msg_lower for x in ['ubuntu', 'linux', 'bash', 'terminal', 'shell']):
-            intent = "UBUNTU"
-        elif any(x in msg_lower for x in ['sql', 'query', 'database', 'select', 'join']):
-            intent = "SQL"
-        elif any(x in msg_lower for x in ['plan', 'reason', 'analyze', 'think', 'why']):
-            intent = "REASON"
-
-        # 3. Retrieve Context
-        context_data = self.memory.retrieve(user_msg)
-        context_str = "\n".join(context_data)
-
-        # 4. Execute Agent
-        response_text = self.agents[intent].run(user_msg, context_str)
-
-        return {
-            "type": "chat",
-            "msg": response_text,
-            "agent": self.agents[intent].label,
-            "refs": context_data
-        }
-
-# ========================================================
-# 5. Web Interface (Flask)
-# ========================================================
-app = Flask(__name__)
-orchestrator = AgentOrchestrator()
-
-HTML_UI = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EffBoost Workspace</title>
-    <style>
-        :root {
-            --bg-primary: #1e1e1e;
-            --bg-secondary: #252526;
-            --text-main: #d4d4d4;
-            --accent: #007acc;
-            --border: #3e3e42;
-            --code-bg: #1e1e1e;
-        }
-        body { margin: 0; background-color: var(--bg-primary); color: var(--text-main); font-family: 'Segoe UI', 'Roboto', monospace; display: flex; justify-content: center; height: 100vh; overflow: hidden; }
-        .app-frame { width: 100%; max-width: 900px; display: flex; flex-direction: column; background: var(--bg-secondary); border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
-        
-        header { padding: 15px 20px; background: #2d2d2d; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-        header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: 0.5px; color: #fff; }
-        .status { width: 8px; height: 8px; background-color: #4caf50; border-radius: 50%; box-shadow: 0 0 8px #4caf50; }
-
-        .chat-container { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
-        .chat-container::-webkit-scrollbar { width: 10px; }
-        .chat-container::-webkit-scrollbar-thumb { background: #424242; border-radius: 5px; }
-
-        .message { padding: 12px 16px; border-radius: 6px; max-width: 85%; font-size: 14px; line-height: 1.5; position: relative; }
-        .msg-user { align-self: flex-end; background-color: #0e639c; color: white; }
-        .msg-bot { align-self: flex-start; background-color: #333333; border: 1px solid var(--border); }
-        
-        .agent-label { font-size: 10px; color: #9cdcfe; margin-bottom: 4px; display: block; font-weight: bold; text-transform: uppercase; }
-        .ref-box { margin-top: 8px; padding-top: 8px; border-top: 1px solid #444; font-size: 11px; color: #858585; }
-        
-        pre { background: #000; padding: 10px; border-radius: 4px; overflow-x: auto; font-family: 'Consolas', monospace; border: 1px solid #444; color: #ce9178; }
-        code { font-family: 'Consolas', monospace; }
-
-        .input-zone { padding: 20px; background: #2d2d2d; border-top: 1px solid var(--border); display: flex; gap: 10px; }
-        input { flex: 1; padding: 12px; background: #3c3c3c; border: 1px solid #3c3c3c; color: white; border-radius: 4px; outline: none; font-family: inherit; }
-        input:focus { border-color: var(--accent); }
-        button { padding: 0 20px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
-        button:hover { background-color: #0062a3; }
-    </style>
-</head>
-<body>
-    <div class="app-frame">
-        <header>
-            <h1>EffBoost :: Workspace</h1>
-            <div class="status" title="System Online"></div>
-        </header>
-        <div class="chat-container" id="chatBox">
-            <div class="message msg-bot">
-                <span class="agent-label">System</span>
-                Welcome. Ready to boost efficiency.<br>
-                Commands: <code>/save [text]</code> to memorize.
-            </div>
-        </div>
-        <div class="input-zone">
-            <input type="text" id="userInput" placeholder="Type a command or query..." autocomplete="off">
-            <button onclick="send()">RUN</button>
-        </div>
-    </div>
-
-    <script>
-        const input = document.getElementById('userInput');
-        const box = document.getElementById('chatBox');
-
-        input.addEventListener('keypress', (e) => { if(e.key === 'Enter') send(); });
-
-        async function send() {
-            const text = input.value.trim();
-            if (!text) return;
-
-            // Add User Message
-            box.innerHTML += `<div class="message msg-user">${esc(text)}</div>`;
-            input.value = '';
-            box.scrollTop = box.scrollHeight;
-
-            try {
-                const res = await fetch('/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({msg: text})
-                });
-                const data = await res.json();
-                
-                let content = fmt(data.msg);
-                if (data.refs && data.refs.length > 0) {
-                    content += `<div class="ref-box">Recall: ${data.refs.length} item(s) found.</div>`;
-                }
-
-                box.innerHTML += `
-                    <div class="message msg-bot">
-                        <span class="agent-label">${data.agent}</span>
-                        ${content}
-                    </div>
-                `;
-            } catch (err) {
-                box.innerHTML += `<div class="message msg-bot" style="color:#f48771">Connection Error. Check console/logs.</div>`;
-            }
-            box.scrollTop = box.scrollHeight;
-        }
-
-        function esc(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-        function fmt(t) { return t.replace(/\\n/g, '<br>').replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>'); }
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index(): return render_template_string(HTML_UI)
-
-@app.route('/chat', methods=['POST'])
-def chat():
-    data = request.json
-    return jsonify(orchestrator.process(data.get('msg', '')))
-
-if __name__ == '__main__':
-    # Initial Setup
-    Config()
-    
-    print("="*50)
-    print(f" EffBoost Server Running on Port {PORT}")
-    print(f" [!] Edit Config File: {ENV_PATH}")
-    print(f" [>] http://localhost:{PORT}")
-    print("="*50)
-    
-    app.run(host='0.0.0.0', port=PORT)
+reg add 명령어로 RDP가 인텔 그래픽 가속을 쓰지 않게 했으므로, 암호 입력 후 튕기는 현상이 사라지고 "Microsoft Remote Display Adapter"로 안정적으로 접속될 것입니다.
